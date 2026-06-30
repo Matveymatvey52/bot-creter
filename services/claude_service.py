@@ -43,6 +43,18 @@ async def chat_gather_requirements(conversation: list[dict]) -> str:
     return response.content[0].text
 
 
+async def extract_bot_name(requirements_summary: str) -> str:
+    response = await client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=32,
+        system="Extract a short snake_case bot filename (no 'bot' suffix, max 20 chars, only a-z 0-9 _). Return ONLY the name, nothing else.",
+        messages=[{"role": "user", "content": requirements_summary}],
+    )
+    raw = response.content[0].text.strip().lower()
+    name = "".join(c for c in raw.replace(" ", "_") if c.isalnum() or c == "_")[:20]
+    return name or "my_bot"
+
+
 async def generate_bot_code(requirements_summary: str) -> str:
     response = await client.messages.create(
         model="claude-sonnet-4-6",

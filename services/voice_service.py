@@ -6,9 +6,11 @@ import assemblyai as aai
 
 from config import ASSEMBLYAI_API_KEY
 
+if ASSEMBLYAI_API_KEY:
+    aai.settings.api_key = ASSEMBLYAI_API_KEY
+
 
 def _transcribe_sync(file_path: str) -> str:
-    aai.settings.api_key = ASSEMBLYAI_API_KEY
     config = aai.TranscriptionConfig(language_code="ru")
     transcriber = aai.Transcriber(config=config)
     transcript = transcriber.transcribe(file_path)

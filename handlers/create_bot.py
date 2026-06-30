@@ -6,7 +6,7 @@ import tempfile
 from pathlib import Path
 
 from aiogram import Bot, F, Router
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
@@ -27,6 +27,16 @@ GENERATED_BOTS_DIR.mkdir(exist_ok=True)
 class CreateBotStates(StatesGroup):
     gathering = State()
     waiting_for_token = State()
+
+
+@router.message(Command("cancel"), StateFilter("*"))
+async def cmd_cancel(message: Message, state: FSMContext):
+    current = await state.get_state()
+    if current is None:
+        await message.answer("Нечего отменять.")
+        return
+    await state.clear()
+    await message.answer("Отменено. Начни заново с /create")
 
 
 @router.message(Command("create"))
@@ -148,10 +158,9 @@ async def handle_token(message: Message, state: FSMContext, bot: Bot):
     # Get real bot username from Telegram
     real_username: str | None = None
     try:
-        temp_bot = Bot(token=token)
-        bot_info = await temp_bot.get_me()
-        real_username = bot_info.username
-        await temp_bot.session.close()
+        async with Bot(token=token) as temp_bot:
+            bot_info = await temp_bot.get_me()
+            real_username = bot_info.username
     except Exception:
         pass
 

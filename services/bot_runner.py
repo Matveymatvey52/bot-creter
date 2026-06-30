@@ -9,11 +9,12 @@ logger = logging.getLogger(__name__)
 
 _processes: dict[int, asyncio.subprocess.Process] = {}
 _last_errors: dict[int, str] = {}
+_stderr_tasks: dict[int, asyncio.Task] = {}
 
 
 async def _collect_stderr(bot_id: int, process: asyncio.subprocess.Process) -> None:
     try:
-        data = await process.stderr.read(8192)
+        data = await process.stderr.read()  # read until EOF to prevent pipe buffer deadlock
         if data:
             _last_errors[bot_id] = data.decode(errors="replace").strip()
     except Exception:
@@ -28,14 +29,14 @@ async def start_bot(bot_id: int, file_path: str, token: str) -> int:
         sys.executable,
         file_path,
         env=env,
-        stdout=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.DEVNULL,  # never read, avoid pipe buffer deadlock
         stderr=asyncio.subprocess.PIPE,
     )
     _processes[bot_id] = process
 
-    # Check if the process crashes within 2 seconds
+    # Check if the process crashes within 2 seconds (no asyncio.shield — it leaks coroutines)
     try:
-        await asyncio.wait_for(asyncio.shield(process.wait()), timeout=2.0)
+        await asyncio.wait_for(process.wait(), timeout=2.0)
         # Process already exited — it crashed
         stderr_data = await process.stderr.read()
         error_text = stderr_data.decode(errors="replace").strip()
@@ -44,8 +45,9 @@ async def start_bot(bot_id: int, file_path: str, token: str) -> int:
         short = error_text[-600:] if len(error_text) > 600 else error_text
         raise RuntimeError(short or "бот завершился сразу после запуска")
     except asyncio.TimeoutError:
-        # Still running after 2 seconds — good
-        asyncio.create_task(_collect_stderr(bot_id, process))
+        # Still running after 2 seconds — good; start background stderr drain
+        task = asyncio.create_task(_collect_stderr(bot_id, process))
+        _stderr_tasks[bot_id] = task  # keep reference to avoid GC and suppress warnings
 
     logger.info(f"Bot {bot_id} started with PID {process.pid}")
     return process.pid
@@ -61,6 +63,7 @@ async def stop_bot(bot_id: int) -> bool:
     except asyncio.TimeoutError:
         process.kill()
     _processes.pop(bot_id, None)
+    _stderr_tasks.pop(bot_id, None)
     logger.info(f"Bot {bot_id} stopped")
     return True
 

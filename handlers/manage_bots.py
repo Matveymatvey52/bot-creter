@@ -11,15 +11,13 @@ router = Router()
 
 
 async def _ensure_username(b: dict) -> str:
-    """Return @username for bot, fetching from Telegram API if missing."""
     if b.get("username"):
         return b["username"]
     if not b.get("token"):
         return ""
     try:
-        tmp = Bot(token=b["token"])
-        info = await tmp.get_me()
-        await tmp.session.close()
+        async with Bot(token=b["token"]) as tmp:
+            info = await tmp.get_me()
         await update_bot_username(b["id"], info.username)
         return info.username
     except Exception:

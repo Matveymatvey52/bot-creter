@@ -27,6 +27,8 @@ async def restore_bots():
                 pid = await start_bot(bot["id"], bot["file_path"], bot["token"])
                 await update_bot_status(bot["id"], "running", pid)
                 logger.info(f"Restored bot '{bot['name']}' (ID: {bot['id']}, PID: {pid})")
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 logger.error(f"Failed to restore bot '{bot['name']}' (ID: {bot['id']}): {e}")
                 await update_bot_status(bot["id"], "error")

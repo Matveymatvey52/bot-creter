@@ -23,8 +23,8 @@ async def init_db():
         """)
         try:
             await db.execute("ALTER TABLE bots ADD COLUMN username TEXT")
-        except Exception:
-            pass
+        except aiosqlite.OperationalError:
+            pass  # column already exists
         await db.commit()
 
 
@@ -51,8 +51,8 @@ async def get_bot_by_name(name: str) -> dict | None:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT * FROM bots WHERE name = ? OR username = ? OR name = ?",
-            (clean, name.lstrip("@"), name.lstrip("@")),
+            "SELECT * FROM bots WHERE name = ? OR username = ?",
+            (clean, name.lstrip("@")),
         ) as cursor:
             row = await cursor.fetchone()
             return dict(row) if row else None
