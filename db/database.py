@@ -66,6 +66,12 @@ async def get_bot(bot_id: int) -> dict | None:
             return dict(row) if row else None
 
 
+async def update_bot_username(bot_id: int, username: str) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE bots SET username = ? WHERE id = ?", (username, bot_id))
+        await db.commit()
+
+
 async def update_bot_status(bot_id: int, status: str, pid: int | None = None):
     async with aiosqlite.connect(DB_PATH) as db:
         if pid is not None:

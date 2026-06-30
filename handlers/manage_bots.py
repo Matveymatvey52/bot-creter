@@ -1,13 +1,29 @@
 from __future__ import annotations
 
-from aiogram import Router
+from aiogram import Bot, Router
 from aiogram.filters import Command
 from aiogram.types import Message
 
-from db.database import get_all_bots, get_bot, get_bot_by_name, update_bot_status
+from db.database import get_all_bots, get_bot, get_bot_by_name, update_bot_status, update_bot_username
 from services.bot_runner import get_bot_logs, is_running, start_bot, stop_bot
 
 router = Router()
+
+
+async def _ensure_username(b: dict) -> str:
+    """Return @username for bot, fetching from Telegram API if missing."""
+    if b.get("username"):
+        return b["username"]
+    if not b.get("token"):
+        return ""
+    try:
+        tmp = Bot(token=b["token"])
+        info = await tmp.get_me()
+        await tmp.session.close()
+        await update_bot_username(b["id"], info.username)
+        return info.username
+    except Exception:
+        return ""
 
 
 @router.message(Command("list"))
@@ -20,7 +36,8 @@ async def cmd_list(message: Message):
     lines = ["📋 *Список ботов:*\n"]
     for b in bots:
         status = "🟢 работает" if is_running(b["id"]) else "🔴 остановлен"
-        username_str = f" (@{b['username']})" if b.get("username") else ""
+        username = await _ensure_username(b)
+        username_str = f" (@{username})" if username else ""
         lines.append(f"*{b['name']}*{username_str} (ID: `{b['id']}`) — {status}")
 
     lines.append("\n/stop `<id>` — остановить\n/run `<id или @username>` — запустить\n/logs `<id>` — ошибки")
