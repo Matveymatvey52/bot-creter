@@ -1,9 +1,11 @@
+from __future__ import annotations
+
 from aiogram import Router
 from aiogram.filters import Command
 from aiogram.types import Message
 
-from db.database import get_all_bots, get_bot, update_bot_status
-from services.bot_runner import is_running, start_bot, stop_bot
+from db.database import get_all_bots, get_bot, get_bot_by_name, update_bot_status
+from services.bot_runner import get_bot_logs, is_running, start_bot, stop_bot
 
 router = Router()
 
@@ -18,9 +20,10 @@ async def cmd_list(message: Message):
     lines = ["📋 *Список ботов:*\n"]
     for b in bots:
         status = "🟢 работает" if is_running(b["id"]) else "🔴 остановлен"
-        lines.append(f"*{b['name']}* (ID: `{b['id']}`) — {status}")
+        username_str = f" (@{b['username']})" if b.get("username") else ""
+        lines.append(f"*{b['name']}*{username_str} (ID: `{b['id']}`) — {status}")
 
-    lines.append("\n/stop `<id>` — остановить\n/run `<id>` — запустить")
+    lines.append("\n/stop `<id>` — остановить\n/run `<id или @username>` — запустить\n/logs `<id>` — ошибки")
     await message.answer("\n".join(lines), parse_mode="Markdown")
 
 
@@ -45,26 +48,60 @@ async def cmd_stop(message: Message):
         await message.answer(f"Бот *{bot['name']}* не запущен.", parse_mode="Markdown")
 
 
+async def _resolve_bot(arg: str) -> dict | None:
+    if arg.isdigit():
+        return await get_bot(int(arg))
+    return await get_bot_by_name(arg)
+
+
 @router.message(Command("run"))
 async def cmd_run(message: Message):
     parts = message.text.split()
-    if len(parts) < 2 or not parts[1].isdigit():
-        await message.answer("Использование: /run <id>")
+    if len(parts) < 2:
+        await message.answer("Использование: /run <id или @username или имя>")
         return
 
-    bot_id = int(parts[1])
-    bot = await get_bot(bot_id)
+    bot = await _resolve_bot(parts[1])
     if not bot:
-        await message.answer(f"Бот с ID {bot_id} не найден.")
+        await message.answer(f"Бот `{parts[1]}` не найден.", parse_mode="Markdown")
         return
 
-    if is_running(bot_id):
+    if is_running(bot["id"]):
         await message.answer(f"Бот *{bot['name']}* уже запущен.", parse_mode="Markdown")
         return
 
     try:
-        pid = await start_bot(bot_id, bot["file_path"], bot["token"])
-        await update_bot_status(bot_id, "running", pid)
+        pid = await start_bot(bot["id"], bot["file_path"], bot["token"])
+        await update_bot_status(bot["id"], "running", pid)
         await message.answer(f"Бот *{bot['name']}* запущен! 🚀", parse_mode="Markdown")
     except Exception as e:
-        await message.answer(f"Ошибка при запуске: `{e}`", parse_mode="Markdown")
+        await update_bot_status(bot["id"], "error")
+        await message.answer(
+            f"Ошибка при запуске *{bot['name']}*:\n```\n{e}\n```\n\nПодробнее: /logs {bot['id']}",
+            parse_mode="Markdown",
+        )
+
+
+@router.message(Command("logs"))
+async def cmd_logs(message: Message):
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.answer("Использование: /logs <id>")
+        return
+
+    bot = await _resolve_bot(parts[1])
+    if not bot:
+        await message.answer("Бот не найден.")
+        return
+
+    logs = get_bot_logs(bot["id"])
+    if not logs:
+        await message.answer(
+            f"Логов для *{bot['name']}* нет (или бот ещё не запускался в этой сессии).",
+            parse_mode="Markdown",
+        )
+        return
+
+    if len(logs) > 3500:
+        logs = "...\n" + logs[-3500:]
+    await message.answer(f"📋 Логи *{bot['name']}*:\n```\n{logs}\n```", parse_mode="Markdown")

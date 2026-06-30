@@ -7,7 +7,17 @@ import sys
 
 logger = logging.getLogger(__name__)
 
-_processes: dict = {}
+_processes: dict[int, asyncio.subprocess.Process] = {}
+_last_errors: dict[int, str] = {}
+
+
+async def _collect_stderr(bot_id: int, process: asyncio.subprocess.Process) -> None:
+    try:
+        data = await process.stderr.read(8192)
+        if data:
+            _last_errors[bot_id] = data.decode(errors="replace").strip()
+    except Exception:
+        pass
 
 
 async def start_bot(bot_id: int, file_path: str, token: str) -> int:
@@ -22,6 +32,21 @@ async def start_bot(bot_id: int, file_path: str, token: str) -> int:
         stderr=asyncio.subprocess.PIPE,
     )
     _processes[bot_id] = process
+
+    # Check if the process crashes within 2 seconds
+    try:
+        await asyncio.wait_for(asyncio.shield(process.wait()), timeout=2.0)
+        # Process already exited — it crashed
+        stderr_data = await process.stderr.read()
+        error_text = stderr_data.decode(errors="replace").strip()
+        _last_errors[bot_id] = error_text
+        _processes.pop(bot_id, None)
+        short = error_text[-600:] if len(error_text) > 600 else error_text
+        raise RuntimeError(short or "бот завершился сразу после запуска")
+    except asyncio.TimeoutError:
+        # Still running after 2 seconds — good
+        asyncio.create_task(_collect_stderr(bot_id, process))
+
     logger.info(f"Bot {bot_id} started with PID {process.pid}")
     return process.pid
 
@@ -43,3 +68,7 @@ async def stop_bot(bot_id: int) -> bool:
 def is_running(bot_id: int) -> bool:
     process = _processes.get(bot_id)
     return process is not None and process.returncode is None
+
+
+def get_bot_logs(bot_id: int) -> str | None:
+    return _last_errors.get(bot_id)

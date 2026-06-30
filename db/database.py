@@ -12,6 +12,7 @@ async def init_db():
             CREATE TABLE IF NOT EXISTS bots (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
+                username TEXT,
                 description TEXT,
                 token TEXT,
                 file_path TEXT,
@@ -20,14 +21,18 @@ async def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        try:
+            await db.execute("ALTER TABLE bots ADD COLUMN username TEXT")
+        except Exception:
+            pass
         await db.commit()
 
 
-async def create_bot_record(name: str, description: str, token: str, file_path: str) -> int:
+async def create_bot_record(name: str, description: str, token: str, file_path: str, username: str | None = None) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
-            "INSERT INTO bots (name, description, token, file_path, status) VALUES (?, ?, ?, ?, 'stopped')",
-            (name, description, token, file_path),
+            "INSERT INTO bots (name, username, description, token, file_path, status) VALUES (?, ?, ?, ?, ?, 'stopped')",
+            (name, username, description, token, file_path),
         )
         await db.commit()
         return cursor.lastrowid
@@ -39,6 +44,18 @@ async def get_all_bots() -> list[dict]:
         async with db.execute("SELECT * FROM bots ORDER BY created_at DESC") as cursor:
             rows = await cursor.fetchall()
             return [dict(row) for row in rows]
+
+
+async def get_bot_by_name(name: str) -> dict | None:
+    clean = name.lstrip("@").removesuffix("_bot")
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM bots WHERE name = ? OR username = ? OR name = ?",
+            (clean, name.lstrip("@"), name.lstrip("@")),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else None
 
 
 async def get_bot(bot_id: int) -> dict | None:
