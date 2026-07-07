@@ -57,7 +57,7 @@ def _bot_keyboard(bot_id: int) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="🗑 Удалить", callback_data=f"delete:{bot_id}"),
     ])
     rows.append([
-        InlineKeyboardButton(text="◀ Назад", callback_data="list"),
+        InlineKeyboardButton(text="◀ К списку", callback_data="list"),
     ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -75,6 +75,16 @@ def _bot_text(b: dict) -> str:
     )
 
 
+async def _send_list(send_fn, bots: list[dict]) -> None:
+    for b in bots:
+        b["username"] = await _ensure_username(b)
+    await send_fn(
+        "📋 *Мои боты* — нажми на бота для управления:",
+        parse_mode="Markdown",
+        reply_markup=_list_keyboard(bots),
+    )
+
+
 # ── /list ─────────────────────────────────────────────────────────────────────
 
 @router.message(Command("list"))
@@ -83,13 +93,7 @@ async def cmd_list(message: Message):
     if not bots:
         await message.answer("Ботов пока нет. Создай первого командой /create")
         return
-    for b in bots:
-        b["username"] = await _ensure_username(b)
-    await message.answer(
-        "📋 *Мои боты* — нажми на бота для управления:",
-        parse_mode="Markdown",
-        reply_markup=_list_keyboard(bots),
-    )
+    await _send_list(message.answer, bots)
 
 
 # ── /stop ─────────────────────────────────────────────────────────────────────
@@ -107,10 +111,7 @@ async def cmd_stop(message: Message):
         text=f"🔴 {b['name']}" + (f"  @{b['username']}" if b.get("username") else ""),
         callback_data=f"stop:{b['id']}"
     )] for b in running]
-    await message.answer(
-        "Выбери бота для остановки:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
-    )
+    await message.answer("Выбери бота для остановки:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
 
 
 # ── /run ──────────────────────────────────────────────────────────────────────
@@ -128,10 +129,7 @@ async def cmd_run(message: Message):
         text=f"🟢 {b['name']}" + (f"  @{b['username']}" if b.get("username") else ""),
         callback_data=f"start:{b['id']}"
     )] for b in stopped]
-    await message.answer(
-        "Выбери бота для запуска:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
-    )
+    await message.answer("Выбери бота для запуска:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
 
 
 # ── /logs ─────────────────────────────────────────────────────────────────────
@@ -169,19 +167,14 @@ async def cb_list(callback: CallbackQuery):
     await callback.answer()
     bots = await get_all_bots()
     if not bots:
-        await callback.message.edit_text("Ботов пока нет. Создай первого командой /create")
+        await callback.message.answer("Ботов пока нет. Создай первого командой /create")
         return
-    for b in bots:
-        b["username"] = await _ensure_username(b)
-    await callback.message.edit_text(
-        "📋 *Мои боты* — нажми на бота для управления:",
-        parse_mode="Markdown",
-        reply_markup=_list_keyboard(bots),
-    )
+    await _send_list(callback.message.answer, bots)
 
 
 @router.callback_query(F.data.startswith("info:"))
 async def cb_info(callback: CallbackQuery):
+    # Answer immediately — ALWAYS, before any async work
     await callback.answer()
     bot_id = int(callback.data.split(":")[1])
     b = await get_bot(bot_id)
@@ -189,18 +182,12 @@ async def cb_info(callback: CallbackQuery):
         await callback.message.answer("Бот не найден.")
         return
     b["username"] = await _ensure_username(b)
-    try:
-        await callback.message.edit_text(
-            _bot_text(b),
-            parse_mode="Markdown",
-            reply_markup=_bot_keyboard(bot_id),
-        )
-    except Exception:
-        await callback.message.answer(
-            _bot_text(b),
-            parse_mode="Markdown",
-            reply_markup=_bot_keyboard(bot_id),
-        )
+    # Send as new message — more reliable than edit_text
+    await callback.message.answer(
+        _bot_text(b),
+        parse_mode="Markdown",
+        reply_markup=_bot_keyboard(bot_id),
+    )
 
 
 @router.callback_query(F.data.startswith("start:"))
@@ -214,25 +201,24 @@ async def cb_start(callback: CallbackQuery):
     if is_running(bot_id):
         await callback.message.answer("Уже запущен.")
         return
-    err_text: str | None = None
     try:
         pid = await start_bot(bot_id, b["file_path"], b["token"])
         await update_bot_status(bot_id, "running", pid)
     except Exception as e:
         await update_bot_status(bot_id, "error")
-        err_text = str(e)[:300]
-    b["username"] = await _ensure_username(b)
-    try:
-        await callback.message.edit_text(
-            _bot_text(b), parse_mode="Markdown", reply_markup=_bot_keyboard(bot_id)
-        )
-    except Exception:
-        pass
-    if err_text:
+        # User-friendly error, no traceback
         await callback.message.answer(
-            f"❌ Ошибка при запуске:\n```\n{err_text}\n```\n\nСм. /logs {bot_id}",
-            parse_mode="Markdown",
+            "❌ Бот не смог запуститься — в сгенерированном коде ошибка.\n\n"
+            "Что делать: удали его кнопкой 🗑 и создай заново через /create.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="🗑 Удалить и пересоздать", callback_data=f"delete:{bot_id}")
+            ]]),
         )
+        return
+    b["username"] = await _ensure_username(b)
+    await callback.message.edit_text(
+        _bot_text(b), parse_mode="Markdown", reply_markup=_bot_keyboard(bot_id)
+    )
 
 
 @router.callback_query(F.data.startswith("stop:"))
@@ -243,16 +229,17 @@ async def cb_stop(callback: CallbackQuery):
     if not b:
         await callback.message.answer("Бот не найден.")
         return
-    stopped = await stop_bot(bot_id)
-    if stopped:
-        await update_bot_status(bot_id, "stopped")
+    await stop_bot(bot_id)
+    await update_bot_status(bot_id, "stopped")
     b["username"] = await _ensure_username(b)
     try:
         await callback.message.edit_text(
             _bot_text(b), parse_mode="Markdown", reply_markup=_bot_keyboard(bot_id)
         )
     except Exception:
-        pass
+        await callback.message.answer(
+            _bot_text(b), parse_mode="Markdown", reply_markup=_bot_keyboard(bot_id)
+        )
 
 
 @router.callback_query(F.data.startswith("restart:"))
@@ -264,24 +251,27 @@ async def cb_restart(callback: CallbackQuery):
         await callback.message.answer("Бот не найден.")
         return
     await stop_bot(bot_id)
-    err_text: str | None = None
     try:
         pid = await start_bot(bot_id, b["file_path"], b["token"])
         await update_bot_status(bot_id, "running", pid)
-    except Exception as e:
+    except Exception:
         await update_bot_status(bot_id, "error")
-        err_text = str(e)[:300]
+        await callback.message.answer(
+            "❌ Бот не смог перезапуститься — в коде ошибка.\n\n"
+            "Удали его и создай заново через /create.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="🗑 Удалить", callback_data=f"delete:{bot_id}")
+            ]]),
+        )
+        return
     b["username"] = await _ensure_username(b)
     try:
         await callback.message.edit_text(
             _bot_text(b), parse_mode="Markdown", reply_markup=_bot_keyboard(bot_id)
         )
     except Exception:
-        pass
-    if err_text:
         await callback.message.answer(
-            f"❌ Ошибка при перезапуске:\n```\n{err_text}\n```",
-            parse_mode="Markdown",
+            _bot_text(b), parse_mode="Markdown", reply_markup=_bot_keyboard(bot_id)
         )
 
 
@@ -304,10 +294,11 @@ async def cb_delete(callback: CallbackQuery):
     if not b:
         await callback.message.answer("Бот не найден.")
         return
+    name = b["name"]
     await stop_bot(bot_id)
     await delete_bot(bot_id)
     await callback.message.edit_text(
-        f"🗑 Бот *{b['name']}* удалён.",
+        f"✅ Бот *{name}* удалён.\n\nСоздай нового: /create",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="◀ К списку", callback_data="list")

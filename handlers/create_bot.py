@@ -255,21 +255,21 @@ async def auto_launch_managed_bot(managed_data: dict, bot: Bot) -> None:
         await update_bot_status(bot_record_id, "running", pid)
         await bot.send_message(
             chat_id,
-            f"Бот *{bot_name}*{username_display} создан и запущен! 🚀\n"
-            f"ID: `{bot_record_id}`\n\n"
-            "Используй /list чтобы посмотреть все боты.",
+            f"Бот *{bot_name}*{username_display} создан и запущен! 🚀\n\n"
+            "Используй /list чтобы управлять ботом.",
             parse_mode="Markdown",
         )
     except Exception as e:
         logger.error(f"Failed to start managed bot {bot_record_id}: {e}")
         await update_bot_status(bot_record_id, "error")
-        short_err = str(e)[:400]
         await bot.send_message(
             chat_id,
-            f"Бот создан (ID: `{bot_record_id}`){username_display}, но упал при запуске:\n```\n{short_err}\n```\n\n"
-            f"Запустить снова: `/run {bot_record_id}`\n"
-            f"Логи: `/logs {bot_record_id}`",
+            f"Бот *{bot_name}*{username_display} создан, но не смог запуститься 😔\n\n"
+            "Скорее всего ошибка в сгенерированном коде. Попробуй удалить и создать заново через /create.",
             parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="🗑 Удалить бота", callback_data=f"delete:{bot_record_id}")
+            ]]),
         )
 
 
@@ -318,20 +318,20 @@ async def handle_token(message: Message, state: FSMContext, bot: Bot):
         pid = await start_bot(bot_id, str(bot_file), token)
         await update_bot_status(bot_id, "running", pid)
         await message.answer(
-            f"Бот *{bot_name}*{username_display} запущен! 🚀\n"
-            f"ID: `{bot_id}`\n\n"
-            "Используй /list чтобы посмотреть все боты.",
+            f"Бот *{bot_name}*{username_display} запущен! 🚀\n\n"
+            "Используй /list чтобы управлять ботом.",
             parse_mode="Markdown",
         )
     except Exception as e:
         logger.error(f"Failed to start bot {bot_id}: {e}")
         await update_bot_status(bot_id, "error")
-        short_err = str(e)[:400]
         await message.answer(
-            f"Бот создан (ID: `{bot_id}`){username_display}, но упал при запуске:\n```\n{short_err}\n```\n\n"
-            f"Запустить снова: `/run {bot_id}`\n"
-            f"Логи: `/logs {bot_id}`",
+            f"Бот *{bot_name}*{username_display} создан, но не смог запуститься 😔\n\n"
+            "Скорее всего ошибка в сгенерированном коде. Попробуй удалить и создать заново.",
             parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="🗑 Удалить бота", callback_data=f"delete:{bot_id}")
+            ]]),
         )
 
     await state.clear()

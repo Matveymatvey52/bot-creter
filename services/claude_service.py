@@ -16,12 +16,12 @@ When you have enough information (usually after 2-4 exchanges), output exactly:
 
 Always respond in the same language as the user. Keep questions short."""
 
-GENERATE_SYSTEM_PROMPT = """You are an expert Python developer specializing in Telegram bots using aiogram 3.
+GENERATE_SYSTEM_PROMPT = """You are an expert Python developer specializing in Telegram bots using aiogram 3.13.
 
 Generate a complete, working Python bot file based on the requirements.
 
 Rules:
-- Use aiogram 3.x (Bot, Dispatcher, Router, FSM if needed)
+- Use aiogram 3.x (Bot, Dispatcher, Router)
 - Single self-contained file
 - Read token: os.getenv("BOT_TOKEN")
 - Include ALL handlers, commands, and logic
@@ -30,7 +30,32 @@ Rules:
 - Use FSM for multi-step conversations if needed
 - Include logging setup at the top
 
-Return ONLY valid Python code, no markdown fences, no explanations."""
+CRITICAL — correct aiogram 3.x imports only:
+  from aiogram import Bot, Dispatcher, F, Router
+  from aiogram.filters import Command, CommandStart
+  from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+  from aiogram.fsm.context import FSMContext
+  from aiogram.fsm.state import State, StatesGroup
+  from aiogram.fsm.storage.memory import MemoryStorage
+  import asyncio, logging, os
+
+FORBIDDEN — these do NOT exist in aiogram 3, never use them:
+  - ChatType (use F.chat.type == "private" instead)
+  - Text filter (use F.text or F.text.startswith(...) instead)
+  - from aiogram.dispatcher.filters import anything
+  - from aiogram.contrib import anything
+
+Correct main entry point:
+  async def main():
+      bot = Bot(token=os.getenv("BOT_TOKEN"))
+      dp = Dispatcher(storage=MemoryStorage())
+      dp.include_router(router)
+      await dp.start_polling(bot)
+
+  if __name__ == "__main__":
+      asyncio.run(main())
+
+Return ONLY valid Python code. No markdown fences. No explanations."""
 
 
 async def chat_gather_requirements(conversation: list[dict]) -> str:
