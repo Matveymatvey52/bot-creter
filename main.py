@@ -1,12 +1,14 @@
 import asyncio
 import logging
+from typing import Any, Awaitable, Callable
 
-from aiogram import Bot, Dispatcher
+from aiogram import BaseMiddleware, Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import Update
 
 from config import BOT_TOKEN
 from db.database import get_all_bots, init_db, update_bot_status
-from handlers.create_bot import router as create_router
+from handlers.create_bot import auto_launch_managed_bot, router as create_router, set_manager_username
 from handlers.manage_bots import router as manage_router
 from handlers.start import router as start_router
 from services.bot_runner import start_bot
@@ -17,6 +19,23 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger(__name__)
+
+
+class ManagedBotMiddleware(BaseMiddleware):
+    """Intercepts managed_bot updates (Bot API 9.6+) before aiogram routing."""
+
+    async def __call__(
+        self,
+        handler: Callable[[Update, dict[str, Any]], Awaitable[Any]],
+        event: Update,
+        data: dict[str, Any],
+    ) -> Any:
+        extra = getattr(event, "model_extra", None) or {}
+        if "managed_bot" in extra:
+            bot: Bot = data["bot"]
+            asyncio.create_task(auto_launch_managed_bot(extra["managed_bot"], bot))
+            return  # don't forward to normal handlers
+        return await handler(event, data)
 
 
 async def restore_bots():
@@ -36,17 +55,36 @@ async def restore_bots():
 
 async def main():
     await init_db()
-    await restore_bots()
 
     bot = Bot(token=BOT_TOKEN)
+
+    # Store our username for managed-bot deep links
+    try:
+        me = await bot.get_me()
+        set_manager_username(me.username)
+        logger.info(f"Manager bot: @{me.username}")
+    except Exception as e:
+        logger.warning(f"Could not fetch bot info: {e}")
+
+    await restore_bots()
+
     dp = Dispatcher(storage=MemoryStorage())
+    dp.update.outer_middleware(ManagedBotMiddleware())
 
     dp.include_router(start_router)
     dp.include_router(create_router)
     dp.include_router(manage_router)
 
     await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
+    await dp.start_polling(
+        bot,
+        allowed_updates=[
+            "message",
+            "callback_query",
+            "inline_query",
+            "managed_bot",  # Telegram Bot API 9.6+
+        ],
+    )
 
 
 if __name__ == "__main__":

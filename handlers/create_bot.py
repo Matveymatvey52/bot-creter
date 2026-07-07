@@ -4,6 +4,7 @@ import asyncio
 import logging
 import tempfile
 from pathlib import Path
+from urllib.parse import quote_plus
 
 from aiogram import Bot, F, Router
 from aiogram.filters import Command, StateFilter
@@ -11,10 +12,11 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-from config import ASSEMBLYAI_API_KEY, DATA_DIR
+from config import ASSEMBLYAI_API_KEY, BOT_TOKEN, DATA_DIR
 from db.database import create_bot_record, update_bot_status
 from services.bot_runner import start_bot
 from services.claude_service import chat_gather_requirements, extract_bot_name, generate_bot_code
+from services.telegram_api import get_managed_bot_token
 from services.voice_service import transcribe_voice
 
 router = Router()
@@ -22,6 +24,17 @@ logger = logging.getLogger(__name__)
 
 GENERATED_BOTS_DIR = DATA_DIR / "generated_bots"
 GENERATED_BOTS_DIR.mkdir(exist_ok=True)
+
+# Set at startup via set_manager_username()
+_manager_username: str = ""
+
+# user_id -> pending bot creation data (populated before user clicks the link)
+_pending: dict[int, dict] = {}
+
+
+def set_manager_username(username: str) -> None:
+    global _manager_username
+    _manager_username = username
 
 
 class CreateBotStates(StatesGroup):
@@ -35,12 +48,14 @@ async def cmd_cancel(message: Message, state: FSMContext):
     if current is None:
         await message.answer("Нечего отменять.")
         return
+    _pending.pop(message.from_user.id, None)
     await state.clear()
     await message.answer("Отменено. Начни заново с /create")
 
 
 @router.message(Command("create"))
 async def cmd_create(message: Message, state: FSMContext):
+    _pending.pop(message.from_user.id, None)
     await state.clear()
     await state.set_state(CreateBotStates.gathering)
     await state.update_data(conversation=[])
@@ -118,22 +133,131 @@ async def _process_gathering_text(message: Message, state: FSMContext, text: str
         await state.update_data(conversation=conversation, bot_code=code, bot_summary=summary, bot_name=bot_name)
         await state.set_state(CreateBotStates.waiting_for_token)
 
+        # Store pending so managed_bot update handler can find it by creator user_id
+        _pending[message.from_user.id] = {
+            "chat_id": message.chat.id,
+            "code": code,
+            "name": bot_name,
+            "summary": summary,
+        }
+
+        # Build managed-bot deep link — user lands in BotFather with name/username pre-filled
+        suggested_username = f"{bot_name}Bot"
+        display_name = bot_name.replace("_", " ").title()
+        if _manager_username:
+            url = (
+                f"https://t.me/newbot/{_manager_username}/"
+                f"{suggested_username}?name={quote_plus(display_name)}"
+            )
+            button_text = "Создать бота автоматически ✨"
+            instructions = (
+                f"Код готов! ✅\n\n"
+                f"Предлагаемый username: *@{suggested_username}*\n\n"
+                f"1️⃣ Нажми кнопку ниже\n"
+                f"2️⃣ Проверь имя и username в BotFather (можно изменить)\n"
+                f"3️⃣ Нажми «Создать» — бот запустится автоматически!"
+            )
+        else:
+            url = "https://t.me/BotFather?start=newbot"
+            button_text = "Открыть BotFather 🤖"
+            instructions = (
+                f"Код готов! ✅\n\n"
+                f"Предлагаемое имя: *{bot_name}_bot*\n\n"
+                f"1️⃣ Нажми кнопку → BotFather\n"
+                f"2️⃣ Отправь /newbot, введи имя и username\n"
+                f"3️⃣ Скопируй токен и вставь сюда"
+            )
+
         keyboard = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="Открыть BotFather 🤖", url="https://t.me/BotFather?start=newbot")
+            InlineKeyboardButton(text=button_text, url=url)
         ]])
-        await message.answer(
-            f"Код готов! ✅\n\n"
-            f"Предлагаемое имя бота: *{bot_name}_bot*\n\n"
-            f"1️⃣ Нажми кнопку ниже — откроется BotFather\n"
-            f"2️⃣ Отправь /newbot, введи имя и username\n"
-            f"3️⃣ Скопируй токен и вставь сюда",
-            parse_mode="Markdown",
-            reply_markup=keyboard,
-        )
+        await message.answer(instructions, parse_mode="Markdown", reply_markup=keyboard)
     else:
         await state.update_data(conversation=conversation)
         await message.answer(response)
 
+
+async def auto_launch_managed_bot(managed_data: dict, bot: Bot) -> None:
+    """Called from main.py middleware when a managed_bot update arrives."""
+    logger.info(f"managed_bot update: {managed_data}")
+
+    # Extract new bot ID and creator user ID (try common field name patterns)
+    new_bot_info = managed_data.get("bot") or managed_data.get("new_bot") or {}
+    creator_info = managed_data.get("user") or managed_data.get("creator") or {}
+
+    new_bot_id: int | None = new_bot_info.get("id")
+    creator_user_id: int | None = creator_info.get("id")
+
+    if not new_bot_id or not creator_user_id:
+        logger.warning(f"managed_bot missing bot/user IDs — full data: {managed_data}")
+        return
+
+    pending = _pending.pop(creator_user_id, None)
+    if not pending:
+        logger.info(f"No pending creation for user {creator_user_id}")
+        return
+
+    chat_id = pending["chat_id"]
+
+    # Get the new bot's token
+    try:
+        token = await get_managed_bot_token(BOT_TOKEN, new_bot_id)
+    except Exception as e:
+        logger.error(f"getManagedBotToken failed: {e}")
+        await bot.send_message(
+            chat_id,
+            f"Бот создан в BotFather, но не удалось получить токен автоматически:\n`{e}`\n\n"
+            "Скопируй токен из BotFather и отправь его сюда вручную.",
+            parse_mode="Markdown",
+        )
+        return
+
+    # Fetch real username
+    real_username: str | None = None
+    try:
+        async with Bot(token=token) as temp_bot:
+            info = await temp_bot.get_me()
+            real_username = info.username
+    except Exception:
+        pass
+
+    bot_name: str = pending["name"]
+    bot_code: str = pending["code"]
+    bot_summary: str = pending["summary"]
+
+    bot_file = GENERATED_BOTS_DIR / f"{bot_name}.py"
+    bot_file.write_text(bot_code, encoding="utf-8")
+
+    bot_record_id = await create_bot_record(
+        name=bot_name,
+        description=bot_summary,
+        token=token,
+        file_path=str(bot_file),
+        username=real_username,
+    )
+
+    username_display = f" (@{real_username})" if real_username else ""
+    try:
+        pid = await start_bot(bot_record_id, str(bot_file), token)
+        await update_bot_status(bot_record_id, "running", pid)
+        await bot.send_message(
+            chat_id,
+            f"Бот *{bot_name}*{username_display} создан и запущен! 🚀\n"
+            f"ID: `{bot_record_id}`\n\n"
+            "Используй /list чтобы посмотреть все боты.",
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        logger.error(f"Failed to start managed bot {bot_record_id}: {e}")
+        await update_bot_status(bot_record_id, "error")
+        short_err = str(e)[:400]
+        await bot.send_message(
+            chat_id,
+            f"Бот создан (ID: `{bot_record_id}`){username_display}, но упал при запуске:\n```\n{short_err}\n```\n\n"
+            f"Запустить снова: `/run {bot_record_id}`\n"
+            f"Логи: `/logs {bot_record_id}`",
+            parse_mode="Markdown",
+        )
 
 
 @router.message(CreateBotStates.waiting_for_token, F.voice)
@@ -150,12 +274,13 @@ async def handle_token(message: Message, state: FSMContext, bot: Bot):
         await message.answer("Не похоже на токен Telegram. Попробуйте ещё раз.")
         return
 
+    _pending.pop(message.from_user.id, None)
+
     data = await state.get_data()
     bot_code: str = data["bot_code"]
     bot_name: str = data["bot_name"]
     bot_summary: str = data.get("bot_summary", "")
 
-    # Get real bot username from Telegram
     real_username: str | None = None
     try:
         async with Bot(token=token) as temp_bot:
