@@ -4,7 +4,7 @@ from aiogram import Bot, F, Router
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-from db.database import get_all_bots, get_bot, get_bot_by_name, update_bot_status, update_bot_username
+from db.database import delete_bot, get_all_bots, get_bot, get_bot_by_name, update_bot_status, update_bot_username
 from services.bot_runner import get_bot_logs, is_running, start_bot, stop_bot
 
 router = Router()
@@ -54,6 +54,9 @@ def _bot_keyboard(bot_id: int) -> InlineKeyboardMarkup:
         ])
     rows.append([
         InlineKeyboardButton(text="📋 Логи", callback_data=f"logs:{bot_id}"),
+        InlineKeyboardButton(text="🗑 Удалить", callback_data=f"delete:{bot_id}"),
+    ])
+    rows.append([
         InlineKeyboardButton(text="◀ Назад", callback_data="list"),
     ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -163,10 +166,10 @@ async def _send_logs(send_fn, b: dict) -> None:
 
 @router.callback_query(F.data == "list")
 async def cb_list(callback: CallbackQuery):
+    await callback.answer()
     bots = await get_all_bots()
     if not bots:
-        await callback.message.edit_text("Ботов пока нет.")
-        await callback.answer()
+        await callback.message.edit_text("Ботов пока нет. Создай первого командой /create")
         return
     for b in bots:
         b["username"] = await _ensure_username(b)
@@ -175,94 +178,138 @@ async def cb_list(callback: CallbackQuery):
         parse_mode="Markdown",
         reply_markup=_list_keyboard(bots),
     )
-    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("info:"))
 async def cb_info(callback: CallbackQuery):
+    await callback.answer()
     bot_id = int(callback.data.split(":")[1])
     b = await get_bot(bot_id)
     if not b:
-        await callback.answer("Бот не найден.", show_alert=True)
+        await callback.message.answer("Бот не найден.")
         return
     b["username"] = await _ensure_username(b)
-    await callback.message.edit_text(
-        _bot_text(b),
-        parse_mode="Markdown",
-        reply_markup=_bot_keyboard(bot_id),
-    )
-    await callback.answer()
+    try:
+        await callback.message.edit_text(
+            _bot_text(b),
+            parse_mode="Markdown",
+            reply_markup=_bot_keyboard(bot_id),
+        )
+    except Exception:
+        await callback.message.answer(
+            _bot_text(b),
+            parse_mode="Markdown",
+            reply_markup=_bot_keyboard(bot_id),
+        )
 
 
 @router.callback_query(F.data.startswith("start:"))
 async def cb_start(callback: CallbackQuery):
+    await callback.answer()
     bot_id = int(callback.data.split(":")[1])
     b = await get_bot(bot_id)
     if not b:
-        await callback.answer("Бот не найден.", show_alert=True)
+        await callback.message.answer("Бот не найден.")
         return
     if is_running(bot_id):
-        await callback.answer("Уже запущен.", show_alert=True)
+        await callback.message.answer("Уже запущен.")
         return
+    err_text: str | None = None
     try:
         pid = await start_bot(bot_id, b["file_path"], b["token"])
         await update_bot_status(bot_id, "running", pid)
-        await callback.answer("Запущен!")
     except Exception as e:
         await update_bot_status(bot_id, "error")
-        await callback.answer(f"Ошибка: {str(e)[:100]}", show_alert=True)
+        err_text = str(e)[:300]
     b["username"] = await _ensure_username(b)
-    await callback.message.edit_text(
-        _bot_text(b), parse_mode="Markdown", reply_markup=_bot_keyboard(bot_id)
-    )
+    try:
+        await callback.message.edit_text(
+            _bot_text(b), parse_mode="Markdown", reply_markup=_bot_keyboard(bot_id)
+        )
+    except Exception:
+        pass
+    if err_text:
+        await callback.message.answer(
+            f"❌ Ошибка при запуске:\n```\n{err_text}\n```\n\nСм. /logs {bot_id}",
+            parse_mode="Markdown",
+        )
 
 
 @router.callback_query(F.data.startswith("stop:"))
 async def cb_stop(callback: CallbackQuery):
+    await callback.answer()
     bot_id = int(callback.data.split(":")[1])
     b = await get_bot(bot_id)
     if not b:
-        await callback.answer("Бот не найден.", show_alert=True)
+        await callback.message.answer("Бот не найден.")
         return
     stopped = await stop_bot(bot_id)
     if stopped:
         await update_bot_status(bot_id, "stopped")
-        await callback.answer("Остановлен.")
-    else:
-        await callback.answer("Бот не был запущен.")
     b["username"] = await _ensure_username(b)
-    await callback.message.edit_text(
-        _bot_text(b), parse_mode="Markdown", reply_markup=_bot_keyboard(bot_id)
-    )
+    try:
+        await callback.message.edit_text(
+            _bot_text(b), parse_mode="Markdown", reply_markup=_bot_keyboard(bot_id)
+        )
+    except Exception:
+        pass
 
 
 @router.callback_query(F.data.startswith("restart:"))
 async def cb_restart(callback: CallbackQuery):
+    await callback.answer()
     bot_id = int(callback.data.split(":")[1])
     b = await get_bot(bot_id)
     if not b:
-        await callback.answer("Бот не найден.", show_alert=True)
+        await callback.message.answer("Бот не найден.")
         return
     await stop_bot(bot_id)
+    err_text: str | None = None
     try:
         pid = await start_bot(bot_id, b["file_path"], b["token"])
         await update_bot_status(bot_id, "running", pid)
-        await callback.answer("Перезапущен!")
     except Exception as e:
         await update_bot_status(bot_id, "error")
-        await callback.answer(f"Ошибка: {str(e)[:100]}", show_alert=True)
+        err_text = str(e)[:300]
     b["username"] = await _ensure_username(b)
-    await callback.message.edit_text(
-        _bot_text(b), parse_mode="Markdown", reply_markup=_bot_keyboard(bot_id)
-    )
+    try:
+        await callback.message.edit_text(
+            _bot_text(b), parse_mode="Markdown", reply_markup=_bot_keyboard(bot_id)
+        )
+    except Exception:
+        pass
+    if err_text:
+        await callback.message.answer(
+            f"❌ Ошибка при перезапуске:\n```\n{err_text}\n```",
+            parse_mode="Markdown",
+        )
 
 
 @router.callback_query(F.data.startswith("logs:"))
 async def cb_logs(callback: CallbackQuery):
+    await callback.answer()
     bot_id = int(callback.data.split(":")[1])
     b = await get_bot(bot_id)
     if not b:
-        await callback.answer("Бот не найден.", show_alert=True)
+        await callback.message.answer("Бот не найден.")
         return
-    await callback.answer()
     await _send_logs(callback.message.answer, b)
+
+
+@router.callback_query(F.data.startswith("delete:"))
+async def cb_delete(callback: CallbackQuery):
+    await callback.answer()
+    bot_id = int(callback.data.split(":")[1])
+    b = await get_bot(bot_id)
+    if not b:
+        await callback.message.answer("Бот не найден.")
+        return
+    await stop_bot(bot_id)
+    await delete_bot(bot_id)
+    await callback.message.edit_text(
+        f"🗑 Бот *{b['name']}* удалён.",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="◀ К списку", callback_data="list")
+        ]]),
+    )
