@@ -165,11 +165,23 @@ async def _send_logs(send_fn, b: dict) -> None:
 @router.callback_query(F.data == "list")
 async def cb_list(callback: CallbackQuery):
     await callback.answer()
+    chat_id = callback.message.chat.id
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
     bots = await get_all_bots()
     if not bots:
-        await callback.message.answer("Ботов пока нет. Создай первого командой /create")
+        await callback.bot.send_message(chat_id, "Ботов пока нет. Создай первого командой /create")
         return
-    await _send_list(callback.message.answer, bots)
+    for b in bots:
+        b["username"] = await _ensure_username(b)
+    await callback.bot.send_message(
+        chat_id,
+        "📋 <b>Мои боты</b> — нажми на бота для управления:",
+        parse_mode="HTML",
+        reply_markup=_list_keyboard(bots),
+    )
 
 
 @router.callback_query(F.data.startswith("info:"))
