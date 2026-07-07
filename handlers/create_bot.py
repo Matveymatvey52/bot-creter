@@ -105,7 +105,7 @@ async def handle_gathering_voice(message: Message, state: FSMContext, bot: Bot):
     await _process_gathering_text(message, state, text)
 
 
-@router.message(CreateBotStates.gathering, F.text)
+@router.message(CreateBotStates.gathering, F.text, ~F.text.startswith("/"))
 async def handle_gathering(message: Message, state: FSMContext):
     await _process_gathering_text(message, state, message.text)
 
@@ -115,10 +115,15 @@ async def _process_gathering_text(message: Message, state: FSMContext, text: str
     conversation: list[dict] = data.get("conversation", [])
 
     conversation.append({"role": "user", "content": text})
-    await message.answer("Анализирую... ⏳")
+    analyzing_msg = await message.answer("Анализирую... ⏳")
 
     response = await chat_gather_requirements(conversation)
     conversation.append({"role": "assistant", "content": response})
+
+    try:
+        await analyzing_msg.delete()
+    except Exception:
+        pass
 
     if "===READY_TO_GENERATE===" in response:
         parts = response.split("===READY_TO_GENERATE===")

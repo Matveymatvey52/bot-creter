@@ -15,9 +15,7 @@ async def cmd_start(message: Message):
         "👋 Привет! Я Bot-Creator — создаю Telegram-ботов по твоему описанию.\n\n"
         "Команды:\n"
         "/create — создать нового бота\n"
-        "/list — список созданных ботов\n"
-        "/stop <id> — остановить бота\n"
-        "/run <id> — запустить бота\n\n"
+        "/list — мои боты и управление ими\n\n"
         "Начни с /create! Можно текстом или голосовым 🎤"
     )
     if WELCOME_IMAGE.exists():
