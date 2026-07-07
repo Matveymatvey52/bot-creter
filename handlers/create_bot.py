@@ -179,14 +179,22 @@ async def _process_gathering_text(message: Message, state: FSMContext, text: str
 
 async def auto_launch_managed_bot(managed_data: dict, bot: Bot) -> None:
     """Called from main.py middleware when a managed_bot update arrives."""
-    logger.info(f"managed_bot update: {managed_data}")
+    logger.warning(f"managed_bot RAW data: {managed_data}")
 
-    # Extract new bot ID and creator user ID (try common field name patterns)
+    # Try flat fields first, then nested objects
     new_bot_info = managed_data.get("bot") or managed_data.get("new_bot") or {}
     creator_info = managed_data.get("user") or managed_data.get("creator") or {}
 
-    new_bot_id: int | None = new_bot_info.get("id")
-    creator_user_id: int | None = creator_info.get("id")
+    new_bot_id: int | None = (
+        managed_data.get("bot_id")
+        or new_bot_info.get("id")
+        or new_bot_info.get("user_id")
+    )
+    creator_user_id: int | None = (
+        managed_data.get("user_id")
+        or managed_data.get("creator_id")
+        or creator_info.get("id")
+    )
 
     if not new_bot_id or not creator_user_id:
         logger.warning(f"managed_bot missing bot/user IDs — full data: {managed_data}")

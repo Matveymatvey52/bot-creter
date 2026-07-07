@@ -11,7 +11,7 @@ async def get_managed_bot_token(manager_token: str, bot_id: int) -> str:
     async with aiohttp.ClientSession() as session:
         async with session.post(
             f"https://api.telegram.org/bot{manager_token}/getManagedBotToken",
-            json={"bot_id": bot_id},
+            json={"user_id": bot_id},
         ) as resp:
             data = await resp.json()
 
