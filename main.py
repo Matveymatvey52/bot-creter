@@ -66,6 +66,19 @@ async def main():
     except Exception as e:
         logger.warning(f"Could not fetch bot info: {e}")
 
+    # Set intro page shown before user presses Start
+    try:
+        await bot.set_my_description(
+            "Создаю Telegram-ботов по твоему описанию 🤖\n\n"
+            "⚡ Быстро — бот готов за несколько минут\n"
+            "🧩 Умно — понимаю задачи и делаю лучшее решение\n"
+            "🛡 Надёжно — стабильные боты на долгую перспективу\n\n"
+            "Нажми «Начать» и опиши своего бота!"
+        )
+        await bot.set_my_short_description("Создаю Telegram-ботов по описанию за несколько минут")
+    except Exception as e:
+        logger.warning(f"Could not set description: {e}")
+
     await restore_bots()
 
     dp = Dispatcher(storage=MemoryStorage())
