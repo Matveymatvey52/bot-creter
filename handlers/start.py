@@ -18,4 +18,7 @@ async def cmd_start(message: Message):
         "/list — мои боты и управление ими\n\n"
         "Начни с /create! Можно текстом или голосовым 🎤"
     )
-    await message.answer(caption)
+    if WELCOME_IMAGE.exists():
+        await message.answer_photo(FSInputFile(WELCOME_IMAGE), caption=caption)
+    else:
+        await message.answer(caption)
