@@ -68,10 +68,10 @@ def _bot_text(b: dict) -> str:
     username_line = f"@{username}\n" if username else ""
     status = "работает" if is_running(b["id"]) else "остановлен"
     return (
-        f"🤖 *{b['name']}*\n"
+        f"🤖 <b>{b['name']}</b>\n"
         f"{username_line}"
         f"Статус: {icon} {status}\n"
-        f"ID: `{b['id']}`"
+        f"ID: <code>{b['id']}</code>"
     )
 
 
@@ -80,7 +80,7 @@ async def _send_list(send_fn, bots: list[dict]) -> None:
         b["username"] = await _ensure_username(b)
     await send_fn(
         "📋 *Мои боты* — нажми на бота для управления:",
-        parse_mode="Markdown",
+        parse_mode="HTML",
         reply_markup=_list_keyboard(bots),
     )
 
@@ -152,12 +152,12 @@ async def _send_logs(send_fn, b: dict) -> None:
     if not logs:
         await send_fn(
             f"Логов для *{b['name']}* нет (или бот ещё не запускался в этой сессии).",
-            parse_mode="Markdown",
+            parse_mode="HTML",
         )
         return
     if len(logs) > 3500:
         logs = "...\n" + logs[-3500:]
-    await send_fn(f"📋 Логи *{b['name']}*:\n```\n{logs}\n```", parse_mode="Markdown")
+    await send_fn(f"📋 Логи <b>{b['name']}</b>:\n<pre>{logs}</pre>", parse_mode="HTML")
 
 
 # ── callbacks ─────────────────────────────────────────────────────────────────
@@ -185,7 +185,7 @@ async def cb_info(callback: CallbackQuery):
     # Send as new message — more reliable than edit_text
     await callback.message.answer(
         _bot_text(b),
-        parse_mode="Markdown",
+        parse_mode="HTML",
         reply_markup=_bot_keyboard(bot_id),
     )
 
@@ -217,7 +217,7 @@ async def cb_start(callback: CallbackQuery):
         return
     b["username"] = await _ensure_username(b)
     await callback.message.edit_text(
-        _bot_text(b), parse_mode="Markdown", reply_markup=_bot_keyboard(bot_id)
+        _bot_text(b), parse_mode="HTML", reply_markup=_bot_keyboard(bot_id)
     )
 
 
@@ -234,11 +234,11 @@ async def cb_stop(callback: CallbackQuery):
     b["username"] = await _ensure_username(b)
     try:
         await callback.message.edit_text(
-            _bot_text(b), parse_mode="Markdown", reply_markup=_bot_keyboard(bot_id)
+            _bot_text(b), parse_mode="HTML", reply_markup=_bot_keyboard(bot_id)
         )
     except Exception:
         await callback.message.answer(
-            _bot_text(b), parse_mode="Markdown", reply_markup=_bot_keyboard(bot_id)
+            _bot_text(b), parse_mode="HTML", reply_markup=_bot_keyboard(bot_id)
         )
 
 
@@ -267,11 +267,11 @@ async def cb_restart(callback: CallbackQuery):
     b["username"] = await _ensure_username(b)
     try:
         await callback.message.edit_text(
-            _bot_text(b), parse_mode="Markdown", reply_markup=_bot_keyboard(bot_id)
+            _bot_text(b), parse_mode="HTML", reply_markup=_bot_keyboard(bot_id)
         )
     except Exception:
         await callback.message.answer(
-            _bot_text(b), parse_mode="Markdown", reply_markup=_bot_keyboard(bot_id)
+            _bot_text(b), parse_mode="HTML", reply_markup=_bot_keyboard(bot_id)
         )
 
 
@@ -299,7 +299,7 @@ async def cb_delete(callback: CallbackQuery):
     await delete_bot(bot_id)
     await callback.message.edit_text(
         f"✅ Бот *{name}* удалён.\n\nСоздай нового: /create",
-        parse_mode="Markdown",
+        parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="◀ К списку", callback_data="list")
         ]]),
