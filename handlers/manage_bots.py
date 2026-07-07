@@ -79,7 +79,7 @@ async def _send_list(send_fn, bots: list[dict]) -> None:
     for b in bots:
         b["username"] = await _ensure_username(b)
     await send_fn(
-        "📋 *Мои боты* — нажми на бота для управления:",
+        "📋 <b>Мои боты</b> — нажми на бота для управления:",
         parse_mode="HTML",
         reply_markup=_list_keyboard(bots),
     )
@@ -186,16 +186,20 @@ async def cb_list(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("info:"))
 async def cb_info(callback: CallbackQuery):
-    # Answer immediately — ALWAYS, before any async work
     await callback.answer()
+    chat_id = callback.message.chat.id
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
     bot_id = int(callback.data.split(":")[1])
     b = await get_bot(bot_id)
     if not b:
-        await callback.message.answer("Бот не найден.")
+        await callback.bot.send_message(chat_id, "Бот не найден.")
         return
     b["username"] = await _ensure_username(b)
-    # Send as new message — more reliable than edit_text
-    await callback.message.answer(
+    await callback.bot.send_message(
+        chat_id,
         _bot_text(b),
         parse_mode="HTML",
         reply_markup=_bot_keyboard(bot_id),
