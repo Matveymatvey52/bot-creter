@@ -149,7 +149,7 @@ async def _process_gathering_text(message: Message, state: FSMContext, text: str
                 f"https://t.me/newbot/{_manager_username}/"
                 f"{suggested_username}?name={quote_plus(display_name)}"
             )
-            button_text = "Создать бота автоматически ✨"
+            button_text = "Создать бота ✨"
             instructions = (
                 f"Код готов! ✅\n\n"
                 f"Предлагаемый username: *@{suggested_username}*\n\n"
