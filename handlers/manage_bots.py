@@ -148,16 +148,26 @@ async def cmd_logs(message: Message):
 
 
 async def _send_logs(send_fn, b: dict) -> None:
-    logs = get_bot_logs(b["id"])
+    bot_id = b["id"]
+    logs = get_bot_logs(bot_id)
+    back_kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="◀ К боту", callback_data=f"info:{bot_id}"),
+        InlineKeyboardButton(text="◀ К списку", callback_data="list"),
+    ]])
     if not logs:
         await send_fn(
-            f"Логов для *{b['name']}* нет (или бот ещё не запускался в этой сессии).",
+            f"Логов для <b>{b['name']}</b> нет (бот не запускался в этой сессии).",
             parse_mode="HTML",
+            reply_markup=back_kb,
         )
         return
     if len(logs) > 3500:
         logs = "...\n" + logs[-3500:]
-    await send_fn(f"📋 Логи <b>{b['name']}</b>:\n<pre>{logs}</pre>", parse_mode="HTML")
+    await send_fn(
+        f"📋 Логи <b>{b['name']}</b>:\n<pre>{logs}</pre>",
+        parse_mode="HTML",
+        reply_markup=back_kb,
+    )
 
 
 # ── callbacks ─────────────────────────────────────────────────────────────────
@@ -299,7 +309,13 @@ async def cb_logs(callback: CallbackQuery):
     if not b:
         await callback.message.answer("Бот не найден.")
         return
-    await _send_logs(callback.message.answer, b)
+    chat_id = callback.message.chat.id
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+    import functools
+    await _send_logs(functools.partial(callback.bot.send_message, chat_id), b)
 
 
 @router.callback_query(F.data.startswith("delete:"))
