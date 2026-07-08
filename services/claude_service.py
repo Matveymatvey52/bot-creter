@@ -32,6 +32,13 @@ Rules:
 - Use FSM for multi-step conversations if needed
 - Include logging setup at the top
 
+PERSISTENT DATA — always use SQLite for any data the bot needs to remember:
+- import aiosqlite
+- DB_PATH = os.path.join(os.getenv("DATA_DIR", "./data"), "bot_data.db")
+- Always use CREATE TABLE IF NOT EXISTS (never DROP, never DELETE all rows)
+- This ensures data survives bot restarts and code updates
+- Every user record, appointment, entry must be stored in SQLite, never in memory dicts
+
 CRITICAL — correct aiogram 3.x imports only:
   from aiogram import Bot, Dispatcher, F, Router
   from aiogram.filters import Command, CommandStart
@@ -39,7 +46,7 @@ CRITICAL — correct aiogram 3.x imports only:
   from aiogram.fsm.context import FSMContext
   from aiogram.fsm.state import State, StatesGroup
   from aiogram.fsm.storage.memory import MemoryStorage
-  import asyncio, logging, os
+  import aiosqlite, asyncio, logging, os
 
 FORBIDDEN — these do NOT exist in aiogram 3, never use them:
   - ChatType (use F.chat.type == "private" instead)
