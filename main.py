@@ -8,7 +8,7 @@ from aiogram.types import Update
 
 from config import BOT_TOKEN
 from db.database import get_all_bots, init_db, update_bot_status
-from handlers.create_bot import auto_launch_managed_bot, router as create_router, set_manager_username
+from handlers.create_bot import auto_launch_managed_bot, router as create_router, set_bot_id, set_manager_username
 from handlers.manage_bots import router as manage_router
 from handlers.start import router as start_router
 from services.bot_runner import start_bot
@@ -24,6 +24,10 @@ logger = logging.getLogger(__name__)
 class ManagedBotMiddleware(BaseMiddleware):
     """Intercepts managed_bot updates (Bot API 9.6+) before aiogram routing."""
 
+    def __init__(self, storage):
+        self.storage = storage
+        super().__init__()
+
     async def __call__(
         self,
         handler: Callable[[Update, dict[str, Any]], Awaitable[Any]],
@@ -33,7 +37,7 @@ class ManagedBotMiddleware(BaseMiddleware):
         extra = getattr(event, "model_extra", None) or {}
         if "managed_bot" in extra:
             bot: Bot = data["bot"]
-            asyncio.create_task(auto_launch_managed_bot(extra["managed_bot"], bot))
+            asyncio.create_task(auto_launch_managed_bot(extra["managed_bot"], bot, self.storage))
             return  # don't forward to normal handlers
         return await handler(event, data)
 
@@ -62,7 +66,8 @@ async def main():
     try:
         me = await bot.get_me()
         set_manager_username(me.username)
-        logger.info(f"Manager bot: @{me.username}")
+        set_bot_id(me.id)
+        logger.info(f"Manager bot: @{me.username} (id={me.id})")
     except Exception as e:
         logger.warning(f"Could not fetch bot info: {e}")
 
@@ -81,8 +86,9 @@ async def main():
 
     await restore_bots()
 
-    dp = Dispatcher(storage=MemoryStorage())
-    dp.update.outer_middleware(ManagedBotMiddleware())
+    storage = MemoryStorage()
+    dp = Dispatcher(storage=storage)
+    dp.update.outer_middleware(ManagedBotMiddleware(storage))
 
     dp.include_router(start_router)
     dp.include_router(create_router)

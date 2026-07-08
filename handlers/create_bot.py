@@ -27,6 +27,7 @@ GENERATED_BOTS_DIR.mkdir(exist_ok=True)
 
 # Set at startup via set_manager_username()
 _manager_username: str = ""
+_bot_id: int = 0
 
 # user_id -> pending bot creation data (populated before user clicks the link)
 _pending: dict[int, dict] = {}
@@ -35,6 +36,23 @@ _pending: dict[int, dict] = {}
 def set_manager_username(username: str) -> None:
     global _manager_username
     _manager_username = username
+
+
+def set_bot_id(bid: int) -> None:
+    global _bot_id
+    _bot_id = bid
+
+
+async def _clear_user_fsm(storage, user_id: int) -> None:
+    if not storage or not _bot_id or not user_id:
+        return
+    try:
+        from aiogram.fsm.storage.base import StorageKey
+        key = StorageKey(bot_id=_bot_id, chat_id=user_id, user_id=user_id)
+        await storage.set_state(key=key, state=None)
+        await storage.set_data(key=key, data={})
+    except Exception as e:
+        logger.warning(f"Could not clear FSM state for user {user_id}: {e}")
 
 
 class CreateBotStates(StatesGroup):
@@ -182,7 +200,7 @@ async def _process_gathering_text(message: Message, state: FSMContext, text: str
         await message.answer(response)
 
 
-async def auto_launch_managed_bot(managed_data: dict, bot: Bot) -> None:
+async def auto_launch_managed_bot(managed_data: dict, bot: Bot, storage=None) -> None:
     """Called from main.py middleware when a managed_bot update arrives."""
     logger.warning(f"managed_bot RAW data: {managed_data}")
 
@@ -219,11 +237,13 @@ async def auto_launch_managed_bot(managed_data: dict, bot: Bot) -> None:
         logger.error(f"getManagedBotToken failed: {e}")
         await bot.send_message(
             chat_id,
-            f"Бот создан в BotFather, но не удалось получить токен автоматически:\n`{e}`\n\n"
+            "Бот создан в BotFather, но не удалось получить токен автоматически 😔\n\n"
             "Скопируй токен из BotFather и отправь его сюда вручную.",
-            parse_mode="Markdown",
         )
         return
+
+    # Token received — clear FSM state so user isn't stuck in waiting_for_token
+    await _clear_user_fsm(storage, creator_user_id)
 
     # Fetch real username
     real_username: str | None = None
@@ -280,7 +300,7 @@ async def handle_token_voice(message: Message):
     )
 
 
-@router.message(CreateBotStates.waiting_for_token, F.text)
+@router.message(CreateBotStates.waiting_for_token, F.text, ~F.text.startswith("/"))
 async def handle_token(message: Message, state: FSMContext, bot: Bot):
     token = message.text.strip()
     if ":" not in token or len(token) < 30:
