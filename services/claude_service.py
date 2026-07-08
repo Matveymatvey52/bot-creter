@@ -32,6 +32,20 @@ Rules:
 - Use FSM for multi-step conversations if needed
 - Include logging setup at the top
 
+STARTUP AND WELCOME — always include this exact pattern:
+- At startup call: await bot.set_my_description("...friendly description of what this bot does...")
+- /start handler must greet the user with a specific message matching the bot's purpose
+- Support optional welcome image (the creator may have saved one):
+    from pathlib import Path
+    from aiogram.types import FSInputFile
+    BOT_NAME = Path(__file__).stem
+    WELCOME_IMAGE = Path(os.getenv("DATA_DIR", "./data")) / "bot_images" / f"{BOT_NAME}.jpg"
+    In /start:
+        if WELCOME_IMAGE.exists():
+            await message.answer_photo(FSInputFile(str(WELCOME_IMAGE)), caption=welcome_text)
+        else:
+            await message.answer(welcome_text)
+
 PERSISTENT DATA — always use SQLite for any data the bot needs to remember:
 - import aiosqlite
 - DB_PATH = os.path.join(os.getenv("DATA_DIR", "./data"), "bot_data.db")

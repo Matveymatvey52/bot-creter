@@ -58,6 +58,23 @@ async def _clear_user_fsm(storage, user_id: int) -> None:
 class CreateBotStates(StatesGroup):
     gathering = State()
     waiting_for_token = State()
+    waiting_for_image = State()
+
+
+BOT_IMAGES_DIR = DATA_DIR / "bot_images"
+BOT_IMAGES_DIR.mkdir(exist_ok=True)
+
+
+async def _set_waiting_for_image(storage, user_id: int, bot_name: str, bot_record_id: int) -> None:
+    if not storage or not _bot_id or not user_id:
+        return
+    try:
+        from aiogram.fsm.storage.base import StorageKey
+        key = StorageKey(bot_id=_bot_id, chat_id=user_id, user_id=user_id)
+        await storage.set_state(key=key, state=CreateBotStates.waiting_for_image)
+        await storage.set_data(key=key, data={"bot_name": bot_name, "image_bot_id": bot_record_id})
+    except Exception as e:
+        logger.warning(f"Could not set waiting_for_image state: {e}")
 
 
 @router.message(Command("cancel"), StateFilter("*"))
@@ -273,10 +290,13 @@ async def auto_launch_managed_bot(managed_data: dict, bot: Bot, storage=None) ->
     try:
         pid = await start_bot(bot_record_id, str(bot_file), token)
         await update_bot_status(bot_record_id, "running", pid)
+        await _set_waiting_for_image(storage, creator_user_id, bot_name, bot_record_id)
         await bot.send_message(
             chat_id,
             f"Бот *{bot_name}*{username_display} создан и запущен! 🚀\n\n"
-            "Используй /list чтобы управлять ботом.",
+            "📸 Хотите добавить приветственное фото?\n"
+            "Отправьте картинку — она будет показываться при /start.\n"
+            "Или напишите /skip чтобы пропустить.",
             parse_mode="Markdown",
         )
     except Exception as e:
@@ -291,6 +311,33 @@ async def auto_launch_managed_bot(managed_data: dict, bot: Bot, storage=None) ->
                 InlineKeyboardButton(text="🗑 Удалить бота", callback_data=f"delete:{bot_record_id}")
             ]]),
         )
+
+
+@router.message(CreateBotStates.waiting_for_image, F.photo)
+async def handle_bot_image(message: Message, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    bot_name = data.get("bot_name", "bot")
+    BOT_IMAGES_DIR.mkdir(exist_ok=True)
+    image_path = BOT_IMAGES_DIR / f"{bot_name}.jpg"
+    photo = message.photo[-1]
+    file = await bot.get_file(photo.file_id)
+    await bot.download_file(file.file_path, destination=str(image_path))
+    await state.clear()
+    await message.answer(
+        "✅ Фото сохранено! Теперь при /start бот покажет эту картинку.\n\n"
+        "Используй /list чтобы управлять ботом."
+    )
+
+
+@router.message(CreateBotStates.waiting_for_image, Command("skip"))
+async def handle_bot_image_skip(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Пропущено. Используй /list чтобы управлять ботом.")
+
+
+@router.message(CreateBotStates.waiting_for_image, F.text, ~F.text.startswith("/"))
+async def handle_bot_image_invalid(message: Message):
+    await message.answer("Отправьте фото или напишите /skip чтобы пропустить.")
 
 
 @router.message(CreateBotStates.waiting_for_token, F.voice)
@@ -337,9 +384,13 @@ async def handle_token(message: Message, state: FSMContext, bot: Bot):
     try:
         pid = await start_bot(bot_id, str(bot_file), token)
         await update_bot_status(bot_id, "running", pid)
+        await state.set_state(CreateBotStates.waiting_for_image)
+        await state.set_data({"bot_name": bot_name, "image_bot_id": bot_id})
         await message.answer(
             f"Бот *{bot_name}*{username_display} запущен! 🚀\n\n"
-            "Используй /list чтобы управлять ботом.",
+            "📸 Хотите добавить приветственное фото?\n"
+            "Отправьте картинку — она будет показываться при /start.\n"
+            "Или напишите /skip чтобы пропустить.",
             parse_mode="Markdown",
         )
     except Exception as e:
