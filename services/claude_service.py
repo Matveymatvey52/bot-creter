@@ -1,3 +1,5 @@
+import ast as _ast
+
 from anthropic import AsyncAnthropic
 from config import ANTHROPIC_API_KEY
 
@@ -80,16 +82,41 @@ async def extract_bot_name(requirements_summary: str) -> str:
     return name or "my_bot"
 
 
+def _strip_code_fences(code: str) -> str:
+    code = code.strip()
+    if code.startswith("```"):
+        first_newline = code.index("\n") if "\n" in code else len(code)
+        code = code[first_newline:].strip()
+        if code.endswith("```"):
+            code = code[:-3].strip()
+    return code
+
+
 async def generate_bot_code(requirements_summary: str) -> str:
+    user_msg = f"Create a Telegram bot with these requirements:\n\n{requirements_summary}"
     response = await client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=8192,
         system=GENERATE_SYSTEM_PROMPT,
-        messages=[
-            {
-                "role": "user",
-                "content": f"Create a Telegram bot with these requirements:\n\n{requirements_summary}",
-            }
-        ],
+        messages=[{"role": "user", "content": user_msg}],
     )
-    return response.content[0].text
+    code = _strip_code_fences(response.content[0].text)
+
+    # Validate syntax; if broken ask Claude to fix it once
+    try:
+        _ast.parse(code)
+    except SyntaxError as e:
+        fix_response = await client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=8192,
+            system=GENERATE_SYSTEM_PROMPT,
+            messages=[
+                {"role": "user", "content": user_msg},
+                {"role": "assistant", "content": code},
+                {"role": "user", "content": f"SyntaxError on line {e.lineno}: {e.msg}. Return ONLY corrected Python code, no markdown."},
+            ],
+        )
+        code = _strip_code_fences(fix_response.content[0].text)
+        _ast.parse(code)  # raises if still broken — caught upstream
+
+    return code
