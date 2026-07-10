@@ -277,7 +277,7 @@ Return ONLY valid Python code. No markdown, no explanations."""
 async def _review_bot_code(code: str, requirements: str) -> str:
     response = await client.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=32000,
+        max_tokens=25000,
         system=REVIEW_SYSTEM_PROMPT,
         messages=[{
             "role": "user",
@@ -307,7 +307,7 @@ Rules:
 async def fix_bot_code(current_code: str, bug_description: str) -> str:
     response = await client.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=32000,
+        max_tokens=25000,
         system=FIX_SYSTEM_PROMPT,
         messages=[{
             "role": "user",
@@ -320,7 +320,7 @@ async def fix_bot_code(current_code: str, bug_description: str) -> str:
     except SyntaxError as e:
         fix_response = await client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=32000,
+            max_tokens=25000,
             system=FIX_SYSTEM_PROMPT,
             messages=[
                 {"role": "user", "content": f"Bug / improvement request:\n{bug_description}\n\nCurrent bot code:\n{current_code}"},
@@ -333,7 +333,7 @@ async def fix_bot_code(current_code: str, bug_description: str) -> str:
     if "asyncio.run(main())" not in code:
         cont = await client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=32000,
+            max_tokens=25000,
             system=FIX_SYSTEM_PROMPT,
             messages=[
                 {"role": "user", "content": f"Bug / improvement request:\n{bug_description}\n\nCurrent bot code:\n{current_code}"},
@@ -371,7 +371,7 @@ async def ask_assistant(user_message: str, bots_summary: str = "") -> str:
         system += f"\n\nБоты пользователя:\n{bots_summary}"
     response = await client.messages.create(
         model="claude-haiku-4-5-20251001",
-        max_tokens=1200,
+        max_tokens=900,
         system=system,
         messages=[{"role": "user", "content": user_message}],
     )
@@ -414,7 +414,7 @@ async def generate_bot_code(requirements_summary: str) -> str:
     user_msg = f"Create a Telegram bot with these requirements:\n\n{requirements_summary}"
     response = await client.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=32000,
+        max_tokens=25000,
         system=GENERATE_SYSTEM_PROMPT,
         messages=[{"role": "user", "content": user_msg}],
     )
@@ -426,7 +426,7 @@ async def generate_bot_code(requirements_summary: str) -> str:
     except SyntaxError as e:
         fix_response = await client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=32000,
+            max_tokens=25000,
             system=GENERATE_SYSTEM_PROMPT,
             messages=[
                 {"role": "user", "content": user_msg},
@@ -441,7 +441,7 @@ async def generate_bot_code(requirements_summary: str) -> str:
     if "asyncio.run(main())" not in code:
         fix_response = await client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=32000,
+            max_tokens=25000,
             system=GENERATE_SYSTEM_PROMPT,
             messages=[
                 {"role": "user", "content": user_msg},
