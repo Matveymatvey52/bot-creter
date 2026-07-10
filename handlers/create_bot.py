@@ -17,7 +17,7 @@ from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, Inli
 from config import ASSEMBLYAI_API_KEY, BOT_TOKEN, DATA_DIR
 from db.database import add_bot_admin, create_bot_record, set_bot_display_name, update_bot_status
 from services.bot_runner import start_bot
-from services.claude_service import chat_gather_requirements, extract_bot_name, generate_bot_code
+from services.claude_service import chat_gather_requirements, extract_bot_name, generate_bot_code, generate_bot_guide
 from services.github_sync import push_bot_to_github
 from services.telegram_api import get_managed_bot_token
 from services.voice_service import transcribe_voice
@@ -482,23 +482,24 @@ async def auto_launch_managed_bot(managed_data: dict, bot: Bot, storage=None) ->
     try:
         pid = await start_bot(bot_record_id, str(bot_file), token, extra_env=extra_env or None)
         await update_bot_status(bot_record_id, "running", pid)
-        await bot.send_message(
-            chat_id,
-            f"✅ Бот <b>{bot_name}</b>{username_display} создан и запущен!\n\n"
-            f"Вы являетесь администратором этого бота.\n\n"
-            f"<b>📊 Доступ к данным бота</b>\n"
-            f"Если бот собирает записи, заявки или любую другую информацию — всё это хранится в таблице Excel прямо на сервере. Чтобы получить эту таблицу, напишите боту:\n"
-            f"<code>/excel</code> — бот пришлёт файл .xlsx с актуальными данными\n\n"
-            f"Эта команда доступна <b>только администраторам</b>. Обычные пользователи её не видят и не могут вызвать.\n\n"
-            f"<b>👥 Управление администраторами</b>\n"
-            f"Все команды пишутся прямо в созданный бот:\n"
-            f"<code>/admins</code> — посмотреть список администраторов\n"
-            f"<code>/addadmin 123456789</code> — добавить администратора по его Telegram ID\n"
-            f"<code>/removeadmin 123456789</code> — убрать администратора\n\n"
-            f"💡 Узнать Telegram ID: попроси человека написать боту @userinfobot\n\n"
-            f"Управление ботом: /list",
-            parse_mode="HTML",
+        try:
+            guide = await generate_bot_guide(bot_name, data.get("bot_summary", ""))
+        except Exception:
+            guide = ""
+        admin_block = (
+            "<b>👥 Управление администраторами</b>\n"
+            "Команды пишутся прямо в созданный бот:\n"
+            "<code>/admins</code> — список администраторов\n"
+            "<code>/addadmin 123456789</code> — добавить администратора\n"
+            "<code>/removeadmin 123456789</code> — убрать администратора\n\n"
+            "💡 Узнать Telegram ID: попроси человека написать боту @userinfobot\n\n"
+            "Управление ботом: /list"
         )
+        text = f"✅ Бот <b>{bot_name}</b>{username_display} создан и запущен!\n\nВы являетесь администратором этого бота.\n\n"
+        if guide:
+            text += guide + "\n\n"
+        text += admin_block
+        await bot.send_message(chat_id, text, parse_mode="HTML")
     except Exception as e:
         logger.error(f"Failed to start managed bot {bot_record_id}: {e}")
         await update_bot_status(bot_record_id, "error")
@@ -574,22 +575,24 @@ async def handle_token(message: Message, state: FSMContext, bot: Bot):
     try:
         pid = await start_bot(bot_id, str(bot_file), token, extra_env=extra_env or None)
         await update_bot_status(bot_id, "running", pid)
-        await message.answer(
-            f"✅ Бот <b>{bot_name}</b>{username_display} создан и запущен!\n\n"
-            f"Вы являетесь администратором этого бота.\n\n"
-            f"<b>📊 Доступ к данным бота</b>\n"
-            f"Если бот собирает записи, заявки или любую другую информацию — всё это хранится в таблице Excel прямо на сервере. Чтобы получить эту таблицу, напишите боту:\n"
-            f"<code>/excel</code> — бот пришлёт файл .xlsx с актуальными данными\n\n"
-            f"Эта команда доступна <b>только администраторам</b>. Обычные пользователи её не видят и не могут вызвать.\n\n"
-            f"<b>👥 Управление администраторами</b>\n"
-            f"Все команды пишутся прямо в созданный бот:\n"
-            f"<code>/admins</code> — посмотреть список администраторов\n"
-            f"<code>/addadmin 123456789</code> — добавить администратора по его Telegram ID\n"
-            f"<code>/removeadmin 123456789</code> — убрать администратора\n\n"
-            f"💡 Узнать Telegram ID: попроси человека написать боту @userinfobot\n\n"
-            f"Управление ботом: /list",
-            parse_mode="HTML",
+        try:
+            guide = await generate_bot_guide(bot_name, bot_summary)
+        except Exception:
+            guide = ""
+        admin_block = (
+            "<b>👥 Управление администраторами</b>\n"
+            "Команды пишутся прямо в созданный бот:\n"
+            "<code>/admins</code> — список администраторов\n"
+            "<code>/addadmin 123456789</code> — добавить администратора\n"
+            "<code>/removeadmin 123456789</code> — убрать администратора\n\n"
+            "💡 Узнать Telegram ID: попроси человека написать боту @userinfobot\n\n"
+            "Управление ботом: /list"
         )
+        text = f"✅ Бот <b>{bot_name}</b>{username_display} создан и запущен!\n\nВы являетесь администратором этого бота.\n\n"
+        if guide:
+            text += guide + "\n\n"
+        text += admin_block
+        await message.answer(text, parse_mode="HTML")
     except Exception as e:
         logger.error(f"Failed to start bot {bot_id}: {e}")
         await update_bot_status(bot_id, "error")

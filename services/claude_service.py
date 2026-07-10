@@ -365,6 +365,29 @@ ASSISTANT_SYSTEM_PROMPT = """Ты — умный ассистент бота Bot
 Отвечай коротко и по-русски. Если не знаешь точного ответа — честно скажи."""
 
 
+async def generate_bot_guide(bot_name: str, summary: str) -> str:
+    """Generate a personalized guide for the bot owner after creation."""
+    response = await client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=600,
+        system=(
+            "Ты пишешь короткую персональную справку владельцу Telegram-бота сразу после его создания. "
+            "Пиши по-русски, кратко и конкретно. Используй HTML-теги (<b>, <code>). "
+            "НЕ пиши про команды /admins /addadmin /removeadmin — это будет отдельным блоком. "
+            "НЕ пиши 'данные хранятся в таблице Excel' — данные хранятся в базе данных на сервере. "
+            "Если бот собирает данные — упомяни команду <code>/excel</code> для выгрузки базы в .xlsx файл. "
+            "Если не собирает — не упоминай /excel вообще."
+        ),
+        messages=[{"role": "user", "content": (
+            f"Бот называется: {bot_name}\n\n"
+            f"Что умеет этот бот (требования):\n{summary}\n\n"
+            "Напиши 3-5 строк: что делает этот конкретный бот, его основные команды для пользователей, "
+            "и если собирает данные — как их получить. Только про этот бот, без общих слов."
+        )}],
+    )
+    return response.content[0].text.strip()
+
+
 async def ask_assistant(user_message: str, bots_summary: str = "") -> str:
     system = ASSISTANT_SYSTEM_PROMPT
     if bots_summary:
