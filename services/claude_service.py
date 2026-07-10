@@ -123,6 +123,16 @@ UI QUALITY — every bot must look modern and polished:
 - Date/time pickers: use inline keyboard buttons for selecting time slots, not free-text input
 - parse_mode="HTML" everywhere for rich formatting; use <b>bold</b>, <i>italic</i>, <code>mono</code>
 
+EXCEL EXPORT — every bot that stores data must have /excel; make it beautiful with openpyxl:
+- Header row: bold white text on dark blue fill (#1F4E79), row height 22
+- Data rows: alternate white (#FFFFFF) and light blue (#DCE6F1) — zebra striping
+- All cells: thin border on all 4 sides using Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
+- Freeze header: ws.freeze_panes = "A2"
+- Auto-filter: ws.auto_filter.ref = ws.dimensions
+- Auto-fit column widths (min 10, max 40 chars)
+- Always regenerate from DB on every /excel call — never cache a stale file
+- Import: from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+
 FSM — correct pattern (NEVER use string states, always use StatesGroup):
   class MyStates(StatesGroup):
       step1 = State()
@@ -380,7 +390,18 @@ Rules:
 - Minimise changes: edit only what needs improving, keep the rest as-is.
 - Follow original constraints (aiogram 3.13, aiosqlite, openpyxl, aiohttp only).
 - The file must end with asyncio.run(main()).
-- parse_mode="HTML" for all rich messages; use <b>bold</b>, <i>italic</i>, <code>mono</code>."""
+- parse_mode="HTML" for all rich messages; use <b>bold</b>, <i>italic</i>, <code>mono</code>.
+
+EXCEL EXPORT — if the bot has a /excel or export function, make it beautiful:
+- Header row: bold white text on dark blue background (#1F4E79), row height 22
+- Data rows: alternate between white (#FFFFFF) and light blue (#DCE6F1) — zebra striping
+- All cells: thin border on all 4 sides (Border(left=Side(style='thin'), ...))
+- Freeze the header row: ws.freeze_panes = "A2"
+- Auto-filter on header row: ws.auto_filter.ref = ws.dimensions
+- Column widths: auto-fit based on content (min 10, max 40)
+- Center-align header cells; left-align data cells
+- Number/date columns: apply proper number format
+- Use openpyxl.styles: PatternFill, Font, Alignment, Border, Side"""
 
 
 async def improve_bot_code(current_code: str, description: str) -> str:
