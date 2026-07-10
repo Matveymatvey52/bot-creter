@@ -16,7 +16,7 @@ def _transcribe_sync(file_path: str) -> str:
     transcript = transcriber.transcribe(file_path)
     if transcript.status == aai.TranscriptStatus.error:
         raise RuntimeError(transcript.error)
-    return transcript.text
+    return transcript.text or ""
 
 
 async def transcribe_voice(file_path: str) -> str:

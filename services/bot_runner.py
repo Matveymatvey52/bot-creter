@@ -21,9 +21,14 @@ async def _collect_stderr(bot_id: int, process: asyncio.subprocess.Process) -> N
         pass
 
 
-async def start_bot(bot_id: int, file_path: str, token: str) -> int:
+async def start_bot(bot_id: int, file_path: str, token: str, extra_env: dict | None = None) -> int:
+    if is_running(bot_id):
+        await stop_bot(bot_id)
+
     env = os.environ.copy()
     env["BOT_TOKEN"] = token
+    if extra_env:
+        env.update(extra_env)
 
     process = await asyncio.create_subprocess_exec(
         sys.executable,
@@ -63,9 +68,20 @@ async def stop_bot(bot_id: int) -> bool:
     except asyncio.TimeoutError:
         process.kill()
     _processes.pop(bot_id, None)
-    _stderr_tasks.pop(bot_id, None)
+    task = _stderr_tasks.pop(bot_id, None)
+    if task and not task.done():
+        task.cancel()
     logger.info(f"Bot {bot_id} stopped")
     return True
+
+
+def _make_extra_env(bot: dict) -> dict | None:
+    extra = {}
+    if bot.get("display_name"):
+        extra["BOT_DISPLAY_NAME"] = bot["display_name"]
+    if bot.get("group_chat_id"):
+        extra["GROUP_CHAT_ID"] = bot["group_chat_id"]
+    return extra or None
 
 
 def is_running(bot_id: int) -> bool:
