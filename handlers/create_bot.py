@@ -177,7 +177,10 @@ async def _process_gathering_text(message: Message, state: FSMContext, text: str
     if "===READY_TO_GENERATE===" in response:
         parts = response.split("===READY_TO_GENERATE===")
         summary = parts[1].strip() if len(parts) > 1 else response
-        bot_name = await extract_bot_name(summary)
+        try:
+            bot_name = await extract_bot_name(summary)
+        except Exception:
+            bot_name = "my_bot"
 
         await state.update_data(
             conversation=conversation,
@@ -291,12 +294,20 @@ async def _generate_and_show_button(message: Message, state: FSMContext) -> None
 
 async def _run_generation(chat_id: int, user_id: int, bot: Bot, state: FSMContext) -> None:
     data = await state.get_data()
-    summary: str = data["bot_summary"]
-    bot_name: str = data["bot_name"]
+    summary: str = data.get("bot_summary", "")
+    bot_name: str = data.get("bot_name", "my_bot")
+
+    if not summary:
+        await bot.send_message(
+            chat_id,
+            "⚠️ Данные о боте потеряны (бот мог перезапуститься).\n\nПожалуйста, начните заново с /create.",
+        )
+        await state.clear()
+        return
 
     gen_msg = await bot.send_message(chat_id, "Генерирую код... 🔧")
     try:
-        code = await asyncio.wait_for(generate_bot_code(summary), timeout=240.0)
+        code = await asyncio.wait_for(generate_bot_code(summary), timeout=360.0)
     except asyncio.TimeoutError:
         logger.error("Code generation timed out after 240s")
         try:
@@ -305,7 +316,7 @@ async def _run_generation(chat_id: int, user_id: int, bot: Bot, state: FSMContex
             pass
         await bot.send_message(
             chat_id,
-            "⏱ Генерация заняла слишком много времени. Попробуй ещё раз — обычно со второго раза работает быстрее.",
+            "⏱ Генерация заняла слишком много времени (>6 мин). Попробуй ещё раз — обычно со второго раза работает быстрее.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
                 InlineKeyboardButton(text="🔄 Попробовать снова", callback_data="retry_generate")
             ]]),
@@ -483,7 +494,7 @@ async def auto_launch_managed_bot(managed_data: dict, bot: Bot, storage=None) ->
         pid = await start_bot(bot_record_id, str(bot_file), token, extra_env=extra_env or None)
         await update_bot_status(bot_record_id, "running", pid)
         try:
-            guide = await generate_bot_guide(bot_name, data.get("bot_summary", ""))
+            guide = await generate_bot_guide(bot_name, bot_summary)
         except Exception:
             guide = ""
         admin_block = (
