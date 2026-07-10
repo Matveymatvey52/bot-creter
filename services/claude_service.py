@@ -104,6 +104,25 @@ KEYBOARDS — correct syntax:
   # Reply:
   ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="...")]], resize_keyboard=True)
 
+UI QUALITY — every bot must look modern and polished:
+- Use emojis generously in all messages and button labels to make the interface lively and clear
+- Tables/schedules: format with monospace using <code>...</code> tags in HTML parse_mode.
+  Use box-drawing characters to make beautiful tables:
+  ┌─────────────┬──────────┬──────────┐
+  │ День        │ Мастер   │ Время    │
+  ├─────────────┼──────────┼──────────┤
+  │ Понедельник │ Анна     │ 10:00    │
+  └─────────────┴──────────┴──────────┘
+- Lists: use bold headers, clear separators (▪️ • ─── etc.), never plain text walls
+- Status messages: show progress with emojis (✅ ❌ ⏳ 🔄 📅 etc.)
+- Navigation: always provide inline buttons to go back, cancel, or move between sections
+- Filters/selection: when showing schedules or lists by day/category, use inline buttons as filters
+  so the user can tap a day (Пн / Вт / Ср ...) and see only that day's data — not a text prompt
+- Confirmations: before deleting or booking, show a summary with ✅ Подтвердить / ❌ Отмена buttons
+- Empty states: never show a blank response — always explain what's empty and offer an action button
+- Date/time pickers: use inline keyboard buttons for selecting time slots, not free-text input
+- parse_mode="HTML" everywhere for rich formatting; use <b>bold</b>, <i>italic</i>, <code>mono</code>
+
 FSM — correct pattern (NEVER use string states, always use StatesGroup):
   class MyStates(StatesGroup):
       step1 = State()
