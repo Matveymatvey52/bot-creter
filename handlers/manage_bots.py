@@ -15,7 +15,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from config import ASSEMBLYAI_API_KEY
 from db.database import delete_bot, get_all_bots, get_bot, get_bot_by_name, update_bot_status, update_bot_username
 from services.bot_runner import _make_extra_env, get_bot_logs, is_running, start_bot, stop_bot
-from services.claude_service import fix_bot_code, generate_bot_code
+from services.claude_service import fix_bot_code, generate_bot_code, improve_bot_code
 from services.github_sync import push_bot_to_github
 from services.voice_service import transcribe_voice
 
@@ -377,14 +377,26 @@ async def cb_recreate(callback: CallbackQuery):
         )
         return
 
-    await callback.message.edit_text(f"🔧 Генерирую новый код для <b>{b['name']}</b>...", parse_mode="HTML")
+    current_code = ""
+    if b.get("file_path"):
+        try:
+            current_code = Path(b["file_path"]).read_text(encoding="utf-8")
+        except Exception:
+            pass
+
+    if current_code:
+        await callback.message.edit_text(f"✨ Улучшаю код <b>{b['name']}</b>...", parse_mode="HTML")
+        task = improve_bot_code(current_code, b.get("description", ""))
+    else:
+        await callback.message.edit_text(f"🔧 Генерирую код для <b>{b['name']}</b>...", parse_mode="HTML")
+        task = generate_bot_code(b.get("description", ""))
 
     try:
-        code = await asyncio.wait_for(generate_bot_code(b["description"]), timeout=240.0)
+        code = await asyncio.wait_for(task, timeout=240.0)
     except Exception as e:
         logger.error(f"Failed to regenerate bot {bot_id}: {e}")
         await callback.message.edit_text(
-            "⚠️ Не удалось сгенерировать код. Попробуй ещё раз.",
+            "⚠️ Не удалось улучшить код. Попробуй ещё раз.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
                 InlineKeyboardButton(text="🔄 Попробовать снова", callback_data=f"recreate:{bot_id}"),
                 InlineKeyboardButton(text="◀ Назад", callback_data=f"info:{bot_id}"),

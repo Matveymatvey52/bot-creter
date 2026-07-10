@@ -365,6 +365,68 @@ async def fix_bot_code(current_code: str, bug_description: str) -> str:
     return code
 
 
+IMPROVE_SYSTEM_PROMPT = """You are an expert Python developer specializing in Telegram bots using aiogram 3.13.
+
+You will receive an existing working bot's Python code. Your task: improve it without rewriting from scratch.
+
+What to improve:
+- UI/UX: apply modern formatting — use box-drawing characters for tables inside <code> blocks, add emojis to all messages and buttons, use inline keyboards for date/time/filter selection instead of text input, add confirmation screens, handle empty states gracefully
+- Missing features: if the description mentions something not yet implemented, add it
+- Code quality: fix any obvious bugs, ensure all handlers are robust
+
+Rules:
+- Return ONLY complete valid Python code. No markdown fences, no explanations.
+- Keep ALL existing functionality — do not remove any features.
+- Minimise changes: edit only what needs improving, keep the rest as-is.
+- Follow original constraints (aiogram 3.13, aiosqlite, openpyxl, aiohttp only).
+- The file must end with asyncio.run(main()).
+- parse_mode="HTML" for all rich messages; use <b>bold</b>, <i>italic</i>, <code>mono</code>."""
+
+
+async def improve_bot_code(current_code: str, description: str) -> str:
+    """Improve existing bot code without full regeneration — saves tokens."""
+    prompt = (
+        f"Bot description (for context):\n{description}\n\n"
+        f"Current bot code to improve:\n{current_code}"
+    )
+    response = await client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=25000,
+        system=IMPROVE_SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    code = _strip_code_fences(response.content[0].text)
+    try:
+        _ast.parse(code)
+    except SyntaxError as e:
+        fix_response = await client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=25000,
+            system=IMPROVE_SYSTEM_PROMPT,
+            messages=[
+                {"role": "user", "content": prompt},
+                {"role": "assistant", "content": code},
+                {"role": "user", "content": f"SyntaxError on line {e.lineno}: {e.msg}. Return ONLY corrected Python code."},
+            ],
+        )
+        code = _strip_code_fences(fix_response.content[0].text)
+        _ast.parse(code)
+    if "asyncio.run(main())" not in code:
+        cont = await client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=25000,
+            system=IMPROVE_SYSTEM_PROMPT,
+            messages=[
+                {"role": "user", "content": prompt},
+                {"role": "assistant", "content": code},
+                {"role": "user", "content": "Code was cut off. Complete it ending with asyncio.run(main()). Return ONLY complete Python code."},
+            ],
+        )
+        code = _strip_code_fences(cont.content[0].text)
+        _ast.parse(code)
+    return code
+
+
 ASSISTANT_SYSTEM_PROMPT = """Ты — умный ассистент бота Bot-creter, который создаёт Telegram-ботов.
 
 Ты отвечаешь на вопросы пользователя о его ботах, помогаешь разобраться с настройками и даёшь инструкции.
