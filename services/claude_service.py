@@ -1107,7 +1107,87 @@ def _strip_code_fences(code: str) -> str:
     return code
 
 
+_TEMPLATES_DIR = __import__("pathlib").Path(__file__).parent.parent / "templates"
+
+TEMPLATE_SELECT_PROMPT = """You are a bot template selector. Given a bot description, choose the best matching template or return "none".
+
+Available templates:
+- trip_manager   — travel/trip route manager, flights, hotels, transfers, booking confirmations, prices, prepayments, reminders
+- accountant     — income/expense tracking, financial records, categories, balance, reports, budgets, финансы
+- booking_beauty — appointment booking for beauty salons, nail/hair/brow studios, spa, medical clinics, fitness studios, barbershops — any service requiring time-slot scheduling
+- manager_secretary — virtual assistant/secretary, FAQ bot, lead collection form, client requests, CRM, менеджер, секретарь
+
+Return ONLY the template name (e.g. "trip_manager") or "none" if nothing matches 60%+.
+Do NOT return "none" if 60%+ of core functionality is covered by a template.
+Return ONLY one word, nothing else."""
+
+CUSTOMIZE_TEMPLATE_PROMPT = """You are a Telegram bot customizer. You receive a working bot template and user requirements.
+
+Your task: customize the template for the specific use case WITHOUT changing any logic, handlers, FSM states, or database schema.
+
+ONLY change these sections (marked with # CUSTOMIZE in the template):
+- BOT_DESCRIPTION — update to match the specific business/use case
+- WELCOME_TEXT — update greeting to match the specific bot purpose
+- SERVICES / MASTERS / FAQS / EXPENSE_CATEGORIES / INCOME_CATEGORIES etc. — update lists to match requirements
+- Any other constants in the # CUSTOMIZE block
+
+DO NOT change:
+- Any function definitions or handlers
+- FSM states or callback_data formats
+- Database schema or queries
+- Import statements
+- The main() function
+- Anything outside the # CUSTOMIZE...# END CUSTOMIZE block
+
+Return ONLY the complete modified Python code. No markdown fences. No explanations."""
+
+
+async def _select_template(summary: str) -> str | None:
+    """Returns template name like 'trip_manager', or None if no match."""
+    if not _TEMPLATES_DIR.exists():
+        return None
+    response = await client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=20,
+        system=TEMPLATE_SELECT_PROMPT,
+        messages=[{"role": "user", "content": summary}],
+    )
+    result = response.content[0].text.strip().lower().split()[0]
+    if result == "none":
+        return None
+    template_file = _TEMPLATES_DIR / f"{result}.py"
+    return result if template_file.exists() else None
+
+
+async def _customize_from_template(template_name: str, requirements: str) -> str:
+    """Customizes a template for specific requirements. Returns Python code."""
+    template_path = _TEMPLATES_DIR / f"{template_name}.py"
+    template_code = template_path.read_text(encoding="utf-8")
+    response = await client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=25000,
+        system=CUSTOMIZE_TEMPLATE_PROMPT,
+        messages=[{
+            "role": "user",
+            "content": f"User requirements:\n{requirements}\n\nTemplate to customize:\n{template_code}",
+        }],
+    )
+    code = _strip_code_fences(response.content[0].text)
+    try:
+        _ast.parse(code)
+        return code
+    except SyntaxError:
+        return template_code  # fallback to unmodified template
+
+
 async def generate_bot_code(requirements_summary: str) -> str:
+    # Try template first — saves 5-10x tokens vs generating from scratch
+    template_name = await _select_template(requirements_summary)
+    if template_name:
+        code = await _customize_from_template(template_name, requirements_summary)
+        if "asyncio.run(main())" in code:
+            return code
+
     bot_type = await classify_bot_type(requirements_summary)
     extra = _BOT_TYPE_EXTRAS.get(bot_type, "")
     system = GENERATE_SYSTEM_PROMPT + extra
