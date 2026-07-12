@@ -1,6 +1,7 @@
 # TEMPLATE: accountant
 # USE FOR: income/expense tracking, финансы, бухгалтерия, учёт расходов, бюджет
 # CUSTOMIZE: sections marked with # CUSTOMIZE
+from __future__ import annotations
 
 import asyncio
 import json
@@ -12,6 +13,8 @@ from pathlib import Path
 
 import aiohttp
 import aiosqlite
+from dotenv import load_dotenv
+load_dotenv()
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -48,6 +51,7 @@ DATA_DIR = Path(os.getenv("DATA_DIR", "./data"))
 DATA_DIR.mkdir(exist_ok=True)
 DB_PATH = str(DATA_DIR / f"{BOT_NAME}_data.db")
 EXCEL_PATH = str(DATA_DIR / f"{BOT_NAME}_data.xlsx")
+HTML_PATH = str(DATA_DIR / f"{BOT_NAME}_report.html")
 WELCOME_IMAGE = DATA_DIR / "bot_images" / f"{BOT_NAME}.jpg"
 ADMINS_FILE = DATA_DIR / f"admins_{BOT_NAME}.json"
 TELEGRAPH_API = "https://api.telegra.ph"
@@ -102,6 +106,11 @@ async def init_db():
         await db.execute(
             "CREATE TABLE IF NOT EXISTS _meta (key TEXT PRIMARY KEY, value TEXT)"
         )
+        # Migration: add project_id to transactions if table was created by an older schema
+        try:
+            await db.execute("ALTER TABLE transactions ADD COLUMN project_id INTEGER DEFAULT 1")
+        except Exception:
+            pass  # column already exists
         await db.commit()
 
 
@@ -134,6 +143,11 @@ async def _set_active_project(user_id: str, project_id: int):
         await db.commit()
 
 
+MAIN_BUTTONS = frozenset({
+    "➕ Доход", "➖ Расход", "💰 Баланс",
+    "📋 История", "📊 Отчёт", "📁 Проекты", "📥 Excel", "🌐 HTML",
+})
+
 # ── keyboards ─────────────────────────────────────────────────────────────────
 
 def kb_main() -> ReplyKeyboardMarkup:
@@ -141,7 +155,7 @@ def kb_main() -> ReplyKeyboardMarkup:
         [KeyboardButton(text="➕ Доход"),     KeyboardButton(text="➖ Расход")],
         [KeyboardButton(text="💰 Баланс"),   KeyboardButton(text="📋 История")],
         [KeyboardButton(text="📊 Отчёт"),    KeyboardButton(text="📁 Проекты")],
-        [KeyboardButton(text="📥 Excel")],
+        [KeyboardButton(text="📥 Excel"),    KeyboardButton(text="🌐 HTML")],
     ], resize_keyboard=True)
 
 def kb_cats(cats: list[str], kind: str) -> InlineKeyboardMarkup:
@@ -196,7 +210,8 @@ async def cmd_start(message: Message):
 # ── PROJECTS PANEL ────────────────────────────────────────────────────────────
 
 @router.message(F.text == "📁 Проекты")
-async def projects_panel(msg: Message):
+async def projects_panel(msg: Message, state: FSMContext):
+    await state.clear()
     projects = await _all_projects()
     if not projects:
         await msg.answer(
@@ -224,7 +239,7 @@ async def cb_proj_new(cb: CallbackQuery, state: FSMContext):
         parse_mode="HTML"
     )
 
-@router.message(ProjectCreate.name, F.text)
+@router.message(ProjectCreate.name, F.text, ~F.text.in_(MAIN_BUTTONS))
 async def proj_create_name(msg: Message, state: FSMContext):
     name = msg.text.strip()
     async with aiosqlite.connect(DB_PATH) as db:
@@ -273,6 +288,7 @@ async def cb_proj_list(cb: CallbackQuery):
 
 @router.message(F.text.in_({"➕ Доход", "➖ Расход"}))
 async def add_start(msg: Message, state: FSMContext):
+    await state.clear()
     project = await _get_active_project(str(msg.from_user.id))
     if not project:
         await msg.answer("Сначала создайте проект — нажмите 📁 Проекты.", reply_markup=kb_main()); return
@@ -295,7 +311,7 @@ async def cb_cat(cb: CallbackQuery, state: FSMContext):
     label = "дохода" if kind == "income" else "расхода"
     await cb.message.edit_text(f"💰 Введите сумму {label} (цифрами):")
 
-@router.message(AddTx.amount, F.text)
+@router.message(AddTx.amount, F.text, ~F.text.in_(MAIN_BUTTONS))
 async def add_amount(msg: Message, state: FSMContext):
     cleaned = re.sub(r"[^\d.]", "", msg.text)
     try:
@@ -307,7 +323,7 @@ async def add_amount(msg: Message, state: FSMContext):
     await state.set_state(AddTx.note)
     await msg.answer("📝 Комментарий (необязательно):\nОтправьте текст или /skip")
 
-@router.message(AddTx.note, F.text)
+@router.message(AddTx.note, F.text, ~F.text.in_(MAIN_BUTTONS))
 async def add_note(msg: Message, state: FSMContext):
     note = None if msg.text.strip() == "/skip" else msg.text.strip()
     await _save_tx(msg, state, note)
@@ -345,7 +361,8 @@ async def cb_cancel(cb: CallbackQuery, state: FSMContext):
 # ── BALANCE ───────────────────────────────────────────────────────────────────
 
 @router.message(F.text == "💰 Баланс")
-async def show_balance(msg: Message):
+async def show_balance(msg: Message, state: FSMContext):
+    await state.clear()
     project = await _get_active_project(str(msg.from_user.id))
     if not project:
         await msg.answer("Сначала создайте проект — нажмите 📁 Проекты."); return
@@ -386,7 +403,8 @@ async def show_balance(msg: Message):
 # ── HISTORY ───────────────────────────────────────────────────────────────────
 
 @router.message(F.text == "📋 История")
-async def show_history(msg: Message):
+async def show_history(msg: Message, state: FSMContext):
+    await state.clear()
     project = await _get_active_project(str(msg.from_user.id))
     if not project:
         await msg.answer("Сначала создайте проект — нажмите 📁 Проекты."); return
@@ -443,7 +461,8 @@ async def cb_tx_close(cb: CallbackQuery):
 # ── REPORT ────────────────────────────────────────────────────────────────────
 
 @router.message(F.text == "📊 Отчёт")
-async def report_start(msg: Message):
+async def report_start(msg: Message, state: FSMContext):
+    await state.clear()
     project = await _get_active_project(str(msg.from_user.id))
     if not project:
         await msg.answer("Сначала создайте проект — нажмите 📁 Проекты."); return
@@ -584,7 +603,8 @@ async def cb_cat_filter(cb: CallbackQuery):
 
 @router.message(F.text == "📥 Excel")
 @router.message(Command("excel"))
-async def cmd_excel(msg: Message):
+async def cmd_excel(msg: Message, state: FSMContext):
+    await state.clear()
     if str(msg.from_user.id) not in _load_admins():
         await msg.answer("⛔ Нет доступа"); return
     projects = await _all_projects()
@@ -641,6 +661,235 @@ async def cmd_excel(msg: Message):
     wb.save(EXCEL_PATH)
     await msg.answer_document(FSInputFile(EXCEL_PATH),
                               caption=f"📊 Финансовая выгрузка ({len(projects)} проектов)")
+
+
+# ── HTML REPORT ───────────────────────────────────────────────────────────────
+
+_HTML_REPORT = r"""<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Финансовый отчёт</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+:root{--bg:#0d1117;--card:#161b22;--border:#30363d;--text:#e6edf3;--muted:#8b949e;--green:#3fb950;--red:#f85149;--blue:#58a6ff}
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;padding:20px;min-height:100vh}
+h1{font-size:1.5rem;margin-bottom:4px}
+.sub{color:var(--muted);font-size:.85rem;margin-bottom:24px}
+.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-bottom:24px}
+.stat-card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:18px}
+.stat-card .lbl{color:var(--muted);font-size:.75rem;text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px}
+.stat-card .val{font-size:1.6rem;font-weight:700}
+.c-green{color:var(--green)}.c-red{color:var(--red)}.c-blue{color:var(--blue)}
+.filters{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:16px;margin-bottom:24px;display:flex;flex-wrap:wrap;gap:14px;align-items:flex-end}
+.fg{display:flex;flex-direction:column;gap:6px}
+.fg label{color:var(--muted);font-size:.75rem;text-transform:uppercase;letter-spacing:.06em}
+select,input[type=date]{background:#21262d;color:var(--text);border:1px solid var(--border);border-radius:8px;padding:7px 10px;font-size:.88rem;outline:none}
+.tbtn-row,.pbtn-row{display:flex;gap:5px;flex-wrap:wrap}
+.tbtn,.pbtn{background:#21262d;color:var(--muted);border:1px solid var(--border);border-radius:8px;padding:7px 14px;font-size:.82rem;cursor:pointer;transition:all .15s}
+.tbtn.active,.pbtn.active{background:var(--blue);color:#fff;border-color:var(--blue)}
+.chart-wrap{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:20px;margin-bottom:24px;display:flex;align-items:center;gap:28px;flex-wrap:wrap}
+.chart-wrap canvas{max-width:190px;max-height:190px}
+.legend{display:flex;flex-direction:column;gap:10px}
+.leg-item{display:flex;align-items:center;gap:9px;font-size:.88rem}
+.leg-dot{width:11px;height:11px;border-radius:50%;flex-shrink:0}
+.table-wrap{background:var(--card);border:1px solid var(--border);border-radius:14px;overflow:hidden}
+table{width:100%;border-collapse:collapse}
+th{background:#1c2128;color:var(--muted);font-size:.75rem;text-transform:uppercase;letter-spacing:.06em;padding:11px 14px;text-align:left;cursor:pointer;user-select:none;white-space:nowrap}
+th:hover{color:var(--text)}
+th.srt .arr{opacity:1!important}
+.arr{margin-left:4px;opacity:.3}
+td{padding:11px 14px;border-top:1px solid var(--border);font-size:.88rem;vertical-align:middle}
+tr:hover td{background:#1c2128}
+.badge{display:inline-block;padding:2px 9px;border-radius:12px;font-size:.75rem;font-weight:600}
+.bi{background:#1a3a1a;color:var(--green)}.be{background:#3a1a1a;color:var(--red)}
+.ai{color:var(--green);font-weight:600}.ae{color:var(--red);font-weight:600}
+.chip{background:#21262d;border:1px solid var(--border);border-radius:6px;padding:2px 8px;font-size:.75rem;color:var(--muted)}
+.empty{text-align:center;padding:40px;color:var(--muted)}
+.foot{display:flex;justify-content:space-between;align-items:center;padding:12px 0;color:var(--muted);font-size:.82rem;margin-top:8px}
+.csv-btn{background:#21262d;color:var(--text);border:1px solid var(--border);border-radius:8px;padding:6px 14px;font-size:.82rem;cursor:pointer}
+.csv-btn:hover{background:#30363d}
+#custom-rng{display:none}
+@media(max-width:580px){.stats{grid-template-columns:1fr 1fr}.stat-card:last-child{grid-column:span 2}}
+</style>
+</head>
+<body>
+<h1>📊 Финансовый отчёт</h1>
+<div class="sub" id="sub"></div>
+<div class="stats">
+  <div class="stat-card"><div class="lbl">Баланс</div><div class="val c-blue" id="s-bal">—</div></div>
+  <div class="stat-card"><div class="lbl">Доходы</div><div class="val c-green" id="s-inc">—</div></div>
+  <div class="stat-card"><div class="lbl">Расходы</div><div class="val c-red" id="s-exp">—</div></div>
+</div>
+<div class="filters">
+  <div class="fg"><label>Проект</label><select id="fp"><option value="">Все проекты</option></select></div>
+  <div class="fg"><label>Тип</label>
+    <div class="tbtn-row">
+      <button class="tbtn active" data-t="">Все</button>
+      <button class="tbtn" data-t="income">Доход</button>
+      <button class="tbtn" data-t="expense">Расход</button>
+    </div>
+  </div>
+  <div class="fg"><label>Категория</label><select id="fc"><option value="">Все категории</option></select></div>
+  <div class="fg"><label>Период</label>
+    <div class="pbtn-row">
+      <button class="pbtn" data-p="today">Сегодня</button>
+      <button class="pbtn" data-p="week">Неделя</button>
+      <button class="pbtn" data-p="month">Месяц</button>
+      <button class="pbtn" data-p="year">Год</button>
+      <button class="pbtn active" data-p="all">Всё</button>
+      <button class="pbtn" data-p="custom">Диапазон</button>
+    </div>
+  </div>
+  <div class="fg" id="custom-rng"><label>Диапазон</label>
+    <div style="display:flex;gap:6px;align-items:center">
+      <input type="date" id="fd1"><span style="color:var(--muted)">—</span><input type="date" id="fd2">
+    </div>
+  </div>
+</div>
+<div class="chart-wrap"><canvas id="chart"></canvas><div class="legend" id="legend"></div></div>
+<div class="table-wrap">
+<table>
+  <thead><tr>
+    <th data-c="tx_date">Дата<span class="arr">↕</span></th>
+    <th data-c="kind">Тип<span class="arr">↕</span></th>
+    <th data-c="amount">Сумма<span class="arr">↕</span></th>
+    <th data-c="category">Категория<span class="arr">↕</span></th>
+    <th data-c="note">Комментарий<span class="arr">↕</span></th>
+    <th data-c="_proj">Проект<span class="arr">↕</span></th>
+  </tr></thead>
+  <tbody id="tb"></tbody>
+</table>
+</div>
+<div class="foot"><span id="cnt"></span><button class="csv-btn" onclick="dl()">⬇ CSV</button></div>
+<script>
+const TXS=__DATA_JSON__;
+const PROJS=__PROJECTS_JSON__;
+document.getElementById('sub').textContent='Сформирован: __GENERATED_AT__';
+const pm={};PROJS.forEach(p=>pm[p.id]=p.name);
+TXS.forEach(t=>t._proj=pm[t.project_id]||'—');
+const sel=document.getElementById('fp');
+PROJS.forEach(p=>{const o=document.createElement('option');o.value=p.id;o.textContent=p.name;sel.appendChild(o);});
+const sc=document.getElementById('fc');
+[...new Set(TXS.map(t=>t.category).filter(Boolean))].sort().forEach(c=>{const o=document.createElement('option');o.value=c;o.textContent=c;sc.appendChild(o);});
+let fP='',fT='',fC='',fPer='all',fd1='',fd2='',sCol='tx_date',sDir=-1;
+function filtered(){
+  const now=new Date();
+  return TXS.filter(t=>{
+    if(fP&&String(t.project_id)!==String(fP))return false;
+    if(fT&&t.kind!==fT)return false;
+    if(fC&&t.category!==fC)return false;
+    if(fPer!=='all'&&fPer!=='custom'){
+      const d=new Date(t.tx_date);
+      if(fPer==='today'&&d.toDateString()!==now.toDateString())return false;
+      if(fPer==='week'){const w=new Date(now);w.setDate(now.getDate()-7);if(d<w)return false;}
+      if(fPer==='month'){const m=new Date(now);m.setMonth(now.getMonth()-1);if(d<m)return false;}
+      if(fPer==='year'){const y=new Date(now);y.setFullYear(now.getFullYear()-1);if(d<y)return false;}
+    }
+    if(fPer==='custom'){if(fd1&&t.tx_date<fd1)return false;if(fd2&&t.tx_date>fd2)return false;}
+    return true;
+  });
+}
+const fmt=n=>new Intl.NumberFormat('ru-RU').format(Math.abs(n))+' ₽';
+const pal=['#58a6ff','#3fb950','#d29922','#f85149','#bc8cff','#ffa657','#39d353','#ff7b72'];
+let ch=null;
+function render(){
+  const data=filtered().slice().sort((a,b)=>{
+    let av=a[sCol]??'',bv=b[sCol]??'';
+    return(typeof av==='number'?(av-bv):String(av).localeCompare(String(bv)))*sDir;
+  });
+  let inc=0,exp=0;data.forEach(t=>t.kind==='income'?inc+=t.amount:exp+=t.amount);
+  const bal=inc-exp;
+  document.getElementById('s-bal').textContent=(bal>=0?'+':'')+fmt(bal);
+  document.getElementById('s-inc').textContent='+'+fmt(inc);
+  document.getElementById('s-exp').textContent='-'+fmt(exp);
+  const cd={};data.forEach(t=>{const k=t.category||'Без категории';cd[k]=(cd[k]||0)+t.amount;});
+  const cl=Object.keys(cd),cv=Object.values(cd),cc=cl.map((_,i)=>pal[i%pal.length]);
+  if(ch)ch.destroy();
+  ch=new Chart(document.getElementById('chart'),{
+    type:'doughnut',data:{labels:cl,datasets:[{data:cv,backgroundColor:cc,borderWidth:0,hoverOffset:4}]},
+    options:{cutout:'68%',plugins:{legend:{display:false},tooltip:{callbacks:{label:c=>` ${c.label}: ${fmt(c.raw)}`}}},animation:{duration:250}}
+  });
+  document.getElementById('legend').innerHTML=cl.map((l,i)=>`<div class="leg-item"><div class="leg-dot" style="background:${cc[i]}"></div><span>${l} — ${fmt(cv[i])}</span></div>`).join('');
+  const esc=s=>String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;');
+  document.getElementById('tb').innerHTML=data.length?data.map(t=>`<tr>
+    <td>${esc(t.tx_date)}</td>
+    <td><span class="badge ${t.kind==='income'?'bi':'be'}">${t.kind==='income'?'Доход':'Расход'}</span></td>
+    <td class="${t.kind==='income'?'ai':'ae'}">${t.kind==='income'?'+':'-'}${fmt(t.amount)}</td>
+    <td>${esc(t.category)}</td><td>${esc(t.note)}</td>
+    <td><span class="chip">${esc(t._proj)}</span></td></tr>`).join('')
+    :'<tr><td colspan="6" class="empty">Нет данных</td></tr>';
+  document.getElementById('cnt').textContent=`Записей: ${data.length}`;
+  document.querySelectorAll('th[data-c]').forEach(th=>{
+    th.classList.toggle('srt',th.dataset.c===sCol);
+    th.querySelector('.arr').textContent=th.dataset.c===sCol?(sDir===1?'↑':'↓'):'↕';
+  });
+}
+document.getElementById('fp').addEventListener('change',e=>{fP=e.target.value;render();});
+document.getElementById('fc').addEventListener('change',e=>{fC=e.target.value;render();});
+document.getElementById('fd1').addEventListener('change',e=>{fd1=e.target.value;render();});
+document.getElementById('fd2').addEventListener('change',e=>{fd2=e.target.value;render();});
+document.querySelectorAll('.tbtn').forEach(b=>b.addEventListener('click',()=>{
+  document.querySelectorAll('.tbtn').forEach(x=>x.classList.remove('active'));
+  b.classList.add('active');fT=b.dataset.t;render();
+}));
+document.querySelectorAll('.pbtn').forEach(b=>b.addEventListener('click',()=>{
+  document.querySelectorAll('.pbtn').forEach(x=>x.classList.remove('active'));
+  b.classList.add('active');fPer=b.dataset.p;
+  document.getElementById('custom-rng').style.display=fPer==='custom'?'':'none';
+  render();
+}));
+document.querySelectorAll('th[data-c]').forEach(th=>th.addEventListener('click',()=>{
+  sCol===th.dataset.c?sDir*=-1:(sCol=th.dataset.c,sDir=-1);render();
+}));
+function dl(){
+  const rows=[['Дата','Тип','Сумма','Категория','Комментарий','Проект'],
+    ...filtered().map(t=>[t.tx_date,t.kind==='income'?'Доход':'Расход',t.amount,t.category||'',t.note||'',t._proj])];
+  const csv=rows.map(r=>r.map(v=>`"${String(v).replace(/"/g,'""')}"`).join(',')).join('\n');
+  const a=document.createElement('a');a.href='data:text/csv;charset=utf-8,﻿'+encodeURIComponent(csv);
+  a.download='report.csv';a.click();
+}
+render();
+</script>
+</body>
+</html>"""
+
+
+def _build_html(transactions: list, projects: list) -> str:
+    from datetime import datetime as _dt
+    return (
+        _HTML_REPORT
+        .replace("__DATA_JSON__", json.dumps(transactions, ensure_ascii=False))
+        .replace("__PROJECTS_JSON__", json.dumps(projects, ensure_ascii=False))
+        .replace("__GENERATED_AT__", _dt.now().strftime("%d.%m.%Y %H:%M"))
+    )
+
+
+@router.message(F.text == "🌐 HTML")
+@router.message(Command("html"))
+async def cmd_html_report(msg: Message, state: FSMContext):
+    await state.clear()
+    if str(msg.from_user.id) not in _load_admins():
+        await msg.answer("⛔ Нет доступа"); return
+    projects = await _all_projects()
+    if not projects:
+        await msg.answer("Данных нет."); return
+    all_txs: list = []
+    for project in projects:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            rows = await (await db.execute(
+                "SELECT * FROM transactions WHERE project_id=? ORDER BY tx_date, id",
+                (project["id"],)
+            )).fetchall()
+            all_txs.extend(dict(r) for r in rows)
+    html = _build_html(all_txs, projects)
+    Path(HTML_PATH).write_text(html, encoding="utf-8")
+    await msg.answer_document(
+        FSInputFile(HTML_PATH),
+        caption="🌐 Открой файл в браузере — фильтры, диаграмма и сортировка внутри"
+    )
 
 
 # ── TELEGRAPH ─────────────────────────────────────────────────────────────────
