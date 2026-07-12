@@ -352,7 +352,7 @@ async def cmd_start(message: Message, state: FSMContext):
         await message.answer(WELCOME_TEXT, parse_mode="HTML", reply_markup=kb_main())
     if str(message.from_user.id) in _load_admins():
         await message.answer(
-            "🔧 <b>Команды:</b> /excel · /publish · /weblink\n"
+            "🔧 <b>Команды:</b> /publish · /weblink\n"
             "/digest 08:00 — ежедневный дайджест\n"
             "/admins · /addadmin · /removeadmin",
             parse_mode="HTML"
@@ -487,101 +487,146 @@ async def add_start(message: Message, state: FSMContext):
         parse_mode="HTML", reply_markup=kb_types()
     )
 
+async def _rm_q_buttons(bot: Bot, chat_id: int, msg_id: int | None):
+    if msg_id:
+        try:
+            await bot.edit_message_reply_markup(chat_id=chat_id, message_id=msg_id, reply_markup=None)
+        except Exception:
+            pass
+
+
 @router.callback_query(F.data.startswith("itype:"))
 async def cb_type(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
     itype = cb.data.split(":")[1]
     await state.update_data(item_type=itype)
     await state.set_state(Add.title)
-    await cb.message.edit_text(
+    try:
+        await cb.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    sent = await cb.message.answer(
         f"{ITEM_TYPES[itype]}\n\n✏️ <b>Название</b> (например: «Рейс SU1234», «Hilton Istanbul»):",
         parse_mode="HTML"
     )
+    await state.update_data(_qid=sent.message_id)
 
 @router.message(Add.title, F.text)
 async def add_title(msg: Message, state: FSMContext):
     await state.update_data(title=msg.text.strip())
     await state.set_state(Add.destination)
-    await msg.answer("📍 <b>Куда / место</b> (город, адрес):", parse_mode="HTML", reply_markup=kb_skip("destination"))
+    sent = await msg.answer("📍 <b>Куда / место</b> (город, адрес):", parse_mode="HTML", reply_markup=kb_skip("destination"))
+    await state.update_data(_qid=sent.message_id)
 
 @router.message(Add.destination, F.text, ~F.text.startswith("/"))
-async def add_destination(msg: Message, state: FSMContext):
+async def add_destination(msg: Message, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    await _rm_q_buttons(bot, msg.chat.id, data.get("_qid"))
     await state.update_data(destination=msg.text.strip())
     await state.set_state(Add.date_start)
-    await msg.answer("📅 <b>Дата начала</b> (например: 25.07.2025):", parse_mode="HTML", reply_markup=kb_skip("date_start"))
+    sent = await msg.answer("📅 <b>Дата начала</b> (например: 25.07.2025):", parse_mode="HTML", reply_markup=kb_skip("date_start"))
+    await state.update_data(_qid=sent.message_id)
 
 @router.message(Add.date_start, F.text, ~F.text.startswith("/"))
-async def add_date_start(msg: Message, state: FSMContext):
+async def add_date_start(msg: Message, state: FSMContext, bot: Bot):
+    data = await state.get_data()
     parsed = _parse_date(msg.text)
     if parsed is None:
         await msg.answer("❌ Неверный формат. Введите дату как 25.07.2025:", reply_markup=kb_skip("date_start"))
         return
+    await _rm_q_buttons(bot, msg.chat.id, data.get("_qid"))
     await state.update_data(date_start=parsed)
     await state.set_state(Add.time_start)
-    await msg.answer("⏰ <b>Время начала</b> (например: 14:30):", parse_mode="HTML", reply_markup=kb_skip("time_start"))
+    sent = await msg.answer("⏰ <b>Время начала</b> (например: 14:30):", parse_mode="HTML", reply_markup=kb_skip("time_start"))
+    await state.update_data(_qid=sent.message_id)
 
 @router.message(Add.time_start, F.text, ~F.text.startswith("/"))
-async def add_time_start(msg: Message, state: FSMContext):
+async def add_time_start(msg: Message, state: FSMContext, bot: Bot):
+    data = await state.get_data()
     parsed = _parse_time(msg.text)
     if parsed is None:
         await msg.answer("❌ Неверный формат. Введите время как 14:30:", reply_markup=kb_skip("time_start"))
         return
+    await _rm_q_buttons(bot, msg.chat.id, data.get("_qid"))
     await state.update_data(time_start=parsed)
     await state.set_state(Add.date_end)
-    await msg.answer("📅 <b>Дата окончания</b> (например: 28.07.2025):", parse_mode="HTML", reply_markup=kb_skip("date_end"))
+    sent = await msg.answer("📅 <b>Дата окончания</b> (например: 28.07.2025):", parse_mode="HTML", reply_markup=kb_skip("date_end"))
+    await state.update_data(_qid=sent.message_id)
 
 @router.message(Add.date_end, F.text, ~F.text.startswith("/"))
-async def add_date_end(msg: Message, state: FSMContext):
+async def add_date_end(msg: Message, state: FSMContext, bot: Bot):
+    data = await state.get_data()
     parsed = _parse_date(msg.text)
     if parsed is None:
         await msg.answer("❌ Неверный формат. Введите дату как 28.07.2025:", reply_markup=kb_skip("date_end"))
         return
+    await _rm_q_buttons(bot, msg.chat.id, data.get("_qid"))
     await state.update_data(date_end=parsed)
     await state.set_state(Add.link)
-    await msg.answer("🔗 <b>Ссылка на бронирование:</b>", parse_mode="HTML", reply_markup=kb_skip("link"))
+    sent = await msg.answer("🔗 <b>Ссылка на бронирование:</b>", parse_mode="HTML", reply_markup=kb_skip("link"))
+    await state.update_data(_qid=sent.message_id)
 
 @router.message(Add.link, F.text, ~F.text.startswith("/"))
-async def add_link(msg: Message, state: FSMContext):
+async def add_link(msg: Message, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    await _rm_q_buttons(bot, msg.chat.id, data.get("_qid"))
     await state.update_data(link=msg.text.strip())
     await state.set_state(Add.confirm_num)
-    await msg.answer("🔖 <b>Номер подтверждения / брони:</b>", parse_mode="HTML", reply_markup=kb_skip("confirm_num"))
+    sent = await msg.answer("🔖 <b>Номер подтверждения / брони:</b>", parse_mode="HTML", reply_markup=kb_skip("confirm_num"))
+    await state.update_data(_qid=sent.message_id)
 
 @router.message(Add.confirm_num, F.text, ~F.text.startswith("/"))
-async def add_confirm(msg: Message, state: FSMContext):
+async def add_confirm(msg: Message, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    await _rm_q_buttons(bot, msg.chat.id, data.get("_qid"))
     await state.update_data(confirm_num=msg.text.strip())
     await state.set_state(Add.price)
-    await msg.answer("💰 <b>Стоимость</b> (только цифры, например 15000):", parse_mode="HTML", reply_markup=kb_skip("price"))
+    sent = await msg.answer("💰 <b>Стоимость</b> (только цифры, например 15000):", parse_mode="HTML", reply_markup=kb_skip("price"))
+    await state.update_data(_qid=sent.message_id)
 
 @router.message(Add.price, F.text, ~F.text.startswith("/"))
-async def add_price(msg: Message, state: FSMContext):
+async def add_price(msg: Message, state: FSMContext, bot: Bot):
+    data = await state.get_data()
     cleaned = re.sub(r"[^\d.]", "", msg.text)
     try:
-        await state.update_data(price=float(cleaned))
+        price = float(cleaned)
     except ValueError:
         await msg.answer("❌ Введите число, например 15000:", reply_markup=kb_skip("price"))
         return
+    await _rm_q_buttons(bot, msg.chat.id, data.get("_qid"))
+    await state.update_data(price=price)
     await state.set_state(Add.prepayment)
-    await msg.answer("💳 <b>Предоплата</b> (цифрами, если была):", parse_mode="HTML", reply_markup=kb_skip("prepayment"))
+    sent = await msg.answer("💳 <b>Предоплата</b> (цифрами, если была):", parse_mode="HTML", reply_markup=kb_skip("prepayment"))
+    await state.update_data(_qid=sent.message_id)
 
 @router.message(Add.prepayment, F.text, ~F.text.startswith("/"))
-async def add_prepay(msg: Message, state: FSMContext):
+async def add_prepay(msg: Message, state: FSMContext, bot: Bot):
+    data = await state.get_data()
     cleaned = re.sub(r"[^\d.]", "", msg.text)
     try:
-        await state.update_data(prepayment=float(cleaned))
+        prepay = float(cleaned)
     except ValueError:
         await msg.answer("❌ Введите число, например 5000:", reply_markup=kb_skip("prepayment"))
         return
+    await _rm_q_buttons(bot, msg.chat.id, data.get("_qid"))
+    await state.update_data(prepayment=prepay)
     await state.set_state(Add.notes)
-    await msg.answer("📝 <b>Заметки / пометки:</b>", parse_mode="HTML", reply_markup=kb_skip("notes"))
+    sent = await msg.answer("📝 <b>Заметки / пометки:</b>", parse_mode="HTML", reply_markup=kb_skip("notes"))
+    await state.update_data(_qid=sent.message_id)
 
 @router.message(Add.notes, F.text, ~F.text.startswith("/"))
-async def add_notes(msg: Message, state: FSMContext):
+async def add_notes(msg: Message, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    await _rm_q_buttons(bot, msg.chat.id, data.get("_qid"))
     await state.update_data(notes=msg.text.strip())
     await state.set_state(Add.remind)
-    await msg.answer("⏰ <b>Напомнить за</b> (например: 1д / 3ч / 30м):", parse_mode="HTML", reply_markup=kb_skip("remind"))
+    sent = await msg.answer("⏰ <b>Напомнить за</b> (например: 1д / 3ч / 30м):", parse_mode="HTML", reply_markup=kb_skip("remind"))
+    await state.update_data(_qid=sent.message_id)
 
 @router.message(Add.remind, F.text, ~F.text.startswith("/"))
-async def add_remind(msg: Message, state: FSMContext):
+async def add_remind(msg: Message, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    await _rm_q_buttons(bot, msg.chat.id, data.get("_qid"))
     await state.update_data(remind_raw=msg.text.strip())
     await _finalize(msg, state)
 
