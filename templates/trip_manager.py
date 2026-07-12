@@ -303,17 +303,6 @@ def _fmt_item(r: dict) -> str:
     if r.get("status") == "done": lines.append("✅ Выполнено")
     return "\n".join(lines)
 
-async def _wiz_next(bot: Bot, data: dict, text: str, markup=None):
-    try:
-        await bot.edit_message_text(
-            text, chat_id=data["wiz_chat"], message_id=data["wiz_id"],
-            parse_mode="HTML", reply_markup=markup
-        )
-    except Exception as e:
-        logger.warning(f"wiz_next failed: {e}")
-
-async def _wiz_error(bot: Bot, data: dict, error: str, prompt: str, markup=None):
-    await _wiz_next(bot, data, f"❌ {error}\n\n{prompt}", markup)
 
 
 # ── FSM ───────────────────────────────────────────────────────────────────────
@@ -476,11 +465,11 @@ async def add_start(message: Message, state: FSMContext):
         await message.answer("Сначала создайте путешествие — 🗂 Путешествия.", reply_markup=kb_main())
         return
     await state.set_state(Add.type)
-    wiz = await message.answer(
+    await state.update_data(trip_id=trip["id"])
+    await message.answer(
         f"🗺 <b>{trip['name']}</b>\n\nВыберите тип:",
         parse_mode="HTML", reply_markup=kb_types()
     )
-    await state.update_data(trip_id=trip["id"], wiz_id=wiz.message_id, wiz_chat=wiz.chat.id)
 
 @router.callback_query(F.data.startswith("itype:"))
 async def cb_type(cb: CallbackQuery, state: FSMContext):
@@ -494,109 +483,94 @@ async def cb_type(cb: CallbackQuery, state: FSMContext):
     )
 
 @router.message(Add.title, F.text)
-async def add_title(msg: Message, state: FSMContext, bot: Bot):
+async def add_title(msg: Message, state: FSMContext):
     await state.update_data(title=msg.text.strip())
     await state.set_state(Add.destination)
-    data = await state.get_data()
-    await _wiz_next(bot, data, "📍 <b>Куда / место</b> (город, адрес):", kb_skip("destination"))
+    await msg.answer("📍 <b>Куда / место</b> (город, адрес):", parse_mode="HTML", reply_markup=kb_skip("destination"))
 
 @router.message(Add.destination, F.text, ~F.text.startswith("/"))
-async def add_destination(msg: Message, state: FSMContext, bot: Bot):
+async def add_destination(msg: Message, state: FSMContext):
     await state.update_data(destination=msg.text.strip())
     await state.set_state(Add.date_start)
-    data = await state.get_data()
-    await _wiz_next(bot, data, "📅 <b>Дата начала</b> (например: 25.07.2025):", kb_skip("date_start"))
+    await msg.answer("📅 <b>Дата начала</b> (например: 25.07.2025):", parse_mode="HTML", reply_markup=kb_skip("date_start"))
 
 @router.message(Add.date_start, F.text, ~F.text.startswith("/"))
-async def add_date_start(msg: Message, state: FSMContext, bot: Bot):
+async def add_date_start(msg: Message, state: FSMContext):
     parsed = _parse_date(msg.text)
-    data = await state.get_data()
     if parsed is None:
-        await _wiz_error(bot, data, "Неверный формат даты.",
-                         "📅 <b>Дата начала</b> (например: 25.07.2025):", kb_skip("date_start"))
+        await msg.answer("❌ Неверный формат. Введите дату как 25.07.2025:", reply_markup=kb_skip("date_start"))
         return
     await state.update_data(date_start=parsed)
     await state.set_state(Add.time_start)
-    await _wiz_next(bot, data, "⏰ <b>Время начала</b> (например: 14:30):", kb_skip("time_start"))
+    await msg.answer("⏰ <b>Время начала</b> (например: 14:30):", parse_mode="HTML", reply_markup=kb_skip("time_start"))
 
 @router.message(Add.time_start, F.text, ~F.text.startswith("/"))
-async def add_time_start(msg: Message, state: FSMContext, bot: Bot):
+async def add_time_start(msg: Message, state: FSMContext):
     parsed = _parse_time(msg.text)
-    data = await state.get_data()
     if parsed is None:
-        await _wiz_error(bot, data, "Неверный формат. Введите время как 14:30.",
-                         "⏰ <b>Время начала</b> (например: 14:30):", kb_skip("time_start"))
+        await msg.answer("❌ Неверный формат. Введите время как 14:30:", reply_markup=kb_skip("time_start"))
         return
     await state.update_data(time_start=parsed)
     await state.set_state(Add.date_end)
-    await _wiz_next(bot, data, "📅 <b>Дата окончания</b> (например: 28.07.2025):", kb_skip("date_end"))
+    await msg.answer("📅 <b>Дата окончания</b> (например: 28.07.2025):", parse_mode="HTML", reply_markup=kb_skip("date_end"))
 
 @router.message(Add.date_end, F.text, ~F.text.startswith("/"))
-async def add_date_end(msg: Message, state: FSMContext, bot: Bot):
+async def add_date_end(msg: Message, state: FSMContext):
     parsed = _parse_date(msg.text)
-    data = await state.get_data()
     if parsed is None:
-        await _wiz_error(bot, data, "Неверный формат даты.",
-                         "📅 <b>Дата окончания</b> (например: 28.07.2025):", kb_skip("date_end"))
+        await msg.answer("❌ Неверный формат. Введите дату как 28.07.2025:", reply_markup=kb_skip("date_end"))
         return
     await state.update_data(date_end=parsed)
     await state.set_state(Add.link)
-    await _wiz_next(bot, data, "🔗 <b>Ссылка на бронирование:</b>", kb_skip("link"))
+    await msg.answer("🔗 <b>Ссылка на бронирование:</b>", parse_mode="HTML", reply_markup=kb_skip("link"))
 
 @router.message(Add.link, F.text, ~F.text.startswith("/"))
-async def add_link(msg: Message, state: FSMContext, bot: Bot):
+async def add_link(msg: Message, state: FSMContext):
     await state.update_data(link=msg.text.strip())
     await state.set_state(Add.confirm_num)
-    data = await state.get_data()
-    await _wiz_next(bot, data, "🔖 <b>Номер подтверждения / брони:</b>", kb_skip("confirm_num"))
+    await msg.answer("🔖 <b>Номер подтверждения / брони:</b>", parse_mode="HTML", reply_markup=kb_skip("confirm_num"))
 
 @router.message(Add.confirm_num, F.text, ~F.text.startswith("/"))
-async def add_confirm(msg: Message, state: FSMContext, bot: Bot):
+async def add_confirm(msg: Message, state: FSMContext):
     await state.update_data(confirm_num=msg.text.strip())
     await state.set_state(Add.price)
-    data = await state.get_data()
-    await _wiz_next(bot, data, "💰 <b>Стоимость</b> (только цифры, например 15000):", kb_skip("price"))
+    await msg.answer("💰 <b>Стоимость</b> (только цифры, например 15000):", parse_mode="HTML", reply_markup=kb_skip("price"))
 
 @router.message(Add.price, F.text, ~F.text.startswith("/"))
-async def add_price(msg: Message, state: FSMContext, bot: Bot):
+async def add_price(msg: Message, state: FSMContext):
     cleaned = re.sub(r"[^\d.]", "", msg.text)
-    data = await state.get_data()
     try:
         await state.update_data(price=float(cleaned))
     except ValueError:
-        await _wiz_error(bot, data, "Введите число.",
-                         "💰 <b>Стоимость</b> (только цифры, например 15000):", kb_skip("price"))
+        await msg.answer("❌ Введите число, например 15000:", reply_markup=kb_skip("price"))
         return
     await state.set_state(Add.prepayment)
-    await _wiz_next(bot, data, "💳 <b>Предоплата</b> (цифрами, если была):", kb_skip("prepayment"))
+    await msg.answer("💳 <b>Предоплата</b> (цифрами, если была):", parse_mode="HTML", reply_markup=kb_skip("prepayment"))
 
 @router.message(Add.prepayment, F.text, ~F.text.startswith("/"))
-async def add_prepay(msg: Message, state: FSMContext, bot: Bot):
+async def add_prepay(msg: Message, state: FSMContext):
     cleaned = re.sub(r"[^\d.]", "", msg.text)
-    data = await state.get_data()
     try:
         await state.update_data(prepayment=float(cleaned))
     except ValueError:
-        await _wiz_error(bot, data, "Введите число.",
-                         "💳 <b>Предоплата</b> (цифрами, если была):", kb_skip("prepayment"))
+        await msg.answer("❌ Введите число, например 5000:", reply_markup=kb_skip("prepayment"))
         return
     await state.set_state(Add.notes)
-    await _wiz_next(bot, data, "📝 <b>Заметки / пометки:</b>", kb_skip("notes"))
+    await msg.answer("📝 <b>Заметки / пометки:</b>", parse_mode="HTML", reply_markup=kb_skip("notes"))
 
 @router.message(Add.notes, F.text, ~F.text.startswith("/"))
-async def add_notes(msg: Message, state: FSMContext, bot: Bot):
+async def add_notes(msg: Message, state: FSMContext):
     await state.update_data(notes=msg.text.strip())
     await state.set_state(Add.remind)
-    data = await state.get_data()
-    await _wiz_next(bot, data, "⏰ <b>Напомнить за</b> (например: 1д / 3ч / 30м):", kb_skip("remind"))
+    await msg.answer("⏰ <b>Напомнить за</b> (например: 1д / 3ч / 30м):", parse_mode="HTML", reply_markup=kb_skip("remind"))
 
 @router.message(Add.remind, F.text, ~F.text.startswith("/"))
-async def add_remind(msg: Message, state: FSMContext, bot: Bot):
+async def add_remind(msg: Message, state: FSMContext):
     await state.update_data(remind_raw=msg.text.strip())
-    await _finalize(msg, state, bot)
+    await _finalize(msg, state)
 
 
-async def _finalize(msg: Message, state: FSMContext, bot: Bot):
+async def _finalize(msg: Message, state: FSMContext):
     data = await state.get_data()
     remind_raw = data.pop("remind_raw", None)
     remind_at = None
@@ -635,24 +609,11 @@ async def _finalize(msg: Message, state: FSMContext, bot: Bot):
         if data.get("time_start"): d_line += f" в {data['time_start']}"
         lines.append(d_line)
     if data.get("price"): lines.append(f"💰 {data['price']:,.0f} ₽")
-    success = "\n".join(lines)
 
-    wiz_id = data.get("wiz_id")
-    wiz_chat = data.get("wiz_chat")
     await state.clear()
-
-    if wiz_id and wiz_chat:
-        try:
-            await bot.edit_message_text(success, chat_id=wiz_chat, message_id=wiz_id, parse_mode="HTML")
-            await bot.send_message(wiz_chat, "Что сделаем?", reply_markup=kb_main())
-            if remind_at:
-                asyncio.create_task(_remind(bot, wiz_chat, data.get("title", ""), remind_at))
-            return
-        except Exception:
-            pass
-    await msg.answer(success, parse_mode="HTML", reply_markup=kb_main())
+    await msg.answer("\n".join(lines), parse_mode="HTML", reply_markup=kb_main())
     if remind_at:
-        asyncio.create_task(_remind(bot, msg.chat.id, data.get("title", ""), remind_at))
+        asyncio.create_task(_remind(msg.bot, msg.chat.id, data.get("title", ""), remind_at))
 
 
 async def _remind(bot: Bot, chat_id: int, title: str, remind_at: str):
@@ -668,18 +629,22 @@ async def _remind(bot: Bot, chat_id: int, title: str, remind_at: str):
 # ── SKIP ──────────────────────────────────────────────────────────────────────
 
 @router.callback_query(F.data.startswith("iskip:"))
-async def cb_skip(cb: CallbackQuery, state: FSMContext, bot: Bot):
+async def cb_skip(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
     step = cb.data.split(":")[1]
+    # Remove Skip/Cancel buttons from the skipped message
+    try:
+        await cb.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
     if step == "remind":
-        await _finalize(cb.message, state, bot)
+        await _finalize(cb.message, state)
         return
     idx = _STEP_MAP.get(step, -1)
     if idx + 1 < len(_STEPS):
         next_step, next_state, prompt = _STEPS[idx + 1]
         await state.set_state(next_state)
-        data = await state.get_data()
-        await _wiz_next(bot, data, prompt, kb_skip(next_step))
+        await cb.message.answer(prompt, parse_mode="HTML", reply_markup=kb_skip(next_step))
 
 @router.callback_query(F.data == "icancel")
 async def cb_icancel(cb: CallbackQuery, state: FSMContext):
@@ -1238,10 +1203,17 @@ async def _digest_loop(bot: Bot):
 
 # ── EXCEL ─────────────────────────────────────────────────────────────────────
 
+def _is_admin(user_id: str) -> bool:
+    admins = _load_admins()
+    if not admins:
+        _save_admins({user_id})
+        return True
+    return user_id in admins
+
 @router.message(F.text == "📥 Excel")
 @router.message(Command("excel"))
 async def cmd_excel(msg: Message):
-    if str(msg.from_user.id) not in _load_admins():
+    if not _is_admin(str(msg.from_user.id)):
         await msg.answer("⛔ Нет доступа"); return
     trips = await _all_trips()
     if not trips:
@@ -1414,7 +1386,7 @@ async def _publish_trip(trip: dict, items: list) -> str:
 
 @router.message(Command("publish"))
 async def cmd_publish(msg: Message):
-    if str(msg.from_user.id) not in _load_admins():
+    if not _is_admin(str(msg.from_user.id)):
         await msg.answer("⛔ Нет доступа"); return
     trip = await _get_active_trip(str(msg.from_user.id))
     if not trip:
@@ -1450,7 +1422,7 @@ async def cmd_weblink(msg: Message):
 
 @router.message(Command("addadmin"))
 async def cmd_addadmin(msg: Message):
-    if str(msg.from_user.id) not in _load_admins(): await msg.answer("⛔ Нет доступа"); return
+    if not _is_admin(str(msg.from_user.id)): await msg.answer("⛔ Нет доступа"); return
     parts = msg.text.split()
     if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
         await msg.answer("Использование: /addadmin <id>"); return
@@ -1459,7 +1431,7 @@ async def cmd_addadmin(msg: Message):
 
 @router.message(Command("removeadmin"))
 async def cmd_removeadmin(msg: Message):
-    if str(msg.from_user.id) not in _load_admins(): await msg.answer("⛔ Нет доступа"); return
+    if not _is_admin(str(msg.from_user.id)): await msg.answer("⛔ Нет доступа"); return
     parts = msg.text.split()
     if len(parts) < 2: await msg.answer("Использование: /removeadmin <id>"); return
     ids = _load_admins(); ids.discard(parts[1]); _save_admins(ids)
@@ -1467,7 +1439,7 @@ async def cmd_removeadmin(msg: Message):
 
 @router.message(Command("admins"))
 async def cmd_admins(msg: Message):
-    if str(msg.from_user.id) not in _load_admins(): await msg.answer("⛔ Нет доступа"); return
+    if not _is_admin(str(msg.from_user.id)): await msg.answer("⛔ Нет доступа"); return
     ids = _load_admins()
     await msg.answer(
         "👥 " + ("\n".join(f"• <code>{i}</code>" for i in ids) or "Пусто"),
