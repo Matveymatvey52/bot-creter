@@ -1,6 +1,7 @@
 # TEMPLATE: booking_beauty
 # USE FOR: beauty salons, nail/hair/brow/lash studios, spa — онлайн запись
 # CUSTOMIZE: sections marked with # CUSTOMIZE
+from __future__ import annotations
 
 import asyncio
 import json
@@ -98,6 +99,7 @@ async def init_db():
             CREATE TABLE IF NOT EXISTS bookings (
                 id           INTEGER PRIMARY KEY AUTOINCREMENT,
                 slot_id      INTEGER UNIQUE REFERENCES slots(id),
+                user_id      INTEGER,
                 client_name  TEXT,
                 client_phone TEXT,
                 service      TEXT,
@@ -105,6 +107,10 @@ async def init_db():
                 created_at   TEXT DEFAULT (datetime('now','localtime'))
             )
         """)
+        try:
+            await db.execute("ALTER TABLE bookings ADD COLUMN user_id INTEGER")
+        except Exception:
+            pass
         await db.commit()
     await _ensure_slots()
 
@@ -211,7 +217,8 @@ class CancelFlow(StatesGroup):
 @router.message(Command("start"))
 async def cmd_start(message: Message):
     admins = _load_admins()
-    if not admins:
+    first_time_admin = not admins
+    if first_time_admin:
         _save_admins({str(message.from_user.id)})
     is_admin = str(message.from_user.id) in _load_admins()
     kb = kb_admin() if is_admin else kb_main()
@@ -220,6 +227,18 @@ async def cmd_start(message: Message):
                                    caption=WELCOME_TEXT, parse_mode="HTML", reply_markup=kb)
     else:
         await message.answer(WELCOME_TEXT, parse_mode="HTML", reply_markup=kb)
+    if first_time_admin:
+        await message.answer(
+            "👑 <b>Вы — администратор этого бота.</b>\n\n"
+            "Вам доступны дополнительные кнопки:\n"
+            "🗂 <b>Все записи</b> — полное расписание всех клиентов\n"
+            "📊 <b>Статистика</b> — сводка по записям\n\n"
+            "Управление администраторами:\n"
+            "<code>/addadmin ID</code> — добавить администратора\n"
+            "<code>/removeadmin ID</code> — убрать администратора\n"
+            "<code>/admins</code> — список администраторов",
+            parse_mode="HTML"
+        )
 
 
 # ── BOOK FLOW: service → day → time → master → name → phone → confirm ─────────
@@ -392,8 +411,8 @@ async def cb_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
             await state.clear(); return
         await db.execute("UPDATE slots SET status='booked' WHERE id=?", (slot_id,))
         cur = await db.execute(
-            "INSERT INTO bookings (slot_id, client_name, client_phone, service) VALUES (?,?,?,?)",
-            (slot_id, data.get("client_name"), data.get("client_phone"), data.get("service"))
+            "INSERT INTO bookings (slot_id, user_id, client_name, client_phone, service) VALUES (?,?,?,?,?)",
+            (slot_id, cb.from_user.id, data.get("client_name"), data.get("client_phone"), data.get("service"))
         )
         booking_id = cur.lastrowid
         slot_row = await (await db.execute(
@@ -440,25 +459,17 @@ async def cb_book_cancel(cb: CallbackQuery, state: FSMContext):
 # ── MY BOOKINGS ───────────────────────────────────────────────────────────────
 
 @router.message(F.text == "📋 Мои записи")
-async def my_bookings_start(msg: Message, state: FSMContext):
-    await state.set_state(FindFlow.phone)
-    await msg.answer("📱 Введите ваш номер телефона, чтобы найти записи:")
-
-@router.message(FindFlow.phone, F.text)
-async def my_bookings_find(msg: Message, state: FSMContext):
-    await state.clear()
-    raw = msg.text.strip()
-    norm = _normalize_phone(raw)
+async def my_bookings_start(msg: Message):
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         rows = await (await db.execute(
             "SELECT b.*, s.slot_date, s.slot_time, s.master FROM bookings b "
             "JOIN slots s ON b.slot_id=s.id "
-            "WHERE b.client_phone=? OR b.client_phone=? ORDER BY s.slot_date, s.slot_time",
-            (raw, norm or raw)
+            "WHERE b.user_id=? ORDER BY s.slot_date, s.slot_time",
+            (msg.from_user.id,)
         )).fetchall()
     if not rows:
-        await msg.answer("Записей с этим номером не найдено.", reply_markup=kb_main()); return
+        await msg.answer("📭 У вас нет активных записей.", reply_markup=kb_main()); return
     lines = ["📋 <b>Ваши записи:</b>\n"]
     for r in [dict(x) for x in rows]:
         d = datetime.strptime(r["slot_date"], "%Y-%m-%d")
@@ -470,23 +481,15 @@ async def my_bookings_find(msg: Message, state: FSMContext):
 # ── CANCEL BOOKING ────────────────────────────────────────────────────────────
 
 @router.message(F.text == "❌ Отменить запись")
-async def cancel_start(msg: Message, state: FSMContext):
-    await state.set_state(CancelFlow.phone)
-    await msg.answer("📱 Введите ваш номер телефона:")
-
-@router.message(CancelFlow.phone, F.text)
-async def cancel_find(msg: Message, state: FSMContext):
-    await state.clear()
-    raw = msg.text.strip()
-    norm = _normalize_phone(raw)
+async def cancel_start(msg: Message):
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         rows = await (await db.execute(
             "SELECT b.id, s.slot_date, s.slot_time, s.master FROM bookings b "
             "JOIN slots s ON b.slot_id=s.id "
-            "WHERE (b.client_phone=? OR b.client_phone=?) AND s.slot_date >= date('now','localtime') "
+            "WHERE b.user_id=? AND s.slot_date >= date('now','localtime') "
             "ORDER BY s.slot_date",
-            (raw, norm or raw)
+            (msg.from_user.id,)
         )).fetchall()
     if not rows:
         await msg.answer("Актуальных записей не найдено.", reply_markup=kb_main()); return
