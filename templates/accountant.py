@@ -801,7 +801,7 @@ function render(){
   });
   let inc=0,exp=0;data.forEach(t=>t.kind==='income'?inc+=t.amount:exp+=t.amount);
   const bal=inc-exp;
-  document.getElementById('s-bal').textContent=(bal>=0?'+':'')+fmt(bal);
+  document.getElementById('s-bal').textContent=(bal>=0?'+':'-')+fmt(bal);
   document.getElementById('s-inc').textContent='+'+fmt(inc);
   document.getElementById('s-exp').textContent='-'+fmt(exp);
   const cd={};data.forEach(t=>{const k=t.category||'Без категории';cd[k]=(cd[k]||0)+t.amount;});
