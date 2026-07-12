@@ -1309,29 +1309,86 @@ async def _tg_token() -> str:
     return token
 
 def _tg_nodes_items(trip_name: str, items: list) -> list:
-    nodes = [{"tag": "h3", "children": [trip_name]}]
-    for item in items:
-        icon = ITEM_TYPES.get(item["item_type"], "📌").split()[0]
-        parts = [f"{icon} {item['title']}"]
-        if item.get("destination"): parts.append(f"| {item['destination']}")
-        if item.get("date_start"):
-            d_part = item["date_start"]
-            if item.get("time_start"): d_part += f" в {item['time_start']}"
-            parts.append(f"| {d_part}")
-            if item.get("date_end") and item["date_end"] != item["date_start"]:
-                parts.append(f"– {item['date_end']}")
-        p = _fmt_price(item.get("price"), item.get("prepayment"))
-        if p != "—": parts.append(f"| {p}")
-        if item.get("confirm_num"): parts.append(f"| #{item['confirm_num']}")
-        if item.get("notes"):       parts.append(f"| {item['notes']}")
-        nodes.append({"tag": "p", "children": [" ".join(parts)]})
+    DAYS_FULL   = {0:"понедельник",1:"вторник",2:"среда",3:"четверг",
+                   4:"пятница",5:"суббота",6:"воскресенье"}
+    MONTHS_FULL = {1:"января",2:"февраля",3:"марта",4:"апреля",5:"мая",6:"июня",
+                   7:"июля",8:"августа",9:"сентября",10:"октября",11:"ноября",12:"декабря"}
+
     total_price = sum(i.get("price") or 0 for i in items)
     total_pre   = sum(i.get("prepayment") or 0 for i in items)
+
+    nodes: list = [{"tag": "h3", "children": [trip_name]}]
+    sub = f"{len(items)} событий"
     if total_price:
-        nodes.append({"tag": "p", "children": [
-            f"Итого: {total_price:,.0f} ₽  |  Оплачено: {total_pre:,.0f} ₽  |  "
-            f"Осталось: {total_price - total_pre:,.0f} ₽"
+        sub += f"  ·  {total_price:,.0f} ₽ всего"
+    nodes.append({"tag": "p", "children": [sub]})
+
+    by_date: dict = {}
+    no_date = []
+    for item in items:
+        d = item.get("date_start") or ""
+        (by_date.setdefault(d, []) if d else no_date).append(item)
+
+    def _item_nodes(item: dict) -> list:
+        icon = ITEM_TYPES.get(item["item_type"], "📌").split()[0]
+        title = f"{icon}  {item['title']}"
+        if item.get("time_start"):
+            title += f"  —  {item['time_start']}"
+        result = [{"tag": "p", "children": [{"tag": "b", "children": [title]}]}]
+        details = []
+        if item.get("destination"):
+            details.append({"tag": "li", "children": [f"📍  {item['destination']}"]})
+        if item.get("date_end") and item["date_end"] != item.get("date_start"):
+            try:
+                dt2 = datetime.strptime(item["date_end"], "%Y-%m-%d")
+                end_label = f"{dt2.day} {MONTHS_FULL[dt2.month]} {dt2.year}"
+            except Exception:
+                end_label = item["date_end"]
+            details.append({"tag": "li", "children": [f"🔚  по {end_label}"]})
+        p = _fmt_price(item.get("price"), item.get("prepayment"))
+        if p != "—":
+            details.append({"tag": "li", "children": [f"💰  {p}"]})
+        if item.get("confirm_num"):
+            details.append({"tag": "li", "children": [f"🔖  {item['confirm_num']}"]})
+        if item.get("link"):
+            details.append({"tag": "li", "children": [
+                {"tag": "a", "attrs": {"href": item["link"]}, "children": ["🔗  Открыть бронирование"]}
+            ]})
+        if item.get("notes"):
+            details.append({"tag": "li", "children": [f"📝  {item['notes']}"]})
+        if details:
+            result.append({"tag": "ul", "children": details})
+        return result
+
+    first = True
+    for d in sorted(by_date):
+        if not first:
+            nodes.append({"tag": "hr"})
+        first = False
+        try:
+            dt = datetime.strptime(d, "%Y-%m-%d")
+            day_label = f"📅  {dt.day} {MONTHS_FULL[dt.month]} {dt.year},  {DAYS_FULL[dt.weekday()]}"
+        except Exception:
+            day_label = f"📅  {d}"
+        nodes.append({"tag": "h4", "children": [day_label]})
+        for item in by_date[d]:
+            nodes.extend(_item_nodes(item))
+
+    if no_date:
+        nodes.append({"tag": "hr"})
+        nodes.append({"tag": "h4", "children": ["📌  Без даты"]})
+        for item in no_date:
+            nodes.extend(_item_nodes(item))
+
+    if total_price:
+        nodes.append({"tag": "hr"})
+        nodes.append({"tag": "blockquote", "children": [
+            f"💼 Всего событий: {len(items)}   "
+            f"💰 Стоимость: {total_price:,.0f} ₽   "
+            f"✅ Оплачено: {total_pre:,.0f} ₽   "
+            f"⏳ Осталось: {total_price - total_pre:,.0f} ₽"
         ]})
+
     return nodes
 
 async def _publish_trip(trip: dict, items: list) -> str:
