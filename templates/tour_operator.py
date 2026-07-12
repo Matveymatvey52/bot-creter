@@ -217,11 +217,12 @@ async def transcribe_voice(bot, voice):
 _PARSE_PROMPT = """Ты помощник менеджера туров. Разбери текст и верни JSON.
 
 Тип записи:
+- new_tour: name, destination, date_start(YYYY-MM-DD), date_end(YYYY-MM-DD), guests_count(int)
 - location (ЛиП): name, region, category, status(✅/2️⃣/❗/❌/—), hours, cost, notes, maps_link, contacts, website, youtube, instagram
 - program: day_num(int), date(YYYY-MM-DD), time(HH:MM), title, emoji, cost_fixed, cost_variable, cost_team, cost_extra, tasks, contractor_req
 - hotel: name, region, rating(float 1-5), rooms_info, booking_cost, our_cost, notes, contacts, maps_link, booking_link, status
 - guest: name, total_cost, prepaid, our_price, status(not_paid/partial/paid/refund), notes
-- dds: date(YYYY-MM-DD), amount_rub, amount_usd, amount_idr, description, entity, type(in/out)
+- dds: date(YYYY-MM-DD), amount_rub, amount_usd, description, entity, type(in/out)
 - unknown
 
 Ответ ТОЛЬКО JSON без пояснений:
@@ -279,9 +280,9 @@ def main_kb():
     ])
 
 # ── Voice helpers ─────────────────────────────────────────────────────────────
-_TYPE_ICON = {"location": "📍", "program": "📅", "hotel": "🏨", "guest": "👥", "dds": "💰"}
-_TYPE_NAME = {"location": "ЛиП", "program": "Программа", "hotel": "Отель",
-              "guest": "Гость", "dds": "ДДС", "unknown": "Неизвестно"}
+_TYPE_ICON = {"new_tour": "🌍", "location": "📍", "program": "📅", "hotel": "🏨", "guest": "👥", "dds": "💰"}
+_TYPE_NAME = {"new_tour": "Новый тур", "location": "ЛиП", "program": "Программа",
+              "hotel": "Отель", "guest": "Гость", "dds": "ДДС", "unknown": "Неизвестно"}
 _FIELD_LBL = {
     "name": "Название", "region": "Регион", "category": "Категория", "status": "Статус",
     "hours": "Часы", "cost": "Стоимость", "notes": "Заметки", "maps_link": "Карта",
@@ -293,7 +294,7 @@ _FIELD_LBL = {
     "rating": "Рейтинг", "rooms_info": "Номера", "booking_cost": "Букинг цена",
     "our_cost": "Наша цена", "booking_link": "Букинг ссылка",
     "total_cost": "Полная ст-ть", "prepaid": "Предоплата", "our_price": "Наша цена",
-    "amount_rub": "₽ Рубли", "amount_usd": "$ Доллары", "amount_idr": "Rp Рупии",
+    "amount_rub": "₽ Рубли", "amount_usd": "$ Доллары",
     "description": "Описание", "entity": "Контрагент", "type": "Тип",
 }
 
@@ -343,11 +344,22 @@ async def save_entry(tour_id, kind, d):
                 (tour_id, d.get("name", "Гость"), d.get("total_cost", 0),
                  d.get("prepaid", 0), d.get("our_price", 0), d.get("status", "not_paid"), d.get("notes")),
             )
+        elif kind == "new_tour":
+            cur = await db.execute(
+                "INSERT INTO tours(name,destination,date_start,date_end,guests_count) VALUES(?,?,?,?,?)",
+                (d.get("name", "Новый тур"), d.get("destination"), d.get("date_start"),
+                 d.get("date_end"), d.get("guests_count", 0)),
+            )
+            return cur.lastrowid
         elif kind == "dds":
+            rub = d.get("amount_rub", 0) or 0
+            usd = d.get("amount_usd", 0) or 0
+            if rub and not usd:
+                usd = round(rub / 87.0, 2)
             await db.execute(
                 "INSERT INTO dds(tour_id,date,amount_rub,amount_usd,amount_idr,description,entity,type) VALUES(?,?,?,?,?,?,?,?)",
-                (tour_id, d.get("date"), d.get("amount_rub", 0), d.get("amount_usd", 0),
-                 d.get("amount_idr", 0), d.get("description"), d.get("entity"), d.get("type", "out")),
+                (tour_id, d.get("date"), rub, usd, 0,
+                 d.get("description"), d.get("entity"), d.get("type", "out")),
             )
         await db.commit()
 
@@ -528,11 +540,29 @@ async def on_voice(m: Message, state: FSMContext):
 @router.callback_query(VoicePend.confirm, F.data == "vs_save")
 async def vs_save(cb: CallbackQuery, state: FSMContext):
     d = await state.get_data()
-    await save_entry(d["tour_id"], d["parsed"]["type"], d["parsed"].get("data", {}))
-    await state.clear()
-    icon = _TYPE_ICON.get(d["parsed"]["type"], "✅")
-    name = _TYPE_NAME.get(d["parsed"]["type"], "Запись")
-    await cb.message.edit_text(f"✅ {icon} {name} сохранена!")
+    kind = d["parsed"]["type"]
+    data = d["parsed"].get("data", {})
+    icon = _TYPE_ICON.get(kind, "✅")
+    name = _TYPE_NAME.get(kind, "Запись")
+    if kind == "new_tour":
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute(
+                "INSERT INTO tours(name,destination,date_start,date_end,guests_count) VALUES(?,?,?,?,?)",
+                (data.get("name", "Новый тур"), data.get("destination"),
+                 data.get("date_start"), data.get("date_end"), data.get("guests_count", 0)),
+            )
+            tid = cur.lastrowid
+            await db.commit()
+        await set_active_tour(cb.from_user.id, tid)
+        await state.clear()
+        await cb.message.edit_text(
+            f"✅ 🌍 Тур <b>{data.get('name','Новый тур')}</b> создан и выбран!\n\nДобавляйте данные голосом.",
+            parse_mode="HTML",
+        )
+    else:
+        await save_entry(d["tour_id"], kind, data)
+        await state.clear()
+        await cb.message.edit_text(f"✅ {icon} {name} сохранена!")
     await cb.answer("Сохранено!")
 
 @router.callback_query(VoicePend.confirm, F.data.in_({"vs_edit", "vs_cancel"}))
@@ -574,21 +604,73 @@ async def cb_sw_tour(cb: CallbackQuery):
         await cb.message.edit_text(f"✅ Активный тур: <b>{row['name']}</b>", parse_mode="HTML")
         await cb.answer(f"Тур: {row['name']}")
 
+async def _section_summary(sec: str, tour: dict) -> str:
+    tid = tour["id"]
+    name = tour["name"]
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        if sec == "sec_program":
+            async with db.execute("SELECT COUNT(*) c, COALESCE(SUM(cost_fixed+cost_variable+cost_team+cost_extra),0) tot FROM program WHERE tour_id=?", (tid,)) as c:
+                r = await c.fetchone()
+            days_r = await (await db.execute("SELECT COUNT(DISTINCT day_num) FROM program WHERE tour_id=? AND day_num IS NOT NULL", (tid,))).fetchone()
+            return (f"📅 <b>Программа — {name}</b>\n\n"
+                    f"Мероприятий: <b>{r['c']}</b> · Дней: <b>{days_r[0]}</b>\n"
+                    f"Бюджет: <b>{int(r['tot']):,} ₽</b>".replace(",", " "))
+        elif sec == "sec_lip":
+            async with db.execute("SELECT status, COUNT(*) c FROM locations WHERE tour_id=? GROUP BY status", (tid,)) as c:
+                rows = {r["status"]: r["c"] for r in await c.fetchall()}
+            tot = sum(rows.values())
+            return (f"📍 <b>ЛиП — {name}</b>\n\n"
+                    f"Всего: <b>{tot}</b>\n"
+                    f"✅ {rows.get('✅',0)}  2️⃣ {rows.get('2️⃣',0)}  ❗ {rows.get('❗',0)}  ❌ {rows.get('❌',0)}")
+        elif sec == "sec_hotels":
+            async with db.execute("SELECT status, COUNT(*) c FROM hotels WHERE tour_id=? GROUP BY status", (tid,)) as c:
+                rows = {r["status"]: r["c"] for r in await c.fetchall()}
+            tot = sum(rows.values())
+            return (f"🏨 <b>Отели — {name}</b>\n\n"
+                    f"Всего: <b>{tot}</b>\n"
+                    f"✅ {rows.get('✅',0)}  2️⃣ {rows.get('2️⃣',0)}  ❗ {rows.get('❗',0)}  ❌ {rows.get('❌',0)}")
+        elif sec == "sec_guests":
+            async with db.execute("SELECT COUNT(*) c, COALESCE(SUM(total_cost),0) rev, COALESCE(SUM(prepaid),0) pre, COALESCE(SUM(total_cost-our_price),0) pro FROM guests WHERE tour_id=?", (tid,)) as c:
+                r = await c.fetchone()
+            paid_r = await (await db.execute("SELECT COUNT(*) FROM guests WHERE tour_id=? AND status='paid'", (tid,))).fetchone()
+            return (f"👥 <b>Гости — {name}</b>\n\n"
+                    f"Гостей: <b>{r['c']}</b> (оплатили: {paid_r[0]})\n"
+                    f"Выручка: <b>{int(r['rev']):,} ₽</b>\n"
+                    f"Предоплата: <b>{int(r['pre']):,} ₽</b>\n"
+                    f"Прибыль: <b>{int(r['pro']):,} ₽</b>").replace(",", " ")
+        elif sec == "sec_dds":
+            async with db.execute("SELECT type, COALESCE(SUM(amount_rub),0) r, COALESCE(SUM(amount_usd),0) u FROM dds WHERE tour_id=? GROUP BY type", (tid,)) as c:
+                rows = {r["type"]: r for r in await c.fetchall()}
+            ir = rows.get("in", {})
+            ow = rows.get("out", {})
+            return (f"💰 <b>ДДС — {name}</b>\n\n"
+                    f"⬆️ Приход: <b>{int(ir.get('r',0)):,} ₽</b> / <b>{ir.get('u',0):.2f} $</b>\n"
+                    f"⬇️ Расход: <b>{int(ow.get('r',0)):,} ₽</b> / <b>{ow.get('u',0):.2f} $</b>\n"
+                    f"📊 Баланс: <b>{int(ir.get('r',0)-ow.get('r',0)):,} ₽</b>").replace(",", " ")
+    return ""
+
 @router.callback_query(F.data.startswith("sec_"))
-async def cb_section(cb: CallbackQuery):
+async def cb_section(cb: CallbackQuery, state: FSMContext):
     tour = await get_active_tour(cb.from_user.id)
     if not tour:
         await cb.answer("Нет активного тура! /newtrip", show_alert=True)
         return
+    # Delete previous section message
+    data = await state.get_data()
+    prev_id = data.get("section_msg_id")
+    if prev_id:
+        try:
+            await cb.bot.delete_message(cb.message.chat.id, prev_id)
+        except Exception:
+            pass
     url = f"{BASE_URL}/app?token={cb.from_user.id}"
-    tabs = {"sec_program": "📅 Программа", "sec_lip": "📍 ЛиП",
-            "sec_hotels": "🏨 Отели", "sec_guests": "👥 Гости", "sec_dds": "💰 ДДС"}
-    label = tabs.get(cb.data, "Раздел")
-    await cb.message.answer(
-        f"{label} — <b>{tour['name']}</b>\n\n"
-        f'<a href="{url}">Открыть в веб-приложении →</a>',
+    summary = await _section_summary(cb.data, tour)
+    msg = await cb.message.answer(
+        summary + f'\n\n<a href="{url}">Открыть в веб-приложении →</a>',
         parse_mode="HTML", disable_web_page_preview=True,
     )
+    await state.update_data(section_msg_id=msg.message_id)
     await cb.answer()
 
 # ── REST API helpers ──────────────────────────────────────────────────────────
@@ -916,8 +998,8 @@ textarea{resize:vertical;min-height:64px}
     <button class="btn ba" onclick="openModal('dds')">➕ Добавить</button>
   </div>
   <div class="tw"><table>
-    <thead><tr><th>Дата</th><th>Тип</th><th>₽ Рубли</th><th>$ Доллары</th><th>Rp Рупии</th><th>Описание</th><th>Контрагент</th><th></th></tr></thead>
-    <tbody id="dds-tb"><tr><td colspan="8" class="loading">Загрузка…</td></tr></tbody>
+    <thead><tr><th>Дата</th><th>Тип</th><th>₽ Рубли</th><th>$ Доллары</th><th>Описание</th><th>Контрагент</th><th></th></tr></thead>
+    <tbody id="dds-tb"><tr><td colspan="7" class="loading">Загрузка…</td></tr></tbody>
   </table></div>
 </div>
 
@@ -1106,13 +1188,13 @@ async function loadDds(){
   const calc=t=>({
     r:ddsData.filter(x=>x.type===t).reduce((s,x)=>s+(x.amount_rub||0),0),
     u:ddsData.filter(x=>x.type===t).reduce((s,x)=>s+(x.amount_usd||0),0),
-    i:ddsData.filter(x=>x.type===t).reduce((s,x)=>s+(x.amount_idr||0),0),
   });
   const I=calc('in'),O=calc('out');
+  const balR=I.r-O.r,balU=I.u-O.u;
   document.getElementById('dds-tots').innerHTML=`
     <div class="dtc"><div class="cur">₽ Рубли</div><div class="din">+ ${fmt(I.r)}</div><div class="dout">− ${fmt(O.r)}</div></div>
     <div class="dtc"><div class="cur">$ Доллары</div><div class="din">+ ${fmtd(I.u)}</div><div class="dout">− ${fmtd(O.u)}</div></div>
-    <div class="dtc"><div class="cur">Rp Рупии</div><div class="din">+ ${fmt(I.i)}</div><div class="dout">− ${fmt(O.i)}</div></div>`;
+    <div class="dtc"><div class="cur">📊 Баланс</div><div class="din" style="color:${balR>=0?'#22c55e':'#ef4444'}">${balR>=0?'+':''}${fmt(balR)} ₽</div><div class="din" style="color:${balU>=0?'#22c55e':'#ef4444'};font-size:.8rem">${balU>=0?'+':''}${fmtd(balU)} $</div></div>`;
   renderDds();
 }
 function renderDds(){
@@ -1120,13 +1202,12 @@ function renderDds(){
   const tf=document.getElementById('dds-t').value;
   const rows=ddsData.filter(r=>(!q||(r.description||'').toLowerCase().includes(q)||(r.entity||'').toLowerCase().includes(q))&&(!tf||r.type===tf));
   const tb=document.getElementById('dds-tb');
-  if(!rows.length){tb.innerHTML='<tr><td colspan="8"><div class="empty">Нет данных</div></td></tr>';return;}
+  if(!rows.length){tb.innerHTML='<tr><td colspan="7"><div class="empty">Нет данных</div></td></tr>';return;}
   tb.innerHTML=rows.map(r=>`<tr>
     <td>${r.date||''}</td>
     <td><span class="bdg ${r.type==='in'?'bg':'br'}">${r.type==='in'?'⬆️ Приход':'⬇️ Расход'}</span></td>
     <td class="${r.type==='in'?'cin':'cout'}">${r.amount_rub?fmt(r.amount_rub):''}</td>
     <td class="${r.type==='in'?'cin':'cout'}">${r.amount_usd?fmtd(r.amount_usd):''}</td>
-    <td class="${r.type==='in'?'cin':'cout'}">${r.amount_idr?fmt(r.amount_idr):''}</td>
     <td>${esc(r.description||'')}</td><td>${esc(r.entity||'')}</td>
     <td class="acts"><button class="ib" onclick="openModal('dds',${r.id})">✏️</button><button class="ib" onclick="del('dds',${r.id})">🗑️</button></td>
   </tr>`).join('');
@@ -1170,12 +1251,13 @@ function collectForm(){
   const data={};
   document.getElementById('moBody').querySelectorAll('[name]').forEach(el=>{
     const v=el.value.trim();
-    const nums=['day_num','cost_fixed','cost_variable','cost_team','cost_extra','total_cost','prepaid','our_price','amount_rub','amount_usd','amount_idr','rating','guests_count'];
+    const nums=['day_num','cost_fixed','cost_variable','cost_team','cost_extra','total_cost','prepaid','our_price','amount_rub','amount_usd','rating','guests_count'];
     data[el.name]=nums.includes(el.name)?(v?parseFloat(v):0):(v||null);
   });
   return data;
 }
 
+function autoUsd(){const r=parseFloat(document.getElementById('dds_rub')?.value||0);const u=document.getElementById('dds_usd');if(u&&!parseFloat(u.value||0))u.value=r?+(r/87).toFixed(2):0;}
 function gv(d,f,def){return d[f]!=null&&d[f]!==''?d[f]:(def!=null?def:'');}
 
 function formHtml(type,d){
@@ -1288,10 +1370,9 @@ function formHtml(type,d){
     <div class="fr"><label>Дата</label><input type="date" name="date" value="${gv(d,'date',new Date().toISOString().slice(0,10))}"></div>
     <div class="fr"><label>Описание</label><input name="description" value="${esc(gv(d,'description'))}" placeholder="Оплата водителя, Аренда жилья…"></div>
     <div class="fr"><label>Контрагент</label><input name="entity" value="${esc(gv(d,'entity'))}" placeholder="ИП Иванов…"></div>
-    <div class="fr3">
-      <div class="fr"><label>₽ Рубли</label><input type="number" name="amount_rub" value="${gv(d,'amount_rub',0)}" step="0.01"></div>
-      <div class="fr"><label>$ Доллары</label><input type="number" name="amount_usd" value="${gv(d,'amount_usd',0)}" step="0.01"></div>
-      <div class="fr"><label>Rp Рупии</label><input type="number" name="amount_idr" value="${gv(d,'amount_idr',0)}" step="1"></div>
+    <div class="fr2">
+      <div class="fr"><label>₽ Рубли</label><input type="number" name="amount_rub" id="dds_rub" value="${gv(d,'amount_rub',0)}" step="0.01" oninput="autoUsd()"></div>
+      <div class="fr"><label>$ Доллары <span style="color:#94a3b8;font-size:.7rem">(авто ÷87)</span></label><input type="number" name="amount_usd" id="dds_usd" value="${gv(d,'amount_usd',0)}" step="0.01"></div>
     </div>`;
   return '<p>Неизвестный тип</p>';
 }
