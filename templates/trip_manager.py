@@ -8,7 +8,7 @@ import json
 import logging
 import os
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, date, timedelta
 from pathlib import Path
 
 import aiohttp
@@ -59,6 +59,21 @@ ITEM_TYPES = {
     "other":    "📌 Другое",
 }
 
+MONTHS_RU = {1:"янв",2:"фев",3:"мар",4:"апр",5:"май",6:"июн",
+             7:"июл",8:"авг",9:"сен",10:"окт",11:"ноя",12:"дек"}
+
+EDIT_FIELD_LABELS = {
+    "title":       ("✏️ Название",        "Введите новое название:"),
+    "destination": ("📍 Место",           "Введите место/город:"),
+    "date_start":  ("📅 Дата начала",     "Введите дату (25.07.2025):"),
+    "time_start":  ("⏰ Время",           "Введите время (14:30):"),
+    "date_end":    ("📅 Дата окончания",  "Введите дату окончания (28.07.2025):"),
+    "price":       ("💰 Стоимость",       "Введите сумму (цифры):"),
+    "prepayment":  ("💳 Предоплата",      "Введите предоплату (цифры):"),
+    "confirm_num": ("🔖 Подтверждение",   "Введите номер брони/подтверждения:"),
+    "notes":       ("📝 Заметки",         "Введите заметки:"),
+}
+
 
 # ── admin helpers ─────────────────────────────────────────────────────────────
 
@@ -86,7 +101,9 @@ async def init_db():
         await db.execute("""
             CREATE TABLE IF NOT EXISTS user_prefs (
                 user_id        TEXT PRIMARY KEY,
-                active_trip_id INTEGER
+                active_trip_id INTEGER,
+                digest_time    TEXT,
+                digest_enabled INTEGER DEFAULT 0
             )
         """)
         await db.execute("""
@@ -97,6 +114,7 @@ async def init_db():
                 title       TEXT NOT NULL,
                 destination TEXT,
                 date_start  TEXT,
+                time_start  TEXT,
                 date_end    TEXT,
                 link        TEXT,
                 confirm_num TEXT,
@@ -112,12 +130,22 @@ async def init_db():
         await db.execute(
             "CREATE TABLE IF NOT EXISTS _meta (key TEXT PRIMARY KEY, value TEXT)"
         )
+        # migrations for existing DBs
+        for table, col, definition in [
+            ("items",      "time_start",    "TEXT"),
+            ("user_prefs", "digest_time",   "TEXT"),
+            ("user_prefs", "digest_enabled","INTEGER DEFAULT 0"),
+        ]:
+            try:
+                await db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {definition}")
+            except Exception:
+                pass
         await db.commit()
 
 
 # ── trip helpers ──────────────────────────────────────────────────────────────
 
-async def _all_trips() -> list[dict]:
+async def _all_trips() -> list:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         rows = await (await db.execute("SELECT * FROM trips ORDER BY id DESC")).fetchall()
@@ -138,27 +166,28 @@ async def _get_active_trip(user_id: str) -> dict | None:
 async def _set_active_trip(user_id: str, trip_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT OR REPLACE INTO user_prefs (user_id, active_trip_id) VALUES (?,?)",
+            "INSERT INTO user_prefs (user_id, active_trip_id) VALUES (?,?) "
+            "ON CONFLICT(user_id) DO UPDATE SET active_trip_id=excluded.active_trip_id",
             (user_id, trip_id)
         )
         await db.commit()
 
-async def _trip_items(trip_id: int, status=None) -> list[dict]:
+async def _trip_items(trip_id: int, status=None) -> list:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         if status:
             cur = await db.execute(
-                "SELECT * FROM items WHERE trip_id=? AND status=? ORDER BY date_start,id",
+                "SELECT * FROM items WHERE trip_id=? AND status=? ORDER BY date_start,time_start,id",
                 (trip_id, status)
             )
         else:
             cur = await db.execute(
-                "SELECT * FROM items WHERE trip_id=? ORDER BY date_start,id", (trip_id,)
+                "SELECT * FROM items WHERE trip_id=? ORDER BY date_start,time_start,id", (trip_id,)
             )
         return [dict(r) for r in await cur.fetchall()]
 
 
-# ── date validation ───────────────────────────────────────────────────────────
+# ── validation ────────────────────────────────────────────────────────────────
 
 def _parse_date(text: str) -> str | None:
     text = text.strip()
@@ -175,6 +204,21 @@ def _parse_date(text: str) -> str | None:
     if not (1 <= mo <= 12): return None
     if not (1 <= d <= calendar.monthrange(y, mo)[1]): return None
     return f"{y:04d}-{mo:02d}-{d:02d}"
+
+def _parse_time(text: str) -> str | None:
+    text = text.strip()
+    m = re.fullmatch(r"(\d{1,2})[:\.](\d{2})", text)
+    if not m: return None
+    h, mi = int(m.group(1)), int(m.group(2))
+    if not (0 <= h <= 23 and 0 <= mi <= 59): return None
+    return f"{h:02d}:{mi:02d}"
+
+def _fmt_date_ru(iso_date: str) -> str:
+    try:
+        dt = datetime.strptime(iso_date, "%Y-%m-%d")
+        return f"{dt.day} {MONTHS_RU[dt.month]} {dt.year}"
+    except Exception:
+        return iso_date
 
 
 # ── keyboards ─────────────────────────────────────────────────────────────────
@@ -204,7 +248,8 @@ def kb_item(item_id: int, status: str = "active") -> InlineKeyboardMarkup:
         action_btn = InlineKeyboardButton(text="✅ Выполнено", callback_data=f"idone:{item_id}")
     return InlineKeyboardMarkup(inline_keyboard=[
         [action_btn, InlineKeyboardButton(text="🗑 Удалить", callback_data=f"idel:{item_id}")],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="iback")],
+        [InlineKeyboardButton(text="✏️ Изменить", callback_data=f"iedit:{item_id}")],
+        [InlineKeyboardButton(text="◀️ Назад",    callback_data="iback")],
     ])
 
 def kb_confirm_del(item_id: int) -> InlineKeyboardMarkup:
@@ -213,10 +258,21 @@ def kb_confirm_del(item_id: int) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="◀️ Отмена",      callback_data=f"iview:{item_id}"),
     ]])
 
-def kb_trips(trips: list[dict]) -> InlineKeyboardMarkup:
+def kb_trips(trips: list) -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton(text=f"🗺 {t['name']}", callback_data=f"trip_sel:{t['id']}")] for t in trips]
     rows.append([InlineKeyboardButton(text="➕ Новое путешествие", callback_data="trip_new")])
     rows.append([InlineKeyboardButton(text="❌ Закрыть", callback_data="trip_panel_close")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def kb_edit_fields(item_id: int) -> InlineKeyboardMarkup:
+    fields = list(EDIT_FIELD_LABELS.items())
+    rows = []
+    for i in range(0, len(fields), 2):
+        row = [InlineKeyboardButton(text=fields[i][1][0], callback_data=f"iedit_f:{item_id}:{fields[i][0]}")]
+        if i + 1 < len(fields):
+            row.append(InlineKeyboardButton(text=fields[i+1][1][0], callback_data=f"iedit_f:{item_id}:{fields[i+1][0]}"))
+        rows.append(row)
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"iview:{item_id}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -225,18 +281,20 @@ def kb_trips(trips: list[dict]) -> InlineKeyboardMarkup:
 def _fmt_price(price, prepay, currency="RUB") -> str:
     sym = {"RUB": "₽", "USD": "$", "EUR": "€", "TRY": "₺"}.get(currency, currency)
     parts = []
-    if price:
-        parts.append(f"{price:,.0f} {sym}")
-    if prepay:
-        parts.append(f"предоплата {prepay:,.0f} {sym}")
+    if price: parts.append(f"{price:,.0f} {sym}")
+    if prepay: parts.append(f"предоплата {prepay:,.0f} {sym}")
     return " · ".join(parts) if parts else "—"
 
 def _fmt_item(r: dict) -> str:
     icon = ITEM_TYPES.get(r["item_type"], "📌").split()[0]
     lines = [f"{icon} <b>{r['title']}</b>"]
-    if r.get("destination"):  lines.append(f"📍 {r['destination']}")
-    dates = " – ".join(filter(None, [r.get("date_start"), r.get("date_end")]))
-    if dates: lines.append(f"📅 {dates}")
+    if r.get("destination"): lines.append(f"📍 {r['destination']}")
+    if r.get("date_start"):
+        d_line = f"📅 {r['date_start']}"
+        if r.get("time_start"): d_line += f" в {r['time_start']}"
+        if r.get("date_end") and r["date_end"] != r["date_start"]:
+            d_line += f" – {r['date_end']}"
+        lines.append(d_line)
     p = _fmt_price(r.get("price"), r.get("prepayment"), r.get("currency", "RUB"))
     if p != "—": lines.append(f"💰 {p}")
     if r.get("confirm_num"): lines.append(f"🔖 <code>{r['confirm_num']}</code>")
@@ -245,14 +303,26 @@ def _fmt_item(r: dict) -> str:
     if r.get("status") == "done": lines.append("✅ Выполнено")
     return "\n".join(lines)
 
+async def _wiz_next(bot: Bot, data: dict, text: str, markup=None):
+    try:
+        await bot.edit_message_text(
+            text, chat_id=data["wiz_chat"], message_id=data["wiz_id"],
+            parse_mode="HTML", reply_markup=markup
+        )
+    except Exception as e:
+        logger.warning(f"wiz_next failed: {e}")
+
+async def _wiz_error(bot: Bot, data: dict, error: str, prompt: str, markup=None):
+    await _wiz_next(bot, data, f"❌ {error}\n\n{prompt}", markup)
+
 
 # ── FSM ───────────────────────────────────────────────────────────────────────
 
 class Add(StatesGroup):
     type = State(); title = State(); destination = State()
-    date_start = State(); date_end = State(); link = State()
-    confirm_num = State(); price = State(); prepayment = State()
-    notes = State(); remind = State()
+    date_start = State(); time_start = State(); date_end = State()
+    link = State(); confirm_num = State(); price = State()
+    prepayment = State(); notes = State(); remind = State()
 
 class Search(StatesGroup):
     q = State()
@@ -260,9 +330,13 @@ class Search(StatesGroup):
 class TripCreate(StatesGroup):
     name = State()
 
+class EditItem(StatesGroup):
+    value = State()
+
 _STEPS = [
     ("destination", Add.destination, "📍 <b>Куда / место</b> (город, адрес):"),
     ("date_start",  Add.date_start,  "📅 <b>Дата начала</b> (например: 25.07.2025):"),
+    ("time_start",  Add.time_start,  "⏰ <b>Время начала</b> (например: 14:30):"),
     ("date_end",    Add.date_end,    "📅 <b>Дата окончания</b> (например: 28.07.2025):"),
     ("link",        Add.link,        "🔗 <b>Ссылка на бронирование:</b>"),
     ("confirm_num", Add.confirm_num, "🔖 <b>Номер подтверждения / брони:</b>"),
@@ -288,8 +362,10 @@ async def cmd_start(message: Message):
         await message.answer(WELCOME_TEXT, parse_mode="HTML", reply_markup=kb_main())
     if str(message.from_user.id) in _load_admins():
         await message.answer(
-            "🔧 <b>Админ:</b> /excel · /publish · /weblink\n"
-            "/admins · /addadmin · /removeadmin", parse_mode="HTML"
+            "🔧 <b>Команды:</b> /excel · /publish · /weblink\n"
+            "/digest 08:00 — ежедневный дайджест\n"
+            "/admins · /addadmin · /removeadmin",
+            parse_mode="HTML"
         )
 
 
@@ -300,31 +376,23 @@ async def trips_panel(msg: Message):
     trips = await _all_trips()
     if not trips:
         await msg.answer(
-            "У вас ещё нет путешествий.\nСоздайте первое!",
+            "У вас ещё нет путешествий. Создайте первое!",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="➕ Новое путешествие", callback_data="trip_new")],
             ])
         )
         return
     active = await _get_active_trip(str(msg.from_user.id))
-    active_name = f"🗺 <b>Текущее:</b> {active['name']}\n\n" if active else ""
-    await msg.answer(
-        active_name + "Выберите путешествие или создайте новое:",
-        parse_mode="HTML",
-        reply_markup=kb_trips(trips)
-    )
+    header = f"🗺 <b>Текущее:</b> {active['name']}\n\n" if active else ""
+    await msg.answer(header + "Выберите путешествие:", parse_mode="HTML", reply_markup=kb_trips(trips))
 
 @router.callback_query(F.data == "trip_list")
 async def cb_trip_list(cb: CallbackQuery):
     await cb.answer()
     trips = await _all_trips()
     active = await _get_active_trip(str(cb.from_user.id))
-    active_name = f"🗺 <b>Текущее:</b> {active['name']}\n\n" if active else ""
-    await cb.message.edit_text(
-        active_name + "Выберите путешествие:",
-        parse_mode="HTML",
-        reply_markup=kb_trips(trips)
-    )
+    header = f"🗺 <b>Текущее:</b> {active['name']}\n\n" if active else ""
+    await cb.message.edit_text(header + "Выберите путешествие:", parse_mode="HTML", reply_markup=kb_trips(trips))
 
 @router.callback_query(F.data.startswith("trip_sel:"))
 async def cb_trip_sel(cb: CallbackQuery):
@@ -358,8 +426,7 @@ async def trip_create_name(msg: Message, state: FSMContext):
     await _set_active_trip(str(msg.from_user.id), trip_id)
     await state.clear()
     await msg.answer(
-        f"✅ Создано путешествие <b>{name}</b>!\n"
-        f"Теперь добавляйте пункты маршрута — нажмите ➕ Добавить.",
+        f"✅ Создано путешествие <b>{name}</b>!\nДобавляйте пункты — нажмите ➕ Добавить.",
         parse_mode="HTML", reply_markup=kb_main()
     )
 
@@ -372,15 +439,13 @@ async def cb_trip_del(cb: CallbackQuery):
         row = await (await db.execute("SELECT name FROM trips WHERE id=?", (trip_id,))).fetchone()
     if not row:
         await cb.message.edit_text("Путешествие не найдено."); return
-    name = row[0]
     await cb.message.edit_text(
-        f"🗑 Удалить путешествие <b>{name}</b>?\n"
-        f"Вместе с ним будет удалено <b>{cnt} пунктов</b> маршрута.",
+        f"🗑 Удалить <b>{row[0]}</b>? Вместе с ним удалится <b>{cnt} пунктов</b>.",
         parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🗑 Да, удалить", callback_data=f"trip_del_ok:{trip_id}"),
-             InlineKeyboardButton(text="◀️ Отмена",      callback_data="trip_list")],
-        ])
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="🗑 Да, удалить", callback_data=f"trip_del_ok:{trip_id}"),
+            InlineKeyboardButton(text="◀️ Отмена",      callback_data="trip_list"),
+        ]])
     )
 
 @router.callback_query(F.data.startswith("trip_del_ok:"))
@@ -391,10 +456,9 @@ async def cb_trip_del_ok(cb: CallbackQuery):
         row = await (await db.execute("SELECT name FROM trips WHERE id=?", (trip_id,))).fetchone()
         await db.execute("DELETE FROM items WHERE trip_id=?", (trip_id,))
         await db.execute("DELETE FROM trips WHERE id=?", (trip_id,))
-        await db.execute("DELETE FROM user_prefs WHERE active_trip_id=?", (trip_id,))
+        await db.execute("UPDATE user_prefs SET active_trip_id=NULL WHERE active_trip_id=?", (trip_id,))
         await db.commit()
-    name = row[0] if row else "—"
-    await cb.message.edit_text(f"🗑 Путешествие <b>{name}</b> удалено.", parse_mode="HTML")
+    await cb.message.edit_text(f"🗑 Путешествие <b>{row[0] if row else '—'}</b> удалено.", parse_mode="HTML")
     await cb.message.answer("Что сделаем?", reply_markup=kb_main())
 
 @router.callback_query(F.data == "trip_panel_close")
@@ -409,14 +473,14 @@ async def cb_trip_close(cb: CallbackQuery):
 async def add_start(message: Message, state: FSMContext):
     trip = await _get_active_trip(str(message.from_user.id))
     if not trip:
-        await message.answer(
-            "Сначала создайте путешествие — нажмите 🗂 Путешествия.",
-            reply_markup=kb_main()
-        )
+        await message.answer("Сначала создайте путешествие — 🗂 Путешествия.", reply_markup=kb_main())
         return
-    await state.update_data(trip_id=trip["id"])
     await state.set_state(Add.type)
-    await message.answer(f"🗺 <b>{trip['name']}</b>\n\nВыберите тип:", parse_mode="HTML", reply_markup=kb_types())
+    wiz = await message.answer(
+        f"🗺 <b>{trip['name']}</b>\n\nВыберите тип:",
+        parse_mode="HTML", reply_markup=kb_types()
+    )
+    await state.update_data(trip_id=trip["id"], wiz_id=wiz.message_id, wiz_chat=wiz.chat.id)
 
 @router.callback_query(F.data.startswith("itype:"))
 async def cb_type(cb: CallbackQuery, state: FSMContext):
@@ -430,83 +494,101 @@ async def cb_type(cb: CallbackQuery, state: FSMContext):
     )
 
 @router.message(Add.title, F.text)
-async def add_title(msg: Message, state: FSMContext):
+async def add_title(msg: Message, state: FSMContext, bot: Bot):
     await state.update_data(title=msg.text.strip())
     await state.set_state(Add.destination)
-    await msg.answer("📍 <b>Куда / место</b> (город, адрес):",
-                     parse_mode="HTML", reply_markup=kb_skip("destination"))
+    data = await state.get_data()
+    await _wiz_next(bot, data, "📍 <b>Куда / место</b> (город, адрес):", kb_skip("destination"))
 
 @router.message(Add.destination, F.text, ~F.text.startswith("/"))
-async def add_destination(msg: Message, state: FSMContext):
+async def add_destination(msg: Message, state: FSMContext, bot: Bot):
     await state.update_data(destination=msg.text.strip())
     await state.set_state(Add.date_start)
-    await msg.answer("📅 <b>Дата начала</b> (например: 25.07.2025):",
-                     parse_mode="HTML", reply_markup=kb_skip("date_start"))
+    data = await state.get_data()
+    await _wiz_next(bot, data, "📅 <b>Дата начала</b> (например: 25.07.2025):", kb_skip("date_start"))
 
 @router.message(Add.date_start, F.text, ~F.text.startswith("/"))
-async def add_date_start(msg: Message, state: FSMContext):
+async def add_date_start(msg: Message, state: FSMContext, bot: Bot):
     parsed = _parse_date(msg.text)
+    data = await state.get_data()
     if parsed is None:
-        await msg.answer("❌ Неверный формат даты. Введите, например: <b>25.07.2025</b>", parse_mode="HTML")
+        await _wiz_error(bot, data, "Неверный формат даты.",
+                         "📅 <b>Дата начала</b> (например: 25.07.2025):", kb_skip("date_start"))
         return
     await state.update_data(date_start=parsed)
+    await state.set_state(Add.time_start)
+    await _wiz_next(bot, data, "⏰ <b>Время начала</b> (например: 14:30):", kb_skip("time_start"))
+
+@router.message(Add.time_start, F.text, ~F.text.startswith("/"))
+async def add_time_start(msg: Message, state: FSMContext, bot: Bot):
+    parsed = _parse_time(msg.text)
+    data = await state.get_data()
+    if parsed is None:
+        await _wiz_error(bot, data, "Неверный формат. Введите время как 14:30.",
+                         "⏰ <b>Время начала</b> (например: 14:30):", kb_skip("time_start"))
+        return
+    await state.update_data(time_start=parsed)
     await state.set_state(Add.date_end)
-    await msg.answer("📅 <b>Дата окончания</b> (например: 28.07.2025):",
-                     parse_mode="HTML", reply_markup=kb_skip("date_end"))
+    await _wiz_next(bot, data, "📅 <b>Дата окончания</b> (например: 28.07.2025):", kb_skip("date_end"))
 
 @router.message(Add.date_end, F.text, ~F.text.startswith("/"))
-async def add_date_end(msg: Message, state: FSMContext):
+async def add_date_end(msg: Message, state: FSMContext, bot: Bot):
     parsed = _parse_date(msg.text)
+    data = await state.get_data()
     if parsed is None:
-        await msg.answer("❌ Неверный формат даты. Введите, например: <b>28.07.2025</b>", parse_mode="HTML")
+        await _wiz_error(bot, data, "Неверный формат даты.",
+                         "📅 <b>Дата окончания</b> (например: 28.07.2025):", kb_skip("date_end"))
         return
     await state.update_data(date_end=parsed)
     await state.set_state(Add.link)
-    await msg.answer("🔗 <b>Ссылка на бронирование:</b>",
-                     parse_mode="HTML", reply_markup=kb_skip("link"))
+    await _wiz_next(bot, data, "🔗 <b>Ссылка на бронирование:</b>", kb_skip("link"))
 
 @router.message(Add.link, F.text, ~F.text.startswith("/"))
-async def add_link(msg: Message, state: FSMContext):
+async def add_link(msg: Message, state: FSMContext, bot: Bot):
     await state.update_data(link=msg.text.strip())
     await state.set_state(Add.confirm_num)
-    await msg.answer("🔖 <b>Номер подтверждения / брони:</b>",
-                     parse_mode="HTML", reply_markup=kb_skip("confirm_num"))
+    data = await state.get_data()
+    await _wiz_next(bot, data, "🔖 <b>Номер подтверждения / брони:</b>", kb_skip("confirm_num"))
 
 @router.message(Add.confirm_num, F.text, ~F.text.startswith("/"))
-async def add_confirm(msg: Message, state: FSMContext):
+async def add_confirm(msg: Message, state: FSMContext, bot: Bot):
     await state.update_data(confirm_num=msg.text.strip())
     await state.set_state(Add.price)
-    await msg.answer("💰 <b>Стоимость</b> (только цифры, например 15000):",
-                     parse_mode="HTML", reply_markup=kb_skip("price"))
+    data = await state.get_data()
+    await _wiz_next(bot, data, "💰 <b>Стоимость</b> (только цифры, например 15000):", kb_skip("price"))
 
 @router.message(Add.price, F.text, ~F.text.startswith("/"))
-async def add_price(msg: Message, state: FSMContext):
+async def add_price(msg: Message, state: FSMContext, bot: Bot):
     cleaned = re.sub(r"[^\d.]", "", msg.text)
+    data = await state.get_data()
     try:
         await state.update_data(price=float(cleaned))
     except ValueError:
-        await msg.answer("Введите число, например: 15000"); return
+        await _wiz_error(bot, data, "Введите число.",
+                         "💰 <b>Стоимость</b> (только цифры, например 15000):", kb_skip("price"))
+        return
     await state.set_state(Add.prepayment)
-    await msg.answer("💳 <b>Предоплата</b> (цифрами, если была):",
-                     parse_mode="HTML", reply_markup=kb_skip("prepayment"))
+    await _wiz_next(bot, data, "💳 <b>Предоплата</b> (цифрами, если была):", kb_skip("prepayment"))
 
 @router.message(Add.prepayment, F.text, ~F.text.startswith("/"))
-async def add_prepay(msg: Message, state: FSMContext):
+async def add_prepay(msg: Message, state: FSMContext, bot: Bot):
     cleaned = re.sub(r"[^\d.]", "", msg.text)
+    data = await state.get_data()
     try:
         await state.update_data(prepayment=float(cleaned))
     except ValueError:
-        await msg.answer("Введите число"); return
+        await _wiz_error(bot, data, "Введите число.",
+                         "💳 <b>Предоплата</b> (цифрами, если была):", kb_skip("prepayment"))
+        return
     await state.set_state(Add.notes)
-    await msg.answer("📝 <b>Заметки / пометки:</b>",
-                     parse_mode="HTML", reply_markup=kb_skip("notes"))
+    await _wiz_next(bot, data, "📝 <b>Заметки / пометки:</b>", kb_skip("notes"))
 
 @router.message(Add.notes, F.text, ~F.text.startswith("/"))
-async def add_notes(msg: Message, state: FSMContext):
+async def add_notes(msg: Message, state: FSMContext, bot: Bot):
     await state.update_data(notes=msg.text.strip())
     await state.set_state(Add.remind)
-    await msg.answer("⏰ <b>Напомнить за</b> (например: 1д / 3ч / 30м):",
-                     parse_mode="HTML", reply_markup=kb_skip("remind"))
+    data = await state.get_data()
+    await _wiz_next(bot, data, "⏰ <b>Напомнить за</b> (например: 1д / 3ч / 30м):", kb_skip("remind"))
 
 @router.message(Add.remind, F.text, ~F.text.startswith("/"))
 async def add_remind(msg: Message, state: FSMContext, bot: Bot):
@@ -525,30 +607,50 @@ async def _finalize(msg: Message, state: FSMContext, bot: Bot):
             m = re.match(r"(\d+)([дdhHчcm])", remind_raw.lower())
             if m:
                 n, u = int(m.group(1)), m.group(2)
-                delta = timedelta(days=n) if u in "дd" else (timedelta(hours=n) if u in "чh" else timedelta(minutes=n))
+                delta = (timedelta(days=n) if u in "дd"
+                         else timedelta(hours=n) if u in "чhc"
+                         else timedelta(minutes=n))
                 remind_at = (d - delta).isoformat()
         except Exception:
             pass
 
-    trip_id = data.get("trip_id")
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT INTO items (trip_id,item_type,title,destination,date_start,date_end,link,confirm_num,price,prepayment,notes,remind_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-            (trip_id, data.get("item_type", "other"), data.get("title", ""), data.get("destination"),
-             data.get("date_start"), data.get("date_end"), data.get("link"),
-             data.get("confirm_num"), data.get("price"), data.get("prepayment"),
-             data.get("notes"), remind_at)
+            "INSERT INTO items "
+            "(trip_id,item_type,title,destination,date_start,time_start,date_end,"
+            "link,confirm_num,price,prepayment,notes,remind_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (data.get("trip_id"), data.get("item_type", "other"), data.get("title", ""),
+             data.get("destination"), data.get("date_start"), data.get("time_start"),
+             data.get("date_end"), data.get("link"), data.get("confirm_num"),
+             data.get("price"), data.get("prepayment"), data.get("notes"), remind_at)
         )
         await db.commit()
 
-    await state.clear()
     icon = ITEM_TYPES.get(data.get("item_type", "other"), "📌").split()[0]
     lines = [f"✅ <b>Сохранено!</b>\n", f"{icon} {data.get('title', '')}"]
     if data.get("destination"): lines.append(f"📍 {data['destination']}")
-    if data.get("date_start"):  lines.append(f"📅 {data['date_start']}")
-    if data.get("price"):       lines.append(f"💰 {data['price']:,.0f} ₽")
-    await msg.answer("\n".join(lines), parse_mode="HTML", reply_markup=kb_main())
+    if data.get("date_start"):
+        d_line = f"📅 {data['date_start']}"
+        if data.get("time_start"): d_line += f" в {data['time_start']}"
+        lines.append(d_line)
+    if data.get("price"): lines.append(f"💰 {data['price']:,.0f} ₽")
+    success = "\n".join(lines)
+
+    wiz_id = data.get("wiz_id")
+    wiz_chat = data.get("wiz_chat")
+    await state.clear()
+
+    if wiz_id and wiz_chat:
+        try:
+            await bot.edit_message_text(success, chat_id=wiz_chat, message_id=wiz_id, parse_mode="HTML")
+            await bot.send_message(wiz_chat, "Что сделаем?", reply_markup=kb_main())
+            if remind_at:
+                asyncio.create_task(_remind(bot, wiz_chat, data.get("title", ""), remind_at))
+            return
+        except Exception:
+            pass
+    await msg.answer(success, parse_mode="HTML", reply_markup=kb_main())
     if remind_at:
         asyncio.create_task(_remind(bot, msg.chat.id, data.get("title", ""), remind_at))
 
@@ -574,17 +676,111 @@ async def cb_skip(cb: CallbackQuery, state: FSMContext, bot: Bot):
         return
     idx = _STEP_MAP.get(step, -1)
     if idx + 1 < len(_STEPS):
-        _, next_state, prompt = _STEPS[idx + 1]
+        next_step, next_state, prompt = _STEPS[idx + 1]
         await state.set_state(next_state)
-        next_step = _STEPS[idx + 1][0]
-        await cb.message.edit_text(prompt, parse_mode="HTML",
-                                   reply_markup=kb_skip(next_step))
+        data = await state.get_data()
+        await _wiz_next(bot, data, prompt, kb_skip(next_step))
 
 @router.callback_query(F.data == "icancel")
 async def cb_icancel(cb: CallbackQuery, state: FSMContext):
-    await cb.answer(); await state.clear()
+    await cb.answer()
+    await state.clear()
     await cb.message.edit_text("Отменено.")
     await cb.message.answer("Что сделаем?", reply_markup=kb_main())
+
+
+# ── ITEM EDIT ─────────────────────────────────────────────────────────────────
+
+@router.callback_query(F.data.startswith("iedit:"))
+async def cb_iedit(cb: CallbackQuery):
+    await cb.answer()
+    item_id = int(cb.data.split(":")[1])
+    await cb.message.edit_text(
+        "✏️ <b>Что изменить?</b>",
+        parse_mode="HTML",
+        reply_markup=kb_edit_fields(item_id)
+    )
+
+@router.callback_query(F.data.startswith("iedit_f:"))
+async def cb_iedit_field(cb: CallbackQuery, state: FSMContext):
+    await cb.answer()
+    parts = cb.data.split(":", 2)
+    item_id, field = int(parts[1]), parts[2]
+    _, prompt = EDIT_FIELD_LABELS[field]
+    await state.set_state(EditItem.value)
+    await state.update_data(
+        edit_item_id=item_id, edit_field=field,
+        edit_msg_id=cb.message.message_id, edit_chat_id=cb.message.chat.id
+    )
+    await cb.message.edit_text(
+        f"✏️ {prompt}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="❌ Отмена", callback_data=f"iedit:{item_id}")
+        ]])
+    )
+
+@router.message(EditItem.value, F.text)
+async def edit_item_value(msg: Message, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    field = data["edit_field"]
+    item_id = data["edit_item_id"]
+    value = msg.text.strip()
+
+    if field in ("date_start", "date_end"):
+        value = _parse_date(value)
+        if not value:
+            try:
+                await bot.edit_message_text(
+                    "❌ Неверный формат даты. Введите: 25.07.2025\n\nПовторите:",
+                    chat_id=data["edit_chat_id"], message_id=data["edit_msg_id"]
+                )
+            except Exception:
+                pass
+            return
+    elif field == "time_start":
+        value = _parse_time(value)
+        if not value:
+            try:
+                await bot.edit_message_text(
+                    "❌ Неверный формат. Введите: 14:30\n\nПовторите:",
+                    chat_id=data["edit_chat_id"], message_id=data["edit_msg_id"]
+                )
+            except Exception:
+                pass
+            return
+    elif field in ("price", "prepayment"):
+        cleaned = re.sub(r"[^\d.]", "", value)
+        try:
+            value = float(cleaned)
+        except ValueError:
+            try:
+                await bot.edit_message_text(
+                    "❌ Введите число.\n\nПовторите:",
+                    chat_id=data["edit_chat_id"], message_id=data["edit_msg_id"]
+                )
+            except Exception:
+                pass
+            return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(f"UPDATE items SET {field}=? WHERE id=?", (value, item_id))
+        await db.commit()
+        db.row_factory = aiosqlite.Row
+        row = await (await db.execute("SELECT * FROM items WHERE id=?", (item_id,))).fetchone()
+
+    await state.clear()
+    if row:
+        r = dict(row)
+        try:
+            await bot.edit_message_text(
+                "✅ Сохранено!\n\n" + _fmt_item(r),
+                chat_id=data["edit_chat_id"], message_id=data["edit_msg_id"],
+                parse_mode="HTML", reply_markup=kb_item(item_id, r.get("status", "active"))
+            )
+            return
+        except Exception:
+            pass
+    await msg.answer("✅ Изменено.", reply_markup=kb_main())
 
 
 # ── ROUTE VIEW ────────────────────────────────────────────────────────────────
@@ -593,17 +789,24 @@ async def cb_icancel(cb: CallbackQuery, state: FSMContext):
 async def show_route(msg: Message):
     trip = await _get_active_trip(str(msg.from_user.id))
     if not trip:
-        await msg.answer("Сначала создайте путешествие — нажмите 🗂 Путешествия.", reply_markup=kb_main()); return
+        await msg.answer("Сначала создайте путешествие — 🗂 Путешествия.", reply_markup=kb_main())
+        return
     items = await _trip_items(trip["id"], "active")
     if not items:
-        await msg.answer(f"🗺 <b>{trip['name']}</b>\n\nМаршрут пуст. Нажмите ➕ Добавить.",
-                         parse_mode="HTML", reply_markup=kb_main()); return
+        await msg.answer(
+            f"🗺 <b>{trip['name']}</b>\n\nМаршрут пуст. Нажмите ➕ Добавить.",
+            parse_mode="HTML", reply_markup=kb_main()
+        )
+        return
 
-    by_date: dict[str, list] = {}
+    by_date: dict = {}
     no_date = []
     for item in items:
         d = item.get("date_start") or ""
-        (by_date.setdefault(d, []) if d else no_date).append(item)
+        if d:
+            by_date.setdefault(d, []).append(item)
+        else:
+            no_date.append(item)
 
     lines = [f"🗺 <b>{trip['name']}</b>\n"]
     for d in sorted(by_date):
@@ -614,7 +817,8 @@ async def show_route(msg: Message):
             lines.append(f"\n<b>📅 {d}</b>")
         for i in by_date[d]:
             icon = ITEM_TYPES.get(i["item_type"], "📌").split()[0]
-            line = f"  {icon} {i['title']}"
+            time_str = f"{i['time_start']} " if i.get("time_start") else ""
+            line = f"  {time_str}{icon} {i['title']}"
             p = _fmt_price(i.get("price"), i.get("prepayment"))
             if p != "—": line += f" · {p}"
             if i.get("confirm_num"): line += f"\n     🔖 <code>{i['confirm_num']}</code>"
@@ -631,13 +835,165 @@ async def show_route(msg: Message):
         lines.append(f"💰 Сумма: {total_price:,.0f} ₽  |  Предоплачено: {total_pre:,.0f} ₽")
         lines.append(f"📌 Осталось оплатить: {total_price - total_pre:,.0f} ₽")
 
-    btn_rows = [[InlineKeyboardButton(
-        text=f"{ITEM_TYPES.get(i['item_type'], '📌').split()[0]} {i['title'][:28]}",
-        callback_data=f"iview:{i['id']}"
-    )] for i in items[:20]]
+    btn_rows = []
+    for i in items[:15]:
+        btn_rows.append([InlineKeyboardButton(
+            text=f"{ITEM_TYPES.get(i['item_type'], '📌').split()[0]} {i['title'][:28]}",
+            callback_data=f"iview:{i['id']}"
+        )])
+    btn_rows.append([
+        InlineKeyboardButton(text="📅 По дням",    callback_data=f"route_days:{trip['id']}"),
+        InlineKeyboardButton(text="🗓 Эта неделя", callback_data=f"route_week:{trip['id']}"),
+    ])
+
     text = "\n".join(lines)
     if len(text) > 4000: text = text[:3900] + "\n…"
     await msg.answer(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=btn_rows))
+
+
+@router.callback_query(F.data.startswith("route_days:"))
+async def cb_route_days(cb: CallbackQuery):
+    await cb.answer()
+    trip_id = int(cb.data.split(":")[1])
+    items = await _trip_items(trip_id, "active")
+    dates = sorted(set(i["date_start"] for i in items if i.get("date_start")))
+    if not dates:
+        await cb.message.answer("Нет пунктов с датами.")
+        return
+
+    today_iso    = date.today().isoformat()
+    tomorrow_iso = (date.today() + timedelta(days=1)).isoformat()
+    rows = []
+    for d in dates:
+        cnt = sum(1 for i in items if i.get("date_start") == d)
+        label = _fmt_date_ru(d)
+        if d == today_iso: label = f"Сегодня, {label}"
+        elif d == tomorrow_iso: label = f"Завтра, {label}"
+        rows.append([InlineKeyboardButton(
+            text=f"📅 {label} ({cnt})",
+            callback_data=f"route_day:{trip_id}:{d}"
+        )])
+    rows.append([InlineKeyboardButton(text="❌ Закрыть", callback_data="route_close")])
+
+    await cb.message.answer(
+        "📅 <b>Выберите день:</b>", parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
+    )
+
+@router.callback_query(F.data.startswith("route_day:"))
+async def cb_route_day(cb: CallbackQuery):
+    await cb.answer()
+    parts = cb.data.split(":", 2)
+    trip_id, day = int(parts[1]), parts[2]
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        items = [dict(r) for r in await (await db.execute(
+            "SELECT * FROM items WHERE trip_id=? AND date_start=? ORDER BY time_start,id",
+            (trip_id, day)
+        )).fetchall()]
+        trip_row = await (await db.execute("SELECT name FROM trips WHERE id=?", (trip_id,))).fetchone()
+    trip_name = trip_row[0] if trip_row else ""
+
+    today_iso    = date.today().isoformat()
+    tomorrow_iso = (date.today() + timedelta(days=1)).isoformat()
+    date_label = _fmt_date_ru(day)
+    if day == today_iso: date_label = "Сегодня, " + date_label
+    elif day == tomorrow_iso: date_label = "Завтра, " + date_label
+
+    if not items:
+        text = f"📅 <b>{date_label}</b>\n\nПунктов нет."
+    else:
+        lines = [f"📅 <b>{date_label}</b>  —  {trip_name}\n"]
+        for item in items:
+            icon = ITEM_TYPES.get(item["item_type"], "📌").split()[0]
+            time_str = f"⏰ {item['time_start']}  " if item.get("time_start") else ""
+            lines.append(f"{time_str}{icon} <b>{item['title']}</b>")
+            if item.get("destination"): lines.append(f"   📍 {item['destination']}")
+            p = _fmt_price(item.get("price"), item.get("prepayment"))
+            if p != "—": lines.append(f"   💰 {p}")
+            if item.get("confirm_num"): lines.append(f"   🔖 {item['confirm_num']}")
+            if item.get("notes"): lines.append(f"   📝 {item['notes']}")
+            lines.append("")
+        text = "\n".join(lines).rstrip()
+
+    btn_rows = [[InlineKeyboardButton(
+        text=f"{ITEM_TYPES.get(i['item_type'],'📌').split()[0]} {i['title'][:28]}",
+        callback_data=f"iview:{i['id']}"
+    )] for i in items]
+    btn_rows.append([
+        InlineKeyboardButton(text="◀️ К выбору дня", callback_data=f"route_days:{trip_id}"),
+        InlineKeyboardButton(text="❌ Закрыть",       callback_data="route_close"),
+    ])
+    await cb.message.edit_text(
+        text, parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=btn_rows)
+    )
+
+@router.callback_query(F.data.startswith("route_week:"))
+async def cb_route_week(cb: CallbackQuery):
+    await cb.answer()
+    trip_id = int(cb.data.split(":")[1])
+    today = date.today()
+    week_end = today + timedelta(days=7)
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        items = [dict(r) for r in await (await db.execute(
+            "SELECT * FROM items WHERE trip_id=? AND date_start>=? AND date_start<=? "
+            "ORDER BY date_start,time_start,id",
+            (trip_id, today.isoformat(), week_end.isoformat())
+        )).fetchall()]
+        trip_row = await (await db.execute("SELECT name FROM trips WHERE id=?", (trip_id,))).fetchone()
+    trip_name = trip_row[0] if trip_row else ""
+
+    if not items:
+        await cb.message.answer(
+            f"🗓 <b>Ближайшая неделя — {trip_name}</b>\n\nНет пунктов на ближайшие 7 дней.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="❌ Закрыть", callback_data="route_close")
+            ]])
+        )
+        return
+
+    by_date: dict = {}
+    for item in items:
+        by_date.setdefault(item["date_start"], []).append(item)
+
+    days_map = {0:"Пн",1:"Вт",2:"Ср",3:"Чт",4:"Пт",5:"Сб",6:"Вс"}
+    lines = [f"🗓 <b>Ближайшая неделя — {trip_name}</b>\n"]
+    for d in sorted(by_date):
+        try:
+            dt_date = datetime.strptime(d, "%Y-%m-%d").date()
+            if dt_date == today:
+                label = f"Сегодня, {dt_date.day} {MONTHS_RU[dt_date.month]}"
+            elif dt_date == today + timedelta(days=1):
+                label = f"Завтра, {dt_date.day} {MONTHS_RU[dt_date.month]}"
+            else:
+                label = f"{days_map[dt_date.weekday()]}, {dt_date.day} {MONTHS_RU[dt_date.month]}"
+        except Exception:
+            label = d
+        lines.append(f"\n<b>📅 {label}</b>")
+        for item in by_date[d]:
+            icon = ITEM_TYPES.get(item["item_type"], "📌").split()[0]
+            time_str = f"{item['time_start']} " if item.get("time_start") else ""
+            line = f"  {time_str}{icon} {item['title']}"
+            if item.get("destination"): line += f" → {item['destination']}"
+            lines.append(line)
+
+    text = "\n".join(lines)
+    if len(text) > 4000: text = text[:3900] + "\n…"
+    await cb.message.answer(
+        text, parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="📅 По дням",  callback_data=f"route_days:{trip_id}"),
+            InlineKeyboardButton(text="❌ Закрыть", callback_data="route_close"),
+        ]])
+    )
+
+@router.callback_query(F.data == "route_close")
+async def cb_route_close(cb: CallbackQuery):
+    await cb.answer()
+    await cb.message.delete()
 
 
 @router.callback_query(F.data.startswith("iview:"))
@@ -648,7 +1004,8 @@ async def cb_view(cb: CallbackQuery):
         db.row_factory = aiosqlite.Row
         row = await (await db.execute("SELECT * FROM items WHERE id=?", (item_id,))).fetchone()
     if not row:
-        await cb.message.answer("Не найдено."); return
+        await cb.message.answer("Не найдено.")
+        return
     r = dict(row)
     await cb.message.answer(_fmt_item(r), parse_mode="HTML", reply_markup=kb_item(item_id, r.get("status", "active")))
 
@@ -685,7 +1042,8 @@ async def cb_undone(cb: CallbackQuery):
 
 @router.callback_query(F.data == "iback")
 async def cb_iback(cb: CallbackQuery):
-    await cb.answer(); await cb.message.delete()
+    await cb.answer()
+    await cb.message.delete()
 
 
 # ── SEARCH ────────────────────────────────────────────────────────────────────
@@ -704,7 +1062,8 @@ async def search_do(msg: Message, state: FSMContext):
         db.row_factory = aiosqlite.Row
         if trip:
             rows = await (await db.execute(
-                "SELECT * FROM items WHERE trip_id=? AND (title LIKE ? OR destination LIKE ? OR confirm_num LIKE ? OR notes LIKE ?)",
+                "SELECT * FROM items WHERE trip_id=? AND "
+                "(title LIKE ? OR destination LIKE ? OR confirm_num LIKE ? OR notes LIKE ?)",
                 (trip["id"], q, q, q, q)
             )).fetchall()
         else:
@@ -713,12 +1072,16 @@ async def search_do(msg: Message, state: FSMContext):
                 (q, q, q, q)
             )).fetchall()
     if not rows:
-        await msg.answer("Ничего не найдено.", reply_markup=kb_main()); return
+        await msg.answer("Ничего не найдено.", reply_markup=kb_main())
+        return
     lines = [f"🔍 Найдено: {len(rows)}\n"]
     for r in [dict(x) for x in rows[:10]]:
         icon = ITEM_TYPES.get(r["item_type"], "📌").split()[0]
         lines.append(f"{icon} <b>{r['title']}</b>")
-        if r.get("date_start"): lines.append(f"   📅 {r['date_start']}")
+        if r.get("date_start"):
+            d_line = f"   📅 {r['date_start']}"
+            if r.get("time_start"): d_line += f" в {r['time_start']}"
+            lines.append(d_line)
         if r.get("confirm_num"): lines.append(f"   🔖 <code>{r['confirm_num']}</code>")
     await msg.answer("\n".join(lines), parse_mode="HTML", reply_markup=kb_main())
 
@@ -729,13 +1092,13 @@ async def search_do(msg: Message, state: FSMContext):
 async def show_stats(msg: Message):
     trips = await _all_trips()
     if not trips:
-        await msg.answer("Нет путешествий. Нажмите 🗂 Путешествия чтобы создать."); return
+        await msg.answer("Нет путешествий. Нажмите 🗂 Путешествия чтобы создать.")
+        return
     if len(trips) == 1:
         await _show_trip_stats(msg, trips[0])
         return
     rows = [[InlineKeyboardButton(text=f"🗺 {t['name']}", callback_data=f"stats_trip:{t['id']}")] for t in trips]
-    await msg.answer("📊 Выберите путешествие для итогов:",
-                     reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await msg.answer("📊 Выберите путешествие для итогов:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
 
 @router.callback_query(F.data.startswith("stats_trip:"))
 async def cb_stats_trip(cb: CallbackQuery):
@@ -745,24 +1108,23 @@ async def cb_stats_trip(cb: CallbackQuery):
         db.row_factory = aiosqlite.Row
         row = await (await db.execute("SELECT * FROM trips WHERE id=?", (trip_id,))).fetchone()
     if not row:
-        await cb.message.edit_text("Путешествие не найдено."); return
+        await cb.message.edit_text("Путешествие не найдено.")
+        return
     await cb.message.delete()
     await _show_trip_stats(cb.message, dict(row))
 
 async def _show_trip_stats(msg: Message, trip: dict):
     async with aiosqlite.connect(DB_PATH) as db:
         total = (await (await db.execute(
-            "SELECT COUNT(*) FROM items WHERE trip_id=?", (trip["id"],)
-        )).fetchone())[0]
-        done = (await (await db.execute(
-            "SELECT COUNT(*) FROM items WHERE trip_id=? AND status='done'", (trip["id"],)
-        )).fetchone())[0]
-        cost = (await (await db.execute(
-            "SELECT COALESCE(SUM(price),0) FROM items WHERE trip_id=? AND status='active'", (trip["id"],)
-        )).fetchone())[0]
-        paid = (await (await db.execute(
-            "SELECT COALESCE(SUM(prepayment),0) FROM items WHERE trip_id=? AND status='active'", (trip["id"],)
-        )).fetchone())[0]
+            "SELECT COUNT(*) FROM items WHERE trip_id=?", (trip["id"],))).fetchone())[0]
+        done  = (await (await db.execute(
+            "SELECT COUNT(*) FROM items WHERE trip_id=? AND status='done'", (trip["id"],))).fetchone())[0]
+        cost  = (await (await db.execute(
+            "SELECT COALESCE(SUM(price),0) FROM items WHERE trip_id=? AND status='active'",
+            (trip["id"],))).fetchone())[0]
+        paid  = (await (await db.execute(
+            "SELECT COALESCE(SUM(prepayment),0) FROM items WHERE trip_id=? AND status='active'",
+            (trip["id"],))).fetchone())[0]
         by_type = await (await db.execute(
             "SELECT item_type, COUNT(*), COALESCE(SUM(price),0) FROM items WHERE trip_id=? GROUP BY item_type",
             (trip["id"],)
@@ -780,6 +1142,100 @@ async def _show_trip_stats(msg: Message, trip: dict):
     await msg.answer("\n".join(lines), parse_mode="HTML", reply_markup=kb_main())
 
 
+# ── DAILY DIGEST ──────────────────────────────────────────────────────────────
+
+@router.message(Command("digest"))
+async def cmd_digest(msg: Message):
+    parts = msg.text.split()
+    if len(parts) < 2:
+        await msg.answer(
+            "⏰ <b>Ежедневный дайджест</b>\n\n"
+            "Каждый день присылаю план на завтра.\n\n"
+            "/digest 08:00 — получать утром\n"
+            "/digest 20:00 — получать вечером\n"
+            "/digest off — отключить",
+            parse_mode="HTML"
+        )
+        return
+    arg = parts[1].lower()
+    user_id = str(msg.from_user.id)
+    async with aiosqlite.connect(DB_PATH) as db:
+        if arg == "off":
+            await db.execute(
+                "INSERT INTO user_prefs (user_id, digest_enabled) VALUES (?,0) "
+                "ON CONFLICT(user_id) DO UPDATE SET digest_enabled=0",
+                (user_id,)
+            )
+            await db.commit()
+            await msg.answer("✅ Дайджест отключён.")
+            return
+        t = _parse_time(arg)
+        if not t:
+            await msg.answer("❌ Неверный формат. Пример: /digest 08:00")
+            return
+        await db.execute(
+            "INSERT INTO user_prefs (user_id, digest_time, digest_enabled) VALUES (?,?,1) "
+            "ON CONFLICT(user_id) DO UPDATE SET digest_time=excluded.digest_time, digest_enabled=1",
+            (user_id, t)
+        )
+        await db.commit()
+    await msg.answer(
+        f"✅ Дайджест настроен на <b>{t}</b>\nБуду присылать план на завтра каждый день.",
+        parse_mode="HTML"
+    )
+
+async def _send_digest(bot: Bot, user_id: str):
+    tomorrow = (date.today() + timedelta(days=1)).isoformat()
+    trip = await _get_active_trip(user_id)
+    if not trip: return
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        rows = await (await db.execute(
+            "SELECT * FROM items WHERE trip_id=? AND date_start=? AND status='active' ORDER BY time_start,id",
+            (trip["id"], tomorrow)
+        )).fetchall()
+    if not rows: return
+    lines = [f"🌅 <b>План на завтра — {trip['name']}</b>\n<b>{_fmt_date_ru(tomorrow)}</b>\n"]
+    for r in [dict(x) for x in rows]:
+        icon = ITEM_TYPES.get(r["item_type"], "📌").split()[0]
+        time_str = f"⏰ {r['time_start']}  " if r.get("time_start") else ""
+        line = f"{time_str}{icon} {r['title']}"
+        if r.get("destination"): line += f" — {r['destination']}"
+        if r.get("price"): line += f" · {r['price']:,.0f} ₽"
+        lines.append(line)
+    try:
+        await bot.send_message(int(user_id), "\n".join(lines), parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"Digest send error for {user_id}: {e}")
+
+async def _digest_loop(bot: Bot):
+    sent_keys: set = set()
+    while True:
+        try:
+            now = datetime.now()
+            today_str = now.date().isoformat()
+            async with aiosqlite.connect(DB_PATH) as db:
+                rows = await (await db.execute(
+                    "SELECT user_id, digest_time FROM user_prefs "
+                    "WHERE digest_enabled=1 AND digest_time IS NOT NULL"
+                )).fetchall()
+            for user_id, digest_time in rows:
+                try:
+                    h, m = map(int, digest_time.split(":"))
+                except Exception:
+                    continue
+                key = f"{user_id}_{today_str}_{digest_time}"
+                if key in sent_keys: continue
+                target = now.replace(hour=h, minute=m, second=0, microsecond=0)
+                if now >= target and (now - target).total_seconds() < 120:
+                    await _send_digest(bot, user_id)
+                    sent_keys.add(key)
+            sent_keys = {k for k in sent_keys if today_str in k}
+        except Exception as e:
+            logger.error(f"Digest loop error: {e}")
+        await asyncio.sleep(60)
+
+
 # ── EXCEL ─────────────────────────────────────────────────────────────────────
 
 @router.message(F.text == "📥 Excel")
@@ -790,15 +1246,14 @@ async def cmd_excel(msg: Message):
     trips = await _all_trips()
     if not trips:
         await msg.answer("Данных нет."); return
-    wb = Workbook()
-    wb.remove(wb.active)
-    hdrs = ["Тип", "Название", "Куда", "Дата нач.", "Дата кон.", "Ссылка",
+    wb = Workbook(); wb.remove(wb.active)
+    hdrs = ["Тип", "Название", "Куда", "Дата нач.", "Время", "Дата кон.", "Ссылка",
             "Подтверждение", "Цена", "Предоплата", "Заметки", "Статус"]
-    hfill = PatternFill("solid", fgColor="1F4E79")
-    hfont = Font(bold=True, color="FFFFFF")
+    hfill  = PatternFill("solid", fgColor="1F4E79")
+    hfont  = Font(bold=True, color="FFFFFF")
     border = Border(left=Side(style="thin"), right=Side(style="thin"),
                     top=Side(style="thin"),  bottom=Side(style="thin"))
-    fills = [PatternFill("solid", fgColor="FFFFFF"), PatternFill("solid", fgColor="DCE6F1")]
+    fills      = [PatternFill("solid", fgColor="FFFFFF"), PatternFill("solid", fgColor="DCE6F1")]
     total_fill = PatternFill("solid", fgColor="FFF2CC")
     total_font = Font(bold=True)
 
@@ -806,30 +1261,32 @@ async def cmd_excel(msg: Message):
         items = await _trip_items(trip["id"])
         ws = wb.create_sheet(title=trip["name"][:31])
         for c, h in enumerate(hdrs, 1):
-            cell = ws.cell(1, c, h); cell.fill = hfill; cell.font = hfont; cell.border = border
+            cell = ws.cell(1, c, h)
+            cell.fill = hfill; cell.font = hfont; cell.border = border
             cell.alignment = Alignment(horizontal="center")
         total_price = 0; total_pre = 0
         for ri, item in enumerate(items, 2):
-            vals = [ITEM_TYPES.get(item["item_type"], ""), item["title"],
-                    item.get("destination", ""), item.get("date_start", ""), item.get("date_end", ""),
-                    item.get("link", ""), item.get("confirm_num", ""),
-                    item.get("price"), item.get("prepayment"), item.get("notes", ""), item.get("status", "")]
+            vals = [
+                ITEM_TYPES.get(item["item_type"], ""), item["title"],
+                item.get("destination", ""), item.get("date_start", ""), item.get("time_start", ""),
+                item.get("date_end", ""), item.get("link", ""), item.get("confirm_num", ""),
+                item.get("price"), item.get("prepayment"), item.get("notes", ""), item.get("status", "")
+            ]
             for c, v in enumerate(vals, 1):
                 cell = ws.cell(ri, c, v); cell.fill = fills[ri % 2]; cell.border = border
             total_price += item.get("price") or 0
             total_pre   += item.get("prepayment") or 0
         tr = len(items) + 2
-        ws.cell(tr, 1, "ИТОГО").font = total_font; ws.cell(tr, 1).fill = total_fill
-        ws.cell(tr, 8, total_price).font = total_font; ws.cell(tr, 8).fill = total_fill
-        ws.cell(tr, 9, total_pre).font = total_font; ws.cell(tr, 9).fill = total_fill
-        ws.cell(tr, 11, f"Осталось: {total_price - total_pre:,.0f} ₽").font = total_font
-        ws.cell(tr, 11).fill = total_fill
+        for c, v in [(1, "ИТОГО"), (9, total_price), (10, total_pre),
+                     (12, f"Осталось: {total_price - total_pre:,.0f} ₽")]:
+            ws.cell(tr, c, v).font = total_font
+            ws.cell(tr, c).fill = total_fill
         for col in ws.columns:
             ws.column_dimensions[col[0].column_letter].width = min(
                 max(max(len(str(c.value or "")) for c in col) + 2, 10), 40
             )
         ws.freeze_panes = "A2"
-        ws.auto_filter.ref = f"A1:K{len(items) + 1}"
+        ws.auto_filter.ref = f"A1:L{len(items) + 1}"
 
     wb.save(EXCEL_PATH)
     await msg.answer_document(FSInputFile(EXCEL_PATH),
@@ -847,18 +1304,22 @@ async def _tg_token() -> str:
                           data={"short_name": BOT_NAME[:31], "author_name": "TripBot"}) as r:
             token = (await r.json())["result"]["access_token"]
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT OR REPLACE INTO _meta VALUES ('tg_token',?)", (token,)); await db.commit()
+        await db.execute("INSERT OR REPLACE INTO _meta VALUES ('tg_token',?)", (token,))
+        await db.commit()
     return token
 
-def _tg_nodes_items(trip_name: str, items: list[dict]) -> list:
+def _tg_nodes_items(trip_name: str, items: list) -> list:
     nodes = [{"tag": "h3", "children": [trip_name]}]
     for item in items:
         icon = ITEM_TYPES.get(item["item_type"], "📌").split()[0]
         parts = [f"{icon} {item['title']}"]
         if item.get("destination"): parts.append(f"| {item['destination']}")
-        if item.get("date_start"):  parts.append(f"| {item['date_start']}")
-        if item.get("date_end") and item.get("date_end") != item.get("date_start"):
-            parts.append(f"– {item['date_end']}")
+        if item.get("date_start"):
+            d_part = item["date_start"]
+            if item.get("time_start"): d_part += f" в {item['time_start']}"
+            parts.append(f"| {d_part}")
+            if item.get("date_end") and item["date_end"] != item["date_start"]:
+                parts.append(f"– {item['date_end']}")
         p = _fmt_price(item.get("price"), item.get("prepayment"))
         if p != "—": parts.append(f"| {p}")
         if item.get("confirm_num"): parts.append(f"| #{item['confirm_num']}")
@@ -869,11 +1330,11 @@ def _tg_nodes_items(trip_name: str, items: list[dict]) -> list:
     if total_price:
         nodes.append({"tag": "p", "children": [
             f"Итого: {total_price:,.0f} ₽  |  Оплачено: {total_pre:,.0f} ₽  |  "
-            f"Осталось оплатить: {total_price - total_pre:,.0f} ₽"
+            f"Осталось: {total_price - total_pre:,.0f} ₽"
         ]})
     return nodes
 
-async def _publish_trip(trip: dict, items: list[dict]) -> str:
+async def _publish_trip(trip: dict, items: list) -> str:
     token = await _tg_token()
     nodes = _tg_nodes_items(trip["name"], items)
     key_path = f"tg_path_{trip['id']}"
@@ -885,8 +1346,7 @@ async def _publish_trip(trip: dict, items: list[dict]) -> str:
         result = (await (await s.post(ep, json={
             "access_token": token,
             "title": f"Маршрут: {trip['name']}"[:256],
-            "content": nodes,
-            "return_content": False
+            "content": nodes, "return_content": False
         })).json())["result"]
     if not page_path:
         page_path = result["path"]
@@ -908,7 +1368,8 @@ async def cmd_publish(msg: Message):
         await status_msg.edit_text("Данных нет."); return
     url = await _publish_trip(trip, items)
     await status_msg.edit_text(
-        f"✅ <b>Опубликовано!</b>\n\n🔗 {url}\n\nОбновить: /publish", parse_mode="HTML"
+        f"✅ <b>Опубликовано!</b>\n\n🔗 {url}\n\nОбновить: /publish",
+        parse_mode="HTML"
     )
 
 @router.message(Command("weblink"))
@@ -920,19 +1381,22 @@ async def cmd_weblink(msg: Message):
     async with aiosqlite.connect(DB_PATH) as db:
         row = await (await db.execute("SELECT value FROM _meta WHERE key=?", (key_path,))).fetchone()
     if row:
-        url = f"https://telegra.ph/{row[0]}"
-        await msg.answer(f"🔗 <b>Онлайн-маршрут:</b>\n{url}\n\nОбновить: /publish", parse_mode="HTML")
+        await msg.answer(
+            f"🔗 <b>Онлайн-маршрут:</b>\nhttps://telegra.ph/{row[0]}\n\nОбновить: /publish",
+            parse_mode="HTML"
+        )
     else:
         await msg.answer("Нажмите /publish для первой публикации.")
 
 
-# ── ADMIN COMMANDS ────────────────────────────────────────────────────────────
+# ── ADMIN ─────────────────────────────────────────────────────────────────────
 
 @router.message(Command("addadmin"))
 async def cmd_addadmin(msg: Message):
     if str(msg.from_user.id) not in _load_admins(): await msg.answer("⛔ Нет доступа"); return
     parts = msg.text.split()
-    if len(parts) < 2 or not parts[1].lstrip("-").isdigit(): await msg.answer("Использование: /addadmin <id>"); return
+    if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
+        await msg.answer("Использование: /addadmin <id>"); return
     ids = _load_admins(); ids.add(parts[1]); _save_admins(ids)
     await msg.answer(f"✅ <code>{parts[1]}</code> добавлен.", parse_mode="HTML")
 
@@ -948,26 +1412,31 @@ async def cmd_removeadmin(msg: Message):
 async def cmd_admins(msg: Message):
     if str(msg.from_user.id) not in _load_admins(): await msg.answer("⛔ Нет доступа"); return
     ids = _load_admins()
-    await msg.answer("👥 " + ("\n".join(f"• <code>{i}</code>" for i in ids) or "Пусто"), parse_mode="HTML")
+    await msg.answer(
+        "👥 " + ("\n".join(f"• <code>{i}</code>" for i in ids) or "Пусто"),
+        parse_mode="HTML"
+    )
 
 
 # ── GROUP SUPPORT ─────────────────────────────────────────────────────────────
 
 BOT_DISPLAY_NAME = os.getenv("BOT_DISPLAY_NAME", "").strip()
-GROUP_CHAT_ID    = os.getenv("GROUP_CHAT_ID", "").strip()
 
 @router.message(F.chat.type.in_({"group", "supergroup"}), F.text)
-async def handle_group_mention(msg: Message, bot: Bot):
+async def handle_group_mention(msg: Message):
     if not BOT_DISPLAY_NAME or not msg.text: return
     if msg.from_user and msg.from_user.is_bot: return
     if BOT_DISPLAY_NAME.lower() not in msg.text.lower(): return
-    from anthropic import AsyncAnthropic as _C
-    resp = await _C(api_key=os.getenv("ANTHROPIC_API_KEY", "")).messages.create(
-        model="claude-haiku-4-5-20251001", max_tokens=300,
-        system=f"Ты — {BOT_DISPLAY_NAME}, менеджер маршрутов. Кратко ответь.",
-        messages=[{"role": "user", "content": msg.text}]
-    )
-    await msg.reply(resp.content[0].text)
+    try:
+        from anthropic import AsyncAnthropic as _C
+        resp = await _C(api_key=os.getenv("ANTHROPIC_API_KEY", "")).messages.create(
+            model="claude-haiku-4-5-20251001", max_tokens=300,
+            system=f"Ты — {BOT_DISPLAY_NAME}, менеджер маршрутов. Кратко ответь.",
+            messages=[{"role": "user", "content": msg.text}]
+        )
+        await msg.reply(resp.content[0].text)
+    except Exception as e:
+        logger.error(f"Group mention error: {e}")
 
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
@@ -978,6 +1447,7 @@ async def main():
     dp.include_router(router)
     await bot.set_my_description(BOT_DESCRIPTION)
     await init_db()
+    asyncio.create_task(_digest_loop(bot))
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
