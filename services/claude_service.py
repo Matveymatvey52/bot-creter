@@ -1124,6 +1124,7 @@ Available templates:
 - accountant     — income/expense tracking, financial records, categories, balance, reports, budgets, финансы
 - booking_beauty — appointment booking for beauty salons, nail/hair/brow studios, spa, medical clinics, fitness studios, barbershops — any service requiring time-slot scheduling
 - manager_secretary — virtual assistant/secretary, FAQ bot, lead collection form, client requests, CRM, менеджер, секретарь
+- tour_operator    — professional tour operator CRM, commercial group tours, ЛиП/locations/contractors, hotels, guests/payments, cash flow DDS, voice input, web app, тур-оператор, туры
 
 Return ONLY the template name (e.g. "trip_manager") or "none" if nothing matches 60%+.
 Do NOT return "none" if 60%+ of core functionality is covered by a template.

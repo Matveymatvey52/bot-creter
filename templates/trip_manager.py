@@ -227,7 +227,7 @@ def kb_main() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="➕ Добавить"),    KeyboardButton(text="📋 Маршрут")],
         [KeyboardButton(text="🔍 Поиск"),       KeyboardButton(text="📊 Итоги")],
-        [KeyboardButton(text="🗂 Путешествия"), KeyboardButton(text="📥 Excel")],
+        [KeyboardButton(text="🗂 Путешествия"), KeyboardButton(text="📤 Опубликовать")],
     ], resize_keyboard=True)
 
 def kb_types() -> InlineKeyboardMarkup:
@@ -340,7 +340,8 @@ _STEP_MAP = {s[0]: i for i, s in enumerate(_STEPS)}
 # ── /start ────────────────────────────────────────────────────────────────────
 
 @router.message(Command("start"))
-async def cmd_start(message: Message):
+async def cmd_start(message: Message, state: FSMContext):
+    await state.clear()
     admins = _load_admins()
     if not admins:
         _save_admins({str(message.from_user.id)})
@@ -356,6 +357,21 @@ async def cmd_start(message: Message):
             "/admins · /addadmin · /removeadmin",
             parse_mode="HTML"
         )
+    trips = await _all_trips()
+    if trips:
+        active = await _get_active_trip(str(message.from_user.id))
+        if active:
+            await message.answer(
+                f"📍 Активное путешествие: <b>{active['name']}</b> · всего {len(trips)} шт.",
+                parse_mode="HTML"
+            )
+        else:
+            n = len(trips)
+            ending = "е" if n == 1 else "я" if n in (2, 3, 4) else "й"
+            await message.answer(
+                f"🗂 У вас {n} путешестви{ending}. Откройте «🗂 Путешествия» для просмотра.",
+                parse_mode="HTML"
+            )
 
 
 # ── TRIPS PANEL ───────────────────────────────────────────────────────────────
@@ -1210,7 +1226,6 @@ def _is_admin(user_id: str) -> bool:
         return True
     return user_id in admins
 
-@router.message(F.text == "📥 Excel")
 @router.message(Command("excel"))
 async def cmd_excel(msg: Message):
     if not _is_admin(str(msg.from_user.id)):
@@ -1384,6 +1399,7 @@ async def _publish_trip(trip: dict, items: list) -> str:
             await db.commit()
     return f"https://telegra.ph/{page_path}"
 
+@router.message(F.text == "📤 Опубликовать")
 @router.message(Command("publish"))
 async def cmd_publish(msg: Message):
     if not _is_admin(str(msg.from_user.id)):
@@ -1397,7 +1413,7 @@ async def cmd_publish(msg: Message):
         await status_msg.edit_text("Данных нет."); return
     url = await _publish_trip(trip, items)
     await status_msg.edit_text(
-        f"✅ <b>Опубликовано!</b>\n\n🔗 {url}\n\nОбновить: /publish",
+        f"✅ <b>Опубликовано!</b>\n\n🔗 {url}\n\nНажмите «📤 Опубликовать» ещё раз, чтобы обновить.",
         parse_mode="HTML"
     )
 
