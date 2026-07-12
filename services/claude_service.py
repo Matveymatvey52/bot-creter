@@ -964,6 +964,14 @@ Rules:
 - The file must end with asyncio.run(main()).
 - parse_mode="HTML" for all rich messages; use <b>bold</b>, <i>italic</i>, <code>mono</code>.
 
+ADMIN PANEL — apply these improvements if the bot has admin logic:
+1. /start handler: detect if this is the first admin (admins list was empty before adding). If so, send a SEPARATE follow-up message:
+   "👑 <b>Вы — администратор этого бота.</b>\\n\\nВам доступны дополнительные кнопки:\\n🗂 <b>Все записи</b> — полное расписание\\n📊 <b>Статистика</b> — сводка\\n\\nУправление администраторами:\\n<code>/addadmin ID</code> — добавить\\n<code>/removeadmin ID</code> — убрать\\n<code>/admins</code> — список"
+2. Bookings/records table: add column user_id INTEGER if missing (ALTER TABLE ... ADD COLUMN inside try/except). Save from_user.id as user_id on every INSERT.
+3. "Мои записи" / my bookings button: query by user_id directly — remove phone-input FSM step entirely.
+4. "Отменить запись" / cancel booking button: same — query by user_id directly, no phone prompt.
+5. Add /cleardata admin-only command: deletes all rows from bookings/appointments tables, resets slots to active, confirms "🗑 Все записи удалены."
+
 EXCEL EXPORT — if the bot has a /excel or export function, make it beautiful:
 - Header row: bold white text on dark blue background (#1F4E79), row height 22
 - Data rows: alternate between white (#FFFFFF) and light blue (#DCE6F1) — zebra striping
