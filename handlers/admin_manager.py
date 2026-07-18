@@ -78,7 +78,7 @@ async def cb_bot_selected_add(callback: CallbackQuery, state: FSMContext):
     )
 
 
-@router.message(AdminStates.entering_id_to_add)
+@router.message(AdminStates.entering_id_to_add, ~F.text.startswith("/"))
 async def msg_id_to_add(message: Message, state: FSMContext):
     if not message.text or not message.text.lstrip("-").isdigit():
         await message.answer("Нужно отправить числовой Telegram ID.")
@@ -125,7 +125,7 @@ async def cb_bot_selected_remove(callback: CallbackQuery, state: FSMContext):
     )
 
 
-@router.message(AdminStates.entering_id_to_remove)
+@router.message(AdminStates.entering_id_to_remove, ~F.text.startswith("/"))
 async def msg_id_to_remove(message: Message, state: FSMContext):
     if not message.text or not message.text.lstrip("-").isdigit():
         await message.answer("Нужно отправить числовой Telegram ID.")

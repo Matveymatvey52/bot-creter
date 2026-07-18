@@ -9,7 +9,7 @@ from aiogram.types import ChatMemberUpdated, InlineKeyboardButton, InlineKeyboar
 
 from config import BOT_TOKEN
 from db.database import get_all_bots, init_db, set_bot_group, update_bot_status
-from handlers.admin_manager import router as admin_router
+from handlers.admin_manager import OWNER_ID, router as admin_router
 from handlers.create_bot import auto_launch_managed_bot, router as create_router, set_bot_id, set_manager_username
 from handlers.general import router as general_router
 from handlers.manage_bots import router as manage_router
@@ -72,6 +72,12 @@ async def restore_bots():
 
 
 async def main():
+    if not OWNER_ID:
+        logger.warning(
+            "OWNER_ID is not set (or 0) — bot management commands will be unavailable to everyone. "
+            "Set OWNER_ID in .env to your Telegram user ID."
+        )
+
     await init_db()
 
     bot = Bot(token=BOT_TOKEN)

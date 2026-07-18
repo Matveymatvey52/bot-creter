@@ -10,6 +10,11 @@ logger = logging.getLogger(__name__)
 _processes: dict[int, asyncio.subprocess.Process] = {}
 _last_errors: dict[int, str] = {}
 _stderr_tasks: dict[int, asyncio.Task] = {}
+_locks: dict[int, asyncio.Lock] = {}
+
+
+def _get_lock(bot_id: int) -> asyncio.Lock:
+    return _locks.setdefault(bot_id, asyncio.Lock())
 
 
 async def _collect_stderr(bot_id: int, process: asyncio.subprocess.Process) -> None:
@@ -22,43 +27,44 @@ async def _collect_stderr(bot_id: int, process: asyncio.subprocess.Process) -> N
 
 
 async def start_bot(bot_id: int, file_path: str, token: str, extra_env: dict | None = None) -> int:
-    if is_running(bot_id):
-        await stop_bot(bot_id)
+    async with _get_lock(bot_id):
+        if is_running(bot_id):
+            await _stop_bot_unlocked(bot_id)
 
-    env = os.environ.copy()
-    env["BOT_TOKEN"] = token
-    if extra_env:
-        env.update(extra_env)
+        env = os.environ.copy()
+        env["BOT_TOKEN"] = token
+        if extra_env:
+            env.update(extra_env)
 
-    process = await asyncio.create_subprocess_exec(
-        sys.executable,
-        file_path,
-        env=env,
-        stdout=asyncio.subprocess.DEVNULL,  # never read, avoid pipe buffer deadlock
-        stderr=asyncio.subprocess.PIPE,
-    )
-    _processes[bot_id] = process
+        process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            file_path,
+            env=env,
+            stdout=asyncio.subprocess.DEVNULL,  # never read, avoid pipe buffer deadlock
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _processes[bot_id] = process
 
-    # Check if the process crashes within 2 seconds (no asyncio.shield — it leaks coroutines)
-    try:
-        await asyncio.wait_for(process.wait(), timeout=2.0)
-        # Process already exited — it crashed
-        stderr_data = await process.stderr.read()
-        error_text = stderr_data.decode(errors="replace").strip()
-        _last_errors[bot_id] = error_text
-        _processes.pop(bot_id, None)
-        short = error_text[-600:] if len(error_text) > 600 else error_text
-        raise RuntimeError(short or "бот завершился сразу после запуска")
-    except asyncio.TimeoutError:
-        # Still running after 2 seconds — good; start background stderr drain
-        task = asyncio.create_task(_collect_stderr(bot_id, process))
-        _stderr_tasks[bot_id] = task  # keep reference to avoid GC and suppress warnings
+        # Check if the process crashes within 2 seconds (no asyncio.shield — it leaks coroutines)
+        try:
+            await asyncio.wait_for(process.wait(), timeout=2.0)
+            # Process already exited — it crashed
+            stderr_data = await process.stderr.read()
+            error_text = stderr_data.decode(errors="replace").strip()
+            _last_errors[bot_id] = error_text
+            _processes.pop(bot_id, None)
+            short = error_text[-600:] if len(error_text) > 600 else error_text
+            raise RuntimeError(short or "бот завершился сразу после запуска")
+        except asyncio.TimeoutError:
+            # Still running after 2 seconds — good; start background stderr drain
+            task = asyncio.create_task(_collect_stderr(bot_id, process))
+            _stderr_tasks[bot_id] = task  # keep reference to avoid GC and suppress warnings
 
-    logger.info(f"Bot {bot_id} started with PID {process.pid}")
-    return process.pid
+        logger.info(f"Bot {bot_id} started with PID {process.pid}")
+        return process.pid
 
 
-async def stop_bot(bot_id: int) -> bool:
+async def _stop_bot_unlocked(bot_id: int) -> bool:
     process = _processes.get(bot_id)
     if not process:
         return False
@@ -73,6 +79,11 @@ async def stop_bot(bot_id: int) -> bool:
         task.cancel()
     logger.info(f"Bot {bot_id} stopped")
     return True
+
+
+async def stop_bot(bot_id: int) -> bool:
+    async with _get_lock(bot_id):
+        return await _stop_bot_unlocked(bot_id)
 
 
 def _make_extra_env(bot: dict) -> dict | None:

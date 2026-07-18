@@ -15,7 +15,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from config import ASSEMBLYAI_API_KEY, BOT_TOKEN, DATA_DIR
-from db.database import add_bot_admin, create_bot_record, set_bot_display_name, update_bot_status
+from db.database import create_bot_record_with_admins, set_bot_display_name, update_bot_status
 from services.bot_runner import start_bot
 from services.claude_service import chat_gather_requirements, extract_bot_name, generate_bot_code, generate_bot_guide
 from services.github_sync import push_bot_to_github
@@ -470,19 +470,20 @@ async def auto_launch_managed_bot(managed_data: dict, bot: Bot, storage=None) ->
     bot_file.write_text(bot_code, encoding="utf-8")
     asyncio.create_task(push_bot_to_github(bot_name, bot_code))
 
-    bot_record_id = await create_bot_record(
+    _owner_id = os.getenv("OWNER_ID", "")
+    admin_ids = [str(creator_user_id)]
+    if _owner_id and _owner_id != str(creator_user_id):
+        admin_ids.append(_owner_id)
+
+    bot_record_id = await create_bot_record_with_admins(
         name=bot_name,
         description=bot_summary,
         token=token,
         file_path=str(bot_file),
+        admin_ids=admin_ids,
         username=real_username,
     )
 
-    # Auto-add bot creator and platform owner as admins
-    await add_bot_admin(bot_record_id, str(creator_user_id))
-    _owner_id = os.getenv("OWNER_ID", "")
-    if _owner_id and _owner_id != str(creator_user_id):
-        await add_bot_admin(bot_record_id, _owner_id)
     if display_name:
         await set_bot_display_name(bot_record_id, display_name)
 
@@ -563,19 +564,20 @@ async def handle_token(message: Message, state: FSMContext, bot: Bot):
     bot_file.write_text(bot_code, encoding="utf-8")
     asyncio.create_task(push_bot_to_github(bot_name, bot_code))
 
-    bot_id = await create_bot_record(
+    _owner_id = os.getenv("OWNER_ID", "")
+    admin_ids = [str(message.from_user.id)]
+    if _owner_id and _owner_id != str(message.from_user.id):
+        admin_ids.append(_owner_id)
+
+    bot_id = await create_bot_record_with_admins(
         name=bot_name,
         description=bot_summary,
         token=token,
         file_path=str(bot_file),
+        admin_ids=admin_ids,
         username=real_username,
     )
 
-    # Auto-add bot creator and platform owner as admins
-    await add_bot_admin(bot_id, str(message.from_user.id))
-    _owner_id = os.getenv("OWNER_ID", "")
-    if _owner_id and _owner_id != str(message.from_user.id):
-        await add_bot_admin(bot_id, _owner_id)
     if display_name:
         await set_bot_display_name(bot_id, display_name)
 

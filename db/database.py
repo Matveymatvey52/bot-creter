@@ -84,6 +84,7 @@ async def migrate_encrypt_tokens() -> None:
 
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA journal_mode=WAL")
         await db.execute("""
             CREATE TABLE IF NOT EXISTS bots (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -167,14 +168,30 @@ async def sync_bot_admins_json(bot_id: int) -> None:
     path.write_text(json.dumps({"ids": ids}, ensure_ascii=False))
 
 
-async def create_bot_record(name: str, description: str, token: str, file_path: str, username: str | None = None) -> int:
+async def create_bot_record_with_admins(
+    name: str,
+    description: str,
+    token: str,
+    file_path: str,
+    admin_ids: list[str],
+    username: str | None = None,
+) -> int:
+    """Insert the bot record and its initial admins as one atomic transaction —
+    a crash between the two would otherwise leave a bot with no admin at all."""
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
             "INSERT INTO bots (name, username, description, token, file_path, status) VALUES (?, ?, ?, ?, ?, 'stopped')",
             (name, username, description, _encrypt_token(token), file_path),
         )
+        bot_id = cursor.lastrowid
+        for telegram_id in admin_ids:
+            await db.execute(
+                "INSERT OR IGNORE INTO bot_admins (bot_id, telegram_id) VALUES (?, ?)",
+                (bot_id, telegram_id),
+            )
         await db.commit()
-        return cursor.lastrowid
+    await sync_bot_admins_json(bot_id)
+    return bot_id
 
 
 async def get_all_bots() -> list[dict]:

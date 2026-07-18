@@ -15,7 +15,7 @@ async def get_managed_bot_token(manager_token: str, bot_id: int) -> str:
         ) as resp:
             data = await resp.json()
 
-    logger.info(f"getManagedBotToken response: {data}")
+    logger.info(f"getManagedBotToken response: ok={data.get('ok')}")
 
     if not data.get("ok"):
         raise RuntimeError(data.get("description", str(data)))

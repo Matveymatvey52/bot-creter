@@ -8,6 +8,7 @@ import tempfile
 from pathlib import Path
 
 from aiogram import Bot, F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -25,6 +26,11 @@ from services.voice_service import transcribe_voice
 logger = logging.getLogger(__name__)
 
 _DENY_TEXT = "⛔ Управление ботами доступно только владельцу."
+_BUSY_TEXT = "⏳ Для этого бота уже выполняется операция — подожди её завершения."
+
+# Guards recreate/autofix/fixbug (expensive Claude calls + file writes) against
+# a double click starting a second call for the same bot before the first finishes.
+_busy_bots: set[int] = set()
 
 
 class FixBotStates(StatesGroup):
@@ -41,6 +47,15 @@ async def _deny_message(message: Message) -> None:
 
 async def _deny_callback(callback: CallbackQuery) -> None:
     await callback.answer(_DENY_TEXT, show_alert=True)
+
+
+async def _edit_or_resend(callback: CallbackQuery, text: str, **kwargs) -> None:
+    try:
+        await callback.message.edit_text(text, **kwargs)
+    except TelegramBadRequest as e:
+        if "message is not modified" in str(e).lower():
+            return  # card already shows this exact state — nothing to do
+        await callback.message.answer(text, **kwargs)
 
 
 async def _ensure_username(b: dict) -> str:
@@ -277,32 +292,40 @@ async def cb_start(callback: CallbackQuery):
     if not _is_owner(callback.from_user.id):
         await _deny_callback(callback)
         return
-    await callback.answer()
     bot_id = int(callback.data.split(":")[1])
-    b = await get_bot(bot_id)
-    if not b:
-        await callback.message.answer("Бот не найден.")
+    if bot_id in _busy_bots:
+        await callback.answer(_BUSY_TEXT, show_alert=True)
         return
-    if is_running(bot_id):
-        await callback.message.answer("Уже запущен.")
-        return
+    _busy_bots.add(bot_id)
+    await callback.answer()
     try:
-        pid = await start_bot(bot_id, b["file_path"], b["token"], extra_env=_make_extra_env(b))
-        await update_bot_status(bot_id, "running", pid)
-    except Exception as e:
-        await update_bot_status(bot_id, "error")
-        await callback.message.edit_text(
-            "❌ Бот не смог запуститься — в сгенерированном коде ошибка.\n\n"
-            "Удали и создай заново через /create.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="🗑 Удалить и пересоздать", callback_data=f"delete:{bot_id}")
-            ]]),
+        b = await get_bot(bot_id)
+        if not b:
+            await callback.message.answer("Бот не найден.")
+            return
+        if is_running(bot_id):
+            await callback.message.answer("Уже запущен.")
+            return
+        try:
+            pid = await start_bot(bot_id, b["file_path"], b["token"], extra_env=_make_extra_env(b))
+            await update_bot_status(bot_id, "running", pid)
+        except Exception as e:
+            await update_bot_status(bot_id, "error")
+            await _edit_or_resend(
+                callback,
+                "❌ Бот не смог запуститься — в сгенерированном коде ошибка.\n\n"
+                "Удали и создай заново через /create.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="🗑 Удалить и пересоздать", callback_data=f"delete:{bot_id}")
+                ]]),
+            )
+            return
+        b["username"] = await _ensure_username(b)
+        await _edit_or_resend(
+            callback, _bot_text(b), parse_mode="HTML", reply_markup=_bot_keyboard(bot_id)
         )
-        return
-    b["username"] = await _ensure_username(b)
-    await callback.message.edit_text(
-        _bot_text(b), parse_mode="HTML", reply_markup=_bot_keyboard(bot_id)
-    )
+    finally:
+        _busy_bots.discard(bot_id)
 
 
 @router.callback_query(F.data.startswith("stop:"))
@@ -319,14 +342,9 @@ async def cb_stop(callback: CallbackQuery):
     await stop_bot(bot_id)
     await update_bot_status(bot_id, "stopped")
     b["username"] = await _ensure_username(b)
-    try:
-        await callback.message.edit_text(
-            _bot_text(b), parse_mode="HTML", reply_markup=_bot_keyboard(bot_id)
-        )
-    except Exception:
-        await callback.message.answer(
-            _bot_text(b), parse_mode="HTML", reply_markup=_bot_keyboard(bot_id)
-        )
+    await _edit_or_resend(
+        callback, _bot_text(b), parse_mode="HTML", reply_markup=_bot_keyboard(bot_id)
+    )
 
 
 @router.callback_query(F.data.startswith("restart:"))
@@ -334,36 +352,39 @@ async def cb_restart(callback: CallbackQuery):
     if not _is_owner(callback.from_user.id):
         await _deny_callback(callback)
         return
-    await callback.answer()
     bot_id = int(callback.data.split(":")[1])
-    b = await get_bot(bot_id)
-    if not b:
-        await callback.message.answer("Бот не найден.")
+    if bot_id in _busy_bots:
+        await callback.answer(_BUSY_TEXT, show_alert=True)
         return
-    await stop_bot(bot_id)
+    _busy_bots.add(bot_id)
+    await callback.answer()
     try:
-        pid = await start_bot(bot_id, b["file_path"], b["token"], extra_env=_make_extra_env(b))
-        await update_bot_status(bot_id, "running", pid)
-    except Exception as e:
-        logger.error(f"Failed to restart bot {bot_id}: {e}")
-        await update_bot_status(bot_id, "error")
-        await callback.message.edit_text(
-            "❌ Бот не смог перезапуститься — в коде ошибка.\n\n"
-            "Удали и создай заново через /create.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="🗑 Удалить", callback_data=f"delete:{bot_id}")
-            ]]),
+        b = await get_bot(bot_id)
+        if not b:
+            await callback.message.answer("Бот не найден.")
+            return
+        await stop_bot(bot_id)
+        try:
+            pid = await start_bot(bot_id, b["file_path"], b["token"], extra_env=_make_extra_env(b))
+            await update_bot_status(bot_id, "running", pid)
+        except Exception as e:
+            logger.error(f"Failed to restart bot {bot_id}: {e}")
+            await update_bot_status(bot_id, "error")
+            await _edit_or_resend(
+                callback,
+                "❌ Бот не смог перезапуститься — в коде ошибка.\n\n"
+                "Удали и создай заново через /create.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="🗑 Удалить", callback_data=f"delete:{bot_id}")
+                ]]),
+            )
+            return
+        b["username"] = await _ensure_username(b)
+        await _edit_or_resend(
+            callback, _bot_text(b), parse_mode="HTML", reply_markup=_bot_keyboard(bot_id)
         )
-        return
-    b["username"] = await _ensure_username(b)
-    try:
-        await callback.message.edit_text(
-            _bot_text(b), parse_mode="HTML", reply_markup=_bot_keyboard(bot_id)
-        )
-    except Exception:
-        await callback.message.answer(
-            _bot_text(b), parse_mode="HTML", reply_markup=_bot_keyboard(bot_id)
-        )
+    finally:
+        _busy_bots.discard(bot_id)
 
 
 @router.callback_query(F.data.startswith("logs:"))
@@ -413,70 +434,77 @@ async def cb_recreate(callback: CallbackQuery):
     if not _is_owner(callback.from_user.id):
         await _deny_callback(callback)
         return
-    await callback.answer()
     bot_id = int(callback.data.split(":")[1])
-    b = await get_bot(bot_id)
-    if not b:
-        await callback.message.edit_text("Бот не найден.")
+    if bot_id in _busy_bots:
+        await callback.answer(_BUSY_TEXT, show_alert=True)
         return
-    if not b.get("description"):
-        await callback.message.edit_text(
-            "❌ Не могу пересоздать — описание бота не сохранилось.\n\nСоздай заново через /create.",
-        )
-        return
+    _busy_bots.add(bot_id)
+    await callback.answer()
+    try:
+        b = await get_bot(bot_id)
+        if not b:
+            await callback.message.edit_text("Бот не найден.")
+            return
+        if not b.get("description"):
+            await callback.message.edit_text(
+                "❌ Не могу пересоздать — описание бота не сохранилось.\n\nСоздай заново через /create.",
+            )
+            return
 
-    current_code = ""
-    if b.get("file_path"):
+        current_code = ""
+        if b.get("file_path"):
+            try:
+                current_code = Path(b["file_path"]).read_text(encoding="utf-8")
+            except Exception:
+                pass
+
+        if current_code:
+            await callback.message.edit_text(f"✨ Улучшаю код <b>{b['name']}</b>...", parse_mode="HTML")
+            task = improve_bot_code(current_code, b.get("description", ""))
+        else:
+            await callback.message.edit_text(f"🔧 Генерирую код для <b>{b['name']}</b>...", parse_mode="HTML")
+            task = generate_bot_code(b.get("description", ""))
+
         try:
-            current_code = Path(b["file_path"]).read_text(encoding="utf-8")
-        except Exception:
-            pass
+            code = await asyncio.wait_for(task, timeout=240.0)
+        except Exception as e:
+            logger.error(f"Failed to regenerate bot {bot_id}: {e}")
+            await callback.message.edit_text(
+                "⚠️ Не удалось улучшить код. Попробуй ещё раз.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="🔄 Попробовать снова", callback_data=f"recreate:{bot_id}"),
+                    InlineKeyboardButton(text="◀ Назад", callback_data=f"info:{bot_id}"),
+                ]]),
+            )
+            return
 
-    if current_code:
-        await callback.message.edit_text(f"✨ Улучшаю код <b>{b['name']}</b>...", parse_mode="HTML")
-        task = improve_bot_code(current_code, b.get("description", ""))
-    else:
-        await callback.message.edit_text(f"🔧 Генерирую код для <b>{b['name']}</b>...", parse_mode="HTML")
-        task = generate_bot_code(b.get("description", ""))
+        await stop_bot(bot_id)
 
-    try:
-        code = await asyncio.wait_for(task, timeout=240.0)
-    except Exception as e:
-        logger.error(f"Failed to regenerate bot {bot_id}: {e}")
-        await callback.message.edit_text(
-            "⚠️ Не удалось улучшить код. Попробуй ещё раз.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="🔄 Попробовать снова", callback_data=f"recreate:{bot_id}"),
-                InlineKeyboardButton(text="◀ Назад", callback_data=f"info:{bot_id}"),
-            ]]),
-        )
-        return
+        bot_file = Path(b["file_path"])
+        bot_file.write_text(code, encoding="utf-8")
+        asyncio.create_task(push_bot_to_github(b["name"], code))
 
-    await stop_bot(bot_id)
-
-    bot_file = Path(b["file_path"])
-    bot_file.write_text(code, encoding="utf-8")
-    asyncio.create_task(push_bot_to_github(b["name"], code))
-
-    try:
-        pid = await start_bot(bot_id, str(bot_file), b["token"], extra_env=_make_extra_env(b))
-        await update_bot_status(bot_id, "running", pid)
-        await callback.message.edit_text(
-            f"✅ Бот <b>{b['name']}</b> пересоздан и запущен!\n\n"
-            f"Код обновлён с учётом последних улучшений.",
-            parse_mode="HTML",
-            reply_markup=_bot_keyboard(bot_id),
-        )
-    except Exception as e:
-        await update_bot_status(bot_id, "error")
-        await callback.message.edit_text(
-            f"⚠️ Код сгенерирован, но бот не запустился.\n\n<code>{html.escape(str(e)[-300:])}</code>",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="🔄 Перегенерировать снова", callback_data=f"recreate:{bot_id}"),
-                InlineKeyboardButton(text="🗑 Удалить", callback_data=f"delete:{bot_id}"),
-            ]]),
-        )
+        try:
+            pid = await start_bot(bot_id, str(bot_file), b["token"], extra_env=_make_extra_env(b))
+            await update_bot_status(bot_id, "running", pid)
+            await callback.message.edit_text(
+                f"✅ Бот <b>{b['name']}</b> пересоздан и запущен!\n\n"
+                f"Код обновлён с учётом последних улучшений.",
+                parse_mode="HTML",
+                reply_markup=_bot_keyboard(bot_id),
+            )
+        except Exception as e:
+            await update_bot_status(bot_id, "error")
+            await callback.message.edit_text(
+                f"⚠️ Код сгенерирован, но бот не запустился.\n\n<code>{html.escape(str(e)[-300:])}</code>",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="🔄 Перегенерировать снова", callback_data=f"recreate:{bot_id}"),
+                    InlineKeyboardButton(text="🗑 Удалить", callback_data=f"delete:{bot_id}"),
+                ]]),
+            )
+    finally:
+        _busy_bots.discard(bot_id)
 
 
 # ── auto-diagnose ─────────────────────────────────────────────────────────────
@@ -486,67 +514,74 @@ async def cb_auto_diagnose(callback: CallbackQuery):
     if not _is_owner(callback.from_user.id):
         await _deny_callback(callback)
         return
-    await callback.answer()
     bot_id = int(callback.data.split(":")[1])
-    b = await get_bot(bot_id)
-    if not b or not b.get("file_path") or not Path(b["file_path"]).exists():
-        await callback.message.edit_text("❌ Файл бота не найден — попробуй Перегенерировать.")
+    if bot_id in _busy_bots:
+        await callback.answer(_BUSY_TEXT, show_alert=True)
         return
-
-    current_code = Path(b["file_path"]).read_text(encoding="utf-8")
-    error_log = get_bot_logs(bot_id) or ""
-
-    if error_log:
-        bug_description = f"Bot crashed with the following error:\n{error_log}"
-    else:
-        bug_description = (
-            "The bot is not working correctly but no crash log is available. "
-            "Analyze the code carefully, find potential bugs (wrong imports, missing asyncio.run(main()), "
-            "incorrect aiogram 3.x patterns, missing error handling) and fix them."
-        )
-
-    await callback.message.edit_text(
-        f"🔍 Диагностирую <b>{b['name']}</b>...\n\n"
-        + (f"<code>{html.escape(error_log[-300:])}</code>" if error_log else "Логов нет — анализирую код."),
-        parse_mode="HTML",
-    )
-
+    _busy_bots.add(bot_id)
+    await callback.answer()
     try:
-        fixed_code = await asyncio.wait_for(
-            fix_bot_code(current_code, bug_description), timeout=240.0
-        )
-    except Exception:
-        await callback.message.edit_text(
-            "⚠️ Не удалось проанализировать код. Попробуй ещё раз.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="🔍 Попробовать снова", callback_data=f"autofix:{bot_id}"),
-                InlineKeyboardButton(text="◀ Назад", callback_data=f"info:{bot_id}"),
-            ]]),
-        )
-        return
+        b = await get_bot(bot_id)
+        if not b or not b.get("file_path") or not Path(b["file_path"]).exists():
+            await callback.message.edit_text("❌ Файл бота не найден — попробуй Перегенерировать.")
+            return
 
-    await stop_bot(bot_id)
-    Path(b["file_path"]).write_text(fixed_code, encoding="utf-8")
-    asyncio.create_task(push_bot_to_github(b["name"], fixed_code))
+        current_code = Path(b["file_path"]).read_text(encoding="utf-8")
+        error_log = get_bot_logs(bot_id) or ""
 
-    try:
-        pid = await start_bot(bot_id, b["file_path"], b["token"], extra_env=_make_extra_env(b))
-        await update_bot_status(bot_id, "running", pid)
+        if error_log:
+            bug_description = f"Bot crashed with the following error:\n{error_log}"
+        else:
+            bug_description = (
+                "The bot is not working correctly but no crash log is available. "
+                "Analyze the code carefully, find potential bugs (wrong imports, missing asyncio.run(main()), "
+                "incorrect aiogram 3.x patterns, missing error handling) and fix them."
+            )
+
         await callback.message.edit_text(
-            f"✅ <b>{b['name']}</b> исправлен и перезапущен!",
+            f"🔍 Диагностирую <b>{b['name']}</b>...\n\n"
+            + (f"<code>{html.escape(error_log[-300:])}</code>" if error_log else "Логов нет — анализирую код."),
             parse_mode="HTML",
-            reply_markup=_bot_keyboard(bot_id),
         )
-    except Exception as e:
-        await update_bot_status(bot_id, "error")
-        await callback.message.edit_text(
-            f"⚠️ Код исправлен, но бот снова не запустился:\n<code>{html.escape(str(e)[-300:])}</code>",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="🔍 Диагностировать снова", callback_data=f"autofix:{bot_id}"),
-                InlineKeyboardButton(text="🗑 Удалить", callback_data=f"delete:{bot_id}"),
-            ]]),
-        )
+
+        try:
+            fixed_code = await asyncio.wait_for(
+                fix_bot_code(current_code, bug_description), timeout=240.0
+            )
+        except Exception:
+            await callback.message.edit_text(
+                "⚠️ Не удалось проанализировать код. Попробуй ещё раз.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="🔍 Попробовать снова", callback_data=f"autofix:{bot_id}"),
+                    InlineKeyboardButton(text="◀ Назад", callback_data=f"info:{bot_id}"),
+                ]]),
+            )
+            return
+
+        await stop_bot(bot_id)
+        Path(b["file_path"]).write_text(fixed_code, encoding="utf-8")
+        asyncio.create_task(push_bot_to_github(b["name"], fixed_code))
+
+        try:
+            pid = await start_bot(bot_id, b["file_path"], b["token"], extra_env=_make_extra_env(b))
+            await update_bot_status(bot_id, "running", pid)
+            await callback.message.edit_text(
+                f"✅ <b>{b['name']}</b> исправлен и перезапущен!",
+                parse_mode="HTML",
+                reply_markup=_bot_keyboard(bot_id),
+            )
+        except Exception as e:
+            await update_bot_status(bot_id, "error")
+            await callback.message.edit_text(
+                f"⚠️ Код исправлен, но бот снова не запустился:\n<code>{html.escape(str(e)[-300:])}</code>",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="🔍 Диагностировать снова", callback_data=f"autofix:{bot_id}"),
+                    InlineKeyboardButton(text="🗑 Удалить", callback_data=f"delete:{bot_id}"),
+                ]]),
+            )
+    finally:
+        _busy_bots.discard(bot_id)
 
 
 # ── fix bug ───────────────────────────────────────────────────────────────────
@@ -608,58 +643,65 @@ async def _apply_fix(message: Message, state: FSMContext, bug_description: str, 
     bot_id = data["fix_bot_id"]
     await state.clear()
 
-    b = await get_bot(bot_id)
-    if not b:
-        await message.answer("Бот не найден.")
+    if bot_id in _busy_bots:
+        await message.answer(_BUSY_TEXT)
         return
-
-    current_code = Path(b["file_path"]).read_text(encoding="utf-8")
-
-    fix_msg = await message.answer(f"🔧 Исправляю код <b>{b['name']}</b>...", parse_mode="HTML")
+    _busy_bots.add(bot_id)
     try:
-        fixed_code = await asyncio.wait_for(
-            fix_bot_code(current_code, bug_description), timeout=240.0
-        )
-    except Exception:
+        b = await get_bot(bot_id)
+        if not b:
+            await message.answer("Бот не найден.")
+            return
+
+        current_code = Path(b["file_path"]).read_text(encoding="utf-8")
+
+        fix_msg = await message.answer(f"🔧 Исправляю код <b>{b['name']}</b>...", parse_mode="HTML")
+        try:
+            fixed_code = await asyncio.wait_for(
+                fix_bot_code(current_code, bug_description), timeout=240.0
+            )
+        except Exception:
+            try:
+                await fix_msg.delete()
+            except Exception:
+                pass
+            await message.answer(
+                "⚠️ Не удалось исправить код. Попробуй ещё раз.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="🐛 Попробовать снова", callback_data=f"fixbug:{bot_id}"),
+                ]]),
+            )
+            return
+
         try:
             await fix_msg.delete()
         except Exception:
             pass
-        await message.answer(
-            "⚠️ Не удалось исправить код. Попробуй ещё раз.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="🐛 Попробовать снова", callback_data=f"fixbug:{bot_id}"),
-            ]]),
-        )
-        return
 
-    try:
-        await fix_msg.delete()
-    except Exception:
-        pass
+        await stop_bot(bot_id)
+        Path(b["file_path"]).write_text(fixed_code, encoding="utf-8")
+        asyncio.create_task(push_bot_to_github(b["name"], fixed_code))
 
-    await stop_bot(bot_id)
-    Path(b["file_path"]).write_text(fixed_code, encoding="utf-8")
-    asyncio.create_task(push_bot_to_github(b["name"], fixed_code))
-
-    try:
-        pid = await start_bot(bot_id, b["file_path"], b["token"], extra_env=_make_extra_env(b))
-        await update_bot_status(bot_id, "running", pid)
-        await message.answer(
-            f"✅ Бот <b>{b['name']}</b> исправлен и перезапущен!",
-            parse_mode="HTML",
-            reply_markup=_bot_keyboard(bot_id),
-        )
-    except Exception as e:
-        await update_bot_status(bot_id, "error")
-        await message.answer(
-            f"⚠️ Код исправлен, но бот не запустился.\n\n<code>{html.escape(str(e)[-300:])}</code>",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="🐛 Исправить снова", callback_data=f"fixbug:{bot_id}"),
-                InlineKeyboardButton(text="🗑 Удалить", callback_data=f"delete:{bot_id}"),
-            ]]),
-        )
+        try:
+            pid = await start_bot(bot_id, b["file_path"], b["token"], extra_env=_make_extra_env(b))
+            await update_bot_status(bot_id, "running", pid)
+            await message.answer(
+                f"✅ Бот <b>{b['name']}</b> исправлен и перезапущен!",
+                parse_mode="HTML",
+                reply_markup=_bot_keyboard(bot_id),
+            )
+        except Exception as e:
+            await update_bot_status(bot_id, "error")
+            await message.answer(
+                f"⚠️ Код исправлен, но бот не запустился.\n\n<code>{html.escape(str(e)[-300:])}</code>",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="🐛 Исправить снова", callback_data=f"fixbug:{bot_id}"),
+                    InlineKeyboardButton(text="🗑 Удалить", callback_data=f"delete:{bot_id}"),
+                ]]),
+            )
+    finally:
+        _busy_bots.discard(bot_id)
 
 
 @router.message(FixBotStates.describing_bug, F.voice)
@@ -678,3 +720,11 @@ async def msg_fix_text(message: Message, state: FSMContext, bot: Bot):
         await _deny_message(message)
         return
     await _apply_fix(message, state, message.text, bot)
+
+
+@router.message(FixBotStates.describing_bug)
+async def msg_fix_unsupported(message: Message):
+    if not _is_owner(message.from_user.id):
+        await _deny_message(message)
+        return
+    await message.answer("Не понял — отправь текст или голосовое с описанием бага. /cancel — отменить.")
