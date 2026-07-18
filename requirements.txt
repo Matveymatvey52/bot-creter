@@ -2,6 +2,7 @@ aiogram==3.13.0
 anthropic==0.40.0
 aiosqlite==0.20.0
 python-dotenv==1.0.0
-assemblyai>=0.20.0
-openpyxl>=3.1.0
-aiohttp>=3.9.0
+assemblyai==0.64.31
+openpyxl==3.1.5
+aiohttp==3.10.11
+cryptography==49.0.0

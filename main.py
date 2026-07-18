@@ -46,18 +46,29 @@ class ManagedBotMiddleware(BaseMiddleware):
 
 
 async def restore_bots():
-    bots = await get_all_bots()
+    try:
+        bots = await get_all_bots()
+    except Exception as e:
+        logger.error(f"restore_bots: could not read bots from DB, skipping restore: {e}")
+        return
+
+    restored = 0
+    failed = 0
     for bot in bots:
         if bot["status"] == "running" and bot["file_path"] and bot["token"]:
             try:
                 pid = await start_bot(bot["id"], bot["file_path"], bot["token"], extra_env=_make_extra_env(bot))
                 await update_bot_status(bot["id"], "running", pid)
                 logger.info(f"Restored bot '{bot['name']}' (ID: {bot['id']}, PID: {pid})")
+                restored += 1
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 logger.error(f"Failed to restore bot '{bot['name']}' (ID: {bot['id']}): {e}")
                 await update_bot_status(bot["id"], "error")
+                failed += 1
+    log_fn = logger.warning if failed else logger.info
+    log_fn(f"restore_bots: {restored} restored, {failed} failed")
 
 
 async def main():

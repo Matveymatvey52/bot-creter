@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import html
 import logging
 import tempfile
 from pathlib import Path
@@ -14,6 +15,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 
 from config import ASSEMBLYAI_API_KEY
 from db.database import delete_bot, get_all_bots, get_bot, get_bot_by_name, update_bot_status, update_bot_username
+from handlers.admin_manager import _is_owner
 from services.bot_runner import _make_extra_env, get_bot_logs, is_running, start_bot, stop_bot
 from services.claude_service import fix_bot_code, generate_bot_code, improve_bot_code
 from services.github_sync import push_bot_to_github
@@ -21,6 +23,8 @@ from services.voice_service import transcribe_voice
 
 
 logger = logging.getLogger(__name__)
+
+_DENY_TEXT = "⛔ Управление ботами доступно только владельцу."
 
 
 class FixBotStates(StatesGroup):
@@ -30,6 +34,14 @@ router = Router()
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
+
+async def _deny_message(message: Message) -> None:
+    await message.answer(_DENY_TEXT)
+
+
+async def _deny_callback(callback: CallbackQuery) -> None:
+    await callback.answer(_DENY_TEXT, show_alert=True)
+
 
 async def _ensure_username(b: dict) -> str:
     if b.get("username"):
@@ -115,6 +127,9 @@ async def _send_list(send_fn, bots: list[dict]) -> None:
 
 @router.message(Command("list"))
 async def cmd_list(message: Message):
+    if not _is_owner(message.from_user.id):
+        await _deny_message(message)
+        return
     bots = await get_all_bots()
     if not bots:
         await message.answer("Ботов пока нет. Создай первого командой /create")
@@ -126,6 +141,9 @@ async def cmd_list(message: Message):
 
 @router.message(Command("stop"))
 async def cmd_stop(message: Message):
+    if not _is_owner(message.from_user.id):
+        await _deny_message(message)
+        return
     bots = await get_all_bots()
     running = [b for b in bots if is_running(b["id"])]
     if not running:
@@ -144,6 +162,9 @@ async def cmd_stop(message: Message):
 
 @router.message(Command("run"))
 async def cmd_run(message: Message):
+    if not _is_owner(message.from_user.id):
+        await _deny_message(message)
+        return
     bots = await get_all_bots()
     stopped = [b for b in bots if not is_running(b["id"])]
     if not stopped:
@@ -162,6 +183,9 @@ async def cmd_run(message: Message):
 
 @router.message(Command("logs"))
 async def cmd_logs(message: Message):
+    if not _is_owner(message.from_user.id):
+        await _deny_message(message)
+        return
     parts = message.text.split()
     if len(parts) < 2:
         await message.answer("Использование: /logs <id>")
@@ -190,7 +214,7 @@ async def _send_logs(send_fn, b: dict) -> None:
     if len(logs) > 3500:
         logs = "...\n" + logs[-3500:]
     await send_fn(
-        f"📋 Логи <b>{b['name']}</b>:\n<pre>{logs}</pre>",
+        f"📋 Логи <b>{b['name']}</b>:\n<pre>{html.escape(logs)}</pre>",
         parse_mode="HTML",
         reply_markup=back_kb,
     )
@@ -200,6 +224,9 @@ async def _send_logs(send_fn, b: dict) -> None:
 
 @router.callback_query(F.data == "list")
 async def cb_list(callback: CallbackQuery):
+    if not _is_owner(callback.from_user.id):
+        await _deny_callback(callback)
+        return
     await callback.answer()
     chat_id = callback.message.chat.id
     try:
@@ -222,6 +249,9 @@ async def cb_list(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("info:"))
 async def cb_info(callback: CallbackQuery):
+    if not _is_owner(callback.from_user.id):
+        await _deny_callback(callback)
+        return
     await callback.answer()
     chat_id = callback.message.chat.id
     try:
@@ -244,6 +274,9 @@ async def cb_info(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("start:"))
 async def cb_start(callback: CallbackQuery):
+    if not _is_owner(callback.from_user.id):
+        await _deny_callback(callback)
+        return
     await callback.answer()
     bot_id = int(callback.data.split(":")[1])
     b = await get_bot(bot_id)
@@ -274,6 +307,9 @@ async def cb_start(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("stop:"))
 async def cb_stop(callback: CallbackQuery):
+    if not _is_owner(callback.from_user.id):
+        await _deny_callback(callback)
+        return
     await callback.answer()
     bot_id = int(callback.data.split(":")[1])
     b = await get_bot(bot_id)
@@ -295,6 +331,9 @@ async def cb_stop(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("restart:"))
 async def cb_restart(callback: CallbackQuery):
+    if not _is_owner(callback.from_user.id):
+        await _deny_callback(callback)
+        return
     await callback.answer()
     bot_id = int(callback.data.split(":")[1])
     b = await get_bot(bot_id)
@@ -329,6 +368,9 @@ async def cb_restart(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("logs:"))
 async def cb_logs(callback: CallbackQuery):
+    if not _is_owner(callback.from_user.id):
+        await _deny_callback(callback)
+        return
     await callback.answer()
     bot_id = int(callback.data.split(":")[1])
     b = await get_bot(bot_id)
@@ -345,6 +387,9 @@ async def cb_logs(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("delete:"))
 async def cb_delete(callback: CallbackQuery):
+    if not _is_owner(callback.from_user.id):
+        await _deny_callback(callback)
+        return
     await callback.answer()
     bot_id = int(callback.data.split(":")[1])
     b = await get_bot(bot_id)
@@ -365,6 +410,9 @@ async def cb_delete(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("recreate:"))
 async def cb_recreate(callback: CallbackQuery):
+    if not _is_owner(callback.from_user.id):
+        await _deny_callback(callback)
+        return
     await callback.answer()
     bot_id = int(callback.data.split(":")[1])
     b = await get_bot(bot_id)
@@ -422,7 +470,7 @@ async def cb_recreate(callback: CallbackQuery):
     except Exception as e:
         await update_bot_status(bot_id, "error")
         await callback.message.edit_text(
-            f"⚠️ Код сгенерирован, но бот не запустился.\n\n<code>{str(e)[-300:]}</code>",
+            f"⚠️ Код сгенерирован, но бот не запустился.\n\n<code>{html.escape(str(e)[-300:])}</code>",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
                 InlineKeyboardButton(text="🔄 Перегенерировать снова", callback_data=f"recreate:{bot_id}"),
@@ -435,6 +483,9 @@ async def cb_recreate(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("autofix:"))
 async def cb_auto_diagnose(callback: CallbackQuery):
+    if not _is_owner(callback.from_user.id):
+        await _deny_callback(callback)
+        return
     await callback.answer()
     bot_id = int(callback.data.split(":")[1])
     b = await get_bot(bot_id)
@@ -456,7 +507,7 @@ async def cb_auto_diagnose(callback: CallbackQuery):
 
     await callback.message.edit_text(
         f"🔍 Диагностирую <b>{b['name']}</b>...\n\n"
-        + (f"<code>{error_log[-300:]}</code>" if error_log else "Логов нет — анализирую код."),
+        + (f"<code>{html.escape(error_log[-300:])}</code>" if error_log else "Логов нет — анализирую код."),
         parse_mode="HTML",
     )
 
@@ -489,7 +540,7 @@ async def cb_auto_diagnose(callback: CallbackQuery):
     except Exception as e:
         await update_bot_status(bot_id, "error")
         await callback.message.edit_text(
-            f"⚠️ Код исправлен, но бот снова не запустился:\n<code>{str(e)[-300:]}</code>",
+            f"⚠️ Код исправлен, но бот снова не запустился:\n<code>{html.escape(str(e)[-300:])}</code>",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
                 InlineKeyboardButton(text="🔍 Диагностировать снова", callback_data=f"autofix:{bot_id}"),
@@ -502,6 +553,9 @@ async def cb_auto_diagnose(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("fixbug:"))
 async def cb_fix_bug(callback: CallbackQuery, state: FSMContext):
+    if not _is_owner(callback.from_user.id):
+        await _deny_callback(callback)
+        return
     await callback.answer()
     bot_id = int(callback.data.split(":")[1])
     b = await get_bot(bot_id)
@@ -599,7 +653,7 @@ async def _apply_fix(message: Message, state: FSMContext, bug_description: str, 
     except Exception as e:
         await update_bot_status(bot_id, "error")
         await message.answer(
-            f"⚠️ Код исправлен, но бот не запустился.\n\n<code>{str(e)[-300:]}</code>",
+            f"⚠️ Код исправлен, но бот не запустился.\n\n<code>{html.escape(str(e)[-300:])}</code>",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
                 InlineKeyboardButton(text="🐛 Исправить снова", callback_data=f"fixbug:{bot_id}"),
@@ -610,6 +664,9 @@ async def _apply_fix(message: Message, state: FSMContext, bug_description: str, 
 
 @router.message(FixBotStates.describing_bug, F.voice)
 async def msg_fix_voice(message: Message, state: FSMContext, bot: Bot):
+    if not _is_owner(message.from_user.id):
+        await _deny_message(message)
+        return
     text = await _recognize_voice_fix(message, bot)
     if text:
         await _apply_fix(message, state, text, bot)
@@ -617,4 +674,7 @@ async def msg_fix_voice(message: Message, state: FSMContext, bot: Bot):
 
 @router.message(FixBotStates.describing_bug, F.text, ~F.text.startswith("/"))
 async def msg_fix_text(message: Message, state: FSMContext, bot: Bot):
+    if not _is_owner(message.from_user.id):
+        await _deny_message(message)
+        return
     await _apply_fix(message, state, message.text, bot)

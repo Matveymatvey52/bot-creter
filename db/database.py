@@ -1,11 +1,85 @@
 from __future__ import annotations
 
 import json
+import logging
+import re
 import aiosqlite
-from config import DATA_DIR
+from cryptography.fernet import Fernet, InvalidToken
+from config import DATA_DIR, ENCRYPTION_KEY
+
+_PLAINTEXT_TOKEN_RE = re.compile(r"^\d+:")
+
+logger = logging.getLogger(__name__)
 
 DB_PATH = DATA_DIR / "bots.db"
 ADMINS_FILE = DATA_DIR / "admins.json"
+
+if not ENCRYPTION_KEY:
+    raise ValueError("ENCRYPTION_KEY is not set in .env")
+try:
+    _fernet = Fernet(ENCRYPTION_KEY.encode())
+except (ValueError, TypeError) as e:
+    raise ValueError(
+        "ENCRYPTION_KEY is invalid. Generate one with: "
+        "python -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\""
+    ) from e
+
+
+def _encrypt_token(token: str | None) -> str | None:
+    if not token:
+        return token
+    return _fernet.encrypt(token.encode()).decode()
+
+
+def _decrypt_token(token: str | None) -> str | None:
+    if not token:
+        return token
+    try:
+        return _fernet.decrypt(token.encode()).decode()
+    except (InvalidToken, AttributeError, TypeError, ValueError):
+        # Either not yet migrated (plaintext, first run — migrate_encrypt_tokens() will fix it)
+        # or ENCRYPTION_KEY was rotated/changed since this token was encrypted — in that case
+        # the original token is unrecoverable and this returns the undecryptable blob as-is.
+        logger.warning("Could not decrypt a bot token — plaintext (pre-migration) or ENCRYPTION_KEY changed")
+        return token
+
+
+def _decrypt_row(row: dict) -> dict:
+    if "token" in row:
+        row["token"] = _decrypt_token(row["token"])
+    return row
+
+
+async def migrate_encrypt_tokens() -> None:
+    """One-time migration: encrypt any plaintext tokens left over from before encryption was added.
+
+    Plaintext is detected by Telegram bot token shape (^\\d+:...), not by "fails to decrypt" —
+    a token that fails to decrypt with the current key could just as easily be ciphertext from a
+    since-rotated ENCRYPTION_KEY, and re-encrypting that would destroy it irrecoverably.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT id, token FROM bots WHERE token IS NOT NULL AND token != ''") as cursor:
+            rows = await cursor.fetchall()
+        migrated = 0
+        for row in rows:
+            token = row["token"]
+            if _PLAINTEXT_TOKEN_RE.match(token):
+                encrypted = _fernet.encrypt(token.encode()).decode()
+                await db.execute("UPDATE bots SET token = ? WHERE id = ?", (encrypted, row["id"]))
+                migrated += 1
+                continue
+            try:
+                _fernet.decrypt(token.encode())
+                # already encrypted with the current key — leave as-is
+            except (InvalidToken, AttributeError, TypeError, ValueError):
+                logger.warning(
+                    f"migrate_encrypt_tokens: bot id={row['id']} token is neither plaintext nor "
+                    "decryptable with current ENCRYPTION_KEY — leaving untouched"
+                )
+        await db.commit()
+        if migrated:
+            logger.info(f"migrate_encrypt_tokens: encrypted {migrated} plaintext token(s)")
 
 
 async def init_db():
@@ -36,6 +110,7 @@ async def init_db():
             except aiosqlite.OperationalError:
                 pass
         await db.commit()
+    await migrate_encrypt_tokens()
 
 
 async def add_bot_admin(bot_id: int, telegram_id: str) -> None:
@@ -96,7 +171,7 @@ async def create_bot_record(name: str, description: str, token: str, file_path: 
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
             "INSERT INTO bots (name, username, description, token, file_path, status) VALUES (?, ?, ?, ?, ?, 'stopped')",
-            (name, username, description, token, file_path),
+            (name, username, description, _encrypt_token(token), file_path),
         )
         await db.commit()
         return cursor.lastrowid
@@ -107,7 +182,7 @@ async def get_all_bots() -> list[dict]:
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT * FROM bots ORDER BY created_at DESC") as cursor:
             rows = await cursor.fetchall()
-            return [dict(row) for row in rows]
+            return [_decrypt_row(dict(row)) for row in rows]
 
 
 async def get_bot_by_name(name: str) -> dict | None:
@@ -119,7 +194,7 @@ async def get_bot_by_name(name: str) -> dict | None:
             (clean, name.lstrip("@")),
         ) as cursor:
             row = await cursor.fetchone()
-            return dict(row) if row else None
+            return _decrypt_row(dict(row)) if row else None
 
 
 async def get_bot(bot_id: int) -> dict | None:
@@ -127,7 +202,7 @@ async def get_bot(bot_id: int) -> dict | None:
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT * FROM bots WHERE id = ?", (bot_id,)) as cursor:
             row = await cursor.fetchone()
-            return dict(row) if row else None
+            return _decrypt_row(dict(row)) if row else None
 
 
 async def delete_bot(bot_id: int) -> None:

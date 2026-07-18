@@ -9,6 +9,7 @@ from aiogram.types import Message
 
 from config import ASSEMBLYAI_API_KEY
 from db.database import get_all_bots
+from handlers.admin_manager import _is_owner
 from services.claude_service import ask_assistant
 from services.voice_service import transcribe_voice
 
@@ -26,6 +27,8 @@ def _bots_summary(bots: list[dict]) -> str:
 
 @router.message(StateFilter(None), F.voice)
 async def general_voice(message: Message, bot: Bot):
+    if not _is_owner(message.from_user.id):
+        return
     if not ASSEMBLYAI_API_KEY:
         await message.answer("⚠️ Голосовые не настроены. Напиши текстом.")
         return
@@ -73,6 +76,8 @@ async def general_voice(message: Message, bot: Bot):
 
 @router.message(StateFilter(None), F.text, ~F.text.startswith("/"))
 async def general_text(message: Message):
+    if not _is_owner(message.from_user.id):
+        return
     thinking = await message.answer("⏳")
     bots = await get_all_bots()
     try:

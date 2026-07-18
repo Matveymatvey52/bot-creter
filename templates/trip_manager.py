@@ -1,6 +1,7 @@
 # TEMPLATE: trip_manager
 # USE FOR: travel routes, trip planning, маршруты, путешествия, поездки
 # CUSTOMIZE: sections marked with # CUSTOMIZE
+from __future__ import annotations
 
 import asyncio
 import calendar
