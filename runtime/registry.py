@@ -89,13 +89,11 @@ def get_template_router(template_id: str) -> Router | None:
 
 
 class ConfigMiddleware(BaseMiddleware):
-    """Injects this bot's config dict into every handler's `data`, under data["config"].
-
-    NOTE: this is plumbing, not yet consumption — see STAGE2_REPORT.md. The
-    accountant template's handlers still read module-level constants (DB_PATH,
-    ADMINS_FILE) rather than data["config"]; wiring the template itself to use
-    the injected config is separate follow-up work.
-    """
+    """Generic fallback: injects the raw bot-metadata dict into data["config"] for
+    templates that don't have their own typed config yet (everything except
+    "accountant" — see _TEMPLATE_MIDDLEWARE_BUILDERS below for accountant's own
+    typed AccountantConfig + middleware, defined in templates/accountant.py
+    itself per Stage 2 Phase 2 — see docs/STAGE2_DESIGN.md)."""
 
     def __init__(self, config: dict[str, Any]) -> None:
         self.config = config
@@ -109,6 +107,26 @@ class ConfigMiddleware(BaseMiddleware):
     ) -> Any:
         data["config"] = self.config
         return await handler(event, data)
+
+
+def _build_accountant_middleware(bot_row: dict[str, Any]) -> BaseMiddleware:
+    # Lazy imports: keep importing runtime.registry side-effect-free unless a bot
+    # actually needs this template, and keep the canonical DATA_DIR resolution
+    # (config.py) as the single source of truth passed INTO the template rather
+    # than re-derived inside it — see docs/STAGE2_DESIGN.md "Проверка идентичности
+    # формул путей" for why that distinction matters.
+    from templates import accountant as accountant_template
+    from config import DATA_DIR
+
+    acc_config = accountant_template.config_from_bot_row(bot_row, DATA_DIR)
+    return accountant_template.ConfigMiddleware(acc_config)
+
+
+# template_id -> builder(bot_row) -> BaseMiddleware. Templates not listed here
+# fall back to the generic ConfigMiddleware above (raw dict, not yet consumed).
+_TEMPLATE_MIDDLEWARE_BUILDERS: dict[str, Callable[[dict[str, Any]], BaseMiddleware]] = {
+    "accountant": _build_accountant_middleware,
+}
 
 
 @dataclass
@@ -132,7 +150,10 @@ def build_entry(
 
     bot = Bot(token=token)
     dp = Dispatcher(storage=MemoryStorage())
-    dp.update.outer_middleware(ConfigMiddleware(config))
+
+    middleware_builder = _TEMPLATE_MIDDLEWARE_BUILDERS.get(template_id) if template_id else None
+    middleware = middleware_builder(config) if middleware_builder else ConfigMiddleware(config)
+    dp.update.outer_middleware(middleware)
 
     router = get_template_router(template_id) if template_id else None
     if router is not None:

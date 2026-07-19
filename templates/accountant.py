@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+from dataclasses import dataclass
 from datetime import datetime, date, timedelta
 from pathlib import Path
 
@@ -15,7 +16,7 @@ import aiohttp
 import aiosqlite
 from dotenv import load_dotenv
 load_dotenv()
-from aiogram import Bot, Dispatcher, F, Router
+from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -28,6 +29,9 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 
 # ── CUSTOMIZE ────────────────────────────────────────────────────────────────
+# NOTE (Stage 2 Phase 2): this section is still per-file source-text customization
+# that Claude edits when generating a specific bot, not a per-bot runtime config —
+# see docs/STAGE2_DESIGN.md "# CUSTOMIZE-контент" for why and the planned follow-up.
 BOT_DESCRIPTION = "Учёт доходов и расходов по проектам. Категории, баланс, отчёты, Excel-выгрузка."
 WELCOME_TEXT = (
     "💼 <b>Финансовый учёт</b>\n\n"
@@ -46,14 +50,6 @@ INCOME_CATEGORIES = [
 ]
 # ── END CUSTOMIZE ─────────────────────────────────────────────────────────────
 
-BOT_NAME = Path(__file__).stem
-DATA_DIR = Path(os.getenv("DATA_DIR", "./data"))
-DATA_DIR.mkdir(exist_ok=True)
-DB_PATH = str(DATA_DIR / f"{BOT_NAME}_data.db")
-EXCEL_PATH = str(DATA_DIR / f"{BOT_NAME}_data.xlsx")
-HTML_PATH = str(DATA_DIR / f"{BOT_NAME}_report.html")
-WELCOME_IMAGE = DATA_DIR / "bot_images" / f"{BOT_NAME}.jpg"
-ADMINS_FILE = DATA_DIR / f"admins_{BOT_NAME}.json"
 TELEGRAPH_API = "https://api.telegra.ph"
 
 logging.basicConfig(level=logging.INFO)
@@ -61,22 +57,92 @@ logger = logging.getLogger(__name__)
 router = Router()
 
 
+# ── config (Stage 2 Phase 2) ────────────────────────────────────────────────────
+# See docs/STAGE2_DESIGN.md — "Config-контракт шаблона accountant" for the full
+# rationale. Everything that differs bot-to-bot (DB/admins/export paths, derived
+# from the bot's own name) lives here instead of module-level constants, so this
+# ONE file can serve multiple bots at once under the webhook runtime without them
+# colliding on the same SQLite file / admins JSON.
+
+@dataclass
+class AccountantConfig:
+    bot_name: str
+    db_path: str
+    admins_file: Path
+    excel_path: str
+    html_path: str
+    welcome_image: Path
+    display_name: str | None = None
+    group_chat_id: str | None = None
+
+
+def _paths_for(name: str, data_dir: Path) -> AccountantConfig:
+    return AccountantConfig(
+        bot_name=name,
+        db_path=str(data_dir / f"{name}_data.db"),
+        admins_file=data_dir / f"admins_{name}.json",
+        excel_path=str(data_dir / f"{name}_data.xlsx"),
+        html_path=str(data_dir / f"{name}_report.html"),
+        welcome_image=data_dir / "bot_images" / f"{name}.jpg",
+    )
+
+
+def config_from_env() -> AccountantConfig:
+    """Standalone/subprocess mode: reproduces exactly what the old module-level
+    constants gave (name from the running file's own filename, DATA_DIR from env
+    with the same relative fallback as before) — behavior is unchanged 1:1."""
+    name = Path(__file__).stem
+    data_dir = Path(os.getenv("DATA_DIR", "./data"))
+    data_dir.mkdir(exist_ok=True)
+    return _paths_for(name, data_dir)
+
+
+def config_from_bot_row(bot_row: dict, data_dir: Path) -> AccountantConfig:
+    """Webhook runtime mode. `data_dir` MUST be supplied by the caller (the
+    canonical config.DATA_DIR from the factory) rather than re-resolved from env
+    here — see docs/STAGE2_DESIGN.md "Проверка идентичности формул путей" for why
+    an independent os.getenv("DATA_DIR", "./data") here would risk silently
+    diverging from the subprocess model's paths if the process cwd ever differs.
+
+    Uses the bot's own DB `name` (not this template file's name) so a bot that
+    already has data from a previous subprocess run is found, not orphaned.
+    """
+    config = _paths_for(bot_row["name"], data_dir)
+    config.display_name = bot_row.get("display_name")
+    config.group_chat_id = bot_row.get("group_chat_id")
+    return config
+
+
+class ConfigMiddleware(BaseMiddleware):
+    """Injects this bot's AccountantConfig into every handler's `data["config"]`.
+    Defined here (not imported from runtime/) so this file stays self-contained —
+    same invariant as every other templates/*.py: no project-internal imports."""
+
+    def __init__(self, config: AccountantConfig) -> None:
+        self.config = config
+        super().__init__()
+
+    async def __call__(self, handler, event, data):
+        data["config"] = self.config
+        return await handler(event, data)
+
+
 # ── admin helpers ─────────────────────────────────────────────────────────────
 
-def _load_admins() -> set:
+def _load_admins(admins_file: Path) -> set:
     try:
-        return set(json.loads(ADMINS_FILE.read_text()).get("ids", []))
+        return set(json.loads(admins_file.read_text()).get("ids", []))
     except Exception:
         return set()
 
-def _save_admins(ids: set) -> None:
-    ADMINS_FILE.write_text(json.dumps({"ids": list(ids)}, ensure_ascii=False))
+def _save_admins(admins_file: Path, ids: set) -> None:
+    admins_file.write_text(json.dumps({"ids": list(ids)}, ensure_ascii=False))
 
 
 # ── db ────────────────────────────────────────────────────────────────────────
 
-async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
+async def init_db(db_path: str):
+    async with aiosqlite.connect(db_path) as db:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS projects (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -116,14 +182,14 @@ async def init_db():
 
 # ── project helpers ───────────────────────────────────────────────────────────
 
-async def _all_projects() -> list[dict]:
-    async with aiosqlite.connect(DB_PATH) as db:
+async def _all_projects(db_path: str) -> list[dict]:
+    async with aiosqlite.connect(db_path) as db:
         db.row_factory = aiosqlite.Row
         rows = await (await db.execute("SELECT * FROM projects ORDER BY id DESC")).fetchall()
         return [dict(r) for r in rows]
 
-async def _get_active_project(user_id: str) -> dict | None:
-    async with aiosqlite.connect(DB_PATH) as db:
+async def _get_active_project(db_path: str, user_id: str) -> dict | None:
+    async with aiosqlite.connect(db_path) as db:
         db.row_factory = aiosqlite.Row
         row = await (await db.execute(
             "SELECT p.* FROM user_prefs u JOIN projects p ON u.active_project_id=p.id WHERE u.user_id=?",
@@ -134,8 +200,8 @@ async def _get_active_project(user_id: str) -> dict | None:
         row = await (await db.execute("SELECT * FROM projects ORDER BY id DESC LIMIT 1")).fetchone()
         return dict(row) if row else None
 
-async def _set_active_project(user_id: str, project_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
+async def _set_active_project(db_path: str, user_id: str, project_id: int):
+    async with aiosqlite.connect(db_path) as db:
         await db.execute(
             "INSERT OR REPLACE INTO user_prefs (user_id, active_project_id) VALUES (?,?)",
             (user_id, project_id)
@@ -196,12 +262,12 @@ class ProjectCreate(StatesGroup):
 # ── /start ────────────────────────────────────────────────────────────────────
 
 @router.message(Command("start"))
-async def cmd_start(message: Message):
-    admins = _load_admins()
+async def cmd_start(message: Message, config: AccountantConfig):
+    admins = _load_admins(config.admins_file)
     if not admins:
-        _save_admins({str(message.from_user.id)})
-    if WELCOME_IMAGE.exists():
-        await message.answer_photo(FSInputFile(str(WELCOME_IMAGE)),
+        _save_admins(config.admins_file, {str(message.from_user.id)})
+    if config.welcome_image.exists():
+        await message.answer_photo(FSInputFile(str(config.welcome_image)),
                                    caption=WELCOME_TEXT, parse_mode="HTML", reply_markup=kb_main())
     else:
         await message.answer(WELCOME_TEXT, parse_mode="HTML", reply_markup=kb_main())
@@ -210,9 +276,9 @@ async def cmd_start(message: Message):
 # ── PROJECTS PANEL ────────────────────────────────────────────────────────────
 
 @router.message(F.text == "📁 Проекты")
-async def projects_panel(msg: Message, state: FSMContext):
+async def projects_panel(msg: Message, state: FSMContext, config: AccountantConfig):
     await state.clear()
-    projects = await _all_projects()
+    projects = await _all_projects(config.db_path)
     if not projects:
         await msg.answer(
             "У вас ещё нет проектов.\nСоздайте первый!",
@@ -221,7 +287,7 @@ async def projects_panel(msg: Message, state: FSMContext):
             ])
         )
         return
-    active = await _get_active_project(str(msg.from_user.id))
+    active = await _get_active_project(config.db_path, str(msg.from_user.id))
     header = f"📁 <b>Текущий:</b> {active['name']}\n\n" if active else ""
     await msg.answer(
         header + "Выберите проект или создайте новый:",
@@ -240,13 +306,13 @@ async def cb_proj_new(cb: CallbackQuery, state: FSMContext):
     )
 
 @router.message(ProjectCreate.name, F.text, ~F.text.in_(MAIN_BUTTONS))
-async def proj_create_name(msg: Message, state: FSMContext):
+async def proj_create_name(msg: Message, state: FSMContext, config: AccountantConfig):
     name = msg.text.strip()
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(config.db_path) as db:
         cur = await db.execute("INSERT INTO projects (name) VALUES (?)", (name,))
         project_id = cur.lastrowid
         await db.commit()
-    await _set_active_project(str(msg.from_user.id), project_id)
+    await _set_active_project(config.db_path, str(msg.from_user.id), project_id)
     await state.clear()
     await msg.answer(
         f"✅ Создан проект <b>{name}</b>!\n"
@@ -255,14 +321,14 @@ async def proj_create_name(msg: Message, state: FSMContext):
     )
 
 @router.callback_query(F.data.startswith("proj_sel:"))
-async def cb_proj_sel(cb: CallbackQuery):
+async def cb_proj_sel(cb: CallbackQuery, config: AccountantConfig):
     await cb.answer()
     project_id = int(cb.data.split(":")[1])
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(config.db_path) as db:
         row = await (await db.execute("SELECT name FROM projects WHERE id=?", (project_id,))).fetchone()
     if not row:
         await cb.message.edit_text("Проект не найден."); return
-    await _set_active_project(str(cb.from_user.id), project_id)
+    await _set_active_project(config.db_path, str(cb.from_user.id), project_id)
     await cb.message.edit_text(f"✅ Активный проект: <b>{row[0]}</b>", parse_mode="HTML")
     await cb.message.answer("Что сделаем?", reply_markup=kb_main())
 
@@ -272,10 +338,10 @@ async def cb_proj_close(cb: CallbackQuery):
     await cb.message.delete()
 
 @router.callback_query(F.data == "proj_list")
-async def cb_proj_list(cb: CallbackQuery):
+async def cb_proj_list(cb: CallbackQuery, config: AccountantConfig):
     await cb.answer()
-    projects = await _all_projects()
-    active = await _get_active_project(str(cb.from_user.id))
+    projects = await _all_projects(config.db_path)
+    active = await _get_active_project(config.db_path, str(cb.from_user.id))
     header = f"📁 <b>Текущий:</b> {active['name']}\n\n" if active else ""
     await cb.message.edit_text(
         header + "Выберите проект:",
@@ -287,9 +353,9 @@ async def cb_proj_list(cb: CallbackQuery):
 # ── ADD INCOME / EXPENSE ──────────────────────────────────────────────────────
 
 @router.message(F.text.in_({"➕ Доход", "➖ Расход"}))
-async def add_start(msg: Message, state: FSMContext):
+async def add_start(msg: Message, state: FSMContext, config: AccountantConfig):
     await state.clear()
-    project = await _get_active_project(str(msg.from_user.id))
+    project = await _get_active_project(config.db_path, str(msg.from_user.id))
     if not project:
         await msg.answer("Сначала создайте проект — нажмите 📁 Проекты.", reply_markup=kb_main()); return
     kind = "income" if "Доход" in msg.text else "expense"
@@ -324,17 +390,17 @@ async def add_amount(msg: Message, state: FSMContext):
     await msg.answer("📝 Комментарий (необязательно):\nОтправьте текст или /skip")
 
 @router.message(AddTx.note, F.text, ~F.text.in_(MAIN_BUTTONS))
-async def add_note(msg: Message, state: FSMContext):
+async def add_note(msg: Message, state: FSMContext, config: AccountantConfig):
     note = None if msg.text.strip() == "/skip" else msg.text.strip()
-    await _save_tx(msg, state, note)
+    await _save_tx(config.db_path, msg, state, note)
 
 @router.message(Command("skip"), AddTx.note)
-async def skip_note(msg: Message, state: FSMContext):
-    await _save_tx(msg, state, None)
+async def skip_note(msg: Message, state: FSMContext, config: AccountantConfig):
+    await _save_tx(config.db_path, msg, state, None)
 
-async def _save_tx(msg: Message, state: FSMContext, note):
+async def _save_tx(db_path: str, msg: Message, state: FSMContext, note):
     data = await state.get_data()
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(db_path) as db:
         await db.execute(
             "INSERT INTO transactions (project_id, kind, amount, category, note) VALUES (?,?,?,?,?)",
             (data["project_id"], data["kind"], data["amount"], data.get("category"), note)
@@ -361,13 +427,13 @@ async def cb_cancel(cb: CallbackQuery, state: FSMContext):
 # ── BALANCE ───────────────────────────────────────────────────────────────────
 
 @router.message(F.text == "💰 Баланс")
-async def show_balance(msg: Message, state: FSMContext):
+async def show_balance(msg: Message, state: FSMContext, config: AccountantConfig):
     await state.clear()
-    project = await _get_active_project(str(msg.from_user.id))
+    project = await _get_active_project(config.db_path, str(msg.from_user.id))
     if not project:
         await msg.answer("Сначала создайте проект — нажмите 📁 Проекты."); return
     pid = project["id"]
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(config.db_path) as db:
         income  = (await (await db.execute(
             "SELECT COALESCE(SUM(amount),0) FROM transactions WHERE project_id=? AND kind='income'", (pid,)
         )).fetchone())[0]
@@ -403,12 +469,12 @@ async def show_balance(msg: Message, state: FSMContext):
 # ── HISTORY ───────────────────────────────────────────────────────────────────
 
 @router.message(F.text == "📋 История")
-async def show_history(msg: Message, state: FSMContext):
+async def show_history(msg: Message, state: FSMContext, config: AccountantConfig):
     await state.clear()
-    project = await _get_active_project(str(msg.from_user.id))
+    project = await _get_active_project(config.db_path, str(msg.from_user.id))
     if not project:
         await msg.answer("Сначала создайте проект — нажмите 📁 Проекты."); return
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(config.db_path) as db:
         db.row_factory = aiosqlite.Row
         rows = await (await db.execute(
             "SELECT * FROM transactions WHERE project_id=? ORDER BY tx_date DESC, id DESC LIMIT 20",
@@ -430,10 +496,10 @@ async def show_history(msg: Message, state: FSMContext):
                      reply_markup=InlineKeyboardMarkup(inline_keyboard=btn_rows))
 
 @router.callback_query(F.data.startswith("tx_view:"))
-async def cb_tx_view(cb: CallbackQuery):
+async def cb_tx_view(cb: CallbackQuery, config: AccountantConfig):
     await cb.answer()
     tx_id = int(cb.data.split(":")[1])
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(config.db_path) as db:
         db.row_factory = aiosqlite.Row
         row = await (await db.execute("SELECT * FROM transactions WHERE id=?", (tx_id,))).fetchone()
     if not row:
@@ -446,10 +512,10 @@ async def cb_tx_view(cb: CallbackQuery):
     await cb.message.answer(text, reply_markup=kb_tx_del(tx_id))
 
 @router.callback_query(F.data.startswith("tx_del:"))
-async def cb_tx_del(cb: CallbackQuery):
+async def cb_tx_del(cb: CallbackQuery, config: AccountantConfig):
     await cb.answer()
     tx_id = int(cb.data.split(":")[1])
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(config.db_path) as db:
         await db.execute("DELETE FROM transactions WHERE id=?", (tx_id,)); await db.commit()
     await cb.message.edit_text("🗑 Операция удалена.")
 
@@ -461,9 +527,9 @@ async def cb_tx_close(cb: CallbackQuery):
 # ── REPORT ────────────────────────────────────────────────────────────────────
 
 @router.message(F.text == "📊 Отчёт")
-async def report_start(msg: Message, state: FSMContext):
+async def report_start(msg: Message, state: FSMContext, config: AccountantConfig):
     await state.clear()
-    project = await _get_active_project(str(msg.from_user.id))
+    project = await _get_active_project(config.db_path, str(msg.from_user.id))
     if not project:
         await msg.answer("Сначала создайте проект — нажмите 📁 Проекты."); return
     await msg.answer(
@@ -473,7 +539,7 @@ async def report_start(msg: Message, state: FSMContext):
     )
 
 @router.callback_query(F.data.startswith("rperiod:"))
-async def cb_period(cb: CallbackQuery):
+async def cb_period(cb: CallbackQuery, config: AccountantConfig):
     await cb.answer()
     period = cb.data.split(":")[1]
     today = date.today()
@@ -487,12 +553,12 @@ async def cb_period(cb: CallbackQuery):
     else:
         d_from = "2000-01-01"; d_to = today.isoformat(); label = "Всё время"
 
-    project = await _get_active_project(str(cb.from_user.id))
+    project = await _get_active_project(config.db_path, str(cb.from_user.id))
     if not project:
         await cb.message.edit_text("Нет активного проекта."); return
     pid = project["id"]
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(config.db_path) as db:
         income = (await (await db.execute(
             "SELECT COALESCE(SUM(amount),0) FROM transactions WHERE project_id=? AND kind='income' AND tx_date BETWEEN ? AND ?",
             (pid, d_from, d_to)
@@ -550,7 +616,7 @@ def _kb_cat_filter(cats: list[str], period: str) -> InlineKeyboardMarkup | None:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 @router.callback_query(F.data.startswith("cat_filter:"))
-async def cb_cat_filter(cb: CallbackQuery):
+async def cb_cat_filter(cb: CallbackQuery, config: AccountantConfig):
     await cb.answer()
     parts = cb.data.split(":", 2)
     period, cat = parts[1], parts[2]
@@ -564,12 +630,12 @@ async def cb_cat_filter(cb: CallbackQuery):
     else:
         d_from = "2000-01-01"; d_to = today.isoformat()
 
-    project = await _get_active_project(str(cb.from_user.id))
+    project = await _get_active_project(config.db_path, str(cb.from_user.id))
     if not project:
         await cb.message.edit_text("Нет активного проекта."); return
     pid = project["id"]
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(config.db_path) as db:
         db.row_factory = aiosqlite.Row
         rows = await (await db.execute(
             "SELECT kind, amount, note, tx_date FROM transactions "
@@ -603,11 +669,11 @@ async def cb_cat_filter(cb: CallbackQuery):
 
 @router.message(F.text == "📥 Excel")
 @router.message(Command("excel"))
-async def cmd_excel(msg: Message, state: FSMContext):
+async def cmd_excel(msg: Message, state: FSMContext, config: AccountantConfig):
     await state.clear()
-    if str(msg.from_user.id) not in _load_admins():
+    if str(msg.from_user.id) not in _load_admins(config.admins_file):
         await msg.answer("⛔ Нет доступа"); return
-    projects = await _all_projects()
+    projects = await _all_projects(config.db_path)
     if not projects:
         await msg.answer("Данных нет."); return
     wb = Workbook()
@@ -623,7 +689,7 @@ async def cmd_excel(msg: Message, state: FSMContext):
     total_font = Font(bold=True)
 
     for project in projects:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with aiosqlite.connect(config.db_path) as db:
             db.row_factory = aiosqlite.Row
             rows = [dict(r) for r in await (await db.execute(
                 "SELECT * FROM transactions WHERE project_id=? ORDER BY tx_date, id",
@@ -658,8 +724,8 @@ async def cmd_excel(msg: Message, state: FSMContext):
             )
         ws.freeze_panes = "A2"; ws.auto_filter.ref = f"A1:F{len(rows) + 1}"
 
-    wb.save(EXCEL_PATH)
-    await msg.answer_document(FSInputFile(EXCEL_PATH),
+    wb.save(config.excel_path)
+    await msg.answer_document(FSInputFile(config.excel_path),
                               caption=f"📊 Финансовая выгрузка ({len(projects)} проектов)")
 
 
@@ -868,16 +934,16 @@ def _build_html(transactions: list, projects: list) -> str:
 
 @router.message(F.text == "🌐 HTML")
 @router.message(Command("html"))
-async def cmd_html_report(msg: Message, state: FSMContext):
+async def cmd_html_report(msg: Message, state: FSMContext, config: AccountantConfig):
     await state.clear()
-    if str(msg.from_user.id) not in _load_admins():
+    if str(msg.from_user.id) not in _load_admins(config.admins_file):
         await msg.answer("⛔ Нет доступа"); return
-    projects = await _all_projects()
+    projects = await _all_projects(config.db_path)
     if not projects:
         await msg.answer("Данных нет."); return
     all_txs: list = []
     for project in projects:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with aiosqlite.connect(config.db_path) as db:
             db.row_factory = aiosqlite.Row
             rows = await (await db.execute(
                 "SELECT * FROM transactions WHERE project_id=? ORDER BY tx_date, id",
@@ -885,29 +951,29 @@ async def cmd_html_report(msg: Message, state: FSMContext):
             )).fetchall()
             all_txs.extend(dict(r) for r in rows)
     html = _build_html(all_txs, projects)
-    Path(HTML_PATH).write_text(html, encoding="utf-8")
+    Path(config.html_path).write_text(html, encoding="utf-8")
     await msg.answer_document(
-        FSInputFile(HTML_PATH),
+        FSInputFile(config.html_path),
         caption="🌐 Открой файл в браузере — фильтры, диаграмма и сортировка внутри"
     )
 
 
 # ── TELEGRAPH ─────────────────────────────────────────────────────────────────
 
-async def _tg_token() -> str:
-    async with aiosqlite.connect(DB_PATH) as db:
+async def _tg_token(db_path: str, bot_name: str) -> str:
+    async with aiosqlite.connect(db_path) as db:
         row = await (await db.execute("SELECT value FROM _meta WHERE key='tg_token'")).fetchone()
     if row: return row[0]
     async with aiohttp.ClientSession() as s:
         async with s.post(f"{TELEGRAPH_API}/createAccount",
-                          data={"short_name": BOT_NAME[:31], "author_name": "AccountantBot"}) as r:
+                          data={"short_name": bot_name[:31], "author_name": "AccountantBot"}) as r:
             token = (await r.json())["result"]["access_token"]
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(db_path) as db:
         await db.execute("INSERT OR REPLACE INTO _meta VALUES ('tg_token',?)", (token,)); await db.commit()
     return token
 
-async def _publish_project(project: dict, rows: list[dict]) -> str:
-    token = await _tg_token()
+async def _publish_project(db_path: str, bot_name: str, project: dict, rows: list[dict]) -> str:
+    token = await _tg_token(db_path, bot_name)
     nodes = [{"tag": "h3", "children": [f"Финансы: {project['name']}"]}]
     for r in rows[:100]:
         sym = "+" if r["kind"] == "income" else "-"
@@ -920,7 +986,7 @@ async def _publish_project(project: dict, rows: list[dict]) -> str:
         f"Доходы: +{total_in:,.0f} ₽  |  Расходы: -{total_exp:,.0f} ₽  |  Баланс: {total_in - total_exp:+,.0f} ₽"
     ]})
     key_path = f"tg_path_{project['id']}"
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(db_path) as db:
         row = await (await db.execute("SELECT value FROM _meta WHERE key=?", (key_path,))).fetchone()
     page_path = row[0] if row else None
     async with aiohttp.ClientSession() as s:
@@ -933,20 +999,20 @@ async def _publish_project(project: dict, rows: list[dict]) -> str:
         })).json())["result"]
     if not page_path:
         page_path = result["path"]
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with aiosqlite.connect(db_path) as db:
             await db.execute("INSERT OR REPLACE INTO _meta VALUES (?,?)", (key_path, page_path))
             await db.commit()
     return f"https://telegra.ph/{page_path}"
 
 @router.message(Command("publish"))
-async def cmd_publish(msg: Message):
-    if str(msg.from_user.id) not in _load_admins():
+async def cmd_publish(msg: Message, config: AccountantConfig):
+    if str(msg.from_user.id) not in _load_admins(config.admins_file):
         await msg.answer("⛔ Нет доступа"); return
-    project = await _get_active_project(str(msg.from_user.id))
+    project = await _get_active_project(config.db_path, str(msg.from_user.id))
     if not project:
         await msg.answer("Нет активного проекта."); return
     status_msg = await msg.answer("⏳ Публикую...")
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(config.db_path) as db:
         db.row_factory = aiosqlite.Row
         rows = [dict(r) for r in await (await db.execute(
             "SELECT * FROM transactions WHERE project_id=? ORDER BY tx_date DESC LIMIT 200",
@@ -954,18 +1020,18 @@ async def cmd_publish(msg: Message):
         )).fetchall()]
     if not rows:
         await status_msg.edit_text("Данных нет."); return
-    url = await _publish_project(project, rows)
+    url = await _publish_project(config.db_path, config.bot_name, project, rows)
     await status_msg.edit_text(
         f"✅ <b>Опубликовано!</b>\n\n🔗 {url}\n\nОбновить: /publish", parse_mode="HTML"
     )
 
 @router.message(Command("weblink"))
-async def cmd_weblink(msg: Message):
-    project = await _get_active_project(str(msg.from_user.id))
+async def cmd_weblink(msg: Message, config: AccountantConfig):
+    project = await _get_active_project(config.db_path, str(msg.from_user.id))
     if not project:
         await msg.answer("Нет активного проекта."); return
     key_path = f"tg_path_{project['id']}"
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(config.db_path) as db:
         row = await (await db.execute("SELECT value FROM _meta WHERE key=?", (key_path,))).fetchone()
     if row:
         url = f"https://telegra.ph/{row[0]}"
@@ -977,36 +1043,38 @@ async def cmd_weblink(msg: Message):
 # ── ADMIN ─────────────────────────────────────────────────────────────────────
 
 @router.message(Command("addadmin"))
-async def cmd_addadmin(msg: Message):
-    if str(msg.from_user.id) not in _load_admins(): await msg.answer("⛔ Нет доступа"); return
+async def cmd_addadmin(msg: Message, config: AccountantConfig):
+    if str(msg.from_user.id) not in _load_admins(config.admins_file): await msg.answer("⛔ Нет доступа"); return
     parts = msg.text.split()
     if len(parts) < 2 or not parts[1].lstrip("-").isdigit(): await msg.answer("Использование: /addadmin <id>"); return
-    ids = _load_admins(); ids.add(parts[1]); _save_admins(ids)
+    ids = _load_admins(config.admins_file); ids.add(parts[1]); _save_admins(config.admins_file, ids)
     await msg.answer(f"✅ <code>{parts[1]}</code> добавлен.", parse_mode="HTML")
 
 @router.message(Command("removeadmin"))
-async def cmd_removeadmin(msg: Message):
-    if str(msg.from_user.id) not in _load_admins(): await msg.answer("⛔ Нет доступа"); return
+async def cmd_removeadmin(msg: Message, config: AccountantConfig):
+    if str(msg.from_user.id) not in _load_admins(config.admins_file): await msg.answer("⛔ Нет доступа"); return
     parts = msg.text.split()
     if len(parts) < 2: await msg.answer("Использование: /removeadmin <id>"); return
-    ids = _load_admins(); ids.discard(parts[1]); _save_admins(ids)
+    ids = _load_admins(config.admins_file); ids.discard(parts[1]); _save_admins(config.admins_file, ids)
     await msg.answer(f"✅ <code>{parts[1]}</code> удалён.", parse_mode="HTML")
 
 @router.message(Command("admins"))
-async def cmd_admins(msg: Message):
-    if str(msg.from_user.id) not in _load_admins(): await msg.answer("⛔ Нет доступа"); return
-    ids = _load_admins()
+async def cmd_admins(msg: Message, config: AccountantConfig):
+    if str(msg.from_user.id) not in _load_admins(config.admins_file): await msg.answer("⛔ Нет доступа"); return
+    ids = _load_admins(config.admins_file)
     await msg.answer("👥 " + ("\n".join(f"• <code>{i}</code>" for i in ids) or "Пусто"), parse_mode="HTML")
 
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 
 async def main():
+    config = config_from_env()
     bot = Bot(token=os.getenv("BOT_TOKEN"))
     dp = Dispatcher(storage=MemoryStorage())
+    dp.update.outer_middleware(ConfigMiddleware(config))
     dp.include_router(router)
     await bot.set_my_description(BOT_DESCRIPTION)
-    await init_db()
+    await init_db(config.db_path)
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
