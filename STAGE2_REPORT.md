@@ -95,7 +95,7 @@ python -m runtime.webhook_setup <bot_id> --base-url https://example.up.railway.a
 ```
 
 ## Что осталось (после Фазы 2)
-1. **Перенос остальных шаблонов на `config`** — `accountant` готов (Фаза 2), паттерн эталонный и повторяемый. Остались: `tour_operator`, `trip_manager`, `manager_secretary`, `booking_beauty`.
+1. **Перенос остальных шаблонов на `config`** — `accountant` (Фаза 2) и `manager_secretary` (Фаза 4) готовы, паттерн эталонный и повторяемый. Остались: `tour_operator`, `trip_manager`, `booking_beauty`.
 1а. **Персональный `# CUSTOMIZE`-контент → данные бота** — отдельная будущая фаза (welcome-текст/категории и т.п. переехать из исходника в БД/JSON), см. TODO в `docs/STAGE2_DESIGN.md`.
 2. ~~Живое обновление реестра~~ — **готово в Фазе 3**, см. ниже.
 3. **Postgres** — отдельная фаза, реестр пока читает SQLite как есть.
@@ -156,7 +156,65 @@ python -m unittest tests.test_registry_reload -v
 python -m unittest discover -s tests -v
 ```
 
-## Что осталось
+## Что осталось (после Фазы 3)
 - Связать `Registry.reload_one`/`reload_all` с реальным `/create` (фабрика будет сама дёргать `add_or_replace` при создании бота) — отдельный шаг, сознательно не делал в этой фазе.
 - Узкое окно гонки с in-flight запросом при удалении/замене бота (см. выше) — принято как есть, не блокер.
 - Всё остальное из «Что осталось» Фазы 2 актуально без изменений.
+
+---
+
+# Stage 2, Фаза 4 — перенос `manager_secretary` на `config` (второй эталон)
+
+## Что готово
+
+`templates/manager_secretary.py` полностью переписан по тому же паттерну, что `accountant.py` (Фаза 2) — `@dataclass ManagerSecretaryConfig(bot_name, db_path, admins_file, welcome_image, display_name, group_chat_id)`, без `excel_path`/`html_path` (у шаблона нет Excel/HTML-экспорта — не копировал лишнее). `config_from_env()` / `config_from_bot_row(bot_row, data_dir)` / `ConfigMiddleware` — идентичная механика, включая ту же защиту от расхождения путей (`data_dir` — обязательный параметр от вызывающего, не резолвится из env внутри шаблона).
+
+**Ключевое отличие от `accountant`, которое отдельно проверялось владельцем перед переводом хендлеров:** в `accountant` поле `display_name` было мёртвым (лежало в конфиге, но нигде не читалось). В `manager_secretary` оно **реально используется** в `handle_group_mention` (ответ на упоминание бота в группе через прямой вызов Anthropic API) — сразу в трёх местах: guard-проверка, детект упоминания в тексте, и **системный промпт Claude** (бот представляется этим именем). Все три переведены на `config.display_name` — проверено ревью построчно, смеси старого/нового не осталось.
+
+Отдельно проверено (по прямому запросу владельца, не «по аналогии»):
+- `group_chat_id` — grep по всему файлу: 0 совпадений, реально не используется.
+- `ANTHROPIC_API_KEY` — общий ключ фабрики из `os.getenv`, не бот-специфичен, никакой утечки нет.
+- Сидирование `FAQS` (`_seed_faqs`) — идёт в `init_db(db_path)`, вызываемую с конкретным `config.db_path` каждого бота — сидируется в файл конкретного бота, не глобально (контент сида одинаковый у всех — тот же принятый `# CUSTOMIZE`-компромисс, что и в Фазе 2, не дыра в изоляции).
+
+`runtime/registry.py`: добавлены `_load_manager_secretary_router()` + `_build_manager_secretary_middleware()`, зарегистрированы в `_TEMPLATE_LOADERS`/`_TEMPLATE_MIDDLEWARE_BUILDERS` рядом с `accountant`, тем же паттерном.
+
+## Тесты (`tests/test_manager_secretary_isolation.py`, новый файл) — 8 тестов
+
+Помимо стандартного набора (изоляция БД/admins/FAQ-сида на двух ботах с одним и тем же `user_id`, standalone-smoke), **главный новый тест по прямому требованию владельца** — не просто «данные в разных файлах», а что перевод `display_name` реально сработал в самом чувствительном месте:
+
+```
+test_group_mention_uses_own_display_name_in_claude_prompt ... ok
+  → бот A (display_name="Ася"), упомянут в своей группе
+  → mock_client.messages.create.call_args.kwargs["system"] содержит "Ася", НЕ содержит "Боря"
+  → бот B (display_name="Боря"), упомянут в своей группе
+  → system-промпт содержит "Боря", НЕ содержит "Ася"
+
+test_group_mention_of_wrong_name_does_not_trigger ... ok
+  → бот A получает текст с упоминанием ИМЕНИ БОТА B ("Боря, привет!")
+  → Anthropic не вызывается вообще (call_count == 0)
+  → доказывает, что сам детект упоминания читает per-bot config, а не
+    общий список известных имён (при такой ошибке этот тест бы упал —
+    в тексте буквально есть имя "Боря")
+```
+
+Мокается `anthropic.AsyncAnthropic` (не `Bot.__call__` — это отдельный клиент, вызывается напрямую внутри хендлера). Ревью отдельно проверило: `from anthropic import AsyncAnthropic as _C` — локальный импорт ВНУТРИ функции при каждом вызове, резолвится через текущий атрибут модуля `anthropic` — `patch("anthropic.AsyncAnthropic", ...)` патчит ровно то, что нужно, без риска мимо.
+
+**Полный прогон: 21/21** (13 из Фаз 1-3 + 8 новых).
+
+## Ревью
+
+`review-orchestrator` — **0 блокеров**. Все контрольные вопросы (три места `display_name` в `handle_group_mention`, корректность мока Anthropic, полнота grep-переноса, валидность теста «чужое имя не триггерит», main.py не задет) — подтверждены построчно.
+
+**🟡 На заметку (не регрессия этой фазы, было так и раньше):** `handle_group_mention` не оборачивает вызов Anthropic в try/except — сетевой сбой уронит хендлер необработанным исключением (диспетчер aiogram процесс не убьёт, но конкретный ответ потеряется). Не вносил это этим диффом, не чинил — вне рамок переноса на `config`.
+
+## Как запускать локально
+```bash
+python -m unittest tests.test_manager_secretary_isolation -v
+
+# всё вместе (Фазы 1-4)
+python -m unittest discover -s tests -v
+```
+
+## Что осталось
+- Перенос оставшихся шаблонов (`tour_operator`, `trip_manager`, `booking_beauty`) на `config` — паттерн проверен уже на двух шаблонах подряд, включая нетривиальный случай с реально используемым `display_name`.
+- Всё остальное из «Что осталось» Фазы 3 актуально без изменений.

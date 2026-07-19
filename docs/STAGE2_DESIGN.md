@@ -137,3 +137,48 @@ async def main():
 ## Как хендлеры/хелперы получают значения
 - Хендлеры aiogram получают `config: AccountantConfig` через инжекцию по имени параметра (аналогично `state: FSMContext`, `bot: Bot`) — механизм уже проверен в Фазе 1.
 - Внутренние хелперы (`_all_projects`, `_get_active_project`, `_set_active_project`, `_save_tx`, `init_db`, `_tg_token`, `_publish_project`, `_load_admins`, `_save_admins`) сейчас замыкаются на модульные `DB_PATH`/`ADMINS_FILE` — переводятся на явный параметр (`db_path: str`, `admins_file: Path`), который им передаёт вызывающий хендлер из своего `config`. Не весь `AccountantConfig` целиком — только то поле, которое реально нужно хелперу (более узкая связанность, легче тестировать).
+
+---
+
+# Фаза 4 — Config-контракт шаблона `manager_secretary` (второй эталон)
+
+Структурно почти идентичен `accountant.py` — тот же паттерн, без изобретения нового.
+
+## Инвентаризация
+
+**Переезжает в `config` (различается от бота к боту):**
+
+| Константа сейчас | Откуда берётся | Где используется |
+|---|---|---|
+| `DB_PATH` | `DATA_DIR / f"{BOT_NAME}_data.db"` | `init_db`, `_seed_faqs`, `kb_faqs`, `cb_faq`, `_save_lead`, `admin_leads`, `cb_lead_status`, `admin_stats`, `cmd_addfaq`, `cmd_listfaq`, `cmd_delfaq`, `handle_group_mention` |
+| `ADMINS_FILE` | `DATA_DIR / f"admins_{BOT_NAME}.json"` | `_load_admins`/`_save_admins` (используются в `cmd_start`, `_save_lead`, `admin_leads`, `admin_stats`, `cmd_addfaq/listfaq/delfaq`, `cmd_addadmin/removeadmin/admins`) |
+| `WELCOME_IMAGE` | `DATA_DIR / "bot_images" / f"{BOT_NAME}.jpg"` | `cmd_start` |
+| `BOT_NAME` (как строка) | `Path(__file__).stem` | нигде за пределами построения путей выше (в отличие от `accountant`, где ещё шёл в Telegraph `short_name`) — просто оставляем поле `bot_name` в конфиге для единообразия с `AccountantConfig`, реально не используется хендлерами |
+
+**Отличие от `accountant` — реально потребляемое поле.** `BOT_DISPLAY_NAME = os.getenv("BOT_DISPLAY_NAME", "").strip()` в `handle_group_mention` (group-упоминания → ответ через Claude) — это ЕДИНСТВЕННОЕ отличие от `accountant`, где `display_name`/`group_chat_id` лежали в конфиге, но не читались нигде. Здесь `display_name` — не мёртвое поле, а активно используется. Маппится напрямую на уже существующее поле `config.display_name` (та же generic-форма, что и в реестре `_config_from_row`) — переносится 1-в-1, без новых полей.
+
+**НЕ переезжает — общее для всех:**
+- `ANTHROPIC_API_KEY` (`os.getenv("ANTHROPIC_API_KEY", "")` в `handle_group_mention`) — общий ключ фабрики, не бот-специфичен, как `TELEGRAPH_API` в `accountant`.
+- `group_chat_id` — как и в `accountant`, поле присутствует в общей форме конфига, но самим шаблоном не читается (нет логики, завязанной на конкретный group id).
+
+**`# CUSTOMIZE`-контент (тот же TODO, что в `accountant`):** `BOT_DESCRIPTION`, `WELCOME_TEXT`, `ADMIN_NEW_LEAD`, `FAQS` (используется для сида таблицы `faqs` при первой инициализации БД конкретного бота) — остаются модульными константами, тот же принятый на Фазе 2 компромисс.
+
+## Проверка идентичности формул путей
+Тот же аргумент, что и для `accountant` (см. выше): `bot_name` в `handlers/create_bot.py` — одна переменная и для имени файла, и для `bots.name`, расхождения по имени быть не может. `DATA_DIR` — та же поправка: `config_from_bot_row(bot_row, data_dir)` принимает `data_dir` параметром от вызывающего (`runtime/registry.py`, канонический `config.DATA_DIR`), не резолвит `os.getenv("DATA_DIR")` сама — идентично решению для `accountant`.
+
+## Форма `config`
+
+```python
+@dataclass
+class ManagerSecretaryConfig:
+    bot_name: str
+    db_path: str
+    admins_file: Path
+    welcome_image: Path
+    display_name: str | None = None   # реально используется в handle_group_mention
+    group_chat_id: str | None = None  # не используется шаблоном, как и в accountant
+```
+
+Нет `excel_path`/`html_path` — у этого шаблона нет Excel/HTML-экспорта, поля просто не нужны (не копирую лишнее из `AccountantConfig`).
+
+`config_from_env()` / `config_from_bot_row()` / `ConfigMiddleware` — тот же паттерн, что и в `accountant.py`, определены в самом файле шаблона.

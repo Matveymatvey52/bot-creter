@@ -47,10 +47,18 @@ def _load_accountant_router() -> Router:
     return accountant_template.router
 
 
-# template_id -> loader() -> Router. Only "accountant" is wired in Phase 1 (see
-# docs/STAGE2_DESIGN.md / STAGE2_REPORT.md for why the rest are deferred).
+def _load_manager_secretary_router() -> Router:
+    from templates import manager_secretary as manager_secretary_template
+
+    return manager_secretary_template.router
+
+
+# template_id -> loader() -> Router. "accountant" (Phase 2) and
+# "manager_secretary" (Phase 4) are wired so far — see docs/STAGE2_DESIGN.md /
+# STAGE2_REPORT.md for why the rest are deferred.
 _TEMPLATE_LOADERS: dict[str, Callable[[], Router]] = {
     "accountant": _load_accountant_router,
+    "manager_secretary": _load_manager_secretary_router,
 }
 
 _template_router_cache: dict[str, Router] = {}
@@ -123,10 +131,19 @@ def _build_accountant_middleware(bot_row: dict[str, Any]) -> BaseMiddleware:
     return accountant_template.ConfigMiddleware(acc_config)
 
 
+def _build_manager_secretary_middleware(bot_row: dict[str, Any]) -> BaseMiddleware:
+    from templates import manager_secretary as manager_secretary_template
+    from config import DATA_DIR
+
+    ms_config = manager_secretary_template.config_from_bot_row(bot_row, DATA_DIR)
+    return manager_secretary_template.ConfigMiddleware(ms_config)
+
+
 # template_id -> builder(bot_row) -> BaseMiddleware. Templates not listed here
 # fall back to the generic ConfigMiddleware above (raw dict, not yet consumed).
 _TEMPLATE_MIDDLEWARE_BUILDERS: dict[str, Callable[[dict[str, Any]], BaseMiddleware]] = {
     "accountant": _build_accountant_middleware,
+    "manager_secretary": _build_manager_secretary_middleware,
 }
 
 
