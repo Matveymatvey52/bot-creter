@@ -14,11 +14,11 @@ import os
 
 from aiohttp import web
 
-from runtime.registry import BotEntry, build_registry
+from runtime.registry import BotEntry, Registry, build_registry
 
 logger = logging.getLogger(__name__)
 
-REGISTRY_KEY = web.AppKey("registry", dict)
+REGISTRY_KEY = web.AppKey("registry", Registry)
 
 
 async def health(request: web.Request) -> web.Response:
@@ -41,7 +41,7 @@ async def webhook_handler(request: web.Request) -> web.Response:
         if not hmac.compare_digest(header, secret):
             return web.json_response({"error": "forbidden"}, status=403)
 
-    registry: dict[int, BotEntry] = request.app[REGISTRY_KEY]
+    registry: Registry = request.app[REGISTRY_KEY]
     entry = registry.get(bot_id)
     if entry is None:
         return web.json_response({"error": "unknown bot"}, status=404)
@@ -54,13 +54,51 @@ async def webhook_handler(request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
-def create_app(registry: dict[int, BotEntry] | None = None) -> web.Application:
+def _admin_secret_ok(request: web.Request) -> bool:
+    """Fail-CLOSED — deliberately the opposite trade-off from webhook_handler's
+    public endpoint. This is an internal control surface (force-rebuild any
+    bot's Dispatcher from the DB); an unset WEBHOOK_SECRET must deny access
+    here, not silently skip the check."""
+    secret = os.getenv("WEBHOOK_SECRET", "")
+    if not secret:
+        return False
+    header = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    return hmac.compare_digest(header, secret)
+
+
+async def admin_reload_one(request: web.Request) -> web.Response:
+    if not _admin_secret_ok(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    bot_id_raw = request.match_info.get("bot_id", "")
+    if not bot_id_raw.isdigit():
+        return web.json_response({"error": "bad bot_id"}, status=404)
+    bot_id = int(bot_id_raw)
+
+    registry: Registry = request.app[REGISTRY_KEY]
+    entry = await registry.reload_one(bot_id)
+    logger.info(f"admin_reload_one: bot_id={bot_id} found={entry is not None}")
+    return web.json_response({"bot_id": bot_id, "found": entry is not None})
+
+
+async def admin_reload_all(request: web.Request) -> web.Response:
+    if not _admin_secret_ok(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+
+    registry: Registry = request.app[REGISTRY_KEY]
+    await registry.reload_all()
+    logger.info(f"admin_reload_all: {len(registry)} bot(s) in registry")
+    return web.json_response({"count": len(registry)})
+
+
+def create_app(registry: Registry | None = None) -> web.Application:
     """Build the aiohttp Application. `registry` can be pre-populated (used by tests);
     otherwise it's built from the DB when the app starts (see _bootstrap_app)."""
     app = web.Application()
-    app[REGISTRY_KEY] = registry if registry is not None else {}
+    app[REGISTRY_KEY] = registry if registry is not None else Registry()
     app.router.add_post("/webhook/{bot_id}", webhook_handler)
     app.router.add_get("/health", health)
+    app.router.add_post("/admin/reload/{bot_id}", admin_reload_one)
+    app.router.add_post("/admin/reload-all", admin_reload_all)
     return app
 
 
