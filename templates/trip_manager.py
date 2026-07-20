@@ -9,12 +9,13 @@ import json
 import logging
 import os
 import re
+from dataclasses import dataclass
 from datetime import datetime, date, timedelta
 from pathlib import Path
 
 import aiohttp
 import aiosqlite
-from aiogram import Bot, Dispatcher, F, Router
+from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -37,13 +38,6 @@ WELCOME_TEXT = (
 )
 # ── END CUSTOMIZE ─────────────────────────────────────────────────────────────
 
-BOT_NAME = Path(__file__).stem
-DATA_DIR = Path(os.getenv("DATA_DIR", "./data"))
-DATA_DIR.mkdir(exist_ok=True)
-DB_PATH = str(DATA_DIR / f"{BOT_NAME}_data.db")
-EXCEL_PATH = str(DATA_DIR / f"{BOT_NAME}_data.xlsx")
-WELCOME_IMAGE = DATA_DIR / "bot_images" / f"{BOT_NAME}.jpg"
-ADMINS_FILE = DATA_DIR / f"admins_{BOT_NAME}.json"
 TELEGRAPH_API = "https://api.telegra.ph"
 
 logging.basicConfig(level=logging.INFO)
@@ -76,22 +70,88 @@ EDIT_FIELD_LABELS = {
 }
 
 
+# ── config (Stage 2 Phase 6) ────────────────────────────────────────────────────
+# Same pattern as templates/accountant.py (Phase 2), manager_secretary.py (Phase 4)
+# and booking_beauty.py (Phase 5) — see docs/STAGE2_DESIGN.md "Config-контракт
+# шаблона trip_manager". display_name IS real here (handle_group_mention), same
+# class of usage as manager_secretary's; group_chat_id stays decorative
+# (verified: no matches). Note: cmd_digest/_send_digest/_digest_loop are moved
+# onto config below too, but _digest_loop is only started from main() (standalone
+# mode) — the webhook runtime (runtime/registry.py) deliberately does NOT start
+# it yet, see docs/STAGE2_DESIGN.md "Стоп: _digest_loop() не ложится на паттерн".
+
+@dataclass
+class TripManagerConfig:
+    bot_name: str
+    db_path: str
+    admins_file: Path
+    excel_path: str
+    welcome_image: Path
+    display_name: str | None = None
+    group_chat_id: str | None = None  # not read by this template (verified: no matches)
+
+
+def _paths_for(name: str, data_dir: Path) -> TripManagerConfig:
+    return TripManagerConfig(
+        bot_name=name,
+        db_path=str(data_dir / f"{name}_data.db"),
+        admins_file=data_dir / f"admins_{name}.json",
+        excel_path=str(data_dir / f"{name}_data.xlsx"),
+        welcome_image=data_dir / "bot_images" / f"{name}.jpg",
+    )
+
+
+def config_from_env() -> TripManagerConfig:
+    """Standalone/subprocess mode: reproduces exactly what the old module-level
+    constants gave, behavior unchanged 1:1."""
+    name = Path(__file__).stem
+    data_dir = Path(os.getenv("DATA_DIR", "./data"))
+    data_dir.mkdir(exist_ok=True)
+    config = _paths_for(name, data_dir)
+    config.display_name = os.getenv("BOT_DISPLAY_NAME", "").strip() or None
+    return config
+
+
+def config_from_bot_row(bot_row: dict, data_dir: Path) -> TripManagerConfig:
+    """Webhook runtime mode. `data_dir` is a required caller-supplied param —
+    same reasoning as accountant.py's config_from_bot_row (don't re-resolve
+    DATA_DIR from env here, avoid diverging from the factory's canonical path)."""
+    config = _paths_for(bot_row["name"], data_dir)
+    config.display_name = bot_row.get("display_name")
+    config.group_chat_id = bot_row.get("group_chat_id")
+    return config
+
+
+class ConfigMiddleware(BaseMiddleware):
+    """Injects this bot's TripManagerConfig into every handler's `data["config"]`.
+    Defined here (not imported from runtime/) so this file stays self-contained —
+    same invariant as every other templates/*.py: no project-internal imports."""
+
+    def __init__(self, config: TripManagerConfig) -> None:
+        self.config = config
+        super().__init__()
+
+    async def __call__(self, handler, event, data):
+        data["config"] = self.config
+        return await handler(event, data)
+
+
 # ── admin helpers ─────────────────────────────────────────────────────────────
 
-def _load_admins() -> set:
+def _load_admins(admins_file: Path) -> set:
     try:
-        return set(json.loads(ADMINS_FILE.read_text()).get("ids", []))
+        return set(json.loads(admins_file.read_text()).get("ids", []))
     except Exception:
         return set()
 
-def _save_admins(ids: set) -> None:
-    ADMINS_FILE.write_text(json.dumps({"ids": list(ids)}, ensure_ascii=False))
+def _save_admins(admins_file: Path, ids: set) -> None:
+    admins_file.write_text(json.dumps({"ids": list(ids)}, ensure_ascii=False))
 
 
 # ── db ────────────────────────────────────────────────────────────────────────
 
-async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
+async def init_db(db_path: str):
+    async with aiosqlite.connect(db_path) as db:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS trips (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -146,14 +206,14 @@ async def init_db():
 
 # ── trip helpers ──────────────────────────────────────────────────────────────
 
-async def _all_trips() -> list:
-    async with aiosqlite.connect(DB_PATH) as db:
+async def _all_trips(db_path: str) -> list:
+    async with aiosqlite.connect(db_path) as db:
         db.row_factory = aiosqlite.Row
         rows = await (await db.execute("SELECT * FROM trips ORDER BY id DESC")).fetchall()
         return [dict(r) for r in rows]
 
-async def _get_active_trip(user_id: str) -> dict | None:
-    async with aiosqlite.connect(DB_PATH) as db:
+async def _get_active_trip(db_path: str, user_id: str) -> dict | None:
+    async with aiosqlite.connect(db_path) as db:
         db.row_factory = aiosqlite.Row
         row = await (await db.execute(
             "SELECT t.* FROM user_prefs p JOIN trips t ON p.active_trip_id=t.id WHERE p.user_id=?",
@@ -164,8 +224,8 @@ async def _get_active_trip(user_id: str) -> dict | None:
         row = await (await db.execute("SELECT * FROM trips ORDER BY id DESC LIMIT 1")).fetchone()
         return dict(row) if row else None
 
-async def _set_active_trip(user_id: str, trip_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
+async def _set_active_trip(db_path: str, user_id: str, trip_id: int):
+    async with aiosqlite.connect(db_path) as db:
         await db.execute(
             "INSERT INTO user_prefs (user_id, active_trip_id) VALUES (?,?) "
             "ON CONFLICT(user_id) DO UPDATE SET active_trip_id=excluded.active_trip_id",
@@ -173,8 +233,8 @@ async def _set_active_trip(user_id: str, trip_id: int):
         )
         await db.commit()
 
-async def _trip_items(trip_id: int, status=None) -> list:
-    async with aiosqlite.connect(DB_PATH) as db:
+async def _trip_items(db_path: str, trip_id: int, status=None) -> list:
+    async with aiosqlite.connect(db_path) as db:
         db.row_factory = aiosqlite.Row
         if status:
             cur = await db.execute(
@@ -341,26 +401,26 @@ _STEP_MAP = {s[0]: i for i, s in enumerate(_STEPS)}
 # ── /start ────────────────────────────────────────────────────────────────────
 
 @router.message(Command("start"))
-async def cmd_start(message: Message, state: FSMContext):
+async def cmd_start(message: Message, state: FSMContext, config: TripManagerConfig):
     await state.clear()
-    admins = _load_admins()
+    admins = _load_admins(config.admins_file)
     if not admins:
-        _save_admins({str(message.from_user.id)})
-    if WELCOME_IMAGE.exists():
-        await message.answer_photo(FSInputFile(str(WELCOME_IMAGE)),
+        _save_admins(config.admins_file, {str(message.from_user.id)})
+    if config.welcome_image.exists():
+        await message.answer_photo(FSInputFile(str(config.welcome_image)),
                                    caption=WELCOME_TEXT, parse_mode="HTML", reply_markup=kb_main())
     else:
         await message.answer(WELCOME_TEXT, parse_mode="HTML", reply_markup=kb_main())
-    if str(message.from_user.id) in _load_admins():
+    if str(message.from_user.id) in _load_admins(config.admins_file):
         await message.answer(
             "🔧 <b>Команды:</b> /publish · /weblink\n"
             "/digest 08:00 — ежедневный дайджест\n"
             "/admins · /addadmin · /removeadmin",
             parse_mode="HTML"
         )
-    trips = await _all_trips()
+    trips = await _all_trips(config.db_path)
     if trips:
-        active = await _get_active_trip(str(message.from_user.id))
+        active = await _get_active_trip(config.db_path, str(message.from_user.id))
         if active:
             await message.answer(
                 f"📍 Активное путешествие: <b>{active['name']}</b> · всего {len(trips)} шт.",
@@ -378,8 +438,8 @@ async def cmd_start(message: Message, state: FSMContext):
 # ── TRIPS PANEL ───────────────────────────────────────────────────────────────
 
 @router.message(F.text == "🗂 Путешествия")
-async def trips_panel(msg: Message):
-    trips = await _all_trips()
+async def trips_panel(msg: Message, config: TripManagerConfig):
+    trips = await _all_trips(config.db_path)
     if not trips:
         await msg.answer(
             "У вас ещё нет путешествий. Создайте первое!",
@@ -388,27 +448,27 @@ async def trips_panel(msg: Message):
             ])
         )
         return
-    active = await _get_active_trip(str(msg.from_user.id))
+    active = await _get_active_trip(config.db_path, str(msg.from_user.id))
     header = f"🗺 <b>Текущее:</b> {active['name']}\n\n" if active else ""
     await msg.answer(header + "Выберите путешествие:", parse_mode="HTML", reply_markup=kb_trips(trips))
 
 @router.callback_query(F.data == "trip_list")
-async def cb_trip_list(cb: CallbackQuery):
+async def cb_trip_list(cb: CallbackQuery, config: TripManagerConfig):
     await cb.answer()
-    trips = await _all_trips()
-    active = await _get_active_trip(str(cb.from_user.id))
+    trips = await _all_trips(config.db_path)
+    active = await _get_active_trip(config.db_path, str(cb.from_user.id))
     header = f"🗺 <b>Текущее:</b> {active['name']}\n\n" if active else ""
     await cb.message.edit_text(header + "Выберите путешествие:", parse_mode="HTML", reply_markup=kb_trips(trips))
 
 @router.callback_query(F.data.startswith("trip_sel:"))
-async def cb_trip_sel(cb: CallbackQuery):
+async def cb_trip_sel(cb: CallbackQuery, config: TripManagerConfig):
     await cb.answer()
     trip_id = int(cb.data.split(":")[1])
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(config.db_path) as db:
         row = await (await db.execute("SELECT name FROM trips WHERE id=?", (trip_id,))).fetchone()
     if not row:
         await cb.message.edit_text("Путешествие не найдено."); return
-    await _set_active_trip(str(cb.from_user.id), trip_id)
+    await _set_active_trip(config.db_path, str(cb.from_user.id), trip_id)
     await cb.message.edit_text(f"✅ Активное путешествие: <b>{row[0]}</b>", parse_mode="HTML")
     await cb.message.answer("Что сделаем?", reply_markup=kb_main())
 
@@ -423,13 +483,13 @@ async def cb_trip_new(cb: CallbackQuery, state: FSMContext):
     )
 
 @router.message(TripCreate.name, F.text)
-async def trip_create_name(msg: Message, state: FSMContext):
+async def trip_create_name(msg: Message, state: FSMContext, config: TripManagerConfig):
     name = msg.text.strip()
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(config.db_path) as db:
         cur = await db.execute("INSERT INTO trips (name) VALUES (?)", (name,))
         trip_id = cur.lastrowid
         await db.commit()
-    await _set_active_trip(str(msg.from_user.id), trip_id)
+    await _set_active_trip(config.db_path, str(msg.from_user.id), trip_id)
     await state.clear()
     await msg.answer(
         f"✅ Создано путешествие <b>{name}</b>!\nДобавляйте пункты — нажмите ➕ Добавить.",
@@ -437,10 +497,10 @@ async def trip_create_name(msg: Message, state: FSMContext):
     )
 
 @router.callback_query(F.data.startswith("trip_del:"))
-async def cb_trip_del(cb: CallbackQuery):
+async def cb_trip_del(cb: CallbackQuery, config: TripManagerConfig):
     await cb.answer()
     trip_id = int(cb.data.split(":")[1])
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(config.db_path) as db:
         cnt = (await (await db.execute("SELECT COUNT(*) FROM items WHERE trip_id=?", (trip_id,))).fetchone())[0]
         row = await (await db.execute("SELECT name FROM trips WHERE id=?", (trip_id,))).fetchone()
     if not row:
@@ -455,10 +515,10 @@ async def cb_trip_del(cb: CallbackQuery):
     )
 
 @router.callback_query(F.data.startswith("trip_del_ok:"))
-async def cb_trip_del_ok(cb: CallbackQuery):
+async def cb_trip_del_ok(cb: CallbackQuery, config: TripManagerConfig):
     await cb.answer()
     trip_id = int(cb.data.split(":")[1])
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(config.db_path) as db:
         row = await (await db.execute("SELECT name FROM trips WHERE id=?", (trip_id,))).fetchone()
         await db.execute("DELETE FROM items WHERE trip_id=?", (trip_id,))
         await db.execute("DELETE FROM trips WHERE id=?", (trip_id,))
@@ -476,8 +536,8 @@ async def cb_trip_close(cb: CallbackQuery):
 # ── ADD FLOW ──────────────────────────────────────────────────────────────────
 
 @router.message(F.text == "➕ Добавить")
-async def add_start(message: Message, state: FSMContext):
-    trip = await _get_active_trip(str(message.from_user.id))
+async def add_start(message: Message, state: FSMContext, config: TripManagerConfig):
+    trip = await _get_active_trip(config.db_path, str(message.from_user.id))
     if not trip:
         await message.answer("Сначала создайте путешествие — 🗂 Путешествия.", reply_markup=kb_main())
         return
@@ -625,14 +685,14 @@ async def add_notes(msg: Message, state: FSMContext, bot: Bot):
     await state.update_data(_qid=sent.message_id)
 
 @router.message(Add.remind, F.text, ~F.text.startswith("/"))
-async def add_remind(msg: Message, state: FSMContext, bot: Bot):
+async def add_remind(msg: Message, state: FSMContext, bot: Bot, config: TripManagerConfig):
     data = await state.get_data()
     await _rm_q_buttons(bot, msg.chat.id, data.get("_qid"))
     await state.update_data(remind_raw=msg.text.strip())
-    await _finalize(msg, state)
+    await _finalize(msg, state, config)
 
 
-async def _finalize(msg: Message, state: FSMContext):
+async def _finalize(msg: Message, state: FSMContext, config: TripManagerConfig):
     data = await state.get_data()
     remind_raw = data.pop("remind_raw", None)
     remind_at = None
@@ -650,7 +710,7 @@ async def _finalize(msg: Message, state: FSMContext):
         except Exception:
             pass
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(config.db_path) as db:
         await db.execute(
             "INSERT INTO items "
             "(trip_id,item_type,title,destination,date_start,time_start,date_end,"
@@ -675,23 +735,23 @@ async def _finalize(msg: Message, state: FSMContext):
     await state.clear()
     await msg.answer("\n".join(lines), parse_mode="HTML", reply_markup=kb_main())
     if remind_at:
-        asyncio.create_task(_remind(msg.bot, msg.chat.id, data.get("title", ""), remind_at))
+        asyncio.create_task(_remind(msg.bot, msg.chat.id, data.get("title", ""), remind_at, config.bot_name))
 
 
-async def _remind(bot: Bot, chat_id: int, title: str, remind_at: str):
+async def _remind(bot: Bot, chat_id: int, title: str, remind_at: str, bot_name: str):
     try:
         delay = (datetime.fromisoformat(remind_at) - datetime.now()).total_seconds()
         if delay > 0:
             await asyncio.sleep(delay)
         await bot.send_message(chat_id, f"⏰ <b>Напоминание:</b> {title}", parse_mode="HTML")
     except Exception as e:
-        logger.error(f"Reminder error: {e}")
+        logger.error(f"[{bot_name}] Reminder error: {e}")
 
 
 # ── SKIP ──────────────────────────────────────────────────────────────────────
 
 @router.callback_query(F.data.startswith("iskip:"))
-async def cb_skip(cb: CallbackQuery, state: FSMContext):
+async def cb_skip(cb: CallbackQuery, state: FSMContext, config: TripManagerConfig):
     await cb.answer()
     step = cb.data.split(":")[1]
     # Remove Skip/Cancel buttons from the skipped message
@@ -700,7 +760,7 @@ async def cb_skip(cb: CallbackQuery, state: FSMContext):
     except Exception:
         pass
     if step == "remind":
-        await _finalize(cb.message, state)
+        await _finalize(cb.message, state, config)
         return
     idx = _STEP_MAP.get(step, -1)
     if idx + 1 < len(_STEPS):
@@ -747,7 +807,7 @@ async def cb_iedit_field(cb: CallbackQuery, state: FSMContext):
     )
 
 @router.message(EditItem.value, F.text)
-async def edit_item_value(msg: Message, state: FSMContext, bot: Bot):
+async def edit_item_value(msg: Message, state: FSMContext, bot: Bot, config: TripManagerConfig):
     data = await state.get_data()
     field = data["edit_field"]
     item_id = data["edit_item_id"]
@@ -789,7 +849,7 @@ async def edit_item_value(msg: Message, state: FSMContext, bot: Bot):
                 pass
             return
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(config.db_path) as db:
         await db.execute(f"UPDATE items SET {field}=? WHERE id=?", (value, item_id))
         await db.commit()
         db.row_factory = aiosqlite.Row
@@ -813,12 +873,12 @@ async def edit_item_value(msg: Message, state: FSMContext, bot: Bot):
 # ── ROUTE VIEW ────────────────────────────────────────────────────────────────
 
 @router.message(F.text == "📋 Маршрут")
-async def show_route(msg: Message):
-    trip = await _get_active_trip(str(msg.from_user.id))
+async def show_route(msg: Message, config: TripManagerConfig):
+    trip = await _get_active_trip(config.db_path, str(msg.from_user.id))
     if not trip:
         await msg.answer("Сначала создайте путешествие — 🗂 Путешествия.", reply_markup=kb_main())
         return
-    items = await _trip_items(trip["id"], "active")
+    items = await _trip_items(config.db_path, trip["id"], "active")
     if not items:
         await msg.answer(
             f"🗺 <b>{trip['name']}</b>\n\nМаршрут пуст. Нажмите ➕ Добавить.",
@@ -879,10 +939,10 @@ async def show_route(msg: Message):
 
 
 @router.callback_query(F.data.startswith("route_days:"))
-async def cb_route_days(cb: CallbackQuery):
+async def cb_route_days(cb: CallbackQuery, config: TripManagerConfig):
     await cb.answer()
     trip_id = int(cb.data.split(":")[1])
-    items = await _trip_items(trip_id, "active")
+    items = await _trip_items(config.db_path, trip_id, "active")
     dates = sorted(set(i["date_start"] for i in items if i.get("date_start")))
     if not dates:
         await cb.message.answer("Нет пунктов с датами.")
@@ -908,11 +968,11 @@ async def cb_route_days(cb: CallbackQuery):
     )
 
 @router.callback_query(F.data.startswith("route_day:"))
-async def cb_route_day(cb: CallbackQuery):
+async def cb_route_day(cb: CallbackQuery, config: TripManagerConfig):
     await cb.answer()
     parts = cb.data.split(":", 2)
     trip_id, day = int(parts[1]), parts[2]
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(config.db_path) as db:
         db.row_factory = aiosqlite.Row
         items = [dict(r) for r in await (await db.execute(
             "SELECT * FROM items WHERE trip_id=? AND date_start=? ORDER BY time_start,id",
@@ -957,12 +1017,12 @@ async def cb_route_day(cb: CallbackQuery):
     )
 
 @router.callback_query(F.data.startswith("route_week:"))
-async def cb_route_week(cb: CallbackQuery):
+async def cb_route_week(cb: CallbackQuery, config: TripManagerConfig):
     await cb.answer()
     trip_id = int(cb.data.split(":")[1])
     today = date.today()
     week_end = today + timedelta(days=7)
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(config.db_path) as db:
         db.row_factory = aiosqlite.Row
         items = [dict(r) for r in await (await db.execute(
             "SELECT * FROM items WHERE trip_id=? AND date_start>=? AND date_start<=? "
@@ -1024,10 +1084,10 @@ async def cb_route_close(cb: CallbackQuery):
 
 
 @router.callback_query(F.data.startswith("iview:"))
-async def cb_view(cb: CallbackQuery):
+async def cb_view(cb: CallbackQuery, config: TripManagerConfig):
     await cb.answer()
     item_id = int(cb.data.split(":")[1])
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(config.db_path) as db:
         db.row_factory = aiosqlite.Row
         row = await (await db.execute("SELECT * FROM items WHERE id=?", (item_id,))).fetchone()
     if not row:
@@ -1042,27 +1102,27 @@ async def cb_del(cb: CallbackQuery):
     await cb.message.edit_reply_markup(reply_markup=kb_confirm_del(int(cb.data.split(":")[1])))
 
 @router.callback_query(F.data.startswith("idel_ok:"))
-async def cb_del_ok(cb: CallbackQuery):
+async def cb_del_ok(cb: CallbackQuery, config: TripManagerConfig):
     await cb.answer()
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(config.db_path) as db:
         await db.execute("DELETE FROM items WHERE id=?", (int(cb.data.split(":")[1]),))
         await db.commit()
     await cb.message.edit_text("🗑 Удалено.")
 
 @router.callback_query(F.data.startswith("idone:"))
-async def cb_done(cb: CallbackQuery):
+async def cb_done(cb: CallbackQuery, config: TripManagerConfig):
     await cb.answer()
     item_id = int(cb.data.split(":")[1])
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(config.db_path) as db:
         await db.execute("UPDATE items SET status='done' WHERE id=?", (item_id,))
         await db.commit()
     await cb.message.edit_text("✅ Отмечено как выполнено!", reply_markup=kb_item(item_id, "done"))
 
 @router.callback_query(F.data.startswith("iundone:"))
-async def cb_undone(cb: CallbackQuery):
+async def cb_undone(cb: CallbackQuery, config: TripManagerConfig):
     await cb.answer()
     item_id = int(cb.data.split(":")[1])
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(config.db_path) as db:
         await db.execute("UPDATE items SET status='active' WHERE id=?", (item_id,))
         await db.commit()
     await cb.message.edit_text("↩️ Возвращено в активные.", reply_markup=kb_item(item_id, "active"))
@@ -1081,11 +1141,11 @@ async def search_start(msg: Message, state: FSMContext):
     await msg.answer("🔍 Введите слово (название, город, номер брони):", reply_markup=ReplyKeyboardRemove())
 
 @router.message(Search.q, F.text)
-async def search_do(msg: Message, state: FSMContext):
+async def search_do(msg: Message, state: FSMContext, config: TripManagerConfig):
     await state.clear()
-    trip = await _get_active_trip(str(msg.from_user.id))
+    trip = await _get_active_trip(config.db_path, str(msg.from_user.id))
     q = f"%{msg.text.strip()}%"
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(config.db_path) as db:
         db.row_factory = aiosqlite.Row
         if trip:
             rows = await (await db.execute(
@@ -1116,32 +1176,33 @@ async def search_do(msg: Message, state: FSMContext):
 # ── STATS ─────────────────────────────────────────────────────────────────────
 
 @router.message(F.text == "📊 Итоги")
-async def show_stats(msg: Message):
-    trips = await _all_trips()
+async def show_stats(msg: Message, config: TripManagerConfig):
+    trips = await _all_trips(config.db_path)
     if not trips:
         await msg.answer("Нет путешествий. Нажмите 🗂 Путешествия чтобы создать.")
         return
     if len(trips) == 1:
-        await _show_trip_stats(msg, trips[0])
+        await _show_trip_stats(msg, trips[0], config.db_path)
         return
     rows = [[InlineKeyboardButton(text=f"🗺 {t['name']}", callback_data=f"stats_trip:{t['id']}")] for t in trips]
     await msg.answer("📊 Выберите путешествие для итогов:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
 
 @router.callback_query(F.data.startswith("stats_trip:"))
-async def cb_stats_trip(cb: CallbackQuery):
+async def cb_stats_trip(cb: CallbackQuery, config: TripManagerConfig):
     await cb.answer()
     trip_id = int(cb.data.split(":")[1])
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(config.db_path) as db:
         db.row_factory = aiosqlite.Row
         row = await (await db.execute("SELECT * FROM trips WHERE id=?", (trip_id,))).fetchone()
     if not row:
         await cb.message.edit_text("Путешествие не найдено.")
         return
     await cb.message.delete()
-    await _show_trip_stats(cb.message, dict(row))
+    await _show_trip_stats(cb.message, dict(row), config.db_path)
 
-async def _show_trip_stats(msg: Message, trip: dict):
-    async with aiosqlite.connect(DB_PATH) as db:
+
+async def _show_trip_stats(msg: Message, trip: dict, db_path: str):
+    async with aiosqlite.connect(db_path) as db:
         total = (await (await db.execute(
             "SELECT COUNT(*) FROM items WHERE trip_id=?", (trip["id"],))).fetchone())[0]
         done  = (await (await db.execute(
@@ -1170,9 +1231,13 @@ async def _show_trip_stats(msg: Message, trip: dict):
 
 
 # ── DAILY DIGEST ──────────────────────────────────────────────────────────────
+# Moved onto config like everything else (Task 3), but the actual background
+# loop is only ever started from main() below (standalone mode) — see
+# docs/STAGE2_DESIGN.md "Стоп: _digest_loop() не ложится на паттерн" for why
+# runtime/registry.py deliberately does not start it for webhook-registered bots.
 
 @router.message(Command("digest"))
-async def cmd_digest(msg: Message):
+async def cmd_digest(msg: Message, config: TripManagerConfig):
     parts = msg.text.split()
     if len(parts) < 2:
         await msg.answer(
@@ -1186,7 +1251,7 @@ async def cmd_digest(msg: Message):
         return
     arg = parts[1].lower()
     user_id = str(msg.from_user.id)
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(config.db_path) as db:
         if arg == "off":
             await db.execute(
                 "INSERT INTO user_prefs (user_id, digest_enabled) VALUES (?,0) "
@@ -1211,11 +1276,11 @@ async def cmd_digest(msg: Message):
         parse_mode="HTML"
     )
 
-async def _send_digest(bot: Bot, user_id: str):
+async def _send_digest(bot: Bot, db_path: str, user_id: str, bot_name: str):
     tomorrow = (date.today() + timedelta(days=1)).isoformat()
-    trip = await _get_active_trip(user_id)
+    trip = await _get_active_trip(db_path, user_id)
     if not trip: return
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(db_path) as db:
         db.row_factory = aiosqlite.Row
         rows = await (await db.execute(
             "SELECT * FROM items WHERE trip_id=? AND date_start=? AND status='active' ORDER BY time_start,id",
@@ -1233,15 +1298,15 @@ async def _send_digest(bot: Bot, user_id: str):
     try:
         await bot.send_message(int(user_id), "\n".join(lines), parse_mode="HTML")
     except Exception as e:
-        logger.error(f"Digest send error for {user_id}: {e}")
+        logger.error(f"[{bot_name}] Digest send error for {user_id}: {e}")
 
-async def _digest_loop(bot: Bot):
+async def _digest_loop(bot: Bot, db_path: str, bot_name: str):
     sent_keys: set = set()
     while True:
         try:
             now = datetime.now()
             today_str = now.date().isoformat()
-            async with aiosqlite.connect(DB_PATH) as db:
+            async with aiosqlite.connect(db_path) as db:
                 rows = await (await db.execute(
                     "SELECT user_id, digest_time FROM user_prefs "
                     "WHERE digest_enabled=1 AND digest_time IS NOT NULL"
@@ -1255,28 +1320,28 @@ async def _digest_loop(bot: Bot):
                 if key in sent_keys: continue
                 target = now.replace(hour=h, minute=m, second=0, microsecond=0)
                 if now >= target and (now - target).total_seconds() < 120:
-                    await _send_digest(bot, user_id)
+                    await _send_digest(bot, db_path, user_id, bot_name)
                     sent_keys.add(key)
             sent_keys = {k for k in sent_keys if today_str in k}
         except Exception as e:
-            logger.error(f"Digest loop error: {e}")
+            logger.error(f"[{bot_name}] Digest loop error: {e}")
         await asyncio.sleep(60)
 
 
 # ── EXCEL ─────────────────────────────────────────────────────────────────────
 
-def _is_admin(user_id: str) -> bool:
-    admins = _load_admins()
+def _is_admin(user_id: str, admins_file: Path) -> bool:
+    admins = _load_admins(admins_file)
     if not admins:
-        _save_admins({user_id})
+        _save_admins(admins_file, {user_id})
         return True
     return user_id in admins
 
 @router.message(Command("excel"))
-async def cmd_excel(msg: Message):
-    if not _is_admin(str(msg.from_user.id)):
+async def cmd_excel(msg: Message, config: TripManagerConfig):
+    if not _is_admin(str(msg.from_user.id), config.admins_file):
         await msg.answer("⛔ Нет доступа"); return
-    trips = await _all_trips()
+    trips = await _all_trips(config.db_path)
     if not trips:
         await msg.answer("Данных нет."); return
     wb = Workbook(); wb.remove(wb.active)
@@ -1291,7 +1356,7 @@ async def cmd_excel(msg: Message):
     total_font = Font(bold=True)
 
     for trip in trips:
-        items = await _trip_items(trip["id"])
+        items = await _trip_items(config.db_path, trip["id"])
         ws = wb.create_sheet(title=trip["name"][:31])
         for c, h in enumerate(hdrs, 1):
             cell = ws.cell(1, c, h)
@@ -1321,22 +1386,22 @@ async def cmd_excel(msg: Message):
         ws.freeze_panes = "A2"
         ws.auto_filter.ref = f"A1:L{len(items) + 1}"
 
-    wb.save(EXCEL_PATH)
-    await msg.answer_document(FSInputFile(EXCEL_PATH),
+    wb.save(config.excel_path)
+    await msg.answer_document(FSInputFile(config.excel_path),
                               caption=f"📊 Таблица маршрутов ({len(trips)} путешествий)")
 
 
 # ── TELEGRAPH ─────────────────────────────────────────────────────────────────
 
-async def _tg_token() -> str:
-    async with aiosqlite.connect(DB_PATH) as db:
+async def _tg_token(db_path: str, bot_name: str) -> str:
+    async with aiosqlite.connect(db_path) as db:
         row = await (await db.execute("SELECT value FROM _meta WHERE key='tg_token'")).fetchone()
     if row: return row[0]
     async with aiohttp.ClientSession() as s:
         async with s.post(f"{TELEGRAPH_API}/createAccount",
-                          data={"short_name": BOT_NAME[:31], "author_name": "TripBot"}) as r:
+                          data={"short_name": bot_name[:31], "author_name": "TripBot"}) as r:
             token = (await r.json())["result"]["access_token"]
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(db_path) as db:
         await db.execute("INSERT OR REPLACE INTO _meta VALUES ('tg_token',?)", (token,))
         await db.commit()
     return token
@@ -1424,11 +1489,11 @@ def _tg_nodes_items(trip_name: str, items: list) -> list:
 
     return nodes
 
-async def _publish_trip(trip: dict, items: list) -> str:
-    token = await _tg_token()
+async def _publish_trip(db_path: str, bot_name: str, trip: dict, items: list) -> str:
+    token = await _tg_token(db_path, bot_name)
     nodes = _tg_nodes_items(trip["name"], items)
     key_path = f"tg_path_{trip['id']}"
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(db_path) as db:
         row = await (await db.execute("SELECT value FROM _meta WHERE key=?", (key_path,))).fetchone()
     page_path = row[0] if row else None
     async with aiohttp.ClientSession() as s:
@@ -1440,36 +1505,36 @@ async def _publish_trip(trip: dict, items: list) -> str:
         })).json())["result"]
     if not page_path:
         page_path = result["path"]
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with aiosqlite.connect(db_path) as db:
             await db.execute("INSERT OR REPLACE INTO _meta VALUES (?,?)", (key_path, page_path))
             await db.commit()
     return f"https://telegra.ph/{page_path}"
 
 @router.message(F.text == "📤 Опубликовать")
 @router.message(Command("publish"))
-async def cmd_publish(msg: Message):
-    if not _is_admin(str(msg.from_user.id)):
+async def cmd_publish(msg: Message, config: TripManagerConfig):
+    if not _is_admin(str(msg.from_user.id), config.admins_file):
         await msg.answer("⛔ Нет доступа"); return
-    trip = await _get_active_trip(str(msg.from_user.id))
+    trip = await _get_active_trip(config.db_path, str(msg.from_user.id))
     if not trip:
         await msg.answer("Нет активного путешествия."); return
     status_msg = await msg.answer("⏳ Публикую...")
-    items = await _trip_items(trip["id"])
+    items = await _trip_items(config.db_path, trip["id"])
     if not items:
         await status_msg.edit_text("Данных нет."); return
-    url = await _publish_trip(trip, items)
+    url = await _publish_trip(config.db_path, config.bot_name, trip, items)
     await status_msg.edit_text(
         f"✅ <b>Опубликовано!</b>\n\n🔗 {url}\n\nНажмите «📤 Опубликовать» ещё раз, чтобы обновить.",
         parse_mode="HTML"
     )
 
 @router.message(Command("weblink"))
-async def cmd_weblink(msg: Message):
-    trip = await _get_active_trip(str(msg.from_user.id))
+async def cmd_weblink(msg: Message, config: TripManagerConfig):
+    trip = await _get_active_trip(config.db_path, str(msg.from_user.id))
     if not trip:
         await msg.answer("Нет активного путешествия."); return
     key_path = f"tg_path_{trip['id']}"
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(config.db_path) as db:
         row = await (await db.execute("SELECT value FROM _meta WHERE key=?", (key_path,))).fetchone()
     if row:
         await msg.answer(
@@ -1483,26 +1548,26 @@ async def cmd_weblink(msg: Message):
 # ── ADMIN ─────────────────────────────────────────────────────────────────────
 
 @router.message(Command("addadmin"))
-async def cmd_addadmin(msg: Message):
-    if not _is_admin(str(msg.from_user.id)): await msg.answer("⛔ Нет доступа"); return
+async def cmd_addadmin(msg: Message, config: TripManagerConfig):
+    if not _is_admin(str(msg.from_user.id), config.admins_file): await msg.answer("⛔ Нет доступа"); return
     parts = msg.text.split()
     if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
         await msg.answer("Использование: /addadmin <id>"); return
-    ids = _load_admins(); ids.add(parts[1]); _save_admins(ids)
+    ids = _load_admins(config.admins_file); ids.add(parts[1]); _save_admins(config.admins_file, ids)
     await msg.answer(f"✅ <code>{parts[1]}</code> добавлен.", parse_mode="HTML")
 
 @router.message(Command("removeadmin"))
-async def cmd_removeadmin(msg: Message):
-    if not _is_admin(str(msg.from_user.id)): await msg.answer("⛔ Нет доступа"); return
+async def cmd_removeadmin(msg: Message, config: TripManagerConfig):
+    if not _is_admin(str(msg.from_user.id), config.admins_file): await msg.answer("⛔ Нет доступа"); return
     parts = msg.text.split()
     if len(parts) < 2: await msg.answer("Использование: /removeadmin <id>"); return
-    ids = _load_admins(); ids.discard(parts[1]); _save_admins(ids)
+    ids = _load_admins(config.admins_file); ids.discard(parts[1]); _save_admins(config.admins_file, ids)
     await msg.answer(f"✅ <code>{parts[1]}</code> удалён.", parse_mode="HTML")
 
 @router.message(Command("admins"))
-async def cmd_admins(msg: Message):
-    if not _is_admin(str(msg.from_user.id)): await msg.answer("⛔ Нет доступа"); return
-    ids = _load_admins()
+async def cmd_admins(msg: Message, config: TripManagerConfig):
+    if not _is_admin(str(msg.from_user.id), config.admins_file): await msg.answer("⛔ Нет доступа"); return
+    ids = _load_admins(config.admins_file)
     await msg.answer(
         "👥 " + ("\n".join(f"• <code>{i}</code>" for i in ids) or "Пусто"),
         parse_mode="HTML"
@@ -1511,34 +1576,35 @@ async def cmd_admins(msg: Message):
 
 # ── GROUP SUPPORT ─────────────────────────────────────────────────────────────
 
-BOT_DISPLAY_NAME = os.getenv("BOT_DISPLAY_NAME", "").strip()
-
 @router.message(F.chat.type.in_({"group", "supergroup"}), F.text)
-async def handle_group_mention(msg: Message):
-    if not BOT_DISPLAY_NAME or not msg.text: return
+async def handle_group_mention(msg: Message, config: TripManagerConfig):
+    display_name = config.display_name
+    if not display_name or not msg.text: return
     if msg.from_user and msg.from_user.is_bot: return
-    if BOT_DISPLAY_NAME.lower() not in msg.text.lower(): return
+    if display_name.lower() not in msg.text.lower(): return
     try:
         from anthropic import AsyncAnthropic as _C
         resp = await _C(api_key=os.getenv("ANTHROPIC_API_KEY", "")).messages.create(
             model="claude-haiku-4-5-20251001", max_tokens=300,
-            system=f"Ты — {BOT_DISPLAY_NAME}, менеджер маршрутов. Кратко ответь.",
+            system=f"Ты — {display_name}, менеджер маршрутов. Кратко ответь.",
             messages=[{"role": "user", "content": msg.text}]
         )
         await msg.reply(resp.content[0].text)
     except Exception as e:
-        logger.error(f"Group mention error: {e}")
+        logger.error(f"[{config.bot_name}] Group mention error: {e}")
 
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 
 async def main():
+    config = config_from_env()
     bot = Bot(token=os.getenv("BOT_TOKEN"))
     dp = Dispatcher(storage=MemoryStorage())
+    dp.update.outer_middleware(ConfigMiddleware(config))
     dp.include_router(router)
     await bot.set_my_description(BOT_DESCRIPTION)
-    await init_db()
-    asyncio.create_task(_digest_loop(bot))
+    await init_db(config.db_path)
+    asyncio.create_task(_digest_loop(bot, config.db_path, config.bot_name))
     await dp.start_polling(bot)
 
 if __name__ == "__main__":

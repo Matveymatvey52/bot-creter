@@ -59,13 +59,22 @@ def _load_booking_beauty_router() -> Router:
     return booking_beauty_template.router
 
 
+def _load_trip_manager_router() -> Router:
+    from templates import trip_manager as trip_manager_template
+
+    return trip_manager_template.router
+
+
 # template_id -> loader() -> Router. "accountant" (Phase 2), "manager_secretary"
-# (Phase 4) and "booking_beauty" (Phase 5) are wired so far — see
-# docs/STAGE2_DESIGN.md / STAGE2_REPORT.md for why the rest are deferred.
+# (Phase 4), "booking_beauty" (Phase 5) and "trip_manager" (Phase 6) are wired so
+# far — see docs/STAGE2_DESIGN.md / STAGE2_REPORT.md for why the rest are
+# deferred. Note: trip_manager's _digest_loop() is deliberately NOT started
+# here — see docs/STAGE2_DESIGN.md "Стоп: _digest_loop() не ложится на паттерн".
 _TEMPLATE_LOADERS: dict[str, Callable[[], Router]] = {
     "accountant": _load_accountant_router,
     "manager_secretary": _load_manager_secretary_router,
     "booking_beauty": _load_booking_beauty_router,
+    "trip_manager": _load_trip_manager_router,
 }
 
 _template_router_cache: dict[str, Router] = {}
@@ -154,12 +163,21 @@ def _build_booking_beauty_middleware(bot_row: dict[str, Any]) -> BaseMiddleware:
     return booking_beauty_template.ConfigMiddleware(bb_config)
 
 
+def _build_trip_manager_middleware(bot_row: dict[str, Any]) -> BaseMiddleware:
+    from templates import trip_manager as trip_manager_template
+    from config import DATA_DIR
+
+    tm_config = trip_manager_template.config_from_bot_row(bot_row, DATA_DIR)
+    return trip_manager_template.ConfigMiddleware(tm_config)
+
+
 # template_id -> builder(bot_row) -> BaseMiddleware. Templates not listed here
 # fall back to the generic ConfigMiddleware above (raw dict, not yet consumed).
 _TEMPLATE_MIDDLEWARE_BUILDERS: dict[str, Callable[[dict[str, Any]], BaseMiddleware]] = {
     "accountant": _build_accountant_middleware,
     "manager_secretary": _build_manager_secretary_middleware,
     "booking_beauty": _build_booking_beauty_middleware,
+    "trip_manager": _build_trip_manager_middleware,
 }
 
 
