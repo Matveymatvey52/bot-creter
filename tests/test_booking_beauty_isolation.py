@@ -1,0 +1,241 @@
+"""Stage 2 Phase 5 — data isolation test for the booking_beauty template's
+config переезд (third reference template, after accountant/manager_secretary).
+
+Standard criterion: two bots on the SAME template, different config, must
+never mix data — even driven by the SAME Telegram user_id.
+
+PLUS two checks specific to this template's unique mechanics (requested
+before Task 4):
+- cross-bot slot isolation: bot A booking a (date, time, master) slot must
+  NOT affect bot B's identically-shaped slot in its own file.
+- _ensure_slots() idempotency: calling init_db() twice on the same db_path
+  must not duplicate slot rows or reset existing bookings.
+
+No real Telegram network calls, no real tokens.
+
+Run with: python -m unittest tests.test_booking_beauty_isolation
+"""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
+
+from aiogram import Bot, Dispatcher
+from aiogram.fsm.storage.memory import MemoryStorage
+
+from runtime.registry import get_template_router
+from templates import booking_beauty
+
+FAKE_TOKEN = "123456:test-token-not-real"
+SAME_USER_ID = 111
+
+
+def _text_update(update_id: int, user_id: int, text: str) -> dict:
+    return {
+        "update_id": update_id,
+        "message": {
+            "message_id": update_id,
+            "date": 1700000000,
+            "chat": {"id": user_id, "type": "private"},
+            "from": {"id": user_id, "is_bot": False, "first_name": "Test"},
+            "text": text,
+        },
+    }
+
+
+def _callback_update(update_id: int, user_id: int, data: str) -> dict:
+    return {
+        "update_id": update_id,
+        "callback_query": {
+            "id": str(update_id),
+            "from": {"id": user_id, "is_bot": False, "first_name": "Test"},
+            "message": {
+                "message_id": update_id,
+                "date": 1700000000,
+                "chat": {"id": user_id, "type": "private"},
+                "text": "placeholder",
+            },
+            "chat_instance": "1",
+            "data": data,
+        },
+    }
+
+
+def _build_bot_dispatcher(config: booking_beauty.BookingBeautyConfig) -> tuple[Bot, Dispatcher]:
+    bot = Bot(token=FAKE_TOKEN)
+    dp = Dispatcher(storage=MemoryStorage())
+    dp.update.outer_middleware(booking_beauty.ConfigMiddleware(config))
+    dp.include_router(get_template_router("booking_beauty"))
+    return bot, dp
+
+
+async def _book_full_flow(
+    dp: Dispatcher, bot: Bot, db_path: str, user_id: int,
+    slot_date: str, slot_time: str, master: str,
+    client_name: str, phone: str, start_update_id: int,
+) -> int:
+    """Drives the full booking FSM flow (service -> day -> time -> master ->
+    name -> phone -> confirm) exactly as a real user would, via aiogram
+    updates. Returns the booked slot_id."""
+    uid = start_update_id
+    await dp.feed_webhook_update(bot, _callback_update(uid, user_id, f"book_svc:{booking_beauty.SERVICES[0]}")); uid += 1
+    await dp.feed_webhook_update(bot, _callback_update(uid, user_id, f"book_day:{slot_date}")); uid += 1
+    await dp.feed_webhook_update(bot, _callback_update(uid, user_id, f"book_time:{slot_date}:{slot_time}")); uid += 1
+
+    conn = sqlite3.connect(db_path)
+    slot_id = conn.execute(
+        "SELECT id FROM slots WHERE slot_date=? AND slot_time=? AND master=? AND status='active'",
+        (slot_date, slot_time, master),
+    ).fetchone()[0]
+    conn.close()
+
+    await dp.feed_webhook_update(bot, _callback_update(uid, user_id, f"book_slot:{slot_id}")); uid += 1
+    await dp.feed_webhook_update(bot, _text_update(uid, user_id, client_name)); uid += 1
+    await dp.feed_webhook_update(bot, _text_update(uid, user_id, phone)); uid += 1
+    await dp.feed_webhook_update(bot, _callback_update(uid, user_id, f"book_confirm:{slot_id}")); uid += 1
+    return slot_id
+
+
+class BookingBeautyIsolationTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self._bot_call_patcher = patch.object(Bot, "__call__", new=AsyncMock(return_value=MagicMock()))
+        self._bot_call_patcher.start()
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.data_dir = Path(self._tmp.name)
+
+        self.config_a = booking_beauty.config_from_bot_row(
+            {"name": "bb_isolation_bot_a", "display_name": None, "group_chat_id": None}, self.data_dir
+        )
+        self.config_b = booking_beauty.config_from_bot_row(
+            {"name": "bb_isolation_bot_b", "display_name": None, "group_chat_id": None}, self.data_dir
+        )
+        await booking_beauty.init_db(self.config_a.db_path)
+        await booking_beauty.init_db(self.config_b.db_path)
+
+        self.bot_a, self.dp_a = _build_bot_dispatcher(self.config_a)
+        self.bot_b, self.dp_b = _build_bot_dispatcher(self.config_b)
+
+        # A fixed slot shape both bots definitely have (generated by _ensure_slots).
+        from datetime import date
+        self.slot_date = date.today().isoformat()
+        self.slot_time = booking_beauty.SLOT_TIMES[0]
+        self.master = booking_beauty.MASTERS[0]
+
+    async def asyncTearDown(self):
+        self._tmp.cleanup()
+        self._bot_call_patcher.stop()
+
+    async def test_configs_point_to_different_files(self):
+        self.assertNotEqual(self.config_a.db_path, self.config_b.db_path)
+        self.assertNotEqual(self.config_a.admins_file, self.config_b.admins_file)
+
+    async def test_two_bots_same_user_book_into_separate_db_files(self):
+        await _book_full_flow(
+            self.dp_a, self.bot_a, self.config_a.db_path, SAME_USER_ID,
+            self.slot_date, self.slot_time, self.master, "Alpha Client", "+7 999 111-11-11", 1,
+        )
+        await _book_full_flow(
+            self.dp_b, self.bot_b, self.config_b.db_path, SAME_USER_ID,
+            self.slot_date, self.slot_time, self.master, "Beta Client", "+7 999 222-22-22", 1,
+        )
+
+        conn_a = sqlite3.connect(self.config_a.db_path)
+        names_a = [r[0] for r in conn_a.execute("SELECT client_name FROM bookings").fetchall()]
+        conn_a.close()
+        conn_b = sqlite3.connect(self.config_b.db_path)
+        names_b = [r[0] for r in conn_b.execute("SELECT client_name FROM bookings").fetchall()]
+        conn_b.close()
+
+        self.assertEqual(names_a, ["Alpha Client"])
+        self.assertEqual(names_b, ["Beta Client"])
+
+    async def test_booking_on_bot_a_does_not_affect_bot_b_same_slot_shape(self):
+        """Owner-requested check: bot A books the (date, time, master) slot —
+        bot B's identically-shaped slot in ITS OWN file must remain free."""
+        await _book_full_flow(
+            self.dp_a, self.bot_a, self.config_a.db_path, SAME_USER_ID,
+            self.slot_date, self.slot_time, self.master, "Alpha Client", "+7 999 111-11-11", 1,
+        )
+
+        conn_a = sqlite3.connect(self.config_a.db_path)
+        status_a = conn_a.execute(
+            "SELECT status FROM slots WHERE slot_date=? AND slot_time=? AND master=?",
+            (self.slot_date, self.slot_time, self.master),
+        ).fetchone()[0]
+        conn_a.close()
+
+        conn_b = sqlite3.connect(self.config_b.db_path)
+        status_b = conn_b.execute(
+            "SELECT status FROM slots WHERE slot_date=? AND slot_time=? AND master=?",
+            (self.slot_date, self.slot_time, self.master),
+        ).fetchone()[0]
+        booking_count_b = conn_b.execute("SELECT COUNT(*) FROM bookings").fetchone()[0]
+        conn_b.close()
+
+        self.assertEqual(status_a, "booked")
+        self.assertEqual(status_b, "active")
+        self.assertEqual(booking_count_b, 0)
+
+    async def test_admin_bootstrap_isolated_per_bot(self):
+        await self.dp_a.feed_webhook_update(self.bot_a, _text_update(1, SAME_USER_ID, "/start"))
+        await self.dp_b.feed_webhook_update(self.bot_b, _text_update(1, 999, "/start"))
+
+        admins_a = json.loads(self.config_a.admins_file.read_text())["ids"]
+        admins_b = json.loads(self.config_b.admins_file.read_text())["ids"]
+
+        self.assertEqual(admins_a, [str(SAME_USER_ID)])
+        self.assertEqual(admins_b, ["999"])
+
+    async def test_ensure_slots_is_idempotent_on_repeated_init_db(self):
+        """Owner-requested: repeated init_db() calls must not duplicate slots
+        or reset existing bookings — see booking_beauty.py's _ensure_slots
+        docstring for the mechanism (coarse per-date guard)."""
+        conn = sqlite3.connect(self.config_a.db_path)
+        count_before = conn.execute("SELECT COUNT(*) FROM slots").fetchone()[0]
+        conn.close()
+        self.assertGreater(count_before, 0)
+
+        # Book one slot so we can verify it survives a re-init untouched.
+        slot_id = await _book_full_flow(
+            self.dp_a, self.bot_a, self.config_a.db_path, SAME_USER_ID,
+            self.slot_date, self.slot_time, self.master, "Alpha Client", "+7 999 111-11-11", 1,
+        )
+
+        # Re-run init_db() (as would happen on a registry reload / reconnect).
+        await booking_beauty.init_db(self.config_a.db_path)
+        await booking_beauty.init_db(self.config_a.db_path)
+
+        conn = sqlite3.connect(self.config_a.db_path)
+        count_after = conn.execute("SELECT COUNT(*) FROM slots").fetchone()[0]
+        booking_count = conn.execute("SELECT COUNT(*) FROM bookings").fetchone()[0]
+        booked_status = conn.execute("SELECT status FROM slots WHERE id=?", (slot_id,)).fetchone()[0]
+        conn.close()
+
+        self.assertEqual(count_after, count_before, "repeated init_db() duplicated slot rows")
+        self.assertEqual(booking_count, 1, "repeated init_db() lost the existing booking")
+        self.assertEqual(booked_status, "booked", "repeated init_db() reset a booked slot back to active")
+
+
+class BookingBeautyStandaloneSmokeTest(unittest.TestCase):
+    """Confirms the template still imports and initializes fine outside the
+    webhook runtime — the subprocess model must keep working unmodified."""
+
+    def test_config_from_env_matches_legacy_constant_shape(self):
+        config = booking_beauty.config_from_env()
+        self.assertTrue(config.db_path.endswith("booking_beauty_data.db"))
+        self.assertTrue(str(config.admins_file).endswith("admins_booking_beauty.json"))
+        self.assertEqual(config.bot_name, "booking_beauty")
+
+    def test_router_and_main_entrypoint_exist(self):
+        self.assertTrue(hasattr(booking_beauty, "router"))
+        self.assertTrue(hasattr(booking_beauty, "main"))
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -182,3 +182,52 @@ class ManagerSecretaryConfig:
 Нет `excel_path`/`html_path` — у этого шаблона нет Excel/HTML-экспорта, поля просто не нужны (не копирую лишнее из `AccountantConfig`).
 
 `config_from_env()` / `config_from_bot_row()` / `ConfigMiddleware` — тот же паттерн, что и в `accountant.py`, определены в самом файле шаблона.
+
+---
+
+# Фаза 5 — Config-контракт шаблона `booking_beauty` (третий эталон)
+
+Структурно проще двух предыдущих — никакой уникальной механики за пределами базового паттерна не нашлось.
+
+## Инвентаризация
+
+**Переезжает в `config` (различается от бота к боту):**
+
+| Константа сейчас | Откуда берётся | Где используется |
+|---|---|---|
+| `DB_PATH` | `DATA_DIR / f"{BOT_NAME}_data.db"` | `init_db`, `_ensure_slots`, `kb_times`, `kb_masters_for_time`, `cb_time`, `cb_slot`, `book_phone`, `cb_confirm`, `my_bookings_start`, `cancel_start`, `cb_adm_cancel`, `all_bookings`, `cb_adm_day`, `cb_adm_day_back`, `admin_stats` |
+| `ADMINS_FILE` | `DATA_DIR / f"admins_{BOT_NAME}.json"` | `_load_admins`/`_save_admins` (в `cmd_start`, `cb_confirm` — уведомление админов, `all_bookings`, `admin_stats`, `cmd_addadmin/removeadmin/admins`) |
+| `WELCOME_IMAGE` | `DATA_DIR / "bot_images" / f"{BOT_NAME}.jpg"` | `cmd_start` |
+| `BOT_NAME` | `Path(__file__).stem` | нигде за пределами построения путей — как в `manager_secretary`, не используется хендлерами напрямую |
+
+**Проверено grep'ом по факту (не по аналогии) — в этом шаблоне НЕТ:**
+- `BOT_DISPLAY_NAME`/`display_name`-логики — нет ни одного упоминания, в отличие от `manager_secretary`.
+- `group_chat_id` — 0 совпадений, как и в двух предыдущих.
+- Вызовов внешних API из хендлеров (`anthropic`, `aiohttp`) — этот шаблон ничего не зовёт наружу, проще `manager_secretary`.
+- Фоновых задач/напоминаний (`asyncio.create_task`, планировщиков) — нет.
+- Excel/HTML-экспорта — нет.
+- Веб-части — это НЕ `tour_operator`, чистый однофайловый бот.
+
+**Единственная механика, которой не было в двух предыдущих — `_ensure_slots()`.** При каждом `init_db()` автоматически генерируется скользящее окно слотов (`DAYS_AHEAD=14` дней × `SLOT_TIMES` × `MASTERS`) в таблицу `slots`. Это не требует нового поля конфига — просто ещё один потребитель `db_path`, как и всё остальное; раз `init_db` будет вызываться с `config.db_path` каждого бота отдельно, слоты каждого бота генерируются в его собственный файл, изоляция не нарушается.
+
+**`# CUSTOMIZE`-контент (тот же TODO):** `BOT_DESCRIPTION`, `WELCOME_TEXT`, `OWNER_NOTIFY_TEXT`, `SERVICES`, `MASTERS`, `DAYS_AHEAD`, `SLOT_TIMES`, `SLOT_PRICE` — остаются модульными константами. Обращаю внимание: тут БОЛЬШЕ настраиваемых констант, чем в двух предыдущих (мастера, слоты, цена) — но все они read-only параметры генерации, не runtime-состояние, тот же принятый компромисс.
+
+## Проверка идентичности формул путей
+Тот же аргумент: `bot_name` в `handlers/create_bot.py` — одна переменная для имени файла и `bots.name`. `data_dir` — обязательный параметр `config_from_bot_row(bot_row, data_dir)` от вызывающего, не резолвится из env внутри шаблона.
+
+## Форма `config`
+
+```python
+@dataclass
+class BookingBeautyConfig:
+    bot_name: str
+    db_path: str
+    admins_file: Path
+    welcome_image: Path
+    display_name: str | None = None   # не используется шаблоном (проверено grep'ом)
+    group_chat_id: str | None = None  # не используется шаблоном (проверено grep'ом)
+```
+
+Идентична форме `ManagerSecretaryConfig` минус реально используемый `display_name` — здесь оба поля декоративные (для единообразия формы), как оба поля были в `AccountantConfig`.
+
+Ничего структурно нестандартного не нашлось — «стоп и опиши» не требуется, паттерн ложится чисто, даже чище, чем в `manager_secretary`.
