@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -65,16 +66,31 @@ def _load_trip_manager_router() -> Router:
     return trip_manager_template.router
 
 
-# template_id -> loader() -> Router. "accountant" (Phase 2), "manager_secretary"
-# (Phase 4), "booking_beauty" (Phase 5) and "trip_manager" (Phase 6) are wired so
-# far — see docs/STAGE2_DESIGN.md / STAGE2_REPORT.md for why the rest are
-# deferred. Note: trip_manager's _digest_loop() is deliberately NOT started
-# here — see docs/STAGE2_DESIGN.md "Стоп: _digest_loop() не ложится на паттерн".
+def _load_tour_operator_router() -> Router:
+    # The registry knows it never starts this template's web server (see
+    # docs/STAGE2_DESIGN.md "Фаза 7") — set BEFORE the import below so the
+    # template's own module-level WEB_CRM_ENABLED constant evaluates to False
+    # on its first load, and its handlers adapt their UX accordingly, without
+    # the template needing to know which runtime loaded it.
+    os.environ["TOUR_OPERATOR_WEB_ENABLED"] = "false"
+    from templates import tour_operator as tour_operator_template
+
+    return tour_operator_template.router
+
+
+# template_id -> loader() -> Router. All five reference templates are wired
+# now (Stage 2's per-template migration is complete as of Phase 7) — see
+# docs/STAGE2_DESIGN.md / STAGE2_REPORT.md. Two templates have a known,
+# documented background-work gap not started by this registry: trip_manager's
+# _digest_loop() (Phase 6) and tour_operator's whole web CRM part (Phase 7,
+# "Стоп: веб-часть не ложится на паттерн") — only tour_operator's Telegram
+# router/handlers are registered here, its aiohttp web app is standalone-only.
 _TEMPLATE_LOADERS: dict[str, Callable[[], Router]] = {
     "accountant": _load_accountant_router,
     "manager_secretary": _load_manager_secretary_router,
     "booking_beauty": _load_booking_beauty_router,
     "trip_manager": _load_trip_manager_router,
+    "tour_operator": _load_tour_operator_router,
 }
 
 _template_router_cache: dict[str, Router] = {}
@@ -171,6 +187,14 @@ def _build_trip_manager_middleware(bot_row: dict[str, Any]) -> BaseMiddleware:
     return trip_manager_template.ConfigMiddleware(tm_config)
 
 
+def _build_tour_operator_middleware(bot_row: dict[str, Any]) -> BaseMiddleware:
+    from templates import tour_operator as tour_operator_template
+    from config import DATA_DIR
+
+    to_config = tour_operator_template.config_from_bot_row(bot_row, DATA_DIR)
+    return tour_operator_template.ConfigMiddleware(to_config)
+
+
 # template_id -> builder(bot_row) -> BaseMiddleware. Templates not listed here
 # fall back to the generic ConfigMiddleware above (raw dict, not yet consumed).
 _TEMPLATE_MIDDLEWARE_BUILDERS: dict[str, Callable[[dict[str, Any]], BaseMiddleware]] = {
@@ -178,6 +202,7 @@ _TEMPLATE_MIDDLEWARE_BUILDERS: dict[str, Callable[[dict[str, Any]], BaseMiddlewa
     "manager_secretary": _build_manager_secretary_middleware,
     "booking_beauty": _build_booking_beauty_middleware,
     "trip_manager": _build_trip_manager_middleware,
+    "tour_operator": _build_tour_operator_middleware,
 }
 
 

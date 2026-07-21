@@ -1,19 +1,21 @@
 # TEMPLATE: tour_operator
 # USE FOR: профессиональный тур-оператор, коммерческие туры, управление группами
 # STANDALONE: полноценный CRM — Telegram бот + aiohttp веб-приложение
+from __future__ import annotations
 
 import asyncio
 import json
 import logging
 import os
 import re
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
 import aiohttp
 import aiosqlite
 from aiohttp import web
-from aiogram import Bot, Dispatcher, F, Router
+from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -23,49 +25,124 @@ from aiogram.types import (
 )
 
 # ── Config ────────────────────────────────────────────────────────────────────
+# BOT_TOKEN/ANTHROPIC_KEY/ASSEMBLYAI_KEY/PORT/BASE_URL are process-wide, NOT
+# per-bot — same treatment as ANTHROPIC_API_KEY in manager_secretary/trip_manager
+# (Stage 2 Phases 4/6): they stay module-level env reads, not TourOperatorConfig
+# fields, since every bot in the shared webhook process reads the same values.
 BOT_TOKEN      = os.getenv("BOT_TOKEN", "")
 ANTHROPIC_KEY  = os.getenv("ANTHROPIC_API_KEY", "")
 ASSEMBLYAI_KEY = os.getenv("ASSEMBLYAI_API_KEY", "")
 PORT           = int(os.getenv("PORT", "8080"))
-DATA_DIR       = Path(os.getenv("DATA_DIR", "./data"))
-DATA_DIR.mkdir(exist_ok=True)
-
-BOT_NAME      = Path(__file__).stem
-DB_PATH       = str(DATA_DIR / f"{BOT_NAME}.db")
-ADMINS_FILE   = str(DATA_DIR / f"admins_{BOT_NAME}.json")
-WELCOME_IMAGE = DATA_DIR / "bot_images" / f"{BOT_NAME}.jpg"
 
 RAILWAY_DOMAIN = os.getenv("RAILWAY_PUBLIC_DOMAIN", "")
 BASE_URL       = f"https://{RAILWAY_DOMAIN}" if RAILWAY_DOMAIN else f"http://localhost:{PORT}"
+
+# Standalone-compatible: unset -> true (this bot's own web server is up, same
+# as always). The webhook runtime sets this to "false" in its own environment
+# before first loading this template (runtime/registry.py's
+# _load_tour_operator_router()), because it never starts this template's web
+# server (see docs/STAGE2_DESIGN.md "Фаза 7" — one aiohttp server per PORT).
+# The template itself stays agnostic of which runtime loaded it — that
+# invariant holds across all of Stage 2 — but whoever loads it knows, and
+# signals it via this env var rather than the template guessing its own mode.
+WEB_CRM_ENABLED = os.getenv("TOUR_OPERATOR_WEB_ENABLED", "true").lower() != "false"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 router = Router()
 
+
+# ── config (Stage 2 Phase 7) ─────────────────────────────────────────────────
+# Same pattern as templates/accountant.py (Phase 2), manager_secretary.py
+# (Phase 4), booking_beauty.py (Phase 5) and trip_manager.py (Phase 6) — see
+# docs/STAGE2_DESIGN.md "Фаза 7". display_name/group_chat_id are decorative
+# here (verified: no matches) — this template has no group-chat feature.
+#
+# The web CRM part (build_web_app()/serve_app()/REST API below) is translated
+# onto config too, for structural uniformity with the rest of the file, but per
+# the owner's decision it is NOT started by runtime/registry.py in webhook mode
+# — see docs/STAGE2_DESIGN.md "Стоп: веб-часть не ложится на паттерн" for why
+# (the webhook runtime already binds one aiohttp server on the same PORT; a
+# second one per bot would collide). main() (standalone) is unchanged — it
+# still starts the web server exactly as before.
+
+@dataclass
+class TourOperatorConfig:
+    bot_name: str
+    db_path: str
+    admins_file: str  # plain str (not Path) — matches this template's original
+                       # os.path.exists()/open() style, unchanged behavior
+    welcome_image: Path
+    display_name: str | None = None   # not used by this template (verified: no matches)
+    group_chat_id: str | None = None  # not used by this template (verified: no matches)
+
+
+def _paths_for(name: str, data_dir: Path) -> TourOperatorConfig:
+    return TourOperatorConfig(
+        bot_name=name,
+        db_path=str(data_dir / f"{name}.db"),
+        admins_file=str(data_dir / f"admins_{name}.json"),
+        welcome_image=data_dir / "bot_images" / f"{name}.jpg",
+    )
+
+
+def config_from_env() -> TourOperatorConfig:
+    """Standalone/subprocess mode: reproduces exactly what the old module-level
+    constants gave, behavior unchanged 1:1."""
+    name = Path(__file__).stem
+    data_dir = Path(os.getenv("DATA_DIR", "./data"))
+    data_dir.mkdir(exist_ok=True)
+    return _paths_for(name, data_dir)
+
+
+def config_from_bot_row(bot_row: dict, data_dir: Path) -> TourOperatorConfig:
+    """Webhook runtime mode (Telegram handlers only — see module docstring
+    above). `data_dir` is a required caller-supplied param — same reasoning as
+    every other migrated template's config_from_bot_row."""
+    config = _paths_for(bot_row["name"], data_dir)
+    config.display_name = bot_row.get("display_name")
+    config.group_chat_id = bot_row.get("group_chat_id")
+    return config
+
+
+class ConfigMiddleware(BaseMiddleware):
+    """Injects this bot's TourOperatorConfig into every handler's `data["config"]`.
+    Defined here (not imported from runtime/) so this file stays self-contained —
+    same invariant as every other templates/*.py: no project-internal imports."""
+
+    def __init__(self, config: TourOperatorConfig) -> None:
+        self.config = config
+        super().__init__()
+
+    async def __call__(self, handler, event, data):
+        data["config"] = self.config
+        return await handler(event, data)
+
+
 # ── Admin ─────────────────────────────────────────────────────────────────────
-def _load_admins():
-    if not os.path.exists(ADMINS_FILE):
+def _load_admins(admins_file: str):
+    if not os.path.exists(admins_file):
         return []
     try:
-        with open(ADMINS_FILE) as f:
+        with open(admins_file) as f:
             return json.load(f)
     except Exception:
         return []
 
-def _save_admins(lst):
-    with open(ADMINS_FILE, "w") as f:
+def _save_admins(admins_file: str, lst):
+    with open(admins_file, "w") as f:
         json.dump(lst, f)
 
-def _is_admin(uid):
-    admins = _load_admins()
+def _is_admin(uid, admins_file: str):
+    admins = _load_admins(admins_file)
     if not admins:
-        _save_admins([uid])
+        _save_admins(admins_file, [uid])
         return True
     return uid in admins
 
 # ── Database ──────────────────────────────────────────────────────────────────
-async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
+async def init_db(db_path: str):
+    async with aiosqlite.connect(db_path) as db:
         await db.executescript("""
             CREATE TABLE IF NOT EXISTS tours (
                 id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -156,8 +233,8 @@ async def init_db():
         """)
         await db.commit()
 
-async def get_active_tour(uid):
-    async with aiosqlite.connect(DB_PATH) as db:
+async def get_active_tour(db_path: str, uid):
+    async with aiosqlite.connect(db_path) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
             "SELECT t.* FROM tours t JOIN user_prefs u ON t.id=u.active_tour_id WHERE u.user_id=?",
@@ -166,8 +243,8 @@ async def get_active_tour(uid):
             row = await c.fetchone()
             return dict(row) if row else None
 
-async def set_active_tour(uid, tid):
-    async with aiosqlite.connect(DB_PATH) as db:
+async def set_active_tour(db_path: str, uid, tid):
+    async with aiosqlite.connect(db_path) as db:
         await db.execute(
             "INSERT INTO user_prefs(user_id,active_tour_id) VALUES(?,?)"
             " ON CONFLICT(user_id) DO UPDATE SET active_tour_id=excluded.active_tour_id",
@@ -178,7 +255,12 @@ async def set_active_tour(uid, tid):
 # ── Voice → text (AssemblyAI REST) ───────────────────────────────────────────
 async def transcribe_voice(bot, voice):
     tg_file = await bot.get_file(voice.file_id)
-    audio_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{tg_file.file_path}"
+    # Uses THIS bot's own token (bot.token), not the standalone-mode BOT_TOKEN
+    # module constant — in the webhook runtime, many bots share one process and
+    # each has its own token; the module constant would be wrong for all but
+    # (at most) one of them. Harmless in standalone mode: Bot(token=BOT_TOKEN)
+    # there means bot.token == BOT_TOKEN anyway.
+    audio_url = f"https://api.telegram.org/file/bot{bot.token}/{tg_file.file_path}"
     async with aiohttp.ClientSession() as s:
         async with s.get(audio_url) as r:
             audio_bytes = await r.read()
@@ -312,8 +394,8 @@ def format_parsed(parsed, text):
             lines.append(f"  • {_FIELD_LBL.get(k, k)}: <b>{v}</b>")
     return "\n".join(lines)
 
-async def save_entry(tour_id, kind, d):
-    async with aiosqlite.connect(DB_PATH) as db:
+async def save_entry(db_path: str, tour_id, kind, d):
+    async with aiosqlite.connect(db_path) as db:
         if kind == "location":
             await db.execute(
                 "INSERT INTO locations(tour_id,region,category,status,name,hours,cost,notes,maps_link,contacts,website,youtube,instagram) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -365,12 +447,12 @@ async def save_entry(tour_id, kind, d):
 
 # ── Bot handlers ──────────────────────────────────────────────────────────────
 @router.message(Command("start"))
-async def cmd_start(m: Message, state: FSMContext):
-    if not _is_admin(m.from_user.id):
+async def cmd_start(m: Message, state: FSMContext, config: TourOperatorConfig):
+    if not _is_admin(m.from_user.id, config.admins_file):
         await m.answer("⛔ Нет доступа.")
         return
     await state.clear()
-    tour = await get_active_tour(m.from_user.id)
+    tour = await get_active_tour(config.db_path, m.from_user.id)
     tour_line = f"\n\n🌍 Активный тур: <b>{tour['name']}</b>" if tour else "\n\n⚠️ Нет тура. Создайте: /newtrip"
     text = (
         f"👋 {m.from_user.first_name}!\n\n"
@@ -380,15 +462,15 @@ async def cmd_start(m: Message, state: FSMContext):
         "🎤 Отправьте голосовое → данные добавятся автоматически\n"
         "🌐 /app — открыть веб-приложение"
     )
-    if WELCOME_IMAGE.exists():
-        await m.answer_photo(FSInputFile(str(WELCOME_IMAGE)), caption=text,
+    if config.welcome_image.exists():
+        await m.answer_photo(FSInputFile(str(config.welcome_image)), caption=text,
                              parse_mode="HTML", reply_markup=main_kb())
     else:
         await m.answer(text, parse_mode="HTML", reply_markup=main_kb())
 
 @router.message(Command("newtrip"))
-async def cmd_newtrip(m: Message, state: FSMContext):
-    if not _is_admin(m.from_user.id):
+async def cmd_newtrip(m: Message, state: FSMContext, config: TourOperatorConfig):
+    if not _is_admin(m.from_user.id, config.admins_file):
         return
     await state.set_state(NewTour.name)
     await m.answer("🆕 <b>Новый тур</b>\n\nВведите название:", parse_mode="HTML")
@@ -409,11 +491,11 @@ async def fsm_dest(m: Message, state: FSMContext):
     )
 
 @router.message(Command("skip"), NewTour.dates)
-async def fsm_skip_dates(m: Message, state: FSMContext):
-    await _finish_tour(m, state, None, None)
+async def fsm_skip_dates(m: Message, state: FSMContext, config: TourOperatorConfig):
+    await _finish_tour(m, state, None, None, config)
 
 @router.message(NewTour.dates)
-async def fsm_dates(m: Message, state: FSMContext):
+async def fsm_dates(m: Message, state: FSMContext, config: TourOperatorConfig):
     ds = de = None
     for raw in re.findall(r"(\d{1,2}[./]\d{1,2}[./]\d{4})", m.text):
         try:
@@ -425,18 +507,18 @@ async def fsm_dates(m: Message, state: FSMContext):
                 break
         except ValueError:
             pass
-    await _finish_tour(m, state, ds, de)
+    await _finish_tour(m, state, ds, de, config)
 
-async def _finish_tour(m, state, ds, de):
+async def _finish_tour(m, state, ds, de, config: TourOperatorConfig):
     data = await state.get_data()
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(config.db_path) as db:
         cur = await db.execute(
             "INSERT INTO tours(name,destination,date_start,date_end) VALUES(?,?,?,?)",
             (data["name"], data.get("destination"), ds, de),
         )
         tid = cur.lastrowid
         await db.commit()
-    await set_active_tour(m.from_user.id, tid)
+    await set_active_tour(config.db_path, m.from_user.id, tid)
     await state.clear()
     await m.answer(
         f"✅ Тур <b>{data['name']}</b> создан!\n\nДобавляйте данные голосом или через /app",
@@ -444,17 +526,17 @@ async def _finish_tour(m, state, ds, de):
     )
 
 @router.message(Command("tours"))
-async def cmd_tours(m: Message):
-    if not _is_admin(m.from_user.id):
+async def cmd_tours(m: Message, config: TourOperatorConfig):
+    if not _is_admin(m.from_user.id, config.admins_file):
         return
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(config.db_path) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT * FROM tours ORDER BY created_at DESC") as c:
             tours = [dict(r) for r in await c.fetchall()]
     if not tours:
         await m.answer("Нет туров. Создайте: /newtrip")
         return
-    active = await get_active_tour(m.from_user.id)
+    active = await get_active_tour(config.db_path, m.from_user.id)
     aid = active["id"] if active else None
     rows = []
     for t in tours:
@@ -465,8 +547,14 @@ async def cmd_tours(m: Message):
     await m.answer("🌍 <b>Туры</b> (нажми для переключения):", parse_mode="HTML", reply_markup=mk(rows))
 
 @router.message(Command("app"))
-async def cmd_app(m: Message):
-    if not _is_admin(m.from_user.id):
+async def cmd_app(m: Message, config: TourOperatorConfig):
+    if not _is_admin(m.from_user.id, config.admins_file):
+        return
+    if not WEB_CRM_ENABLED:
+        await m.answer(
+            "🌐 Веб-приложение недоступно в этом режиме бота. "
+            "Пользуйтесь Telegram-командами: /tours /lip /newtrip"
+        )
         return
     url = f"{BASE_URL}/app?token={m.from_user.id}"
     await m.answer(
@@ -476,14 +564,14 @@ async def cmd_app(m: Message):
     )
 
 @router.message(Command("lip"))
-async def cmd_lip(m: Message):
-    if not _is_admin(m.from_user.id):
+async def cmd_lip(m: Message, config: TourOperatorConfig):
+    if not _is_admin(m.from_user.id, config.admins_file):
         return
-    tour = await get_active_tour(m.from_user.id)
+    tour = await get_active_tour(config.db_path, m.from_user.id)
     if not tour:
         await m.answer("⚠️ Нет активного тура. /newtrip")
         return
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(config.db_path) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
             "SELECT * FROM locations WHERE tour_id=? ORDER BY region,category,name", (tour["id"],)
@@ -505,10 +593,10 @@ async def cmd_lip(m: Message):
 
 # ── Voice handler ─────────────────────────────────────────────────────────────
 @router.message(F.voice)
-async def on_voice(m: Message, state: FSMContext):
-    if not _is_admin(m.from_user.id):
+async def on_voice(m: Message, state: FSMContext, config: TourOperatorConfig):
+    if not _is_admin(m.from_user.id, config.admins_file):
         return
-    tour = await get_active_tour(m.from_user.id)
+    tour = await get_active_tour(config.db_path, m.from_user.id)
     if not tour:
         await m.answer("⚠️ Нет активного тура. Создайте: /newtrip")
         return
@@ -538,14 +626,14 @@ async def on_voice(m: Message, state: FSMContext):
     )
 
 @router.callback_query(VoicePend.confirm, F.data == "vs_save")
-async def vs_save(cb: CallbackQuery, state: FSMContext):
+async def vs_save(cb: CallbackQuery, state: FSMContext, config: TourOperatorConfig):
     d = await state.get_data()
     kind = d["parsed"]["type"]
     data = d["parsed"].get("data", {})
     icon = _TYPE_ICON.get(kind, "✅")
     name = _TYPE_NAME.get(kind, "Запись")
     if kind == "new_tour":
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with aiosqlite.connect(config.db_path) as db:
             cur = await db.execute(
                 "INSERT INTO tours(name,destination,date_start,date_end,guests_count) VALUES(?,?,?,?,?)",
                 (data.get("name", "Новый тур"), data.get("destination"),
@@ -553,14 +641,14 @@ async def vs_save(cb: CallbackQuery, state: FSMContext):
             )
             tid = cur.lastrowid
             await db.commit()
-        await set_active_tour(cb.from_user.id, tid)
+        await set_active_tour(config.db_path, cb.from_user.id, tid)
         await state.clear()
         await cb.message.edit_text(
             f"✅ 🌍 Тур <b>{data.get('name','Новый тур')}</b> создан и выбран!\n\nДобавляйте данные голосом.",
             parse_mode="HTML",
         )
     else:
-        await save_entry(d["tour_id"], kind, data)
+        await save_entry(config.db_path, d["tour_id"], kind, data)
         await state.clear()
         await cb.message.edit_text(f"✅ {icon} {name} сохранена!")
     await cb.answer("Сохранено!")
@@ -580,6 +668,13 @@ async def cb_new_tour(cb: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "open_app")
 async def cb_open_app(cb: CallbackQuery):
+    if not WEB_CRM_ENABLED:
+        await cb.message.answer(
+            "🌐 Веб-приложение недоступно в этом режиме бота. "
+            "Пользуйтесь Telegram-командами: /tours /lip /newtrip"
+        )
+        await cb.answer()
+        return
     url = f"{BASE_URL}/app?token={cb.from_user.id}"
     await cb.message.answer(
         f'🌐 <a href="{url}">Открыть CRM →</a>\n<code>{url}</code>',
@@ -588,15 +683,15 @@ async def cb_open_app(cb: CallbackQuery):
     await cb.answer()
 
 @router.callback_query(F.data == "tours_list")
-async def cb_tours_list(cb: CallbackQuery):
-    await cmd_tours(cb.message)
+async def cb_tours_list(cb: CallbackQuery, config: TourOperatorConfig):
+    await cmd_tours(cb.message, config)
     await cb.answer()
 
 @router.callback_query(F.data.startswith("sw_tour_"))
-async def cb_sw_tour(cb: CallbackQuery):
+async def cb_sw_tour(cb: CallbackQuery, config: TourOperatorConfig):
     tid = int(cb.data.split("_")[-1])
-    await set_active_tour(cb.from_user.id, tid)
-    async with aiosqlite.connect(DB_PATH) as db:
+    await set_active_tour(config.db_path, cb.from_user.id, tid)
+    async with aiosqlite.connect(config.db_path) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT name FROM tours WHERE id=?", (tid,)) as c:
             row = await c.fetchone()
@@ -604,10 +699,10 @@ async def cb_sw_tour(cb: CallbackQuery):
         await cb.message.edit_text(f"✅ Активный тур: <b>{row['name']}</b>", parse_mode="HTML")
         await cb.answer(f"Тур: {row['name']}")
 
-async def _section_summary(sec: str, tour: dict) -> str:
+async def _section_summary(sec: str, tour: dict, db_path: str) -> str:
     tid = tour["id"]
     name = tour["name"]
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(db_path) as db:
         db.row_factory = aiosqlite.Row
         if sec == "sec_program":
             async with db.execute("SELECT COUNT(*) c, COALESCE(SUM(cost_fixed+cost_variable+cost_team+cost_extra),0) tot FROM program WHERE tour_id=?", (tid,)) as c:
@@ -651,8 +746,8 @@ async def _section_summary(sec: str, tour: dict) -> str:
     return ""
 
 @router.callback_query(F.data.startswith("sec_"))
-async def cb_section(cb: CallbackQuery, state: FSMContext):
-    tour = await get_active_tour(cb.from_user.id)
+async def cb_section(cb: CallbackQuery, state: FSMContext, config: TourOperatorConfig):
+    tour = await get_active_tour(config.db_path, cb.from_user.id)
     if not tour:
         await cb.answer("Нет активного тура! /newtrip", show_alert=True)
         return
@@ -664,16 +759,23 @@ async def cb_section(cb: CallbackQuery, state: FSMContext):
             await cb.bot.delete_message(cb.message.chat.id, prev_id)
         except Exception:
             pass
-    url = f"{BASE_URL}/app?token={cb.from_user.id}"
-    summary = await _section_summary(cb.data, tour)
+    summary = await _section_summary(cb.data, tour, config.db_path)
+    if WEB_CRM_ENABLED:
+        url = f"{BASE_URL}/app?token={cb.from_user.id}"
+        summary += f'\n\n<a href="{url}">Открыть в веб-приложении →</a>'
     msg = await cb.message.answer(
-        summary + f'\n\n<a href="{url}">Открыть в веб-приложении →</a>',
+        summary,
         parse_mode="HTML", disable_web_page_preview=True,
     )
     await state.update_data(section_msg_id=msg.message_id)
     await cb.answer()
 
 # ── REST API helpers ──────────────────────────────────────────────────────────
+# Translated onto config for structural uniformity (Task 3), via aiohttp's own
+# per-app state (req.app["config"]) rather than aiogram's data-injection, since
+# these are plain aiohttp handlers, not aiogram ones. NOT started by the
+# webhook runtime — see the config-section docstring above and
+# docs/STAGE2_DESIGN.md "Фаза 7" for why.
 def jresp(data, status=200):
     return web.Response(
         text=json.dumps(data, ensure_ascii=False, default=str),
@@ -683,8 +785,9 @@ def jresp(data, status=200):
 
 async def check_auth(req):
     tok = req.headers.get("X-Token") or req.rel_url.query.get("token", "")
+    config: TourOperatorConfig = req.app["config"]
     try:
-        return _is_admin(int(tok)) if tok else False
+        return _is_admin(int(tok), config.admins_file) if tok else False
     except (ValueError, TypeError):
         return False
 
@@ -695,7 +798,8 @@ def rows_to_list(rows):
 async def api_tours_get(req):
     if not await check_auth(req):
         return jresp({"e": "Unauthorized"}, 401)
-    async with aiosqlite.connect(DB_PATH) as db:
+    db_path = req.app["config"].db_path
+    async with aiosqlite.connect(db_path) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT * FROM tours ORDER BY created_at DESC") as c:
             return jresp(rows_to_list(await c.fetchall()))
@@ -703,8 +807,9 @@ async def api_tours_get(req):
 async def api_tours_post(req):
     if not await check_auth(req):
         return jresp({"e": "Unauthorized"}, 401)
+    db_path = req.app["config"].db_path
     b = await req.json()
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(db_path) as db:
         cur = await db.execute(
             "INSERT INTO tours(name,destination,date_start,date_end,guests_count,status) VALUES(?,?,?,?,?,?)",
             (b.get("name", "Тур"), b.get("destination"), b.get("date_start"),
@@ -719,12 +824,13 @@ async def api_tours_post(req):
 async def api_tour_put(req):
     if not await check_auth(req):
         return jresp({"e": "Unauthorized"}, 401)
+    db_path = req.app["config"].db_path
     tid = int(req.match_info["id"])
     b = await req.json()
     flds = ["name", "destination", "date_start", "date_end", "guests_count", "status"]
     sets = ", ".join(f"{f}=?" for f in flds if f in b)
     vals = [b[f] for f in flds if f in b] + [tid]
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(db_path) as db:
         if sets:
             await db.execute(f"UPDATE tours SET {sets} WHERE id=?", vals)
             await db.commit()
@@ -735,8 +841,9 @@ async def api_tour_put(req):
 async def api_tour_delete(req):
     if not await check_auth(req):
         return jresp({"e": "Unauthorized"}, 401)
+    db_path = req.app["config"].db_path
     tid = int(req.match_info["id"])
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(db_path) as db:
         await db.execute("DELETE FROM tours WHERE id=?", (tid,))
         for t in ("program", "locations", "hotels", "guests", "dds"):
             await db.execute(f"DELETE FROM {t} WHERE tour_id=?", (tid,))
@@ -748,8 +855,9 @@ def _make_crud(table, ins_cols, ins_fn, upd_flds, order_by="id"):
     async def _get(req):
         if not await check_auth(req):
             return jresp({"e": "Unauthorized"}, 401)
+        db_path = req.app["config"].db_path
         tid = int(req.match_info["tour_id"])
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with aiosqlite.connect(db_path) as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
                 f"SELECT * FROM {table} WHERE tour_id=? ORDER BY {order_by}", (tid,)
@@ -759,11 +867,12 @@ def _make_crud(table, ins_cols, ins_fn, upd_flds, order_by="id"):
     async def _post(req):
         if not await check_auth(req):
             return jresp({"e": "Unauthorized"}, 401)
+        db_path = req.app["config"].db_path
         tid = int(req.match_info["tour_id"])
         b = await req.json()
         vals = ins_fn(b, tid)
         ph = ",".join(["?"] * len(vals))
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with aiosqlite.connect(db_path) as db:
             cur = await db.execute(f"INSERT INTO {table}({ins_cols}) VALUES({ph})", vals)
             rid = cur.lastrowid
             await db.commit()
@@ -774,11 +883,12 @@ def _make_crud(table, ins_cols, ins_fn, upd_flds, order_by="id"):
     async def _put(req):
         if not await check_auth(req):
             return jresp({"e": "Unauthorized"}, 401)
+        db_path = req.app["config"].db_path
         rid = int(req.match_info["id"])
         b = await req.json()
         sets = ", ".join(f"{f}=?" for f in upd_flds if f in b)
         vals = [b[f] for f in upd_flds if f in b] + [rid]
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with aiosqlite.connect(db_path) as db:
             if sets:
                 await db.execute(f"UPDATE {table} SET {sets} WHERE id=?", vals)
                 await db.commit()
@@ -789,8 +899,9 @@ def _make_crud(table, ins_cols, ins_fn, upd_flds, order_by="id"):
     async def _delete(req):
         if not await check_auth(req):
             return jresp({"e": "Unauthorized"}, 401)
+        db_path = req.app["config"].db_path
         rid = int(req.match_info["id"])
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with aiosqlite.connect(db_path) as db:
             await db.execute(f"DELETE FROM {table} WHERE id=?", (rid,))
             await db.commit()
         return jresp({"ok": True})
@@ -1393,15 +1504,17 @@ setInterval(()=>{if(activeTid)loadTab();},30000);
 # ── Web server ─────────────────────────────────────────────────────────────────
 async def serve_app(req: web.Request):
     tok = req.rel_url.query.get("token", "")
-    if not tok or not tok.isdigit() or not _is_admin(int(tok)):
+    config: TourOperatorConfig = req.app["config"]
+    if not tok or not tok.isdigit() or not _is_admin(int(tok), config.admins_file):
         return web.Response(
             text="<h1 style='font-family:sans-serif;color:#ef4444'>403 Forbidden</h1><p>Invalid token.</p>",
             content_type="text/html", status=403,
         )
     return web.Response(text=HTML_APP, content_type="text/html")
 
-def build_web_app():
+def build_web_app(config: TourOperatorConfig):
     app = web.Application()
+    app["config"] = config
     app.router.add_get("/app", serve_app)
     app.router.add_get("/api/tours", api_tours_get)
     app.router.add_post("/api/tours", api_tours_post)
@@ -1431,13 +1544,15 @@ def build_web_app():
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 async def main():
-    await init_db()
+    config = config_from_env()
+    await init_db(config.db_path)
 
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
+    dp.update.outer_middleware(ConfigMiddleware(config))
     dp.include_router(router)
 
-    web_app = build_web_app()
+    web_app = build_web_app(config)
     runner = web.AppRunner(web_app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
