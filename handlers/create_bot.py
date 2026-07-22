@@ -484,6 +484,14 @@ async def auto_launch_managed_bot(managed_data: dict, bot: Bot, storage=None) ->
         username=real_username,
     )
 
+    # The welcome photo was saved during onboarding under the bot's NAME
+    # (handle_welcome_photo, before this bot's row/id existed). All five
+    # templates now look for it under bot_images/bot_<id>.jpg (Stage 2
+    # "изоляция по bots.id") — move it into place now that the id exists.
+    _welcome_photo_by_name = BOT_IMAGES_DIR / f"{bot_name}.jpg"
+    if _welcome_photo_by_name.exists():
+        _welcome_photo_by_name.rename(BOT_IMAGES_DIR / f"bot_{bot_record_id}.jpg")
+
     if display_name:
         await set_bot_display_name(bot_record_id, display_name)
 
@@ -577,6 +585,13 @@ async def handle_token(message: Message, state: FSMContext, bot: Bot):
         admin_ids=admin_ids,
         username=real_username,
     )
+
+    # See the equivalent comment in _run_generation() above — the welcome
+    # photo was saved under the bot's name before its row/id existed; all
+    # five templates now look for bot_images/bot_<id>.jpg.
+    _welcome_photo_by_name = BOT_IMAGES_DIR / f"{bot_name}.jpg"
+    if _welcome_photo_by_name.exists():
+        _welcome_photo_by_name.rename(BOT_IMAGES_DIR / f"bot_{bot_id}.jpg")
 
     if display_name:
         await set_bot_display_name(bot_id, display_name)
