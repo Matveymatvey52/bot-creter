@@ -150,54 +150,69 @@ class ConfigMiddleware(BaseMiddleware):
         return await handler(event, data)
 
 
-def _build_accountant_middleware(bot_row: dict[str, Any]) -> BaseMiddleware:
+async def _build_accountant_middleware(bot_row: dict[str, Any]) -> BaseMiddleware:
     # Lazy imports: keep importing runtime.registry side-effect-free unless a bot
     # actually needs this template, and keep the canonical DATA_DIR resolution
     # (config.py) as the single source of truth passed INTO the template rather
     # than re-derived inside it — see docs/STAGE2_DESIGN.md "Проверка идентичности
     # формул путей" for why that distinction matters.
+    #
+    # init_db(config.db_path) runs here — the first point where this bot's own
+    # resolved db_path exists — so a bot registered purely through the registry
+    # (never run as a subprocess) still gets its tables created before it can
+    # receive updates. See docs/STAGE2_DESIGN.md "init_db при регистрации":
+    # idempotent (CREATE TABLE IF NOT EXISTS), safe to call on every
+    # registration/reload. If it raises, build_entry()'s caller
+    # (add_or_replace/reload_all) already wraps this in try/except — the bot
+    # simply doesn't get registered.
     from templates import accountant as accountant_template
     from config import DATA_DIR
 
     acc_config = accountant_template.config_from_bot_row(bot_row, DATA_DIR)
+    await accountant_template.init_db(acc_config.db_path)
     return accountant_template.ConfigMiddleware(acc_config)
 
 
-def _build_manager_secretary_middleware(bot_row: dict[str, Any]) -> BaseMiddleware:
+async def _build_manager_secretary_middleware(bot_row: dict[str, Any]) -> BaseMiddleware:
     from templates import manager_secretary as manager_secretary_template
     from config import DATA_DIR
 
     ms_config = manager_secretary_template.config_from_bot_row(bot_row, DATA_DIR)
+    await manager_secretary_template.init_db(ms_config.db_path)
     return manager_secretary_template.ConfigMiddleware(ms_config)
 
 
-def _build_booking_beauty_middleware(bot_row: dict[str, Any]) -> BaseMiddleware:
+async def _build_booking_beauty_middleware(bot_row: dict[str, Any]) -> BaseMiddleware:
     from templates import booking_beauty as booking_beauty_template
     from config import DATA_DIR
 
     bb_config = booking_beauty_template.config_from_bot_row(bot_row, DATA_DIR)
+    await booking_beauty_template.init_db(bb_config.db_path)
     return booking_beauty_template.ConfigMiddleware(bb_config)
 
 
-def _build_trip_manager_middleware(bot_row: dict[str, Any]) -> BaseMiddleware:
+async def _build_trip_manager_middleware(bot_row: dict[str, Any]) -> BaseMiddleware:
     from templates import trip_manager as trip_manager_template
     from config import DATA_DIR
 
     tm_config = trip_manager_template.config_from_bot_row(bot_row, DATA_DIR)
+    await trip_manager_template.init_db(tm_config.db_path)
     return trip_manager_template.ConfigMiddleware(tm_config)
 
 
-def _build_tour_operator_middleware(bot_row: dict[str, Any]) -> BaseMiddleware:
+async def _build_tour_operator_middleware(bot_row: dict[str, Any]) -> BaseMiddleware:
     from templates import tour_operator as tour_operator_template
     from config import DATA_DIR
 
     to_config = tour_operator_template.config_from_bot_row(bot_row, DATA_DIR)
+    await tour_operator_template.init_db(to_config.db_path)
     return tour_operator_template.ConfigMiddleware(to_config)
 
 
-# template_id -> builder(bot_row) -> BaseMiddleware. Templates not listed here
-# fall back to the generic ConfigMiddleware above (raw dict, not yet consumed).
-_TEMPLATE_MIDDLEWARE_BUILDERS: dict[str, Callable[[dict[str, Any]], BaseMiddleware]] = {
+# template_id -> async builder(bot_row) -> BaseMiddleware. Templates not listed
+# here fall back to the generic ConfigMiddleware above (raw dict, not yet
+# consumed, no init_db call — there's no known template to call it on).
+_TEMPLATE_MIDDLEWARE_BUILDERS: dict[str, Callable[[dict[str, Any]], Awaitable[BaseMiddleware]]] = {
     "accountant": _build_accountant_middleware,
     "manager_secretary": _build_manager_secretary_middleware,
     "booking_beauty": _build_booking_beauty_middleware,
@@ -214,14 +229,21 @@ class BotEntry:
     config: dict[str, Any] = field(default_factory=dict)
 
 
-def build_entry(
+async def build_entry(
     bot_id: int,
     token: str,
     template_id: str | None,
     config: dict[str, Any] | None = None,
 ) -> BotEntry:
     """Build one BotEntry: a Bot + a fresh Dispatcher wired to the shared template
-    Router (if the template is known) and the config middleware."""
+    Router (if the template is known) and the config middleware.
+
+    For a known template, the middleware builder also calls that template's
+    own init_db(config.db_path) before returning — see the per-template
+    _build_*_middleware functions above and docs/STAGE2_DESIGN.md "init_db при
+    регистрации". This is what lets a bot registered purely through the
+    registry (never run as a standalone subprocess) actually have tables to
+    write to."""
     config = dict(config or {})
     config.setdefault("bot_id", bot_id)
 
@@ -229,7 +251,7 @@ def build_entry(
     dp = Dispatcher(storage=MemoryStorage())
 
     middleware_builder = _TEMPLATE_MIDDLEWARE_BUILDERS.get(template_id) if template_id else None
-    middleware = middleware_builder(config) if middleware_builder else ConfigMiddleware(config)
+    middleware = await middleware_builder(config) if middleware_builder else ConfigMiddleware(config)
     dp.update.outer_middleware(middleware)
 
     router = get_template_router(template_id) if template_id else None
@@ -294,13 +316,15 @@ class Registry:
         the lock is held (see Task 2 note on reload_all for the same pattern)."""
         if not bot_row.get("token"):
             return None
+        template_id = None  # so the except block below can't NameError on it
         try:
             template_id = infer_template_id(bot_row.get("file_path"))
             config = _config_from_row(bot_row)
-            entry = build_entry(bot_row["id"], bot_row["token"], template_id, config)
+            entry = await build_entry(bot_row["id"], bot_row["token"], template_id, config)
         except Exception:
             logger.exception(
-                f"add_or_replace: bot id={bot_row.get('id')} ({bot_row.get('name')}) — failed to build entry"
+                f"add_or_replace: bot id={bot_row.get('id')} template={template_id!r} "
+                f"({bot_row.get('name')}) — failed to build entry"
             )
             return None
         async with self._lock:
@@ -338,12 +362,16 @@ class Registry:
         for b in await get_all_bots():
             if not b.get("token"):
                 continue
+            template_id = None  # so the except block below can't NameError on it
             try:
                 template_id = infer_template_id(b.get("file_path"))
                 config = _config_from_row(b)
-                new_entries[b["id"]] = build_entry(b["id"], b["token"], template_id, config)
+                new_entries[b["id"]] = await build_entry(b["id"], b["token"], template_id, config)
             except Exception:
-                logger.exception(f"reload_all: skipping bot id={b.get('id')} ({b.get('name')}) — failed to build entry")
+                logger.exception(
+                    f"reload_all: skipping bot id={b.get('id')} template={template_id!r} "
+                    f"({b.get('name')}) — failed to build entry"
+                )
         async with self._lock:
             old_entries = self._entries
             self._entries = new_entries
