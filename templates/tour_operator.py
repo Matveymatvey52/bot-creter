@@ -98,8 +98,28 @@ def config_from_env() -> TourOperatorConfig:
 def config_from_bot_row(bot_row: dict, data_dir: Path) -> TourOperatorConfig:
     """Webhook runtime mode (Telegram handlers only — see module docstring
     above). `data_dir` is a required caller-supplied param — same reasoning as
-    every other migrated template's config_from_bot_row."""
-    config = _paths_for(bot_row["name"], data_dir)
+    every other migrated template's config_from_bot_row.
+
+    Paths are built from bot_row["bot_id"] (bots.id, the physically unique
+    AUTOINCREMENT PK) — NOT bot_row["name"], which has no UNIQUE constraint
+    and would otherwise let two same-named bots silently share one db/admins
+    file (see docs/STAGE2_DESIGN.md "Изоляция по bots.id"). bot_row["name"] is
+    kept only as the human-readable bot_name label, never used in a path.
+    Deliberately does NOT reuse _paths_for()/config_from_env()'s name-based
+    formula — that stays untouched for standalone mode, where bot_id doesn't
+    exist (one process = one bot, no collision possible). admins_file stays a
+    plain str here (this template's own file-handling style, unrelated to
+    isolation), just built from bot_id like everything else; db_path now gets
+    the same "_data" suffix as the other four templates (this template's own
+    historic naming quirk is dropped along with the switch to id — old data
+    is being discarded regardless, so there's no reason to preserve it)."""
+    bot_id = bot_row["bot_id"]
+    config = TourOperatorConfig(
+        bot_name=bot_row["name"],
+        db_path=str(data_dir / f"bot_{bot_id}_data.db"),
+        admins_file=str(data_dir / f"admins_{bot_id}.json"),
+        welcome_image=data_dir / "bot_images" / f"bot_{bot_id}.jpg",
+    )
     config.display_name = bot_row.get("display_name")
     config.group_chat_id = bot_row.get("group_chat_id")
     return config

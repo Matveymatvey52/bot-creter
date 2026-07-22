@@ -129,10 +129,10 @@ class TourOperatorIsolationTests(unittest.IsolatedAsyncioTestCase):
         self.data_dir = Path(self._tmp.name)
 
         self.config_a = tour_operator.config_from_bot_row(
-            {"name": "to_isolation_bot_a", "display_name": None, "group_chat_id": None}, self.data_dir
+            {"bot_id": 101, "name": "to_isolation_bot_a", "display_name": None, "group_chat_id": None}, self.data_dir
         )
         self.config_b = tour_operator.config_from_bot_row(
-            {"name": "to_isolation_bot_b", "display_name": None, "group_chat_id": None}, self.data_dir
+            {"bot_id": 102, "name": "to_isolation_bot_b", "display_name": None, "group_chat_id": None}, self.data_dir
         )
         await tour_operator.init_db(self.config_a.db_path)
         await tour_operator.init_db(self.config_b.db_path)
@@ -171,6 +171,41 @@ class TourOperatorIsolationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(admins_a, [SAME_USER_ID])
         self.assertEqual(admins_b, [999])
+
+    async def test_same_name_different_bot_id_still_isolated(self):
+        """The actual case this phase closes: bots.name has no UNIQUE
+        constraint, so two DB rows can share the exact same name. Before this
+        phase, config_from_bot_row() built paths from bot_row["name"] — two
+        same-named bots would have shared one db/admins file. Now paths are
+        built from bot_row["bot_id"] (the physically unique PK), so even
+        identical names must not collide."""
+        config_c = tour_operator.config_from_bot_row(
+            {"bot_id": 201, "name": "duplicate_name", "display_name": None, "group_chat_id": None}, self.data_dir
+        )
+        config_d = tour_operator.config_from_bot_row(
+            {"bot_id": 202, "name": "duplicate_name", "display_name": None, "group_chat_id": None}, self.data_dir
+        )
+        self.assertEqual(config_c.bot_name, config_d.bot_name)
+        self.assertNotEqual(config_c.db_path, config_d.db_path)
+        self.assertNotEqual(config_c.admins_file, config_d.admins_file)
+
+        await tour_operator.init_db(config_c.db_path)
+        await tour_operator.init_db(config_d.db_path)
+        bot_c, dp_c = _build_bot_dispatcher(config_c)
+        bot_d, dp_d = _build_bot_dispatcher(config_d)
+
+        await _create_and_activate_tour(dp_c, bot_c, SAME_USER_ID, "Gamma Tour", 1)
+        await _create_and_activate_tour(dp_d, bot_d, SAME_USER_ID, "Delta Tour", 1)
+
+        conn_c = sqlite3.connect(config_c.db_path)
+        names_c = [r[0] for r in conn_c.execute("SELECT name FROM tours").fetchall()]
+        conn_c.close()
+        conn_d = sqlite3.connect(config_d.db_path)
+        names_d = [r[0] for r in conn_d.execute("SELECT name FROM tours").fetchall()]
+        conn_d.close()
+
+        self.assertEqual(names_c, ["Gamma Tour"])
+        self.assertEqual(names_d, ["Delta Tour"])
 
     async def test_voice_driven_entry_saved_isolated_per_bot(self):
         """Owner-requested: mock AssemblyAI/Anthropic (transcribe_voice/
@@ -249,7 +284,7 @@ class TourOperatorWebCrmFlagTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(Bot, "__call__", new=bot_call_mock):
             with tempfile.TemporaryDirectory() as tmp:
                 config = tour_operator.config_from_bot_row(
-                    {"name": "to_flag_bot", "display_name": None, "group_chat_id": None}, Path(tmp)
+                    {"bot_id": 901, "name": "to_flag_bot", "display_name": None, "group_chat_id": None}, Path(tmp)
                 )
                 await tour_operator.init_db(config.db_path)
                 bot = Bot(token=FAKE_TOKEN)

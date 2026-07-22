@@ -85,10 +85,10 @@ class AccountantIsolationTests(unittest.IsolatedAsyncioTestCase):
         self.data_dir = Path(self._tmp.name)
 
         self.config_a = accountant.config_from_bot_row(
-            {"name": "isolation_bot_a", "display_name": None, "group_chat_id": None}, self.data_dir
+            {"bot_id": 101, "name": "isolation_bot_a", "display_name": None, "group_chat_id": None}, self.data_dir
         )
         self.config_b = accountant.config_from_bot_row(
-            {"name": "isolation_bot_b", "display_name": None, "group_chat_id": None}, self.data_dir
+            {"bot_id": 102, "name": "isolation_bot_b", "display_name": None, "group_chat_id": None}, self.data_dir
         )
         await accountant.init_db(self.config_a.db_path)
         await accountant.init_db(self.config_b.db_path)
@@ -135,6 +135,43 @@ class AccountantIsolationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(admins_a, {str(SAME_USER_ID)})
         self.assertEqual(admins_b, {"999"})
         self.assertNotEqual(admins_a, admins_b)
+
+    async def test_same_name_different_bot_id_still_isolated(self):
+        """The actual case this phase closes: bots.name has no UNIQUE
+        constraint, so two DB rows can share the exact same name. Before this
+        phase, config_from_bot_row() built paths from bot_row["name"] — two
+        same-named bots would have shared one db/admins file. Now paths are
+        built from bot_row["bot_id"] (the physically unique PK), so even
+        identical names must not collide."""
+        config_c = accountant.config_from_bot_row(
+            {"bot_id": 201, "name": "duplicate_name", "display_name": None, "group_chat_id": None}, self.data_dir
+        )
+        config_d = accountant.config_from_bot_row(
+            {"bot_id": 202, "name": "duplicate_name", "display_name": None, "group_chat_id": None}, self.data_dir
+        )
+        self.assertEqual(config_c.bot_name, config_d.bot_name)  # same name, by design
+        self.assertNotEqual(config_c.db_path, config_d.db_path)
+        self.assertNotEqual(config_c.admins_file, config_d.admins_file)
+
+        await accountant.init_db(config_c.db_path)
+        await accountant.init_db(config_d.db_path)
+        bot_c, dp_c = _build_bot_dispatcher(config_c)
+        bot_d, dp_d = _build_bot_dispatcher(config_d)
+
+        await dp_c.feed_webhook_update(bot_c, _callback_update(1, SAME_USER_ID, "proj_new"))
+        await dp_c.feed_webhook_update(bot_c, _text_update(2, SAME_USER_ID, "Gamma Project"))
+        await dp_d.feed_webhook_update(bot_d, _callback_update(1, SAME_USER_ID, "proj_new"))
+        await dp_d.feed_webhook_update(bot_d, _text_update(2, SAME_USER_ID, "Delta Project"))
+
+        conn_c = sqlite3.connect(config_c.db_path)
+        names_c = [r[0] for r in conn_c.execute("SELECT name FROM projects").fetchall()]
+        conn_c.close()
+        conn_d = sqlite3.connect(config_d.db_path)
+        names_d = [r[0] for r in conn_d.execute("SELECT name FROM projects").fetchall()]
+        conn_d.close()
+
+        self.assertEqual(names_c, ["Gamma Project"])
+        self.assertEqual(names_d, ["Delta Project"])
 
 
 class AccountantStandaloneSmokeTest(unittest.TestCase):

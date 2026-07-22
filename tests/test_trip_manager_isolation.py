@@ -143,10 +143,10 @@ class TripManagerIsolationTests(unittest.IsolatedAsyncioTestCase):
         self.data_dir = Path(self._tmp.name)
 
         self.config_a = trip_manager.config_from_bot_row(
-            {"name": "tm_isolation_bot_a", "display_name": "Марта", "group_chat_id": None}, self.data_dir
+            {"bot_id": 101, "name": "tm_isolation_bot_a", "display_name": "Марта", "group_chat_id": None}, self.data_dir
         )
         self.config_b = trip_manager.config_from_bot_row(
-            {"name": "tm_isolation_bot_b", "display_name": "Тревел", "group_chat_id": None}, self.data_dir
+            {"bot_id": 102, "name": "tm_isolation_bot_b", "display_name": "Тревел", "group_chat_id": None}, self.data_dir
         )
         await trip_manager.init_db(self.config_a.db_path)
         await trip_manager.init_db(self.config_b.db_path)
@@ -191,6 +191,41 @@ class TripManagerIsolationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(admins_a, [str(SAME_USER_ID)])
         self.assertEqual(admins_b, ["999"])
+
+    async def test_same_name_different_bot_id_still_isolated(self):
+        """The actual case this phase closes: bots.name has no UNIQUE
+        constraint, so two DB rows can share the exact same name. Before this
+        phase, config_from_bot_row() built paths from bot_row["name"] — two
+        same-named bots would have shared one db/admins file. Now paths are
+        built from bot_row["bot_id"] (the physically unique PK), so even
+        identical names must not collide."""
+        config_c = trip_manager.config_from_bot_row(
+            {"bot_id": 201, "name": "duplicate_name", "display_name": "Вера", "group_chat_id": None}, self.data_dir
+        )
+        config_d = trip_manager.config_from_bot_row(
+            {"bot_id": 202, "name": "duplicate_name", "display_name": "Гриша", "group_chat_id": None}, self.data_dir
+        )
+        self.assertEqual(config_c.bot_name, config_d.bot_name)
+        self.assertNotEqual(config_c.db_path, config_d.db_path)
+        self.assertNotEqual(config_c.admins_file, config_d.admins_file)
+
+        await trip_manager.init_db(config_c.db_path)
+        await trip_manager.init_db(config_d.db_path)
+        bot_c, dp_c = _build_bot_dispatcher(config_c)
+        bot_d, dp_d = _build_bot_dispatcher(config_d)
+
+        await _create_trip(dp_c, bot_c, SAME_USER_ID, "Gamma Trip", 1)
+        await _create_trip(dp_d, bot_d, SAME_USER_ID, "Delta Trip", 1)
+
+        conn_c = sqlite3.connect(config_c.db_path)
+        names_c = [r[0] for r in conn_c.execute("SELECT name FROM trips").fetchall()]
+        conn_c.close()
+        conn_d = sqlite3.connect(config_d.db_path)
+        names_d = [r[0] for r in conn_d.execute("SELECT name FROM trips").fetchall()]
+        conn_d.close()
+
+        self.assertEqual(names_c, ["Gamma Trip"])
+        self.assertEqual(names_d, ["Delta Trip"])
 
     async def test_group_mention_uses_own_display_name_in_claude_prompt(self):
         """Same class of trap as manager_secretary's display_name check: proves

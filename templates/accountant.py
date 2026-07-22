@@ -104,10 +104,24 @@ def config_from_bot_row(bot_row: dict, data_dir: Path) -> AccountantConfig:
     an independent os.getenv("DATA_DIR", "./data") here would risk silently
     diverging from the subprocess model's paths if the process cwd ever differs.
 
-    Uses the bot's own DB `name` (not this template file's name) so a bot that
-    already has data from a previous subprocess run is found, not orphaned.
+    Paths are built from bot_row["bot_id"] (bots.id, the physically unique
+    AUTOINCREMENT PK) — NOT bot_row["name"]. bots.name has no UNIQUE constraint,
+    so two bots sharing a name would otherwise silently share one db/admins
+    file (see docs/STAGE2_DESIGN.md "Изоляция по bots.id"). bot_row["name"]
+    is kept only as the human-readable bot_name label below — never used to
+    build a path. Deliberately does NOT reuse _paths_for()/config_from_env()'s
+    name-based formula — that one stays untouched for standalone mode, where
+    no bot_id exists at all (one process = one bot, no collision is possible).
     """
-    config = _paths_for(bot_row["name"], data_dir)
+    bot_id = bot_row["bot_id"]
+    config = AccountantConfig(
+        bot_name=bot_row["name"],
+        db_path=str(data_dir / f"bot_{bot_id}_data.db"),
+        admins_file=data_dir / f"admins_{bot_id}.json",
+        excel_path=str(data_dir / f"bot_{bot_id}_data.xlsx"),
+        html_path=str(data_dir / f"bot_{bot_id}_report.html"),
+        welcome_image=data_dir / "bot_images" / f"bot_{bot_id}.jpg",
+    )
     config.display_name = bot_row.get("display_name")
     config.group_chat_id = bot_row.get("group_chat_id")
     return config

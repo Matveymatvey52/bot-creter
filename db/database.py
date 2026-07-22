@@ -164,7 +164,11 @@ async def sync_bot_admins_json(bot_id: int) -> None:
     if not b:
         return
     ids = await get_bot_admins(bot_id)
-    path = DATA_DIR / f"admins_{b['name']}.json"
+    # Keyed by bot_id, not bot name — bots.name has no UNIQUE constraint, and
+    # every template's config_from_bot_row() now reads admins_<bot_id>.json
+    # (Stage 2 "изоляция по bots.id"). Writing by name here would silently
+    # never reach the file the running bot actually consults.
+    path = DATA_DIR / f"admins_{bot_id}.json"
     path.write_text(json.dumps({"ids": ids}, ensure_ascii=False))
 
 
