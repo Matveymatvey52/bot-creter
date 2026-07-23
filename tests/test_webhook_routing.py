@@ -17,7 +17,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiohttp.test_utils import TestClient, TestServer
 
 from runtime.registry import BotEntry, ConfigMiddleware
-from runtime.webhook_app import create_app
+from runtime.webhook_app import WEBHOOK_SECRET_HEADER, create_app
 
 FAKE_TOKEN = "123456:test-token-not-real"
 KNOWN_BOT_ID = 42
@@ -66,15 +66,46 @@ class WebhookRoutingTests(unittest.IsolatedAsyncioTestCase):
         await self.client.close()
 
     async def test_known_bot_routes_update_to_its_dispatcher(self):
-        resp = await self.client.post(
-            f"/webhook/{KNOWN_BOT_ID}", json=_fake_update("/start")
-        )
+        # /webhook/* is fail-closed on an unset WEBHOOK_SECRET (see
+        # STAGE2_REPORT.md "WEBHOOK_SECRET fail-closed") — this test is about
+        # bot_id routing, not secret validation, so it sets a matching
+        # secret/header pair to actually reach the routing logic.
+        with patch.dict(os.environ, {"WEBHOOK_SECRET": "expected-secret"}):
+            resp = await self.client.post(
+                f"/webhook/{KNOWN_BOT_ID}", json=_fake_update("/start"),
+                headers={WEBHOOK_SECRET_HEADER: "expected-secret"},
+            )
         self.assertEqual(resp.status, 200)
         self.assertEqual(self.received, [("/start", KNOWN_BOT_ID)])
 
     async def test_unknown_bot_id_returns_404(self):
-        resp = await self.client.post("/webhook/999999", json=_fake_update())
+        with patch.dict(os.environ, {"WEBHOOK_SECRET": "expected-secret"}):
+            resp = await self.client.post(
+                "/webhook/999999", json=_fake_update(),
+                headers={WEBHOOK_SECRET_HEADER: "expected-secret"},
+            )
         self.assertEqual(resp.status, 404)
+        self.assertEqual(self.received, [])
+
+    async def test_missing_secret_is_fail_closed(self):
+        """The main case this phase closes: an unset/empty WEBHOOK_SECRET must
+        reject the request (403), not silently let it through (the old Phase 1
+        fail-open trade-off). Explicitly clears the env var (restored after
+        the `with` block) rather than relying on it being ambiently unset."""
+        with patch.dict(os.environ):
+            os.environ.pop("WEBHOOK_SECRET", None)
+            resp = await self.client.post(f"/webhook/{KNOWN_BOT_ID}", json=_fake_update())
+        self.assertEqual(resp.status, 403)
+        body = await resp.json()
+        self.assertEqual(body.get("error"), "webhook secret not configured")
+        self.assertEqual(self.received, [])
+
+    async def test_secret_configured_but_header_missing_returns_403(self):
+        """Distinct from the wrong-header case below: no
+        X-Telegram-Bot-Api-Secret-Token header sent at all."""
+        with patch.dict(os.environ, {"WEBHOOK_SECRET": "expected-secret"}):
+            resp = await self.client.post(f"/webhook/{KNOWN_BOT_ID}", json=_fake_update())
+        self.assertEqual(resp.status, 403)
         self.assertEqual(self.received, [])
 
     async def test_wrong_secret_header_returns_403(self):
@@ -82,7 +113,7 @@ class WebhookRoutingTests(unittest.IsolatedAsyncioTestCase):
             resp = await self.client.post(
                 f"/webhook/{KNOWN_BOT_ID}",
                 json=_fake_update(),
-                headers={"X-Telegram-Bot-Api-Secret-Token": "wrong-secret"},
+                headers={WEBHOOK_SECRET_HEADER: "wrong-secret"},
             )
         self.assertEqual(resp.status, 403)
         self.assertEqual(self.received, [])
@@ -92,7 +123,7 @@ class WebhookRoutingTests(unittest.IsolatedAsyncioTestCase):
             resp = await self.client.post(
                 f"/webhook/{KNOWN_BOT_ID}",
                 json=_fake_update("/hello"),
-                headers={"X-Telegram-Bot-Api-Secret-Token": "expected-secret"},
+                headers={WEBHOOK_SECRET_HEADER: "expected-secret"},
             )
         self.assertEqual(resp.status, 200)
         self.assertEqual(self.received, [("/hello", KNOWN_BOT_ID)])
@@ -100,6 +131,19 @@ class WebhookRoutingTests(unittest.IsolatedAsyncioTestCase):
     async def test_health_endpoint(self):
         resp = await self.client.get("/health")
         self.assertEqual(resp.status, 200)
+
+    async def test_health_endpoint_ignores_webhook_secret_state(self):
+        """/health has no secret check at all and must stay reachable for
+        monitoring regardless of whether WEBHOOK_SECRET is set — explicitly
+        exercised under both states, not just whatever the ambient env is."""
+        with patch.dict(os.environ):
+            os.environ.pop("WEBHOOK_SECRET", None)
+            resp = await self.client.get("/health")
+            self.assertEqual(resp.status, 200)
+
+        with patch.dict(os.environ, {"WEBHOOK_SECRET": "expected-secret"}):
+            resp = await self.client.get("/health")
+            self.assertEqual(resp.status, 200)
 
 
 if __name__ == "__main__":
