@@ -14,11 +14,19 @@ import os
 
 from aiohttp import web
 
-from runtime.registry import BotEntry, Registry, build_registry
+from runtime.registry import Registry, build_registry
 
 logger = logging.getLogger(__name__)
 
 REGISTRY_KEY = web.AppKey("registry", Registry)
+WEBHOOK_SECRET_HEADER = "X-Telegram-Bot-Api-Secret-Token"
+
+# Set once the first time webhook_handler sees an unset/empty WEBHOOK_SECRET,
+# so the per-request rejection logs a single logger.warning() instead of a
+# logger.error() on every request — Telegram retries failed deliveries, and an
+# ERROR per retry would spam the log for as long as the secret stays unset.
+# create_app()'s own startup warning is unaffected (still logs once per app build).
+_secret_missing_warned = False
 
 
 async def health(request: web.Request) -> web.Response:
@@ -31,15 +39,22 @@ async def webhook_handler(request: web.Request) -> web.Response:
         return web.json_response({"error": "bad bot_id"}, status=404)
     bot_id = int(bot_id_raw)
 
-    # PHASE 1 TRADE-OFF: if WEBHOOK_SECRET isn't set, the check is skipped (fail-open).
-    # Fine for local smoke-testing with no real webhook registered; before any real
-    # deploy this must become fail-closed (refuse to start, or reject all requests)
-    # when the secret is missing — see STAGE2_REPORT.md.
+    # Fail-closed: an unset/empty WEBHOOK_SECRET rejects every request instead of
+    # skipping the check (the Phase 1 fail-open trade-off — see STAGE2_REPORT.md
+    # "WEBHOOK_SECRET fail-closed"). The app itself still starts without a secret
+    # (rejecting requests, not refusing to boot) — a hard startup failure here
+    # would break local dev/tests the same way a missing ENCRYPTION_KEY already
+    # does elsewhere; see create_app()'s startup warning for the one-time signal.
+    global _secret_missing_warned
     secret = os.getenv("WEBHOOK_SECRET", "")
-    if secret:
-        header = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
-        if not hmac.compare_digest(header, secret):
-            return web.json_response({"error": "forbidden"}, status=403)
+    if not secret:
+        if not _secret_missing_warned:
+            logger.warning("WEBHOOK_SECRET not set — rejecting all webhook requests until it's configured")
+            _secret_missing_warned = True
+        return web.json_response({"error": "webhook secret not configured"}, status=403)
+    header = request.headers.get(WEBHOOK_SECRET_HEADER, "")
+    if not hmac.compare_digest(header, secret):
+        return web.json_response({"error": "forbidden"}, status=403)
 
     registry: Registry = request.app[REGISTRY_KEY]
     entry = registry.get(bot_id)
@@ -55,14 +70,14 @@ async def webhook_handler(request: web.Request) -> web.Response:
 
 
 def _admin_secret_ok(request: web.Request) -> bool:
-    """Fail-CLOSED — deliberately the opposite trade-off from webhook_handler's
-    public endpoint. This is an internal control surface (force-rebuild any
-    bot's Dispatcher from the DB); an unset WEBHOOK_SECRET must deny access
-    here, not silently skip the check."""
+    """Fail-closed, same as webhook_handler's public endpoint now is. This is
+    an internal control surface (force-rebuild any bot's Dispatcher from the
+    DB); an unset WEBHOOK_SECRET must deny access here, not silently skip
+    the check."""
     secret = os.getenv("WEBHOOK_SECRET", "")
     if not secret:
         return False
-    header = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    header = request.headers.get(WEBHOOK_SECRET_HEADER, "")
     return hmac.compare_digest(header, secret)
 
 
@@ -93,6 +108,11 @@ async def admin_reload_all(request: web.Request) -> web.Response:
 def create_app(registry: Registry | None = None) -> web.Application:
     """Build the aiohttp Application. `registry` can be pre-populated (used by tests);
     otherwise it's built from the DB when the app starts (see _bootstrap_app)."""
+    if not os.getenv("WEBHOOK_SECRET", ""):
+        logger.warning(
+            "WEBHOOK_SECRET is not set — /webhook/* will reject every request "
+            "with 403 until it's configured (fail-closed, see STAGE2_REPORT.md)"
+        )
     app = web.Application()
     app[REGISTRY_KEY] = registry if registry is not None else Registry()
     app.router.add_post("/webhook/{bot_id}", webhook_handler)

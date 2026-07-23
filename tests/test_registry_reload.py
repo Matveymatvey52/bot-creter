@@ -13,6 +13,7 @@ Run with: python -m unittest tests.test_registry_reload
 from __future__ import annotations
 
 import asyncio
+import os
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -26,7 +27,7 @@ from db.database import (
     set_bot_display_name,
 )
 from runtime.registry import Registry
-from runtime.webhook_app import create_app
+from runtime.webhook_app import WEBHOOK_SECRET_HEADER, create_app
 
 FAKE_TOKEN = "123456:test-token-not-real"
 
@@ -58,44 +59,51 @@ class RegistryLiveUpdateTests(unittest.IsolatedAsyncioTestCase):
         self._bot_call_patcher.stop()
 
     async def test_add_or_replace_makes_a_new_bot_start_routing(self):
-        registry = Registry()
-        app = create_app(registry)
-        server = TestServer(app)
-        client = TestClient(server)
-        await client.start_server()
-        try:
-            bot_id = await create_bot_record_with_admins(
-                name="reload_test_bot_a",
-                description="test",
-                token=FAKE_TOKEN,
-                file_path="",
-                admin_ids=["111"],
-            )
+        # /webhook/* is fail-closed on an unset WEBHOOK_SECRET (see
+        # STAGE2_REPORT.md "WEBHOOK_SECRET fail-closed") — this test is about
+        # registry routing, not secret validation, so it sets a matching
+        # secret/header pair to keep exercising the 404/200/404 routing
+        # transitions rather than getting 403 on every request.
+        secret_headers = {WEBHOOK_SECRET_HEADER: "test-secret"}
+        with patch.dict(os.environ, {"WEBHOOK_SECRET": "test-secret"}):
+            registry = Registry()
+            app = create_app(registry)
+            server = TestServer(app)
+            client = TestClient(server)
+            await client.start_server()
             try:
-                # Not in the registry yet — 404.
-                resp = await client.post(f"/webhook/{bot_id}", json=_fake_update())
-                self.assertEqual(resp.status, 404)
-
-                # add_or_replace picks it up from a bots-table row shape.
-                added = await registry.add_or_replace(
-                    {"id": bot_id, "name": "reload_test_bot_a", "token": FAKE_TOKEN,
-                     "file_path": "", "display_name": None, "group_chat_id": None}
+                bot_id = await create_bot_record_with_admins(
+                    name="reload_test_bot_a",
+                    description="test",
+                    token=FAKE_TOKEN,
+                    file_path="",
+                    admin_ids=["111"],
                 )
-                self.assertIsNotNone(added)
+                try:
+                    # Not in the registry yet — 404.
+                    resp = await client.post(f"/webhook/{bot_id}", json=_fake_update(), headers=secret_headers)
+                    self.assertEqual(resp.status, 404)
 
-                # Now it routes (200), not 404.
-                resp = await client.post(f"/webhook/{bot_id}", json=_fake_update())
-                self.assertEqual(resp.status, 200)
+                    # add_or_replace picks it up from a bots-table row shape.
+                    added = await registry.add_or_replace(
+                        {"id": bot_id, "name": "reload_test_bot_a", "token": FAKE_TOKEN,
+                         "file_path": "", "display_name": None, "group_chat_id": None}
+                    )
+                    self.assertIsNotNone(added)
 
-                # remove() takes it back out — 404 again.
-                removed = await registry.remove(bot_id)
-                self.assertTrue(removed)
-                resp = await client.post(f"/webhook/{bot_id}", json=_fake_update())
-                self.assertEqual(resp.status, 404)
+                    # Now it routes (200), not 404.
+                    resp = await client.post(f"/webhook/{bot_id}", json=_fake_update(), headers=secret_headers)
+                    self.assertEqual(resp.status, 200)
+
+                    # remove() takes it back out — 404 again.
+                    removed = await registry.remove(bot_id)
+                    self.assertTrue(removed)
+                    resp = await client.post(f"/webhook/{bot_id}", json=_fake_update(), headers=secret_headers)
+                    self.assertEqual(resp.status, 404)
+                finally:
+                    await delete_bot(bot_id)
             finally:
-                await delete_bot(bot_id)
-        finally:
-            await client.close()
+                await client.close()
 
     async def test_reload_one_picks_up_changed_bot_row(self):
         registry = Registry()
