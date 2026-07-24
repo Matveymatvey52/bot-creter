@@ -610,3 +610,106 @@ python -m unittest discover -s tests -v
 3. **Удаление старых данных** — по-прежнему привязано к реальному деплою, не выполнено.
 4. **Отдельный секрет для `/admin/*`** (не переиспользовать `WEBHOOK_SECRET`) — пункт 10 бэклога, не эта фаза; `/admin/*` уже fail-closed на общем секрете, не открыты, но архитектурно смешаны с публичным вебхуком.
 5. **Тест-компаньон для схемы путей `config_from_bot_row`**, **конкурентная загрузка ботов в реестре** — как и раньше, на будущее.
+
+---
+
+# Фабрика как житель реестра / объединённый процесс
+
+Ветка `factory-as-registry-citizen` (от `stage2-webhooks`; предыдущая, более узкая попытка — ветка `factory-registry-link` — осталась без единого коммита и была оставлена как есть). Цель: фабричный бот (`handlers/create_bot.py` + остальные роутеры `main.py`) отвечает через тот же вебхук-рантайм, что и тенант-боты, а не только через отдельный `main.py`'s long-polling процесс.
+
+## Инвентаризация и решения владельца
+
+Построчно подтверждено: `main.py` (фабрика, polling) и `runtime/webhook_app.py` (реестр) — независимые процессы; на Railway реально запускается только `main.py` (`start.sh: exec python ${BOT_SCRIPT:-main.py}`, `railway.toml: startCommand = "bash start.sh"`). `BotEntry` — уже полностью общий dataclass (`bot`, `dispatcher`, `template_id: str | None`, `config: dict`), новый тип записи не требуется — нужны только новая функция построения и новый путь вставки, в обход тенант-ориентированного `build_entry()`/`add_or_replace()`.
+
+Владелец выбрал **вариант 1b — sentinel-id**: `FACTORY_BOT_ID = 0`, без строки в `bots` («фабрика — не продукт, а инструмент производства», строка в `bots` рискует тем, что инструменты, читающие таблицу, спутают фабрику с клиентским ботом). Отклонены: реальная строка в `bots` (смешение ролей) и фиксированный путь `/webhook/factory` (дублировал бы security-логику `WEBHOOK_SECRET fail-closed`, удваивая риск). `0` безопасен не по договорённости, а по устройству SQLite — `AUTOINCREMENT` никогда не выдаёт `0`.
+
+**Важный пересмотр объёма владельцем в процессе:** раз фабрика становится вебхук-жителем (не polling), у неё нет собственного вечного цикла — обработка идёт по одному HTTP-запросу за раз, тем же механизмом, что у тенант-ботов. Изначально запланированный супервизор/обёртка изоляции падений (Task 3 в исходном виде) **отменена целиком** — падать отдельно нечему. Task 3 переопределена как проверка (не переписывание) существующего try/except.
+
+## Что сделано
+
+**Task 2** — `runtime/registry.py`: `FACTORY_BOT_ID = 0` (с комментарием, почему 0 безопасен по конструкции AUTOINCREMENT, а не по соглашению) и `build_factory_entry(bot, dispatcher) -> BotEntry` — оборачивает уже собранные `Bot`+`Dispatcher` в существующий generic `BotEntry`, в обход `build_entry()`/`_TEMPLATE_LOADERS` (фабрика — не тенант, нет строки в БД, нет per-bot config). `template_id="__factory__"` — просто метка для логов, нигде не сверяется с `_TEMPLATE_LOADERS`.
+
+`main.py`: инлайновый блок `group_router` (авто-детект добавления бота в группу) вынесен в модульную `build_group_router()`, чтобы `main.py` и новый `combined_app.py` не дублировали хендлеры. Единственное поведенчески значимое изменение — `on_added_to_group` теперь принимает `bot: Bot` как aiogram-инжектируемый параметр вместо замыкания на внешнюю переменную.
+
+**Task 3** — новый `runtime/combined_app.py`: тот же вебхук-сервер, что и `webhook_app.py`, плюс сборка фабричного `Dispatcher` (тот же набор роутеров, что в `main()`: `admin`/`start`/`create`/`manage`/`general` + `build_group_router()`, `ManagedBotMiddleware`). Bootstrap: единая точка `logging.basicConfig`, `init_bots_db()`, разовые `get_me()`→`set_manager_username`/`set_bot_id`, `set_my_description`, `restore_bots()` (тенант-подпроцессы — без изменений), `build_registry()`, затем прямая вставка `registry._entries[FACTORY_BOT_ID] = factory_entry` (в обход `add_or_replace()`/`build_entry()` — явный выбор владельца), `set_registry(registry)`. `delete_webhook()`+`start_polling()` для фабрики убраны — она больше не polling-бот. `web.run_app()` — единственная верхняя точка (её встроенная обработка SIGINT/SIGTERM признана достаточной). **Не подключено ни к одному реальному деплою** — `main.py` через `start.sh`/`railway.toml` по-прежнему единственная реальная команда запуска (см. Task 6 ниже).
+
+Подтверждено ЧТЕНИЕМ КОДА, не переписыванием: необработанное исключение в фабричном хендлере ловится тем же `try/except` вокруг `feed_webhook_update` в `webhook_handler` (`runtime/webhook_app.py`), что и для тенант-ботов — отдельной обёртки/супервизора не потребовалось и не добавлено.
+
+**Task 4** — `handlers/create_bot.py`: `set_registry(registry)` + `_register_new_bot_in_registry(bot_id, bot_name)` — best-effort, никогда не бросает исключение наружу (сбой регистрации не должен отменять создание бота, поскольку `services.bot_runner.start_bot()`-подпроцесс — то, что реально делает бота отвечающим сегодня, независимо от состояния реестра). Перечитывает свежую строку через `db.database.get_bot(bot_id)` (та же логика, что уже использует `Registry.reload_one()`) и вызывает `registry.add_or_replace(fresh_row)`. Вызвано в обоих местах создания бота — `auto_launch_managed_bot()` и `handle_token()` — сразу после `set_bot_display_name()`, до запуска подпроцесса.
+
+**Task 5** — `tests/test_factory_registry_citizen.py` (новый файл), 3 сценария:
+```
+test_bot_created_via_factory_flow_is_registered_and_responds_without_manual_reload ... ok
+  → реальный handle_token() через настоящий Dispatcher.feed_webhook_update
+  → бот в реестре БЕЗ единого ручного /admin/reload
+  → его собственный Dispatcher реально обрабатывает accountant-флоу
+    (проверено чтением настоящего SQLite-файла)
+
+test_factory_fsm_advances_via_webhook_path ... ok
+  → /create фабрике — через настоящий aiohttp POST /webhook/0
+  → FSM-состояние реально продвинулось (не просто 200 OK)
+
+test_broken_factory_handler_does_not_break_a_healthy_tenant_bot ... ok
+  → фабричный хендлер намеренно бросает RuntimeError
+  → соседний тенант-бот в том же процессе продолжает отвечать и
+    сохранять данные — существующий try/except в webhook_handler
+    изолирует падение по bot_id, новой обвязки не понадобилось
+```
+При написании тестов найдены и починены 2 бага САМОГО ТЕСТА (не прод-кода): фейковый токен короче 30 символов (`handle_token()` его отбраковывал) и попытка дважды прикрепить один и тот же `aiogram.Router`-синглтон (`create_bot_module.router`) к разным `Dispatcher` в одном процессе — у aiogram `Router` может иметь только одного родителя за всё время жизни; тесты, которым нужен настоящий роутер, теперь делят один ленивый общий `(bot, dispatcher)` вместо того, чтобы каждый строил свой.
+
+**Полный прогон после Task 2-5: 60/60** (57 прежних + 3 новых).
+
+## Ревью (`review-orchestrator`, все 7 специалистов)
+
+**0 блокеров, введённых этим диффом.** Ключевые находки:
+
+- **Sentinel-безопасность подтверждена независимо** (security + state-db): `bots.id INTEGER PRIMARY KEY AUTOINCREMENT` никогда не выдаёт `0`, `get_bot()`/`get_all_bots()` всегда возвращают реальный DB-присвоенный id — коллизия физически невозможна. FSM-изоляция тоже двойная: `FACTORY_BOT_ID` — только ключ словаря `_entries`, никогда не участвует в `StorageKey` (тот использует реальный `bot.id` из токена + собственный `MemoryStorage` на каждый `BotEntry`).
+- **Важная находка (security + devops-logs, независимо, затем расширена state-db) — уже почина́т**: `reload_one(0)`/`reload_all()` до фикса тихо вышвыривали (и закрывали `Bot`-сессию) фабричную запись — `reload_one(0)` достижим одним вызовом `/admin/reload/0` (опечатка/скрипт-перебор диапазона id), `reload_all()` — любым `/admin/reload-all`. **Починено до коммита** (см. ниже).
+- **async-pooling**: `restore_bots()` перед `build_registry()`/`web.run_app()` — последовательный перезапуск N тенант-подпроцессов (`~2с` на каждый) откладывает готовность `/health` и приёма вебхуков на потенциально минуты при большом парке ботов. Не блокер, но релевантно при масштабе — зафиксировано в бэклоге.
+- **monkey-tester** — 3 находки, ВСЕ пре-существующие, не введены и не усугублены этой фазой (double-submit FSM race в `handle_token()`; неэкранированный `chat.title` в HTML-сообщении `on_added_to_group` — код перенесён `build_group_router()`'ом дословно, поведение не менялось; узкая гонка `/cancel` против `auto_launch_managed_bot()`). Не чинились по прямому указанию владельца — отдельные будущие фазы.
+- **clean-code**: дублирование между `auto_launch_managed_bot()`/`handle_token()` стало чуть заметнее (третья скопированная строка вызова `_register_new_bot_in_registry`) — кандидат на будущий рефакторинг в общий хелпер, не блокер. Дублирование `main.py`/`combined_app.py`'s текста описания бота и сборки роутеров — приемлемо, т.к. это разные типы процессов (polling vs webhook), не по плану объединять в эту фазу.
+
+## Починено по итогам ревью, до коммита
+
+**`FACTORY_BOT_ID`-guard в `Registry.reload_one()`/`reload_all()`** (`runtime/registry.py`):
+- `reload_one(bot_id)` — в начале: `if bot_id == FACTORY_BOT_ID: logger.warning(...); return None` — не удаляет и не пытается перечитать из БД.
+- `reload_all()` — перед пересборкой сохраняет текущую фабричную запись (`old_entries.get(FACTORY_BOT_ID)`), после сборки `new_entries` из `get_all_bots()` — **добавляет её обратно в `new_entries` ДО свопа** (не после, как в первом черновике формулировки задачи — присвоение в `self._entries` уже post-swap привело бы к тому, что цикл закрытия старых сессий закрыл бы ЖИВУЮ, ещё используемую фабричную `Bot`-сессию; итоговая реализация технически корректна: сессия фабрики явно пропускается в цикле закрытия `for bot_id, entry in old_entries.items(): if bot_id == FACTORY_BOT_ID: continue`). Лог `"factory entry preserved across reload_all"` — как и просили.
+- `runtime/combined_app.py` — комментарий у `registry._entries[FACTORY_BOT_ID] = factory_entry` обновлён: было «KNOWN CONSEQUENCE, not fixed», стало — реестр теперь защищает эту запись при обоих видах reload.
+- 2 новых теста в `tests/test_factory_registry_citizen.py`: `reload_all()` при живой фабричной записи → запись на месте (тот же объект `Bot`, не пересобранный); `reload_one(FACTORY_BOT_ID)` → запись не тронута, `assertLogs` подтверждает WARNING с упоминанием `FACTORY_BOT_ID`.
+
+**Полный прогон после фикса: 62/62** (60 + 2 новых).
+
+**Не чинилось (пре-существующее или отдельный объём, по прямому указанию владельца):**
+1. Double-submit FSM race в `handle_token()`/`auto_launch_managed_bot()` (нет idempotency-guard'а на повторную доставку/двойную отправку токена) — отдельная фаза.
+2. Неэкранированный `chat.title`/`b["name"]` в HTML-сообщениях `main.py`/`build_group_router()` — отдельная фаза.
+3. Узкая гонка `/cancel` против уже запущенного `auto_launch_managed_bot()` (может осиротить реального бота в BotFather без строки в БД) — отдельная фаза.
+4. `restore_bots()` — последовательный перезапуск подпроцессов задерживает готовность сервера при большом парке ботов — зафиксировано как будущий риск масштабирования, не эта фаза.
+5. Дублирование `auto_launch_managed_bot()`/`handle_token()` (общий кандидат-хелпер `_finish_bot_creation(...)`) — отдельный рефакторинг.
+6. Shutdown cleanup (`on_shutdown`/`on_cleanup` для `Bot`-сессий при остановке процесса) — ни `combined_app.py`, ни `webhook_app.py` этого не делают; фабрика наследует тот же пре-существующий пробел, что уже есть у тенант-ботов — отдельная фаза.
+
+## Task 6 — реальный деплой: ОТДЕЛЬНЫЙ стоп, разбит владельцем на 3 подтверждения
+
+Текущая команда: `start.sh: exec python ${BOT_SCRIPT:-main.py}`, `railway.toml: startCommand = "bash start.sh"` — сегодня `BOT_SCRIPT` нигде не задан, реально работает только `main.py`. Предложение: задать `BOT_SCRIPT=runtime/combined_app.py` в переменных Railway (без изменения `start.sh`/`railway.toml`), плюс `WEBHOOK_SECRET`. Откат — снять/очистить `BOT_SCRIPT` и redeploy, без единого изменения кода (ветка не смёржена в `master`... **обновление**: владелец решил слить в `master` отдельным шагом ниже, поведение прода при этом не меняется, т.к. дефолт `BOT_SCRIPT=main.py` работает как раньше).
+
+Владелец разбил Task 6 на 3 независимых «да»:
+1. **Слияние `factory-as-registry-citizen` в `master`** — при условии чистого ревью (условие выполнено), не меняет поведение прода.
+2. **Обычный деплой этого `master` на Railway** (без смены переменных) — отдельное «да».
+3. **Переключение `BOT_SCRIPT` на `combined_app.py`** — отдельное «да», только после проверки, что `WEBHOOK_SECRET` уже задан в Railway (иначе — тихий fail-closed на все вебхуки); перед этим шагом — показать факт, что переменная задана, без значения.
+
+Ничего из пунктов 2-3 не выполнено. Пункт 1 — ждёт отдельного явного «ок» после этого отчёта.
+
+## Как запускать локально
+```bash
+python -m unittest tests.test_factory_registry_citizen -v
+
+# всё вместе
+python -m unittest discover -s tests -v
+```
+
+## Что осталось
+1. ~~Фабрика отвечает только через отдельный polling-процесс~~ — **закрыто этой фазой** (для вебхук-режима; polling через `main.py` остаётся реальной прод-командой до отдельного «да» на Task 6, пункт 3).
+2. ~~`reload_one`/`reload_all` могли тихо вышвырнуть фабричную запись~~ — **закрыто этой фазой, до коммита**.
+3. **Стадия «Офисы»**, **реальное включение Telegram-вебхука**, **Postgres** — без изменений, не входит в объём.
+4. **Double-submit FSM race, HTML-инъекция в group messages, `/cancel`-гонка, `restore_bots()`-задержка при масштабе, дублирование create-flow хелперов, shutdown cleanup** — см. список «не чинилось» выше, все — отдельные будущие фазы/рефакторинги.
+5. **Отдельный секрет для `/admin/*`** — по-прежнему пункт бэклога (см. предыдущую фазу).</new_string>
+
