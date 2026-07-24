@@ -8,11 +8,12 @@ import json
 import logging
 import os
 import re
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
 import aiosqlite
-from aiogram import Bot, Dispatcher, F, Router
+from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -23,6 +24,12 @@ from aiogram.types import (
 )
 
 # ── CUSTOMIZE ────────────────────────────────────────────────────────────────
+# NOTE (Stage 2 Phase 5): same as accountant.py/manager_secretary.py — this
+# section is per-file source-text customization Claude edits when generating a
+# specific bot, not a per-bot runtime config. See docs/STAGE2_DESIGN.md.
+# MASTERS/SLOT_TIMES/SLOT_PRICE/DAYS_AHEAD are shared read-only generation
+# parameters, not per-bot state — the DATA they generate (slots/bookings) is
+# per-bot via config.db_path below, only this list's CONTENT is shared.
 BOT_DESCRIPTION = "Онлайн-запись в студию красоты. Выберите услугу, дату, время — и вы записаны!"
 WELCOME_TEXT = (
     "💅 <b>Онлайн-запись</b>\n\n"
@@ -38,13 +45,6 @@ SLOT_TIMES = ["10:00", "11:00", "12:00", "13:00", "14:00", "15:00", "16:00", "17
 SLOT_PRICE = 0
 # ── END CUSTOMIZE ─────────────────────────────────────────────────────────────
 
-BOT_NAME = Path(__file__).stem
-DATA_DIR = Path(os.getenv("DATA_DIR", "./data"))
-DATA_DIR.mkdir(exist_ok=True)
-DB_PATH = str(DATA_DIR / f"{BOT_NAME}_data.db")
-WELCOME_IMAGE = DATA_DIR / "bot_images" / f"{BOT_NAME}.jpg"
-ADMINS_FILE = DATA_DIR / f"admins_{BOT_NAME}.json"
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 router = Router()
@@ -54,16 +54,89 @@ MONTHS_RU = {1: "янв", 2: "фев", 3: "мар", 4: "апр", 5: "май", 6:
              7: "июл", 8: "авг", 9: "сен", 10: "окт", 11: "ноя", 12: "дек"}
 
 
+# ── config (Stage 2 Phase 5) ────────────────────────────────────────────────────
+# Same pattern as templates/accountant.py (Phase 2) / templates/manager_secretary.py
+# (Phase 4) — see docs/STAGE2_DESIGN.md "Config-контракт шаблона booking_beauty".
+# No excel_path/html_path (no such export). display_name/group_chat_id are kept
+# for form parity with the other templates but are NOT read anywhere in this
+# file (verified by grep before migration) — same status as in accountant.py.
+
+@dataclass
+class BookingBeautyConfig:
+    bot_name: str
+    db_path: str
+    admins_file: Path
+    welcome_image: Path
+    display_name: str | None = None
+    group_chat_id: str | None = None
+
+
+def _paths_for(name: str, data_dir: Path) -> BookingBeautyConfig:
+    return BookingBeautyConfig(
+        bot_name=name,
+        db_path=str(data_dir / f"{name}_data.db"),
+        admins_file=data_dir / f"admins_{name}.json",
+        welcome_image=data_dir / "bot_images" / f"{name}.jpg",
+    )
+
+
+def config_from_env() -> BookingBeautyConfig:
+    """Standalone/subprocess mode: reproduces exactly what the old module-level
+    constants gave, behavior unchanged 1:1."""
+    name = Path(__file__).stem
+    data_dir = Path(os.getenv("DATA_DIR", "./data"))
+    data_dir.mkdir(exist_ok=True)
+    return _paths_for(name, data_dir)
+
+
+def config_from_bot_row(bot_row: dict, data_dir: Path) -> BookingBeautyConfig:
+    """Webhook runtime mode. `data_dir` is a required caller-supplied param —
+    same reasoning as accountant.py's config_from_bot_row (don't re-resolve
+    DATA_DIR from env here, avoid diverging from the factory's canonical path).
+
+    Paths are built from bot_row["bot_id"] (bots.id, the physically unique
+    AUTOINCREMENT PK) — NOT bot_row["name"], which has no UNIQUE constraint
+    and would otherwise let two same-named bots silently share one db/admins
+    file (see docs/STAGE2_DESIGN.md "Изоляция по bots.id"). bot_row["name"] is
+    kept only as the human-readable bot_name label, never used in a path.
+    Deliberately does NOT reuse _paths_for()/config_from_env()'s name-based
+    formula — that stays untouched for standalone mode, where bot_id doesn't
+    exist (one process = one bot, no collision possible)."""
+    bot_id = bot_row["bot_id"]
+    config = BookingBeautyConfig(
+        bot_name=bot_row["name"],
+        db_path=str(data_dir / f"bot_{bot_id}_data.db"),
+        admins_file=data_dir / f"admins_{bot_id}.json",
+        welcome_image=data_dir / "bot_images" / f"bot_{bot_id}.jpg",
+    )
+    config.display_name = bot_row.get("display_name")
+    config.group_chat_id = bot_row.get("group_chat_id")
+    return config
+
+
+class ConfigMiddleware(BaseMiddleware):
+    """Injects this bot's BookingBeautyConfig into data["config"]. Defined here
+    (not imported from runtime/) to keep the template self-contained."""
+
+    def __init__(self, config: BookingBeautyConfig) -> None:
+        self.config = config
+        super().__init__()
+
+    async def __call__(self, handler, event, data):
+        data["config"] = self.config
+        return await handler(event, data)
+
+
 # ── admin helpers ─────────────────────────────────────────────────────────────
 
-def _load_admins() -> set:
+def _load_admins(admins_file: Path) -> set:
     try:
-        return set(json.loads(ADMINS_FILE.read_text()).get("ids", []))
+        return set(json.loads(admins_file.read_text()).get("ids", []))
     except Exception:
         return set()
 
-def _save_admins(ids: set) -> None:
-    ADMINS_FILE.write_text(json.dumps({"ids": list(ids)}, ensure_ascii=False))
+def _save_admins(admins_file: Path, ids: set) -> None:
+    admins_file.write_text(json.dumps({"ids": list(ids)}, ensure_ascii=False))
 
 
 # ── phone validation ──────────────────────────────────────────────────────────
@@ -81,8 +154,8 @@ def _normalize_phone(raw: str) -> str | None:
 
 # ── db ────────────────────────────────────────────────────────────────────────
 
-async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
+async def init_db(db_path: str):
+    async with aiosqlite.connect(db_path) as db:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS slots (
                 id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -112,12 +185,19 @@ async def init_db():
         except Exception:
             pass
         await db.commit()
-    await _ensure_slots()
+    await _ensure_slots(db_path)
 
 
-async def _ensure_slots():
+async def _ensure_slots(db_path: str):
+    # Idempotent by design: for each day in the rolling window, if ANY slot row
+    # already exists for that date, the whole day is skipped — no duplicates on
+    # repeated init_db() calls, and existing rows (including booked ones) are
+    # never touched (no UPDATE/DELETE here). See STAGE2_REPORT.md Phase 5 for
+    # the explicit verification of this — it's a coarse per-date guard, not a
+    # DB-level UNIQUE constraint, which is fine for the current call pattern
+    # (init_db is never called concurrently for the same bot today).
     today = datetime.now().date()
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(db_path) as db:
         for i in range(DAYS_AHEAD):
             d = (today + timedelta(days=i)).isoformat()
             existing = (await (await db.execute(
@@ -163,8 +243,8 @@ def kb_days() -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="book_to_service")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-async def kb_times(slot_date: str) -> InlineKeyboardMarkup:
-    async with aiosqlite.connect(DB_PATH) as db:
+async def kb_times(db_path: str, slot_date: str) -> InlineKeyboardMarkup:
+    async with aiosqlite.connect(db_path) as db:
         rows = await (await db.execute(
             "SELECT DISTINCT slot_time FROM slots WHERE slot_date=? AND status='active' ORDER BY slot_time",
             (slot_date,)
@@ -177,8 +257,8 @@ async def kb_times(slot_date: str) -> InlineKeyboardMarkup:
     btns.append([InlineKeyboardButton(text="◀️ Назад", callback_data="book_to_days")])
     return InlineKeyboardMarkup(inline_keyboard=btns)
 
-async def kb_masters_for_time(slot_date: str, slot_time: str) -> InlineKeyboardMarkup:
-    async with aiosqlite.connect(DB_PATH) as db:
+async def kb_masters_for_time(db_path: str, slot_date: str, slot_time: str) -> InlineKeyboardMarkup:
+    async with aiosqlite.connect(db_path) as db:
         rows = await (await db.execute(
             "SELECT id, master FROM slots WHERE slot_date=? AND slot_time=? AND status='active' ORDER BY master",
             (slot_date, slot_time)
@@ -215,15 +295,15 @@ class CancelFlow(StatesGroup):
 # ── /start ────────────────────────────────────────────────────────────────────
 
 @router.message(Command("start"))
-async def cmd_start(message: Message):
-    admins = _load_admins()
+async def cmd_start(message: Message, config: BookingBeautyConfig):
+    admins = _load_admins(config.admins_file)
     first_time_admin = not admins
     if first_time_admin:
-        _save_admins({str(message.from_user.id)})
-    is_admin = str(message.from_user.id) in _load_admins()
+        _save_admins(config.admins_file, {str(message.from_user.id)})
+    is_admin = str(message.from_user.id) in _load_admins(config.admins_file)
     kb = kb_admin() if is_admin else kb_main()
-    if WELCOME_IMAGE.exists():
-        await message.answer_photo(FSInputFile(str(WELCOME_IMAGE)),
+    if config.welcome_image.exists():
+        await message.answer_photo(FSInputFile(str(config.welcome_image)),
                                    caption=WELCOME_TEXT, parse_mode="HTML", reply_markup=kb)
     else:
         await message.answer(WELCOME_TEXT, parse_mode="HTML", reply_markup=kb)
@@ -263,7 +343,7 @@ async def cb_to_service(cb: CallbackQuery, state: FSMContext):
     await cb.message.edit_text("💅 Выберите услугу:", reply_markup=kb_services())
 
 @router.callback_query(F.data.startswith("book_day:"))
-async def cb_day(cb: CallbackQuery, state: FSMContext):
+async def cb_day(cb: CallbackQuery, state: FSMContext, config: BookingBeautyConfig):
     await cb.answer()
     slot_date = cb.data.split(":")[1]
     await state.update_data(slot_date=slot_date)
@@ -273,7 +353,7 @@ async def cb_day(cb: CallbackQuery, state: FSMContext):
     label = f"{DAYS_RU[d.weekday()]} {d.day} {MONTHS_RU[d.month]}"
     await cb.message.edit_text(
         f"✅ Услуга: {data.get('service', '')}\n📅 {label}\n\n⏰ Выберите время:",
-        reply_markup=await kb_times(slot_date)
+        reply_markup=await kb_times(config.db_path, slot_date)
     )
 
 @router.callback_query(F.data == "book_to_days")
@@ -287,7 +367,7 @@ async def cb_to_days(cb: CallbackQuery, state: FSMContext):
     )
 
 @router.callback_query(F.data.startswith("book_time:"))
-async def cb_time(cb: CallbackQuery, state: FSMContext):
+async def cb_time(cb: CallbackQuery, state: FSMContext, config: BookingBeautyConfig):
     await cb.answer()
     _, slot_date, slot_time = cb.data.split(":", 2)
     await state.update_data(slot_time=slot_time)
@@ -295,7 +375,7 @@ async def cb_time(cb: CallbackQuery, state: FSMContext):
     d = datetime.strptime(slot_date, "%Y-%m-%d")
     label = f"{DAYS_RU[d.weekday()]} {d.day} {MONTHS_RU[d.month]}"
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(config.db_path) as db:
         available = await (await db.execute(
             "SELECT id, master FROM slots WHERE slot_date=? AND slot_time=? AND status='active' ORDER BY master",
             (slot_date, slot_time)
@@ -320,11 +400,11 @@ async def cb_time(cb: CallbackQuery, state: FSMContext):
             f"✅ Услуга: {data.get('service', '')}\n"
             f"📅 {label} в {slot_time}\n\n"
             f"👩 Выберите мастера:",
-            reply_markup=await kb_masters_for_time(slot_date, slot_time)
+            reply_markup=await kb_masters_for_time(config.db_path, slot_date, slot_time)
         )
 
 @router.callback_query(F.data.startswith("book_to_times:"))
-async def cb_to_times(cb: CallbackQuery, state: FSMContext):
+async def cb_to_times(cb: CallbackQuery, state: FSMContext, config: BookingBeautyConfig):
     await cb.answer()
     slot_date = cb.data.split(":", 2)[1]
     await state.update_data(slot_date=slot_date)
@@ -334,14 +414,14 @@ async def cb_to_times(cb: CallbackQuery, state: FSMContext):
     label = f"{DAYS_RU[d.weekday()]} {d.day} {MONTHS_RU[d.month]}"
     await cb.message.edit_text(
         f"✅ Услуга: {data.get('service', '')}\n📅 {label}\n\n⏰ Выберите время:",
-        reply_markup=await kb_times(slot_date)
+        reply_markup=await kb_times(config.db_path, slot_date)
     )
 
 @router.callback_query(F.data.startswith("book_slot:"))
-async def cb_slot(cb: CallbackQuery, state: FSMContext):
+async def cb_slot(cb: CallbackQuery, state: FSMContext, config: BookingBeautyConfig):
     await cb.answer()
     slot_id = int(cb.data.split(":")[1])
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(config.db_path) as db:
         row = await (await db.execute(
             "SELECT status, master, slot_date, slot_time FROM slots WHERE id=?", (slot_id,)
         )).fetchone()
@@ -367,7 +447,7 @@ async def book_name(msg: Message, state: FSMContext):
     await msg.answer("📱 Введите номер телефона (например: +7 999 123-45-67 или 89991234567):")
 
 @router.message(BookFlow.phone, F.text)
-async def book_phone(msg: Message, state: FSMContext):
+async def book_phone(msg: Message, state: FSMContext, config: BookingBeautyConfig):
     phone = _normalize_phone(msg.text.strip())
     if phone is None:
         await msg.answer(
@@ -379,7 +459,7 @@ async def book_phone(msg: Message, state: FSMContext):
     await state.update_data(client_phone=phone)
     data = await state.get_data()
     slot_id = data["slot_id"]
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(config.db_path) as db:
         row = await (await db.execute(
             "SELECT slot_date, slot_time, master FROM slots WHERE id=?", (slot_id,)
         )).fetchone()
@@ -400,11 +480,11 @@ async def book_phone(msg: Message, state: FSMContext):
     )
 
 @router.callback_query(F.data.startswith("book_confirm:"))
-async def cb_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
+async def cb_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot, config: BookingBeautyConfig):
     await cb.answer()
     slot_id = int(cb.data.split(":")[1])
     data = await state.get_data()
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(config.db_path) as db:
         row = await (await db.execute("SELECT status FROM slots WHERE id=?", (slot_id,))).fetchone()
         if not row or row[0] != "active":
             await cb.message.edit_text("❌ Это время уже занято! Выберите другое.")
@@ -431,7 +511,7 @@ async def cb_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
         f"Ждём вас! Если нужно отменить — нажмите ❌ Отменить запись.",
         parse_mode="HTML"
     )
-    for admin_id in _load_admins():
+    for admin_id in _load_admins(config.admins_file):
         try:
             await bot.send_message(
                 int(admin_id),
@@ -459,8 +539,8 @@ async def cb_book_cancel(cb: CallbackQuery, state: FSMContext):
 # ── MY BOOKINGS ───────────────────────────────────────────────────────────────
 
 @router.message(F.text == "📋 Мои записи")
-async def my_bookings_start(msg: Message):
-    async with aiosqlite.connect(DB_PATH) as db:
+async def my_bookings_start(msg: Message, config: BookingBeautyConfig):
+    async with aiosqlite.connect(config.db_path) as db:
         db.row_factory = aiosqlite.Row
         rows = await (await db.execute(
             "SELECT b.*, s.slot_date, s.slot_time, s.master FROM bookings b "
@@ -481,8 +561,8 @@ async def my_bookings_start(msg: Message):
 # ── CANCEL BOOKING ────────────────────────────────────────────────────────────
 
 @router.message(F.text == "❌ Отменить запись")
-async def cancel_start(msg: Message):
-    async with aiosqlite.connect(DB_PATH) as db:
+async def cancel_start(msg: Message, config: BookingBeautyConfig):
+    async with aiosqlite.connect(config.db_path) as db:
         db.row_factory = aiosqlite.Row
         rows = await (await db.execute(
             "SELECT b.id, s.slot_date, s.slot_time, s.master FROM bookings b "
@@ -504,10 +584,10 @@ async def cancel_start(msg: Message):
     await msg.answer("Выберите запись для отмены:", reply_markup=InlineKeyboardMarkup(inline_keyboard=btns))
 
 @router.callback_query(F.data.startswith("adm_cancel:"))
-async def cb_adm_cancel(cb: CallbackQuery):
+async def cb_adm_cancel(cb: CallbackQuery, config: BookingBeautyConfig):
     await cb.answer()
     booking_id = int(cb.data.split(":")[1])
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(config.db_path) as db:
         row = await (await db.execute("SELECT slot_id FROM bookings WHERE id=?", (booking_id,))).fetchone()
         if not row:
             await cb.message.edit_text("Запись не найдена."); return
@@ -521,10 +601,10 @@ async def cb_adm_cancel(cb: CallbackQuery):
 # ── ADMIN: ALL BOOKINGS — day selector → chronological schedule ───────────────
 
 @router.message(F.text == "🗂 Все записи")
-async def all_bookings(msg: Message):
-    if str(msg.from_user.id) not in _load_admins():
+async def all_bookings(msg: Message, config: BookingBeautyConfig):
+    if str(msg.from_user.id) not in _load_admins(config.admins_file):
         await msg.answer("⛔ Нет доступа"); return
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(config.db_path) as db:
         rows = await (await db.execute(
             "SELECT DISTINCT s.slot_date FROM bookings b JOIN slots s ON b.slot_id=s.id "
             "WHERE s.slot_date >= date('now','localtime') ORDER BY s.slot_date LIMIT 30"
@@ -540,10 +620,10 @@ async def all_bookings(msg: Message):
                      reply_markup=InlineKeyboardMarkup(inline_keyboard=btns))
 
 @router.callback_query(F.data.startswith("adm_day:"))
-async def cb_adm_day(cb: CallbackQuery):
+async def cb_adm_day(cb: CallbackQuery, config: BookingBeautyConfig):
     await cb.answer()
     slot_date = cb.data.split(":")[1]
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(config.db_path) as db:
         db.row_factory = aiosqlite.Row
         rows = await (await db.execute(
             "SELECT b.id, b.client_name, b.client_phone, b.service, s.slot_time, s.master "
@@ -570,9 +650,9 @@ async def cb_adm_day(cb: CallbackQuery):
     )
 
 @router.callback_query(F.data == "adm_day_back")
-async def cb_adm_day_back(cb: CallbackQuery):
+async def cb_adm_day_back(cb: CallbackQuery, config: BookingBeautyConfig):
     await cb.answer()
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(config.db_path) as db:
         rows = await (await db.execute(
             "SELECT DISTINCT s.slot_date FROM bookings b JOIN slots s ON b.slot_id=s.id "
             "WHERE s.slot_date >= date('now','localtime') ORDER BY s.slot_date LIMIT 30"
@@ -588,10 +668,10 @@ async def cb_adm_day_back(cb: CallbackQuery):
     )
 
 @router.message(F.text == "📊 Статистика")
-async def admin_stats(msg: Message):
-    if str(msg.from_user.id) not in _load_admins():
+async def admin_stats(msg: Message, config: BookingBeautyConfig):
+    if str(msg.from_user.id) not in _load_admins(config.admins_file):
         await msg.answer("⛔ Нет доступа"); return
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(config.db_path) as db:
         total  = (await (await db.execute("SELECT COUNT(*) FROM bookings")).fetchone())[0]
         future = (await (await db.execute(
             "SELECT COUNT(*) FROM bookings b JOIN slots s ON b.slot_id=s.id WHERE s.slot_date>=date('now','localtime')"
@@ -613,36 +693,38 @@ async def admin_stats(msg: Message):
 # ── ADMIN COMMANDS ────────────────────────────────────────────────────────────
 
 @router.message(Command("addadmin"))
-async def cmd_addadmin(msg: Message):
-    if str(msg.from_user.id) not in _load_admins(): await msg.answer("⛔ Нет доступа"); return
+async def cmd_addadmin(msg: Message, config: BookingBeautyConfig):
+    if str(msg.from_user.id) not in _load_admins(config.admins_file): await msg.answer("⛔ Нет доступа"); return
     parts = msg.text.split()
     if len(parts) < 2 or not parts[1].lstrip("-").isdigit(): await msg.answer("Использование: /addadmin <id>"); return
-    ids = _load_admins(); ids.add(parts[1]); _save_admins(ids)
+    ids = _load_admins(config.admins_file); ids.add(parts[1]); _save_admins(config.admins_file, ids)
     await msg.answer(f"✅ <code>{parts[1]}</code> добавлен.", parse_mode="HTML")
 
 @router.message(Command("removeadmin"))
-async def cmd_removeadmin(msg: Message):
-    if str(msg.from_user.id) not in _load_admins(): await msg.answer("⛔ Нет доступа"); return
+async def cmd_removeadmin(msg: Message, config: BookingBeautyConfig):
+    if str(msg.from_user.id) not in _load_admins(config.admins_file): await msg.answer("⛔ Нет доступа"); return
     parts = msg.text.split()
     if len(parts) < 2: await msg.answer("Использование: /removeadmin <id>"); return
-    ids = _load_admins(); ids.discard(parts[1]); _save_admins(ids)
+    ids = _load_admins(config.admins_file); ids.discard(parts[1]); _save_admins(config.admins_file, ids)
     await msg.answer(f"✅ <code>{parts[1]}</code> удалён.", parse_mode="HTML")
 
 @router.message(Command("admins"))
-async def cmd_admins(msg: Message):
-    if str(msg.from_user.id) not in _load_admins(): await msg.answer("⛔ Нет доступа"); return
-    ids = _load_admins()
+async def cmd_admins(msg: Message, config: BookingBeautyConfig):
+    if str(msg.from_user.id) not in _load_admins(config.admins_file): await msg.answer("⛔ Нет доступа"); return
+    ids = _load_admins(config.admins_file)
     await msg.answer("👥 " + ("\n".join(f"• <code>{i}</code>" for i in ids) or "Пусто"), parse_mode="HTML")
 
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 
 async def main():
+    config = config_from_env()
     bot = Bot(token=os.getenv("BOT_TOKEN"))
     dp = Dispatcher(storage=MemoryStorage())
+    dp.update.outer_middleware(ConfigMiddleware(config))
     dp.include_router(router)
     await bot.set_my_description(BOT_DESCRIPTION)
-    await init_db()
+    await init_db(config.db_path)
     await dp.start_polling(bot)
 
 if __name__ == "__main__":

@@ -1,0 +1,433 @@
+"""Stage 2 Phase 1 — in-memory bot registry for the webhook runtime.
+
+Builds bot_id -> BotEntry (Bot + Dispatcher + template Router + config) from the
+existing SQLite bots table (db/database.py — token decryption already happens there).
+No Postgres, no process spawning: everything lives in this one process's memory.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import re
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Awaitable, Callable
+
+from aiogram import BaseMiddleware, Bot, Dispatcher, Router
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import TelegramObject
+
+from db.database import get_all_bots, get_bot
+
+logger = logging.getLogger(__name__)
+
+# Reserved bot_id for the factory bot's own entry in the registry (see
+# build_factory_entry() below and docs/STAGE2_DESIGN.md "Фабрика как житель
+# реестра"). 0 is safe by construction, not by convention: bots.id is
+# `INTEGER PRIMARY KEY AUTOINCREMENT` in db/database.py, and SQLite's
+# AUTOINCREMENT always starts at 1 and only increases — a real tenant bot can
+# never be assigned id=0, so there is no collision to guard against. The
+# factory itself has no row in `bots` at all (deliberately — see
+# docs/STAGE2_DESIGN.md for why a real row was rejected).
+FACTORY_BOT_ID = 0
+
+_TEMPLATE_MARKER_RE = re.compile(r"^#\s*TEMPLATE:\s*(\S+)", re.MULTILINE)
+
+
+def infer_template_id(file_path: str | None) -> str | None:
+    """Best-effort: reads the '# TEMPLATE: <id>' marker comment that templates/*.py
+    files carry as their first line. Custom Claude-generated bots not based on a
+    fixed template won't have this marker — returns None for those (expected)."""
+    if not file_path:
+        return None
+    try:
+        head = Path(file_path).read_text(encoding="utf-8")[:200]
+    except (OSError, UnicodeDecodeError):
+        return None
+    m = _TEMPLATE_MARKER_RE.search(head)
+    return m.group(1) if m else None
+
+
+def _load_accountant_router() -> Router:
+    # Imported lazily so importing runtime.registry never has side effects unless
+    # a bot actually needs the accountant template's router.
+    from templates import accountant as accountant_template
+
+    return accountant_template.router
+
+
+def _load_manager_secretary_router() -> Router:
+    from templates import manager_secretary as manager_secretary_template
+
+    return manager_secretary_template.router
+
+
+def _load_booking_beauty_router() -> Router:
+    from templates import booking_beauty as booking_beauty_template
+
+    return booking_beauty_template.router
+
+
+def _load_trip_manager_router() -> Router:
+    from templates import trip_manager as trip_manager_template
+
+    return trip_manager_template.router
+
+
+def _load_tour_operator_router() -> Router:
+    # The registry knows it never starts this template's web server (see
+    # docs/STAGE2_DESIGN.md "Фаза 7") — set BEFORE the import below so the
+    # template's own module-level WEB_CRM_ENABLED constant evaluates to False
+    # on its first load, and its handlers adapt their UX accordingly, without
+    # the template needing to know which runtime loaded it.
+    os.environ["TOUR_OPERATOR_WEB_ENABLED"] = "false"
+    from templates import tour_operator as tour_operator_template
+
+    return tour_operator_template.router
+
+
+# template_id -> loader() -> Router. All five reference templates are wired
+# now (Stage 2's per-template migration is complete as of Phase 7) — see
+# docs/STAGE2_DESIGN.md / STAGE2_REPORT.md. Two templates have a known,
+# documented background-work gap not started by this registry: trip_manager's
+# _digest_loop() (Phase 6) and tour_operator's whole web CRM part (Phase 7,
+# "Стоп: веб-часть не ложится на паттерн") — only tour_operator's Telegram
+# router/handlers are registered here, its aiohttp web app is standalone-only.
+_TEMPLATE_LOADERS: dict[str, Callable[[], Router]] = {
+    "accountant": _load_accountant_router,
+    "manager_secretary": _load_manager_secretary_router,
+    "booking_beauty": _load_booking_beauty_router,
+    "trip_manager": _load_trip_manager_router,
+    "tour_operator": _load_tour_operator_router,
+}
+
+_template_router_cache: dict[str, Router] = {}
+
+
+def _clone_router(source: Router) -> Router:
+    """Returns a fresh Router carrying the same handler registrations as `source`.
+
+    aiogram forbids attaching the same Router instance to more than one parent
+    (Dispatcher) for its whole lifetime — Router.include_router raises RuntimeError
+    the second time. Since every bot of a given template needs its own Dispatcher,
+    each one needs its own attachable Router; the handler callbacks and filter
+    objects themselves are stateless and safe to share by reference.
+    """
+    clone = Router(name=f"{source.name}-clone")
+    for event_name, observer in source.observers.items():
+        target = clone.observers[event_name]
+        for handler in observer.handlers:
+            raw_filters = [f.callback for f in handler.filters]
+            target.register(handler.callback, *raw_filters)
+    return clone
+
+
+def get_template_router(template_id: str) -> Router | None:
+    """Returns a fresh, attachable Router carrying template_id's handlers.
+
+    The underlying template module (and its original Router) is loaded and
+    cached once per process; each call here returns a new clone so it can be
+    included into a new bot's Dispatcher without hitting aiogram's one-parent
+    restriction (see _clone_router)."""
+    if template_id not in _template_router_cache:
+        loader = _TEMPLATE_LOADERS.get(template_id)
+        if loader is None:
+            return None
+        _template_router_cache[template_id] = loader()
+    return _clone_router(_template_router_cache[template_id])
+
+
+class ConfigMiddleware(BaseMiddleware):
+    """Generic fallback: injects the raw bot-metadata dict into data["config"] for
+    templates that don't have their own typed config yet (everything except
+    "accountant" — see _TEMPLATE_MIDDLEWARE_BUILDERS below for accountant's own
+    typed AccountantConfig + middleware, defined in templates/accountant.py
+    itself per Stage 2 Phase 2 — see docs/STAGE2_DESIGN.md)."""
+
+    def __init__(self, config: dict[str, Any]) -> None:
+        self.config = config
+        super().__init__()
+
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: dict[str, Any],
+    ) -> Any:
+        data["config"] = self.config
+        return await handler(event, data)
+
+
+async def _build_accountant_middleware(bot_row: dict[str, Any]) -> BaseMiddleware:
+    # Lazy imports: keep importing runtime.registry side-effect-free unless a bot
+    # actually needs this template, and keep the canonical DATA_DIR resolution
+    # (config.py) as the single source of truth passed INTO the template rather
+    # than re-derived inside it — see docs/STAGE2_DESIGN.md "Проверка идентичности
+    # формул путей" for why that distinction matters.
+    #
+    # init_db(config.db_path) runs here — the first point where this bot's own
+    # resolved db_path exists — so a bot registered purely through the registry
+    # (never run as a subprocess) still gets its tables created before it can
+    # receive updates. See docs/STAGE2_DESIGN.md "init_db при регистрации":
+    # idempotent (CREATE TABLE IF NOT EXISTS), safe to call on every
+    # registration/reload. If it raises, build_entry()'s caller
+    # (add_or_replace/reload_all) already wraps this in try/except — the bot
+    # simply doesn't get registered.
+    from templates import accountant as accountant_template
+    from config import DATA_DIR
+
+    acc_config = accountant_template.config_from_bot_row(bot_row, DATA_DIR)
+    await accountant_template.init_db(acc_config.db_path)
+    return accountant_template.ConfigMiddleware(acc_config)
+
+
+async def _build_manager_secretary_middleware(bot_row: dict[str, Any]) -> BaseMiddleware:
+    from templates import manager_secretary as manager_secretary_template
+    from config import DATA_DIR
+
+    ms_config = manager_secretary_template.config_from_bot_row(bot_row, DATA_DIR)
+    await manager_secretary_template.init_db(ms_config.db_path)
+    return manager_secretary_template.ConfigMiddleware(ms_config)
+
+
+async def _build_booking_beauty_middleware(bot_row: dict[str, Any]) -> BaseMiddleware:
+    from templates import booking_beauty as booking_beauty_template
+    from config import DATA_DIR
+
+    bb_config = booking_beauty_template.config_from_bot_row(bot_row, DATA_DIR)
+    await booking_beauty_template.init_db(bb_config.db_path)
+    return booking_beauty_template.ConfigMiddleware(bb_config)
+
+
+async def _build_trip_manager_middleware(bot_row: dict[str, Any]) -> BaseMiddleware:
+    from templates import trip_manager as trip_manager_template
+    from config import DATA_DIR
+
+    tm_config = trip_manager_template.config_from_bot_row(bot_row, DATA_DIR)
+    await trip_manager_template.init_db(tm_config.db_path)
+    return trip_manager_template.ConfigMiddleware(tm_config)
+
+
+async def _build_tour_operator_middleware(bot_row: dict[str, Any]) -> BaseMiddleware:
+    from templates import tour_operator as tour_operator_template
+    from config import DATA_DIR
+
+    to_config = tour_operator_template.config_from_bot_row(bot_row, DATA_DIR)
+    await tour_operator_template.init_db(to_config.db_path)
+    return tour_operator_template.ConfigMiddleware(to_config)
+
+
+# template_id -> async builder(bot_row) -> BaseMiddleware. Templates not listed
+# here fall back to the generic ConfigMiddleware above (raw dict, not yet
+# consumed, no init_db call — there's no known template to call it on).
+_TEMPLATE_MIDDLEWARE_BUILDERS: dict[str, Callable[[dict[str, Any]], Awaitable[BaseMiddleware]]] = {
+    "accountant": _build_accountant_middleware,
+    "manager_secretary": _build_manager_secretary_middleware,
+    "booking_beauty": _build_booking_beauty_middleware,
+    "trip_manager": _build_trip_manager_middleware,
+    "tour_operator": _build_tour_operator_middleware,
+}
+
+
+@dataclass
+class BotEntry:
+    bot: Bot
+    dispatcher: Dispatcher
+    template_id: str | None
+    config: dict[str, Any] = field(default_factory=dict)
+
+
+def build_factory_entry(bot: Bot, dispatcher: Dispatcher) -> BotEntry:
+    """Wraps the factory bot's own already-configured Bot + Dispatcher
+    (routers and middleware attached by the caller — runtime/combined_app.py,
+    which owns handlers/create_bot.py's router and main.py's
+    ManagedBotMiddleware; this module must not import from either, to keep
+    the dependency direction one-way) into a BotEntry.
+
+    Deliberately bypasses build_entry()/_TEMPLATE_LOADERS/
+    _TEMPLATE_MIDDLEWARE_BUILDERS entirely — the factory bot is not a tenant,
+    has no row in the `bots` table, and no per-bot config/db_path to resolve.
+    `template_id="__factory__"` is purely a label for logs/debugging; it is
+    never looked up against _TEMPLATE_LOADERS since this function never calls
+    get_template_router()/build_entry() at all.
+
+    Callers insert the returned entry directly under FACTORY_BOT_ID (see
+    docs/STAGE2_DESIGN.md "Фабрика как житель реестра" for why — this mirrors
+    the owner's explicit choice, not add_or_replace()/build_entry(), which
+    stay untouched for the tenant path)."""
+    return BotEntry(bot=bot, dispatcher=dispatcher, template_id="__factory__", config={"bot_id": FACTORY_BOT_ID})
+
+
+async def build_entry(
+    bot_id: int,
+    token: str,
+    template_id: str | None,
+    config: dict[str, Any] | None = None,
+) -> BotEntry:
+    """Build one BotEntry: a Bot + a fresh Dispatcher wired to the shared template
+    Router (if the template is known) and the config middleware.
+
+    For a known template, the middleware builder also calls that template's
+    own init_db(config.db_path) before returning — see the per-template
+    _build_*_middleware functions above and docs/STAGE2_DESIGN.md "init_db при
+    регистрации". This is what lets a bot registered purely through the
+    registry (never run as a standalone subprocess) actually have tables to
+    write to."""
+    config = dict(config or {})
+    config.setdefault("bot_id", bot_id)
+
+    bot = Bot(token=token)
+    dp = Dispatcher(storage=MemoryStorage())
+
+    middleware_builder = _TEMPLATE_MIDDLEWARE_BUILDERS.get(template_id) if template_id else None
+    middleware = await middleware_builder(config) if middleware_builder else ConfigMiddleware(config)
+    dp.update.outer_middleware(middleware)
+
+    router = get_template_router(template_id) if template_id else None
+    if router is not None:
+        dp.include_router(router)
+
+    return BotEntry(bot=bot, dispatcher=dp, template_id=template_id, config=config)
+
+
+def _config_from_row(b: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "bot_id": b["id"],
+        "name": b["name"],
+        "display_name": b.get("display_name"),
+        "group_chat_id": b.get("group_chat_id"),
+    }
+
+
+async def _close_bot_session(bot: Bot) -> None:
+    try:
+        await bot.session.close()
+    except Exception:
+        logger.exception("Failed to close bot session while evicting a registry entry")
+
+
+class Registry:
+    """Live, in-memory bot_id -> BotEntry registry (Stage 2 Phase 3).
+
+    Wraps a plain dict with methods that let the webhook process pick up bots
+    created/edited/deleted/restarted *after* startup, without a process restart
+    (Phase 1's build_registry() only ran once, at boot).
+
+    `get()` stays a plain synchronous dict-like lookup — deliberately NOT behind
+    the lock. CPython's GIL makes a single dict.get()/__setitem__ atomic already;
+    the lock's job here is only to serialize the *write* side (add_or_replace/
+    remove/reload_all) against each other, e.g. two concurrent reload_all() calls,
+    so a reader never has to await anything on the hot webhook path. Keeping the
+    lookup synchronous also means this class is a drop-in replacement for the
+    plain dict callers already use (webhook_app.py's webhook_handler, and Phase 1's
+    tests that construct a raw dict directly) — nothing there needs to change.
+    """
+
+    def __init__(self) -> None:
+        self._entries: dict[int, BotEntry] = {}
+        self._lock = asyncio.Lock()
+
+    def get(self, bot_id: int) -> BotEntry | None:
+        return self._entries.get(bot_id)
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def bot_ids(self) -> list[int]:
+        return list(self._entries.keys())
+
+    async def add_or_replace(self, bot_row: dict[str, Any]) -> BotEntry | None:
+        """Builds a BotEntry from a bots-table row and inserts/replaces it under
+        that bot's id. Returns None (registry left untouched) if the row has no
+        token yet (bot not fully created). The old entry's Bot session (if any)
+        is closed only AFTER the swap, outside the lock — building the new entry
+        and closing the old one both do I/O/awaits, which must never happen while
+        the lock is held (see Task 2 note on reload_all for the same pattern)."""
+        if not bot_row.get("token"):
+            return None
+        template_id = None  # so the except block below can't NameError on it
+        try:
+            template_id = infer_template_id(bot_row.get("file_path"))
+            config = _config_from_row(bot_row)
+            entry = await build_entry(bot_row["id"], bot_row["token"], template_id, config)
+        except Exception:
+            logger.exception(
+                f"add_or_replace: bot id={bot_row.get('id')} template={template_id!r} "
+                f"({bot_row.get('name')}) — failed to build entry"
+            )
+            return None
+        async with self._lock:
+            old = self._entries.get(bot_row["id"])
+            self._entries[bot_row["id"]] = entry
+        if old is not None:
+            await _close_bot_session(old.bot)
+        return entry
+
+    async def remove(self, bot_id: int) -> bool:
+        async with self._lock:
+            entry = self._entries.pop(bot_id, None)
+        if entry is None:
+            return False
+        await _close_bot_session(entry.bot)
+        return True
+
+    async def reload_one(self, bot_id: int) -> BotEntry | None:
+        """Re-reads one bot from the DB and rebuilds its entry in place. If the
+        bot was deleted (or its token cleared), it's removed from the registry."""
+        if bot_id == FACTORY_BOT_ID:
+            logger.warning(
+                "reload_one called with FACTORY_BOT_ID — skipping (factory entry is not reloadable from DB)"
+            )
+            return None
+        bot_row = await get_bot(bot_id)
+        if bot_row is None:
+            await self.remove(bot_id)
+            return None
+        entry = await self.add_or_replace(bot_row)
+        if entry is None:
+            await self.remove(bot_id)
+        return entry
+
+    async def reload_all(self) -> None:
+        """Full rebuild — same source data and per-bot error isolation as Phase
+        1's build_registry(), but swaps the registry's contents in place under
+        the lock instead of returning a fresh dict. The factory bot
+        (FACTORY_BOT_ID) has no row in `bots` to rebuild from — its entry is
+        preserved across the swap (and its Bot session left open) instead of
+        being dropped and closed like a deleted tenant's would be."""
+        new_entries: dict[int, BotEntry] = {}
+        for b in await get_all_bots():
+            if not b.get("token"):
+                continue
+            template_id = None  # so the except block below can't NameError on it
+            try:
+                template_id = infer_template_id(b.get("file_path"))
+                config = _config_from_row(b)
+                new_entries[b["id"]] = await build_entry(b["id"], b["token"], template_id, config)
+            except Exception:
+                logger.exception(
+                    f"reload_all: skipping bot id={b.get('id')} template={template_id!r} "
+                    f"({b.get('name')}) — failed to build entry"
+                )
+        async with self._lock:
+            old_entries = self._entries
+            factory_entry = old_entries.get(FACTORY_BOT_ID)
+            if factory_entry is not None:
+                new_entries[FACTORY_BOT_ID] = factory_entry
+                logger.info("factory entry preserved across reload_all")
+            self._entries = new_entries
+        for bot_id, entry in old_entries.items():
+            if bot_id == FACTORY_BOT_ID:
+                continue  # preserved into new_entries above — its session must stay open
+            await _close_bot_session(entry.bot)
+
+
+async def build_registry() -> Registry:
+    """Boot-time entry point (Phase 1's name, kept for webhook_app.py's
+    _bootstrap_app() — behaves identically, just returns a live Registry
+    instead of a one-shot dict)."""
+    registry = Registry()
+    await registry.reload_all()
+    return registry
