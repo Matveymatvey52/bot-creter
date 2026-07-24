@@ -15,7 +15,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from config import ASSEMBLYAI_API_KEY, BOT_TOKEN, DATA_DIR
-from db.database import create_bot_record_with_admins, set_bot_display_name, update_bot_status
+from db.database import create_bot_record_with_admins, get_bot, set_bot_display_name, update_bot_status
 from services.bot_runner import start_bot
 from services.claude_service import chat_gather_requirements, extract_bot_name, generate_bot_code, generate_bot_guide
 from services.github_sync import push_bot_to_github
@@ -49,6 +49,53 @@ def set_manager_username(username: str) -> None:
 def set_bot_id(bid: int) -> None:
     global _bot_id
     _bot_id = bid
+
+
+# The live webhook Registry, set once by runtime/combined_app.py's bootstrap —
+# only present when this router is running inside the combined process (Stage
+# 2's "фабрика как житель реестра"). Still None when running under main.py's
+# separate long-polling process, since no Registry exists there — new bots
+# then rely purely on services.bot_runner.start_bot() (subprocess model,
+# unchanged) to actually respond, exactly as they do today.
+_registry = None
+
+
+def set_registry(registry) -> None:
+    global _registry
+    _registry = registry
+
+
+async def _register_new_bot_in_registry(bot_id: int, bot_name: str) -> None:
+    """Best-effort: registers a freshly-created bot into the live registry
+    (direct in-process call — see runtime/registry.py's Registry.add_or_replace,
+    untouched by this phase) so it can answer webhook traffic immediately,
+    without waiting for a manual /admin/reload/{id}. Never raises — a failure
+    here must not abort bot creation, since services.bot_runner.start_bot()
+    (subprocess model) is what actually makes the bot respond today regardless
+    of registry state; a bot present in the DB but missing from the registry
+    is recoverable later via a manual reload, not a data-loss scenario."""
+    if _registry is None:
+        logger.debug(
+            f"No live registry available (polling-only process) — bot id={bot_id} "
+            f"({bot_name}) not registered; use /admin/reload/{bot_id} once the "
+            "combined app is running, if that ever applies."
+        )
+        return
+    try:
+        fresh_row = await get_bot(bot_id)
+        if fresh_row is None:
+            logger.error(f"Registry registration skipped for bot id={bot_id} ({bot_name}) — row vanished after creation")
+            return
+        entry = await _registry.add_or_replace(fresh_row)
+        if entry is None:
+            logger.warning(
+                f"Bot id={bot_id} ({bot_name}) created but registry registration failed — "
+                f"it will only answer webhook traffic after a manual /admin/reload/{bot_id}"
+            )
+        else:
+            logger.info(f"Bot id={bot_id} ({bot_name}) registered in the live registry")
+    except Exception as e:
+        logger.error(f"Registry registration raised for bot id={bot_id} ({bot_name}): {e}")
 
 
 async def _clear_user_fsm(storage, user_id: int) -> None:
@@ -495,6 +542,8 @@ async def auto_launch_managed_bot(managed_data: dict, bot: Bot, storage=None) ->
     if display_name:
         await set_bot_display_name(bot_record_id, display_name)
 
+    await _register_new_bot_in_registry(bot_record_id, bot_name)
+
     username_display = f" (@{real_username})" if real_username else ""
     extra_env = {}
     if display_name:
@@ -595,6 +644,8 @@ async def handle_token(message: Message, state: FSMContext, bot: Bot):
 
     if display_name:
         await set_bot_display_name(bot_id, display_name)
+
+    await _register_new_bot_in_registry(bot_id, bot_name)
 
     username_display = f" (@{real_username})" if real_username else ""
     extra_env = {}

@@ -23,6 +23,16 @@ from db.database import get_all_bots, get_bot
 
 logger = logging.getLogger(__name__)
 
+# Reserved bot_id for the factory bot's own entry in the registry (see
+# build_factory_entry() below and docs/STAGE2_DESIGN.md "Фабрика как житель
+# реестра"). 0 is safe by construction, not by convention: bots.id is
+# `INTEGER PRIMARY KEY AUTOINCREMENT` in db/database.py, and SQLite's
+# AUTOINCREMENT always starts at 1 and only increases — a real tenant bot can
+# never be assigned id=0, so there is no collision to guard against. The
+# factory itself has no row in `bots` at all (deliberately — see
+# docs/STAGE2_DESIGN.md for why a real row was rejected).
+FACTORY_BOT_ID = 0
+
 _TEMPLATE_MARKER_RE = re.compile(r"^#\s*TEMPLATE:\s*(\S+)", re.MULTILINE)
 
 
@@ -229,6 +239,27 @@ class BotEntry:
     config: dict[str, Any] = field(default_factory=dict)
 
 
+def build_factory_entry(bot: Bot, dispatcher: Dispatcher) -> BotEntry:
+    """Wraps the factory bot's own already-configured Bot + Dispatcher
+    (routers and middleware attached by the caller — runtime/combined_app.py,
+    which owns handlers/create_bot.py's router and main.py's
+    ManagedBotMiddleware; this module must not import from either, to keep
+    the dependency direction one-way) into a BotEntry.
+
+    Deliberately bypasses build_entry()/_TEMPLATE_LOADERS/
+    _TEMPLATE_MIDDLEWARE_BUILDERS entirely — the factory bot is not a tenant,
+    has no row in the `bots` table, and no per-bot config/db_path to resolve.
+    `template_id="__factory__"` is purely a label for logs/debugging; it is
+    never looked up against _TEMPLATE_LOADERS since this function never calls
+    get_template_router()/build_entry() at all.
+
+    Callers insert the returned entry directly under FACTORY_BOT_ID (see
+    docs/STAGE2_DESIGN.md "Фабрика как житель реестра" for why — this mirrors
+    the owner's explicit choice, not add_or_replace()/build_entry(), which
+    stay untouched for the tenant path)."""
+    return BotEntry(bot=bot, dispatcher=dispatcher, template_id="__factory__", config={"bot_id": FACTORY_BOT_ID})
+
+
 async def build_entry(
     bot_id: int,
     token: str,
@@ -345,6 +376,11 @@ class Registry:
     async def reload_one(self, bot_id: int) -> BotEntry | None:
         """Re-reads one bot from the DB and rebuilds its entry in place. If the
         bot was deleted (or its token cleared), it's removed from the registry."""
+        if bot_id == FACTORY_BOT_ID:
+            logger.warning(
+                "reload_one called with FACTORY_BOT_ID — skipping (factory entry is not reloadable from DB)"
+            )
+            return None
         bot_row = await get_bot(bot_id)
         if bot_row is None:
             await self.remove(bot_id)
@@ -357,7 +393,10 @@ class Registry:
     async def reload_all(self) -> None:
         """Full rebuild — same source data and per-bot error isolation as Phase
         1's build_registry(), but swaps the registry's contents in place under
-        the lock instead of returning a fresh dict."""
+        the lock instead of returning a fresh dict. The factory bot
+        (FACTORY_BOT_ID) has no row in `bots` to rebuild from — its entry is
+        preserved across the swap (and its Bot session left open) instead of
+        being dropped and closed like a deleted tenant's would be."""
         new_entries: dict[int, BotEntry] = {}
         for b in await get_all_bots():
             if not b.get("token"):
@@ -374,8 +413,14 @@ class Registry:
                 )
         async with self._lock:
             old_entries = self._entries
+            factory_entry = old_entries.get(FACTORY_BOT_ID)
+            if factory_entry is not None:
+                new_entries[FACTORY_BOT_ID] = factory_entry
+                logger.info("factory entry preserved across reload_all")
             self._entries = new_entries
-        for entry in old_entries.values():
+        for bot_id, entry in old_entries.items():
+            if bot_id == FACTORY_BOT_ID:
+                continue  # preserved into new_entries above — its session must stay open
             await _close_bot_session(entry.bot)
 
 
