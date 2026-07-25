@@ -768,6 +768,13 @@ python -m unittest discover -s tests -v
 
 ## Что осталось
 1. ~~`ModuleNotFoundError` при прямом запуске `combined_app.py`~~ — **закрыто этой фазой**.
-2. **Переключение `BOT_SCRIPT` на `runtime/combined_app.py` в проде** — по-прежнему отдельный, ещё не сделанный шаг (см. предыдущую фазу, Task 6 пункт 3).
-3. Остальное — без изменений с прошлой фазы.</new_string>
+2. ~~**Переключение `BOT_SCRIPT` на `runtime/combined_app.py` в проде**~~ — **сделано**, вебхуки включены (см. раздел ниже и `docs/WEBHOOK_ACTIVATION.md`).
+3. Остальное — без изменений с прошлой фазы.
 
+---
+
+# Вебхуки включены в проде
+
+Вебхук-режим активирован на Railway (`BOT_SCRIPT=runtime/combined_app.py`,
+публичный домен, `setWebhook` для фабрики и клиентских ботов). Полная
+пошаговая процедура включения и отката — в **`docs/WEBHOOK_ACTIVATION.md`**.
