@@ -25,10 +25,21 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
+from pathlib import Path
 
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiohttp import web
+
+# Позволяет запускать этот файл напрямую (python runtime/combined_app.py, как
+# задаёт BOT_SCRIPT в Railway), а не только через python -m runtime.combined_app.
+# main.py этого не требует (лежит в корне), webhook_app.py не требует по той же
+# причине, что и раньше — он никогда не запускался напрямую, только через -m
+# (см. его докстринг).
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 
 from config import BOT_TOKEN
 from db.database import init_db as init_bots_db
@@ -128,4 +139,13 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    # Used by tests/test_combined_app_entrypoint.py to verify the sys.path fix
+    # above without actually starting the bootstrap (real Telegram API calls,
+    # DB writes, binding a port) — by the time argv is checked, every
+    # module-level import (including the ones the sys.path fix exists for) has
+    # already either succeeded or raised, so this only needs to short-circuit
+    # main() itself.
+    if "--check-imports" in sys.argv:
+        print("imports OK")
+        sys.exit(0)
     main()

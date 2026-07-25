@@ -711,5 +711,63 @@ python -m unittest discover -s tests -v
 2. ~~`reload_one`/`reload_all` могли тихо вышвырнуть фабричную запись~~ — **закрыто этой фазой, до коммита**.
 3. **Стадия «Офисы»**, **реальное включение Telegram-вебхука**, **Postgres** — без изменений, не входит в объём.
 4. **Double-submit FSM race, HTML-инъекция в group messages, `/cancel`-гонка, `restore_bots()`-задержка при масштабе, дублирование create-flow хелперов, shutdown cleanup** — см. список «не чинилось» выше, все — отдельные будущие фазы/рефакторинги.
-5. **Отдельный секрет для `/admin/*`** — по-прежнему пункт бэклога (см. предыдущую фазу).</new_string>
+5. **Отдельный секрет для `/admin/*`** — по-прежнему пункт бэклога (см. предыдущую фазу).
+
+---
+
+# Фикс: `ModuleNotFoundError: No module named 'config'` в `runtime/combined_app.py` на Railway
+
+Ветка `fix-combined-app-path` (от `master`). Реальный прод-креш, подтверждённый логами: после переключения `BOT_SCRIPT` на `runtime/combined_app.py` процесс падал на импорте `config`.
+
+## Инвентаризация
+
+Прямое воспроизведение: `python3 runtime/combined_app.py` → `ModuleNotFoundError: No module named 'config'` на строке `from config import BOT_TOKEN`. Причина — способ запуска, не код: `python file.py` кладёт на `sys.path[0]` директорию скрипта (`runtime/`), а не корень проекта, и абсолютно все внутрипроектные импорты файла (`config`, `db.database`, `handlers.*`, `main`, и даже `runtime.registry`/`runtime.webhook_app` — те же модули из ЕГО СОБСТВЕННОГО пакета, но импортированные абсолютной формой) требуют корень на пути. Подтверждено обратным тестом: `python3 -m runtime.combined_app` (модульная форма) проходит те же импорты без ошибки — `-m` кладёт CWD на путь, не директорию скрипта.
+
+`runtime/webhook_app.py` — та же природа зависимости (те же абсолютные импорты), но никогда не проявляла баг, поскольку по факту всегда запускалась только через `-m` (её собственный докстринг: `"Run locally with: python -m runtime.webhook_app"`) и никогда не была реальной прод-командой. Прецедентов `sys.path.insert()` в проекте не было (`grep -rn "sys.path"` — пусто).
+
+## Решение владельца
+
+**Вариант Б** — sys.path-патч внутри `combined_app.py`, `start.sh` не трогаем. Причина: `start.sh` — общая инфраструктура для ВСЕХ точек входа, включая рабочий сейчас `main.py`; правка ради одного файла (плюс разный формат `BOT_SCRIPT` для файлового и модульного вида) признана лишним риском.
+
+## Что сделано
+
+**Task 2** — `runtime/combined_app.py`, перед внутрипроектными импортами:
+```python
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+```
+С комментарием, почему нужен именно этому файлу (не `main.py` — тот уже в корне; не `webhook_app.py` — тот никогда не запускался напрямую).
+
+**Task 3** — `--check-imports` флаг в `if __name__ == "__main__":` (печатает `"imports OK"`, `sys.exit(0)` до вызова `main()` — не запускает реальный bootstrap: сеть, БД, порт). `tests/test_combined_app_entrypoint.py` (новый файл) — 2 теста через настоящий `subprocess.run`, не in-process импорт (обычный тест НЕ поймал бы этот класс бага — у pytest/unittest корень проекта уже на пути):
+```
+test_direct_file_invocation_does_not_raise_modulenotfounderror ... ok
+  → python runtime/combined_app.py --check-imports — точно то, что делает Railway
+test_module_invocation_form_still_works_too ... ok
+  → python -m runtime.combined_app --check-imports — не был сломан, страховка на будущее
+```
+Регрессионность подтверждена вручную: `git stash` временно откатил фикс → `test_direct_file_invocation_...` упал именно с воспроизведённым `ModuleNotFoundError: No module named 'config'` в stderr → `git stash pop` вернул фикс → тест снова зелёный.
+
+**Полный прогон: 64/64** (62 прежних + 2 новых).
+
+## Ревью
+
+`review-orchestrator` (qa-stability, devops-logs, clean-code — остальные четыре признаны нерелевантными диффу: нет секретов, нет асинхронных гонок, нет FSM/БД-транзакций, нет пользовательского ввода) — **0 блокеров, 0 важных, 5 по желанию**, ни один не задет корректность: дублирование строки `"--check-imports"` без общей константы, мёртвый повторный `logging.basicConfig()` (безвреден — `main.py` уже повесил handler на root-логгер раньше), чуть тесный `timeout=15` в тестах, теоретическая `PYTHONPATH`-хрупкость тестового окружения, предсуществующее дублирование `_build_factory_dispatcher()`/`main()` (не относится к этому диффу). Независимо подтверждено: нет коллизий имён верхнего уровня от `sys.path.insert(0, ...)`, `--check-imports` физически недостижим из `start.sh`/`railway.toml` (оба без доп. аргументов), `BOT_SCRIPT` в проде пока не переключён на `combined_app.py` (этот фикс — «спящий», до отдельного шага).
+
+**Побочно найдено и починено при обновлении этого отчёта:** в предыдущем разделе («Фабрика как житель реестра») в пункт 5 списка «Что осталось» закрался артефакт редактирования — литеральный `</new_string>` в конце файла (следствие моей же более ранней правки). Убран.
+
+**Не чинилось (по желанию, не блокеры):** 5 находок ревью выше — не входят в объём этого узкого фикса.
+
+## Как запускать локально
+```bash
+python -m unittest tests.test_combined_app_entrypoint -v
+
+# всё вместе
+python -m unittest discover -s tests -v
+```
+
+## Что осталось
+1. ~~`ModuleNotFoundError` при прямом запуске `combined_app.py`~~ — **закрыто этой фазой**.
+2. **Переключение `BOT_SCRIPT` на `runtime/combined_app.py` в проде** — по-прежнему отдельный, ещё не сделанный шаг (см. предыдущую фазу, Task 6 пункт 3).
+3. Остальное — без изменений с прошлой фазы.</new_string>
 
