@@ -5,6 +5,7 @@ import logging
 import os
 import tempfile
 from pathlib import Path
+from typing import NamedTuple
 from urllib.parse import quote_plus
 
 import aiohttp
@@ -16,6 +17,7 @@ from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, Inli
 
 from config import ASSEMBLYAI_API_KEY, BOT_TOKEN, DATA_DIR
 from db.database import create_bot_record_with_admins, get_bot, set_bot_display_name, update_bot_status
+from runtime.webhook_setup import build_webhook_url, set_webhook_for_bot
 from services.bot_runner import start_bot
 from services.claude_service import chat_gather_requirements, extract_bot_name, generate_bot_code, generate_bot_guide
 from services.github_sync import push_bot_to_github
@@ -96,6 +98,137 @@ async def _register_new_bot_in_registry(bot_id: int, bot_name: str) -> None:
             logger.info(f"Bot id={bot_id} ({bot_name}) registered in the live registry")
     except Exception as e:
         logger.error(f"Registry registration raised for bot id={bot_id} ({bot_name}): {e}")
+
+
+class _Activation(NamedTuple):
+    """Outcome of bringing a freshly-created bot online (see _activate_new_bot).
+    outcome ∈ {webhook_ok, webhook_failed, webhook_no_secret, polling_ok, polling_failed}."""
+    outcome: str
+    pid: int | None = None
+
+
+async def _activate_new_bot(
+    bot_id: int, bot_name: str, bot_file: Path, token: str, extra_env: dict | None
+) -> _Activation:
+    """Brings a freshly-created bot online, choosing the mechanism by runtime mode.
+    Never raises — an activation failure must not undo an already-created bot (it is
+    already in the DB and, in webhook mode, in the live registry via add_or_replace()).
+
+    Webhook mode (PUBLIC_BASE_URL set — combined_app in prod): register the bot's
+    Telegram webhook at /webhook/<bot_id> (served by the live registry) and do NOT
+    start a polling subprocess. Webhook and long-polling are mutually exclusive ways
+    to receive updates for one token — running both makes Telegram 409 the polling
+    side. If WEBHOOK_SECRET is unset, a registered webhook would immediately get 403
+    from the fail-closed handler (runtime/webhook_app.py), so registration is skipped;
+    the bot stays in the registry and will serve once the secret is configured and the
+    webhook registered manually (see docs/WEBHOOK_ACTIVATION.md). We still do NOT start
+    polling in that case — we are in webhook mode.
+
+    Polling / standalone mode (PUBLIC_BASE_URL empty — main.py): start_bot() as before.
+    """
+    base_url = os.getenv("PUBLIC_BASE_URL", "").strip()
+    if base_url:
+        secret = os.getenv("WEBHOOK_SECRET", "").strip()
+        if not secret:
+            logger.warning(
+                f"Bot id={bot_id} ({bot_name}) created in webhook mode, but WEBHOOK_SECRET "
+                "is not set — skipping webhook registration (a webhook without a matching "
+                "secret is rejected 403 by the fail-closed handler). Not starting a polling "
+                "subprocess either (webhook mode). Register manually once the secret is set "
+                "(see docs/WEBHOOK_ACTIVATION.md)."
+            )
+            return _Activation("webhook_no_secret")
+        try:
+            await set_webhook_for_bot(token, base_url, bot_id, secret)
+        except Exception as e:
+            logger.error(f"Bot id={bot_id} ({bot_name}) created but webhook registration failed: {e}")
+            return _Activation("webhook_failed")
+        # Webhook is LIVE from here. A failure writing the DB status must NOT be
+        # reported as webhook_failed (that would tell the user the webhook isn't
+        # registered while it actually is, and leave the row at 'stopped'), so the
+        # status write is guarded separately, outside the set_webhook try.
+        try:
+            await update_bot_status(bot_id, "running")
+        except Exception as e:
+            logger.error(f"Bot id={bot_id} ({bot_name}) webhook registered but status update failed: {e}")
+        logger.info(
+            f"Bot id={bot_id} ({bot_name}) webhook registered at {build_webhook_url(base_url, bot_id)}"
+        )
+        return _Activation("webhook_ok")
+
+    try:
+        pid = await start_bot(bot_id, str(bot_file), token, extra_env=extra_env or None)
+        await update_bot_status(bot_id, "running", pid)
+        return _Activation("polling_ok", pid)
+    except Exception as e:
+        logger.error(f"Failed to start bot {bot_id}: {e}")
+        # Guarded: _activate_new_bot promises never to raise (an activation failure
+        # must not undo an already-created bot), so a failing status write here must
+        # not propagate out either.
+        try:
+            await update_bot_status(bot_id, "error")
+        except Exception as status_err:
+            logger.error(f"Also failed to mark bot {bot_id} as error: {status_err}")
+        return _Activation("polling_failed")
+
+
+_ADMIN_BLOCK = (
+    "<b>👥 Управление администраторами</b>\n"
+    "Команды пишутся прямо в созданный бот:\n"
+    "<code>/admins</code> — список администраторов\n"
+    "<code>/addadmin 123456789</code> — добавить администратора\n"
+    "<code>/removeadmin 123456789</code> — убрать администратора\n\n"
+    "💡 Узнать Telegram ID: попроси человека написать боту @userinfobot\n\n"
+    "Управление ботом: /list"
+)
+
+
+async def _notify_bot_created(
+    bot: Bot, chat_id: int, bot_id: int, bot_name: str, bot_summary: str,
+    username_display: str, activation: _Activation,
+) -> None:
+    """Sends the creator the outcome message for a freshly-created bot. Shared by
+    both creation paths (auto_launch_managed_bot, handle_token) so the webhook /
+    polling / failure wording lives in one place."""
+    if activation.outcome in ("polling_ok", "webhook_ok"):
+        try:
+            guide = await generate_bot_guide(bot_name, bot_summary)
+        except Exception:
+            guide = ""
+        launched = "запущен" if activation.outcome == "polling_ok" else "подключён по вебхуку"
+        text = (
+            f"✅ Бот <b>{bot_name}</b>{username_display} создан и {launched}!\n\n"
+            "Вы являетесь администратором этого бота.\n\n"
+        )
+        if guide:
+            text += guide + "\n\n"
+        text += _ADMIN_BLOCK
+        await bot.send_message(chat_id, text, parse_mode="HTML")
+        return
+
+    if activation.outcome in ("webhook_failed", "webhook_no_secret"):
+        detail = (
+            "вебхук не зарегистрирован" if activation.outcome == "webhook_failed"
+            else "вебхук не настроен (не задан секрет)"
+        )
+        await bot.send_message(
+            chat_id,
+            f"✅ Бот <b>{bot_name}</b>{username_display} создан, но {detail} 😔\n\n"
+            "Бот сохранён — обратитесь к администратору, чтобы завершить подключение.",
+            parse_mode="HTML",
+        )
+        return
+
+    # polling_failed
+    await bot.send_message(
+        chat_id,
+        f"Бот <b>{bot_name}</b>{username_display} создан, но не смог запуститься 😔\n\n"
+        "Попробуй удалить и создать заново.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="🗑 Удалить бота", callback_data=f"delete:{bot_id}")
+        ]]),
+    )
 
 
 async def _clear_user_fsm(storage, user_id: int) -> None:
@@ -548,39 +681,8 @@ async def auto_launch_managed_bot(managed_data: dict, bot: Bot, storage=None) ->
     extra_env = {}
     if display_name:
         extra_env["BOT_DISPLAY_NAME"] = display_name
-    try:
-        pid = await start_bot(bot_record_id, str(bot_file), token, extra_env=extra_env or None)
-        await update_bot_status(bot_record_id, "running", pid)
-        try:
-            guide = await generate_bot_guide(bot_name, bot_summary)
-        except Exception:
-            guide = ""
-        admin_block = (
-            "<b>👥 Управление администраторами</b>\n"
-            "Команды пишутся прямо в созданный бот:\n"
-            "<code>/admins</code> — список администраторов\n"
-            "<code>/addadmin 123456789</code> — добавить администратора\n"
-            "<code>/removeadmin 123456789</code> — убрать администратора\n\n"
-            "💡 Узнать Telegram ID: попроси человека написать боту @userinfobot\n\n"
-            "Управление ботом: /list"
-        )
-        text = f"✅ Бот <b>{bot_name}</b>{username_display} создан и запущен!\n\nВы являетесь администратором этого бота.\n\n"
-        if guide:
-            text += guide + "\n\n"
-        text += admin_block
-        await bot.send_message(chat_id, text, parse_mode="HTML")
-    except Exception as e:
-        logger.error(f"Failed to start managed bot {bot_record_id}: {e}")
-        await update_bot_status(bot_record_id, "error")
-        await bot.send_message(
-            chat_id,
-            f"Бот *{bot_name}*{username_display} создан, но не смог запуститься 😔\n\n"
-            "Попробуй удалить и создать заново через /create.",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="🗑 Удалить бота", callback_data=f"delete:{bot_record_id}")
-            ]]),
-        )
+    activation = await _activate_new_bot(bot_record_id, bot_name, bot_file, token, extra_env)
+    await _notify_bot_created(bot, chat_id, bot_record_id, bot_name, bot_summary, username_display, activation)
 
 
 # ── manual token entry (fallback) ─────────────────────────────────────────────
@@ -651,37 +753,7 @@ async def handle_token(message: Message, state: FSMContext, bot: Bot):
     extra_env = {}
     if display_name:
         extra_env["BOT_DISPLAY_NAME"] = display_name
-    try:
-        pid = await start_bot(bot_id, str(bot_file), token, extra_env=extra_env or None)
-        await update_bot_status(bot_id, "running", pid)
-        try:
-            guide = await generate_bot_guide(bot_name, bot_summary)
-        except Exception:
-            guide = ""
-        admin_block = (
-            "<b>👥 Управление администраторами</b>\n"
-            "Команды пишутся прямо в созданный бот:\n"
-            "<code>/admins</code> — список администраторов\n"
-            "<code>/addadmin 123456789</code> — добавить администратора\n"
-            "<code>/removeadmin 123456789</code> — убрать администратора\n\n"
-            "💡 Узнать Telegram ID: попроси человека написать боту @userinfobot\n\n"
-            "Управление ботом: /list"
-        )
-        text = f"✅ Бот <b>{bot_name}</b>{username_display} создан и запущен!\n\nВы являетесь администратором этого бота.\n\n"
-        if guide:
-            text += guide + "\n\n"
-        text += admin_block
-        await message.answer(text, parse_mode="HTML")
-    except Exception as e:
-        logger.error(f"Failed to start bot {bot_id}: {e}")
-        await update_bot_status(bot_id, "error")
-        await message.answer(
-            f"Бот *{bot_name}*{username_display} создан, но не смог запуститься 😔\n\n"
-            "Попробуй удалить и создать заново.",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="🗑 Удалить бота", callback_data=f"delete:{bot_id}")
-            ]]),
-        )
+    activation = await _activate_new_bot(bot_id, bot_name, bot_file, token, extra_env)
+    await _notify_bot_created(bot, message.chat.id, bot_id, bot_name, bot_summary, username_display, activation)
 
     await state.clear()
