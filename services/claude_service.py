@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import ast as _ast
+import logging
+import re
 
 from anthropic import AsyncAnthropic
 from config import ANTHROPIC_API_KEY
 
 client = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+logger = logging.getLogger(__name__)
 
 GATHER_SYSTEM_PROMPT = """You are a Telegram bot development assistant. Your job is to understand what bot the user wants to create.
 
@@ -1119,18 +1122,72 @@ def _strip_code_fences(code: str) -> str:
 
 _TEMPLATES_DIR = __import__("pathlib").Path(__file__).parent.parent / "templates"
 
-TEMPLATE_SELECT_PROMPT = """You are a bot template selector. Given a bot description, choose the best matching template or return "none".
+# Same "# TEMPLATE: <id>" marker convention runtime/registry.py's
+# infer_template_id() reads (that file untouched, out of this phase's scope —
+# a separate constant/regex lives here instead of importing from runtime/, to
+# avoid a services -> runtime dependency). Read by LINE COUNT, not a byte/char
+# budget: a byte-sliced read (registry.py's own approach) risks silently
+# truncating mid-line if a future USE FOR: description runs long — reading
+# whole lines instead means TEMPLATE:/USE FOR: either match in full or don't
+# match at all, never a silently half-parsed value. Uses a file handle (not
+# Path.read_text()) so only the first few lines are ever actually read off
+# disk — relevant once the library grows well past 5 templates.
+_TEMPLATE_HEADER_MAX_LINES = 10
+_TEMPLATE_LINE_RE = re.compile(r"^#\s*TEMPLATE:\s*(\S+)", re.MULTILINE)
+_USE_FOR_LINE_RE = re.compile(r"^#\s*USE FOR:\s*(.+)$", re.MULTILINE)
 
-Available templates:
-- trip_manager   — travel/trip route manager, flights, hotels, transfers, booking confirmations, prices, prepayments, reminders
-- accountant     — income/expense tracking, financial records, categories, balance, reports, budgets, финансы
-- booking_beauty — appointment booking for beauty salons, nail/hair/brow studios, spa, medical clinics, fitness studios, barbershops — any service requiring time-slot scheduling
-- manager_secretary — virtual assistant/secretary, FAQ bot, lead collection form, client requests, CRM, менеджер, секретарь
-- tour_operator    — professional tour operator CRM, commercial group tours, ЛиП/locations/contractors, hotels, guests/payments, cash flow DDS, voice input, web app, тур-оператор, туры
 
-Return ONLY the template name (e.g. "trip_manager") or "none" if nothing matches 60%+.
-Do NOT return "none" if 60%+ of core functionality is covered by a template.
-Return ONLY one word, nothing else."""
+def discover_templates() -> list[dict[str, str]]:
+    """Scans templates/*.py for '# TEMPLATE: <id>' / '# USE FOR: <description>'
+    header comments and returns [{"name": ..., "use_for": ...}, ...] for every
+    file that has both. This is what makes adding a new template to templates/
+    show up in Claude's selection prompt automatically — no code change here
+    needed (see _build_template_select_prompt below).
+
+    A file missing either marker (or unreadable) is skipped with a warning,
+    not fatal — one broken/incomplete file in templates/ must not take down
+    template selection for every other template. Files whose name starts with
+    "_" (e.g. a future shared templates/_common.py helper module) are skipped
+    silently, not warned about — such files aren't meant to be templates at
+    all, so warning on every single call forever would just be noise."""
+    results: list[dict[str, str]] = []
+    if not _TEMPLATES_DIR.exists():
+        return results
+    for path in sorted(_TEMPLATES_DIR.glob("*.py")):
+        if path.stem.startswith("_"):
+            continue
+        try:
+            with path.open(encoding="utf-8") as f:
+                head = "".join(next(f, "") for _ in range(_TEMPLATE_HEADER_MAX_LINES))
+        except (OSError, UnicodeDecodeError) as e:
+            logger.warning(f"discover_templates: could not read {path.name}: {e}")
+            continue
+        name_match = _TEMPLATE_LINE_RE.search(head)
+        use_for_match = _USE_FOR_LINE_RE.search(head)
+        if not name_match or not use_for_match:
+            logger.warning(f"discover_templates: {path.name} missing # TEMPLATE:/# USE FOR: header — skipped")
+            continue
+        results.append({"name": name_match.group(1), "use_for": use_for_match.group(1).strip()})
+    return results
+
+
+_TEMPLATE_SELECT_PROMPT_HEADER = (
+    'You are a bot template selector. Given a bot description, choose the best '
+    'matching template or return "none".\n\nAvailable templates:\n'
+)
+_TEMPLATE_SELECT_PROMPT_FOOTER = (
+    '\n\nReturn ONLY the template name (e.g. "trip_manager") or "none" if nothing matches 60%+.\n'
+    'Do NOT return "none" if 60%+ of core functionality is covered by a template.\n'
+    'Return ONLY one word, nothing else.'
+)
+
+
+def _build_template_select_prompt() -> str:
+    """Same wording/format as the old hardcoded TEMPLATE_SELECT_PROMPT — only the
+    template list itself is now sourced from discover_templates() instead of being
+    manually typed, so adding a templates/*.py file needs no edit here."""
+    lines = "\n".join(f"- {t['name']} — {t['use_for']}" for t in discover_templates())
+    return _TEMPLATE_SELECT_PROMPT_HEADER + lines + _TEMPLATE_SELECT_PROMPT_FOOTER
 
 CUSTOMIZE_TEMPLATE_PROMPT = """You are a Telegram bot customizer. You receive a working bot template and user requirements.
 
@@ -1160,7 +1217,7 @@ async def _select_template(summary: str) -> str | None:
     response = await client.messages.create(
         model="claude-haiku-4-5-20251001",
         max_tokens=20,
-        system=TEMPLATE_SELECT_PROMPT,
+        system=_build_template_select_prompt(),
         messages=[{"role": "user", "content": summary}],
     )
     result = response.content[0].text.strip().lower().split()[0]
