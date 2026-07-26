@@ -778,3 +778,60 @@ python -m unittest discover -s tests -v
 Вебхук-режим активирован на Railway (`BOT_SCRIPT=runtime/combined_app.py`,
 публичный домен, `setWebhook` для фабрики и клиентских ботов). Полная
 пошаговая процедура включения и отката — в **`docs/WEBHOOK_ACTIVATION.md`**.
+
+---
+
+# Авто-регистрация вебхука при создании бота
+
+Ветка `auto-webhook-registration` (от `master`). Проблема: `combined_app` готов обслуживать `/webhook/<id>`, фабрика при создании уже зовёт `add_or_replace()` (бот в реестре), но вебхук в Telegram не регистрировался — новый бот молчал, пока вручную не выполнить `webhook_setup` через Console.
+
+## Решения владельца
+
+- Гейт по **`PUBLIC_BASE_URL`** (задан → вебхук-режим): семантически точнее, чем `_registry`, и это одновременно жёсткая предпосылка операции (без base_url URL не построить).
+- **Вариант B2**: вебхук и polling — взаимоисключающие способы оживить бота, не дополняющие. Поэтому в вебхук-режиме регистрируем вебхук И **не** вызываем `start_bot()`; в polling-режиме — `start_bot()` как раньше, вебхук не трогаем.
+- Пустой `WEBHOOK_SECRET` при заданном `PUBLIC_BASE_URL`: ни вебхук (сразу дал бы 403 от fail-closed), ни `start_bot` (мы в вебхук-режиме) — только `warning`. Бот остаётся в реестре, дорегистрируется вручную.
+
+## Что сделано
+
+**Task 2-3** — `handlers/create_bot.py`:
+- `_activate_new_bot(bot_id, bot_name, bot_file, token, extra_env) -> _Activation` (NamedTuple `outcome`/`pid`) — централизует выбор механизма по режиму, **никогда не бросает** (сбой активации не откатывает уже созданного бота). Исходы: `webhook_ok` / `webhook_failed` / `webhook_no_secret` / `polling_ok` / `polling_failed`. Вебхук — через `set_webhook_for_bot()` из `runtime/webhook_setup.py` (переиспользование, не дублирование).
+- `_notify_bot_created(...)` — единое сообщение об исходе, общее для обоих путей создания (`auto_launch_managed_bot`, `handle_token`). Успех: «создан и запущен» (polling) / «создан и подключён по вебхуку». Сбой вебхука: «создан, но вебхук не зарегистрирован — обратитесь к администратору» (бот сохранён, не откатывается). Сбой polling: прежнее сообщение с кнопкой удаления.
+- Оба хендлера: прежний дублированный блок `try: start_bot(); … except:` заменён на две строки (`_activate_new_bot` + `_notify_bot_created`) — попутно **убрано пре-существующее дублирование** (флагилось прошлым clean-code); `admin_block` вынесен в модульную константу `_ADMIN_BLOCK`.
+
+## Ревью и фикс блокера (до коммита)
+
+`review-orchestrator` (7 агентов) — **1 блокер, 2 важных, 5 по желанию**.
+
+**🔴 Блокер (нашли qa-stability + state-db + devops-logs независимо):** `webhook_ok` пишет `status="running"` + `pid=NULL` и регистрирует живой вебхук. Но `combined_app` на **каждом** старте зовёт `restore_bots()` (`main.py`), который поднимает polling-подпроцесс для **любой** строки `status=="running"` (смотрел только на статус, не на pid). Итог: на первом же передеплое у вебхук-бота появлялись бы И вебхук, И polling → Telegram 409. Не гипотетический откат на `main.py`, а нормальный прод-путь.
+
+**Фикс — R1 (по решению владельца):** в `restore_bots()` в вебхук-режиме (`PUBLIC_BASE_URL` задан) пропускать ботов с `status=="running" AND pid IS NULL` — ровно тот стейт, что пишет `webhook_ok` (вебхук-обслуживаемый бот без polling-подпроцесса). Polling-боты (pid не NULL) восстанавливаются как раньше; в polling-режиме поведение не меняется вообще. Эвристика «pid IS NULL при running = вебхук-бот» задокументирована явным комментарием у места проверки (кто пишет стейт, почему нельзя поднимать polling → 409). Обоснование, что это не выход за объём: без фикса `restore_bots` авто-регистрация ломается на первом передеплое (`combined_app` сам зовёт `restore_bots`) — фикс неотъемлемая часть «сделать авто-регистрацию рабочей».
+
+**🟡 Важные (оба починены):** (1) `update_bot_status` в `webhook_ok` вынесен из-под `try` регистрации вебхука — падение записи статуса после успешной регистрации больше не даёт `webhook_failed` при живом вебхуке; (2) `update_bot_status(..., "error")` в polling-`except` обёрнут в свой try — контракт «never raises» больше не нарушается при падении записи статуса.
+
+**🟢 По желанию:** добавлен тест на persisted-стейт `webhook_ok` (тот, что рождал конфликт) и на сообщения `_notify_bot_created`; секреты/токены в логи не утекают (проверено); os.getenv-at-call-time — консистентно с `webhook_setup.py`. Остальное оставлено.
+
+## Тесты (`tests/test_auto_webhook_registration.py`, новый файл) — 9
+
+```
+ActivateNewBotChoosesMechanismByMode:
+  webhook-режим → set_webhook_for_bot(token, base_url, id, secret), start_bot НЕ вызван,
+    update_bot_status(id, "running") без pid (pid IS NULL — стейт, что рождал 409)
+  polling-режим (PUBLIC_BASE_URL пуст) → start_bot вызван, вебхук НЕ регистрируется
+  вебхук-режим + пустой WEBHOOK_SECRET → ни вебхук, ни start_bot, WARNING
+  set_webhook бросил → webhook_failed, start_bot НЕ вызван (не откат на polling), ERROR
+RestoreBotsRespectsWebhookMode:
+  вебхук-режим → running+pid IS NULL пропущен (start_bot НЕ вызван)
+  вебхук-режим → running+pid≠NULL восстановлен (настоящий polling-бот)
+  polling-режим → running+pid IS NULL восстановлен (регресс не сломан)
+NotifyBotCreatedMessaging:
+  webhook_ok → «подключён по вебхуку»; webhook_failed → «обратитесь к администратору»
+```
+Реальный Telegram/БД/подпроцесс не дёргаются (моки `set_webhook_for_bot`/`start_bot`/`update_bot_status`/`get_all_bots`).
+
+**Полный прогон: 73/73** (68 прежних + 5 новых).
+
+## Что осталось
+1. ~~Новый бот молчит до ручной регистрации вебхука~~ — **закрыто этой фазой** (в вебхук-режиме).
+2. ~~`restore_bots` поднял бы polling для вебхук-бота → 409~~ — **закрыто (R1) в этой же фазе**.
+3. Массовая перерегистрация существующих ботов — не делаем (их нет). Стадия «Офисы», Postgres — без изменений.</new_string>
+

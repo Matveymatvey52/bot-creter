@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 from typing import Any, Awaitable, Callable
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, Router
@@ -123,10 +124,32 @@ async def restore_bots():
         logger.error(f"restore_bots: could not read bots from DB, skipping restore: {e}")
         return
 
+    # Webhook mode (combined_app in prod) vs polling/standalone (main.py):
+    # PUBLIC_BASE_URL is set only in webhook mode. See handlers/create_bot.py's
+    # _activate_new_bot for the other half of this contract.
+    webhook_mode = bool(os.getenv("PUBLIC_BASE_URL", "").strip())
+
     restored = 0
     failed = 0
+    skipped_webhook = 0
     for bot in bots:
         if bot["status"] == "running" and bot["file_path"] and bot["token"]:
+            # In webhook mode, a bot with status="running" but pid IS NULL is a
+            # WEBHOOK-SERVED bot, not a polling one, and must NOT be re-spawned here:
+            #   - handlers/create_bot.py's _activate_new_bot writes exactly this state
+            #     on its webhook_ok path — it registers the bot's Telegram webhook and
+            #     deliberately does NOT start a polling subprocess, so it never records
+            #     a pid (update_bot_status(id, "running") with no pid → pid stays NULL).
+            #   - Such a bot already receives updates through the live registry over
+            #     /webhook/<id>. Spawning a polling subprocess for it would make
+            #     Telegram 409 ("can't use getUpdates while webhook is active").
+            #   - Real polling bots ALWAYS have a non-NULL pid (start_bot records it),
+            #     so "pid IS NULL" is the reliable webhook-served signal.
+            # Only skip in webhook mode — in polling mode every running bot with a
+            # file+token must be re-spawned exactly as before (behavior unchanged).
+            if webhook_mode and bot.get("pid") is None:
+                skipped_webhook += 1
+                continue
             try:
                 pid = await start_bot(bot["id"], bot["file_path"], bot["token"], extra_env=_make_extra_env(bot))
                 await update_bot_status(bot["id"], "running", pid)
@@ -138,6 +161,8 @@ async def restore_bots():
                 logger.error(f"Failed to restore bot '{bot['name']}' (ID: {bot['id']}): {e}")
                 await update_bot_status(bot["id"], "error")
                 failed += 1
+    if skipped_webhook:
+        logger.info(f"restore_bots: skipped {skipped_webhook} webhook-served bot(s) (status=running, pid IS NULL)")
     log_fn = logger.warning if failed else logger.info
     log_fn(f"restore_bots: {restored} restored, {failed} failed")
 
