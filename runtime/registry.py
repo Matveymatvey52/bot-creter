@@ -8,11 +8,13 @@ No Postgres, no process spawning: everything lives in this one process's memory.
 from __future__ import annotations
 
 import asyncio
+import importlib
 import logging
 import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import ModuleType
 from typing import Any, Awaitable, Callable
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, Router
@@ -50,60 +52,58 @@ def infer_template_id(file_path: str | None) -> str | None:
     return m.group(1) if m else None
 
 
-def _load_accountant_router() -> Router:
-    # Imported lazily so importing runtime.registry never has side effects unless
-    # a bot actually needs the accountant template's router.
-    from templates import accountant as accountant_template
-
-    return accountant_template.router
-
-
-def _load_manager_secretary_router() -> Router:
-    from templates import manager_secretary as manager_secretary_template
-
-    return manager_secretary_template.router
-
-
-def _load_booking_beauty_router() -> Router:
-    from templates import booking_beauty as booking_beauty_template
-
-    return booking_beauty_template.router
-
-
-def _load_trip_manager_router() -> Router:
-    from templates import trip_manager as trip_manager_template
-
-    return trip_manager_template.router
-
-
-def _load_tour_operator_router() -> Router:
-    # The registry knows it never starts this template's web server (see
-    # docs/STAGE2_DESIGN.md "Фаза 7") — set BEFORE the import below so the
-    # template's own module-level WEB_CRM_ENABLED constant evaluates to False
-    # on its first load, and its handlers adapt their UX accordingly, without
-    # the template needing to know which runtime loaded it.
-    os.environ["TOUR_OPERATOR_WEB_ENABLED"] = "false"
-    from templates import tour_operator as tour_operator_template
-
-    return tour_operator_template.router
-
-
-# template_id -> loader() -> Router. All five reference templates are wired
-# now (Stage 2's per-template migration is complete as of Phase 7) — see
-# docs/STAGE2_DESIGN.md / STAGE2_REPORT.md. Two templates have a known,
-# documented background-work gap not started by this registry: trip_manager's
-# _digest_loop() (Phase 6) and tour_operator's whole web CRM part (Phase 7,
-# "Стоп: веб-часть не ложится на паттерн") — only tour_operator's Telegram
-# router/handlers are registered here, its aiohttp web app is standalone-only.
-_TEMPLATE_LOADERS: dict[str, Callable[[], Router]] = {
-    "accountant": _load_accountant_router,
-    "manager_secretary": _load_manager_secretary_router,
-    "booking_beauty": _load_booking_beauty_router,
-    "trip_manager": _load_trip_manager_router,
-    "tour_operator": _load_tour_operator_router,
+# Some templates read an env var at MODULE IMPORT TIME to decide their own
+# behavior (tour_operator's WEB_CRM_ENABLED constant — see docs/STAGE2_DESIGN.md
+# "Фаза 7"), and that decision can't be changed after the module is first
+# imported. This registry never starts tour_operator's web CRM server (only
+# its Telegram router/handlers are registered here — see "Стоп: веб-часть не
+# ложится на паттерн"), so the override below must be applied BEFORE that
+# template's first import — see _load_template_module(). Deliberately a small,
+# explicit, narrow exception table — NOT a general mechanism (e.g. a new
+# template-header marker) — since this is a one-off need of one template, not
+# a pattern other templates are expected to share.
+_PRE_IMPORT_ENV_OVERRIDES: dict[str, dict[str, str]] = {
+    "tour_operator": {"TOUR_OPERATOR_WEB_ENABLED": "false"},
 }
 
-_template_router_cache: dict[str, Router] = {}
+_template_module_cache: dict[str, ModuleType] = {}
+
+
+def _load_template_module(template_id: str) -> ModuleType | None:
+    """Loads templates/<template_id>.py by CONVENTION, not a hardcoded
+    per-template import — every template module is expected to expose `router`,
+    `config_from_bot_row(bot_row, data_dir)`, `ConfigMiddleware`, and
+    `init_db(db_path)` under exactly these names (verified uniform across all
+    5 reference templates — see docs/STAGE2_DESIGN.md "Динамическая
+    регистрация шаблонов"). Adding a new templates/*.py file needs NO change
+    here, as long as it follows this convention — this is what makes the
+    template library scalable past the current 5 without touching this file.
+
+    Cached per process (imported once) — this is also the ONLY point where
+    _PRE_IMPORT_ENV_OVERRIDES is applied, exactly once, right before a
+    template's FIRST import.
+
+    Returns None if there's no templates/<template_id>.py at all, OR if it
+    exists but fails to import for any reason (syntax error, missing
+    third-party dependency, etc. — not just ImportError, since a brand-new
+    hand-edited template file is exactly where those show up first). The full
+    exception is logged here (with traceback) before returning None, since
+    this is the only place that still has it — callers only get told the
+    module didn't load, which is enough for their own bot_id-contextualized
+    warning but not for diagnosing WHY."""
+    if template_id in _template_module_cache:
+        return _template_module_cache[template_id]
+    overrides = _PRE_IMPORT_ENV_OVERRIDES.get(template_id)
+    if overrides:
+        logger.info(f"_load_template_module: applying pre-import env override for {template_id!r}: {overrides}")
+        os.environ.update(overrides)
+    try:
+        module = importlib.import_module(f"templates.{template_id}")
+    except Exception:
+        logger.exception(f"_load_template_module: failed to import templates.{template_id}")
+        return None
+    _template_module_cache[template_id] = module
+    return module
 
 
 def _clone_router(source: Router) -> Router:
@@ -127,22 +127,23 @@ def _clone_router(source: Router) -> Router:
 def get_template_router(template_id: str) -> Router | None:
     """Returns a fresh, attachable Router carrying template_id's handlers.
 
-    The underlying template module (and its original Router) is loaded and
-    cached once per process; each call here returns a new clone so it can be
-    included into a new bot's Dispatcher without hitting aiogram's one-parent
-    restriction (see _clone_router)."""
-    if template_id not in _template_router_cache:
-        loader = _TEMPLATE_LOADERS.get(template_id)
-        if loader is None:
-            return None
-        _template_router_cache[template_id] = loader()
-    return _clone_router(_template_router_cache[template_id])
+    The underlying template module (and its original Router) is loaded via
+    _load_template_module and cached once per process; each call here returns
+    a new clone so it can be included into a new bot's Dispatcher without
+    hitting aiogram's one-parent restriction (see _clone_router)."""
+    module = _load_template_module(template_id)
+    if module is None:
+        return None
+    router = getattr(module, "router", None)
+    if router is None:
+        return None
+    return _clone_router(router)
 
 
 class ConfigMiddleware(BaseMiddleware):
     """Generic fallback: injects the raw bot-metadata dict into data["config"] for
     templates that don't have their own typed config yet (everything except
-    "accountant" — see _TEMPLATE_MIDDLEWARE_BUILDERS below for accountant's own
+    "accountant" — see _build_generic_middleware below for accountant's own
     typed AccountantConfig + middleware, defined in templates/accountant.py
     itself per Stage 2 Phase 2 — see docs/STAGE2_DESIGN.md)."""
 
@@ -160,75 +161,28 @@ class ConfigMiddleware(BaseMiddleware):
         return await handler(event, data)
 
 
-async def _build_accountant_middleware(bot_row: dict[str, Any]) -> BaseMiddleware:
-    # Lazy imports: keep importing runtime.registry side-effect-free unless a bot
-    # actually needs this template, and keep the canonical DATA_DIR resolution
-    # (config.py) as the single source of truth passed INTO the template rather
-    # than re-derived inside it — see docs/STAGE2_DESIGN.md "Проверка идентичности
-    # формул путей" for why that distinction matters.
-    #
-    # init_db(config.db_path) runs here — the first point where this bot's own
-    # resolved db_path exists — so a bot registered purely through the registry
-    # (never run as a subprocess) still gets its tables created before it can
-    # receive updates. See docs/STAGE2_DESIGN.md "init_db при регистрации":
-    # idempotent (CREATE TABLE IF NOT EXISTS), safe to call on every
-    # registration/reload. If it raises, build_entry()'s caller
-    # (add_or_replace/reload_all) already wraps this in try/except — the bot
-    # simply doesn't get registered.
-    from templates import accountant as accountant_template
+async def _build_generic_middleware(bot_row: dict[str, Any], module: ModuleType) -> BaseMiddleware:
+    """Generalizes what used to be five near-identical _build_*_middleware
+    functions (one per template) into one, using the same by-convention
+    attribute names _load_template_module relies on: config_from_bot_row,
+    init_db, ConfigMiddleware. Keeps the canonical DATA_DIR resolution
+    (config.py) as the single source of truth passed INTO the template rather
+    than re-derived inside it — see docs/STAGE2_DESIGN.md "Проверка
+    идентичности формул путей" for why that distinction matters.
+
+    init_db(config.db_path) runs here — the first point where this bot's own
+    resolved db_path exists — so a bot registered purely through the registry
+    (never run as a subprocess) still gets its tables created before it can
+    receive updates. See docs/STAGE2_DESIGN.md "init_db при регистрации":
+    idempotent (CREATE TABLE IF NOT EXISTS), safe to call on every
+    registration/reload. If it raises, build_entry()'s caller
+    (add_or_replace/reload_all) already wraps this in try/except — the bot
+    simply doesn't get registered."""
     from config import DATA_DIR
 
-    acc_config = accountant_template.config_from_bot_row(bot_row, DATA_DIR)
-    await accountant_template.init_db(acc_config.db_path)
-    return accountant_template.ConfigMiddleware(acc_config)
-
-
-async def _build_manager_secretary_middleware(bot_row: dict[str, Any]) -> BaseMiddleware:
-    from templates import manager_secretary as manager_secretary_template
-    from config import DATA_DIR
-
-    ms_config = manager_secretary_template.config_from_bot_row(bot_row, DATA_DIR)
-    await manager_secretary_template.init_db(ms_config.db_path)
-    return manager_secretary_template.ConfigMiddleware(ms_config)
-
-
-async def _build_booking_beauty_middleware(bot_row: dict[str, Any]) -> BaseMiddleware:
-    from templates import booking_beauty as booking_beauty_template
-    from config import DATA_DIR
-
-    bb_config = booking_beauty_template.config_from_bot_row(bot_row, DATA_DIR)
-    await booking_beauty_template.init_db(bb_config.db_path)
-    return booking_beauty_template.ConfigMiddleware(bb_config)
-
-
-async def _build_trip_manager_middleware(bot_row: dict[str, Any]) -> BaseMiddleware:
-    from templates import trip_manager as trip_manager_template
-    from config import DATA_DIR
-
-    tm_config = trip_manager_template.config_from_bot_row(bot_row, DATA_DIR)
-    await trip_manager_template.init_db(tm_config.db_path)
-    return trip_manager_template.ConfigMiddleware(tm_config)
-
-
-async def _build_tour_operator_middleware(bot_row: dict[str, Any]) -> BaseMiddleware:
-    from templates import tour_operator as tour_operator_template
-    from config import DATA_DIR
-
-    to_config = tour_operator_template.config_from_bot_row(bot_row, DATA_DIR)
-    await tour_operator_template.init_db(to_config.db_path)
-    return tour_operator_template.ConfigMiddleware(to_config)
-
-
-# template_id -> async builder(bot_row) -> BaseMiddleware. Templates not listed
-# here fall back to the generic ConfigMiddleware above (raw dict, not yet
-# consumed, no init_db call — there's no known template to call it on).
-_TEMPLATE_MIDDLEWARE_BUILDERS: dict[str, Callable[[dict[str, Any]], Awaitable[BaseMiddleware]]] = {
-    "accountant": _build_accountant_middleware,
-    "manager_secretary": _build_manager_secretary_middleware,
-    "booking_beauty": _build_booking_beauty_middleware,
-    "trip_manager": _build_trip_manager_middleware,
-    "tour_operator": _build_tour_operator_middleware,
-}
+    config = module.config_from_bot_row(bot_row, DATA_DIR)
+    await module.init_db(config.db_path)
+    return module.ConfigMiddleware(config)
 
 
 @dataclass
@@ -246,11 +200,11 @@ def build_factory_entry(bot: Bot, dispatcher: Dispatcher) -> BotEntry:
     ManagedBotMiddleware; this module must not import from either, to keep
     the dependency direction one-way) into a BotEntry.
 
-    Deliberately bypasses build_entry()/_TEMPLATE_LOADERS/
-    _TEMPLATE_MIDDLEWARE_BUILDERS entirely — the factory bot is not a tenant,
-    has no row in the `bots` table, and no per-bot config/db_path to resolve.
-    `template_id="__factory__"` is purely a label for logs/debugging; it is
-    never looked up against _TEMPLATE_LOADERS since this function never calls
+    Deliberately bypasses build_entry()/_load_template_module() entirely —
+    the factory bot is not a tenant, has no row in the `bots` table, and no
+    per-bot config/db_path to resolve. `template_id="__factory__"` is purely
+    a label for logs/debugging; it is never looked up against any
+    templates/*.py module since this function never calls
     get_template_router()/build_entry() at all.
 
     Callers insert the returned entry directly under FACTORY_BOT_ID (see
@@ -269,23 +223,52 @@ async def build_entry(
     """Build one BotEntry: a Bot + a fresh Dispatcher wired to the shared template
     Router (if the template is known) and the config middleware.
 
-    For a known template, the middleware builder also calls that template's
-    own init_db(config.db_path) before returning — see the per-template
-    _build_*_middleware functions above and docs/STAGE2_DESIGN.md "init_db при
-    регистрации". This is what lets a bot registered purely through the
-    registry (never run as a standalone subprocess) actually have tables to
-    write to."""
+    For a known template, _build_generic_middleware also calls that template's
+    own init_db(config.db_path) before returning — see docs/STAGE2_DESIGN.md
+    "init_db при регистрации". This is what lets a bot registered purely
+    through the registry (never run as a standalone subprocess) actually have
+    tables to write to.
+
+    If template_id doesn't resolve to any templates/*.py module, this does NOT
+    raise or refuse to register the bot (unchanged from before this phase) —
+    it logs a WARNING (loud, visible in Deploy Logs) and falls back to the
+    generic ConfigMiddleware with no router. Previously this was a silent
+    partial registration with no log at all — the bot would sit in the
+    registry answering nothing, and nobody would know why."""
     config = dict(config or {})
     config.setdefault("bot_id", bot_id)
 
     bot = Bot(token=token)
     dp = Dispatcher(storage=MemoryStorage())
 
-    middleware_builder = _TEMPLATE_MIDDLEWARE_BUILDERS.get(template_id) if template_id else None
-    middleware = await middleware_builder(config) if middleware_builder else ConfigMiddleware(config)
+    module = _load_template_module(template_id) if template_id else None
+    if template_id and module is None:
+        logger.warning(
+            f"build_entry: bot_id={bot_id} has template_id={template_id!r} that does not "
+            "match any templates/*.py module — registering with generic middleware and "
+            "NO router; this bot will not respond to any update until its template_id is "
+            "fixed or a matching template is added"
+        )
+
+    middleware = await _build_generic_middleware(config, module) if module is not None else ConfigMiddleware(config)
     dp.update.outer_middleware(middleware)
 
-    router = get_template_router(template_id) if template_id else None
+    router = None
+    if module is not None:
+        raw_router = getattr(module, "router", None)
+        if raw_router is None:
+            # Module imported fine but doesn't follow the naming convention —
+            # same silent-half-registration risk as an unresolved template_id
+            # (init_db/config DID run via _build_generic_middleware above, but
+            # there's no router at all: no handlers, every update unanswered).
+            logger.warning(
+                f"build_entry: bot_id={bot_id} template_id={template_id!r} module has no "
+                "'router' attribute — registering with working middleware/DB but NO "
+                "handlers; this bot will not respond to any update until the template "
+                "module exposes a module-level `router`"
+            )
+        else:
+            router = _clone_router(raw_router)
     if router is not None:
         dp.include_router(router)
 
