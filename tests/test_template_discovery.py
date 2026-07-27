@@ -116,17 +116,19 @@ class DiscoverTemplatesFindsNewFixtureWithNoCodeChange(unittest.TestCase):
 
 
 class DiscoverTemplatesRegressionOnRealTemplates(unittest.TestCase):
-    """Regression: all five existing templates/*.py files must still be found and
+    """Regression: all existing templates/*.py files must still be found and
     correctly parsed — including tour_operator.py, whose third header line is
     "# STANDALONE" instead of "# CUSTOMIZE" (a known, accepted format divergence
-    that must not affect TEMPLATE:/USE FOR: parsing)."""
+    that must not affect TEMPLATE:/USE FOR: parsing). booking_medical was added
+    after this test was first written — it's the first template added purely
+    by dropping a file into templates/, with zero changes to this file."""
 
-    def test_all_five_real_templates_are_discovered(self):
+    def test_all_real_templates_are_discovered(self):
         found = claude_service.discover_templates()
         names = {t["name"] for t in found}
         self.assertEqual(
             names,
-            {"accountant", "booking_beauty", "manager_secretary", "tour_operator", "trip_manager"},
+            {"accountant", "booking_beauty", "booking_medical", "manager_secretary", "tour_operator", "trip_manager"},
         )
 
     def test_tour_operator_use_for_is_parsed_despite_missing_customize_line(self):
@@ -138,7 +140,7 @@ class DiscoverTemplatesRegressionOnRealTemplates(unittest.TestCase):
 
     def test_prompt_lists_all_real_templates(self):
         prompt = claude_service._build_template_select_prompt()
-        for name in ("accountant", "booking_beauty", "manager_secretary", "tour_operator", "trip_manager"):
+        for name in ("accountant", "booking_beauty", "booking_medical", "manager_secretary", "tour_operator", "trip_manager"):
             self.assertIn(f"- {name} —", prompt)
 
 
