@@ -388,3 +388,114 @@ class TourOperatorConfig:
 Идемпотентность `_ensure_slots()` (`booking_beauty`) рассчитана на **последовательные** вызовы `init_db()`, не на одновременные: проверка `COUNT(*) FROM slots WHERE slot_date=?` и последующая вставка не атомарны (между ними есть `await`). Если `init_db()` для ОДНОГО И ТОГО ЖЕ бота будет вызван по-настоящему параллельно (два конкурентных таска), теоретически возможны дублирующиеся строки слотов на один день — эффект того же класса, что уже описан в докстринге самой `_ensure_slots()` (Фаза 5).
 
 Текущий паттерн вызовов (`add_or_replace`/`reload_one` по отдельным админ-действиям, `reload_all`'s единый последовательный цикл по ботам) конкурентность для одного бота не создаёт — каждый бот обрабатывается ровно в одном месте кода за раз. Это не проблема сейчас. Отдельный пункт на будущее: если реестр когда-нибудь начнёт грузить ботов **параллельно** (например, `asyncio.gather` по списку ботов вместо последовательного цикла в `reload_all()`), эту гарантию нужно будет пересмотреть — либо через `asyncio.Lock` на уровне бота/шаблона, либо через настоящий `UNIQUE`-индекс в БД вместо coarse-guard'а.
+
+---
+
+# Фаза «два новых шаблона: inventory + moderator» — дизайн `moderator` (утверждён владельцем, код ещё не написан)
+
+Ветка `template-moderator` (от `master`). Часть валидационного раунда перед решением по остальным 58 шаблонам общего каталога — `inventory` и `moderator` делаются отдельно от этого решения. Дизайн ниже утверждён владельцем явным «ок» — **записан здесь ПОСЛЕ утверждения**, специально чтобы следующая сессия могла перечитать его из файла, а не восстанавливать по памяти чата.
+
+## Доменное содержание (владельцем, не переосмыслять)
+
+Не приветствие новых участников (это гипотетический `welcome_gatekeeper`, не этот шаблон) — непрерывный мониторинг поведения участников уже в группе:
+- Детекция нарушений (спам-ссылки, запрещённые слова) по сообщениям.
+- Лестница эскалации: предупреждение → мут → бан, не сразу бан.
+- Журнал модерации — кто, когда, за что получил санкцию.
+- Настраиваемый список правил/стоп-слов администратором.
+- Работает постоянно фоново, не по запросу пользователя.
+
+## Вопрос «ложится ли на паттерн» — да, config-каркас ложится чисто
+
+`Config`/`config_from_bot_row`/`config_from_env`/`ConfigMiddleware`/`init_db`/`router`+`dp.include_router(router)` работают идентично остальным шаблонам, без единого отступления. Разница — только в содержимом роутера: вместо FSM-цепочки по командам пользователя, большинство хендлеров — `@router.message(F.chat.type.in_({"group","supergroup"}))`-catch-all (реагируют на любое сообщение в группе), плюс `@router.my_chat_member()` (изменение статуса самого бота в группе) — тот же класс хендлера, что `on_added_to_group` в `main.py`, но шире (см. ниже почему). Это вопрос устройства РОУТЕРА, не каркаса конфига.
+
+**Структурное отличие от остальных шаблонов**: один экземпляр бота может модерировать НЕСКОЛЬКО разных Telegram-групп одновременно (в отличие от booking_*/accountant/inventory, где весь бот = один бизнес). Настройки (стоп-слова, пороги эскалации) — per-`chat_id` внутри ОДНОЙ базы этого бота, не per-bot. `config.admins_file`/`db_path` остаются per-bot (как везде).
+
+## Config
+
+```python
+@dataclass
+class ModeratorConfig:
+    bot_name: str
+    db_path: str
+    admins_file: Path
+    welcome_image: Path
+    display_name: str | None = None
+    group_chat_id: str | None = None
+```
+Без доменных полей — идентично остальным. `config_from_env()`/`config_from_bot_row()` — та же формула bot_id-based путей.
+
+## Схема БД
+
+```sql
+CREATE TABLE IF NOT EXISTS chat_settings (
+    chat_id      INTEGER PRIMARY KEY,
+    delete_links INTEGER DEFAULT 1,
+    max_warnings INTEGER DEFAULT 3,     -- предупреждений до мута
+    mute_minutes INTEGER DEFAULT 60
+);
+
+CREATE TABLE IF NOT EXISTS stopwords (
+    chat_id INTEGER,
+    word    TEXT,
+    PRIMARY KEY (chat_id, word)
+);
+
+CREATE TABLE IF NOT EXISTS warnings (
+    user_id        INTEGER,
+    chat_id        INTEGER,
+    count          INTEGER DEFAULT 0,
+    stage          TEXT DEFAULT 'warn',   -- 'warn' | 'muted' | 'banned'
+    last_violation TEXT,
+    PRIMARY KEY (user_id, chat_id)
+);
+
+CREATE TABLE IF NOT EXISTS moderation_log (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id    INTEGER NOT NULL,
+    user_id    INTEGER NOT NULL,
+    action     TEXT NOT NULL,     -- 'warn' | 'mute' | 'ban'
+    reason     TEXT,
+    created_at TEXT DEFAULT (datetime('now','localtime'))
+);
+```
+
+**Лестница эскалации** (одна колонка `stage`, без отдельных счётчиков на мут/бан):
+- нарушение при `stage='warn'` и `count < max_warnings` → предупреждение, `count += 1`, лог `action='warn'`.
+- нарушение при `stage='warn'` и `count >= max_warnings` → мут на `mute_minutes`, `stage='muted'`, `count=0`, лог `action='mute'`.
+- нарушение при `stage='muted'` (уже был мут) → бан, `stage='banned'`, лог `action='ban'`.
+
+**Детекция** — спам-ссылки (тот же `LINK_PATTERN`-regex, что уже в generic-промпте `MODERATOR_EXTRA` в `services/claude_service.py`, для консистентности) + настраиваемый список стоп-слов из `stopwords` (per-chat). Telegram-нативные админы/создатель группы (проверяется live через `get_chat_member` на автора сообщения) исключены из модерации полностью — тот же паттерн, что уже в `MODERATOR_EXTRA`.
+
+**Настройка стоп-слов/порогов** — командами внутри самой группы (`/addstopword`, `/removestopword`, `/stopwords`, `/setmaxwarnings N`), доступ — live-проверка Telegram-статуса вызывающего (`administrator`/`creator` в ЭТОЙ группе), НЕ через `admins_file` бота. `admins_file` используется отдельно — для `/modlog` (сводный журнал модерации по ВСЕМ группам сразу, через ЛС боту, для владельца бота).
+
+## ⚠️ ГЛАВНОЕ ТРЕБОВАНИЕ ВЛАДЕЛЬЦА — уникальное для этого шаблона, не типовой паттерн, легко потерять
+
+Модерация (удаление/мут/бан) физически невозможна без прав администратора бота В КОНКРЕТНОЙ Telegram-группе — внешнее действие пользователя в Telegram, не настройка внутри бота. Без явной проверки/инструкции — тихий сбой (бот пытается удалить, получает ошибку от Telegram API, молча ничего не происходит), пользователь решает, что бот сломан. Три обязательных механизма:
+
+**1. При изменении статуса бота в группе** — `@router.my_chat_member()` **БЕЗ фильтра направления** (не `IS_NOT_MEMBER >> IS_MEMBER`, а любое изменение) — потому что реальный сценарий на Telegram обычно двухшаговый: бота добавляют обычным участником, администратором делают ВТОРЫМ отдельным действием чуть позже (`my_chat_member`: member → administrator) — фильтр только на «добавление» пропустил бы момент реального получения прав.
+```python
+@router.my_chat_member()
+async def on_bot_membership_changed(update: ChatMemberUpdated, bot: Bot, config: ModeratorConfig):
+    if update.chat.type not in ("group", "supergroup"):
+        return
+    await _check_and_report_rights(bot, update.chat.id, update.new_chat_member, silent_if_ok=True)
+```
+Инспектирует `update.new_chat_member` напрямую (не отдельный `get_chat_member`-запрос — статус бота уже есть в самом апдейте). Проверка: `isinstance(update.new_chat_member, ChatMemberAdministrator)` и `can_delete_messages` И `can_restrict_members` (это ОДНО поле в Telegram Bot API покрывает и мут через `restrict_chat_member`, и бан через `ban_chat_member`). Если прав достаточно — **молча**, без сообщения (не спамить группу на каждое повышение). Если НЕ хватает — пошаговая инструкция в группу: «Настройки группы → Администраторы → [имя бота] → включить „Удаление сообщений“ и „Блокировка пользователей“».
+
+**2. `/checkrights`** — доступна Telegram-нативным админам/создателю группы (live-проверка вызывающего через `get_chat_member` на его собственный статус). Перепроверяет права бота тем же `_check_and_report_rights(..., silent_if_ok=False)` — при нехватке прав то же сообщение-инструкция, при достатке — явное «✅ Всё в порядке, у бота есть права на удаление/мут/бан».
+
+**3. В момент реальной попытки действия** (удаление/мут/бан) — обёртка `_moderate_safely(...)`, ловит `TelegramBadRequest`/`TelegramForbiddenError`. Решение (владелец делегировал «реши по месту»): `logger.error` всегда + **ЛС `admins_file`-админам бота** (НЕ в саму группу — иначе (а) спам при массовом флуде с одной и той же ошибкой на каждое сообщение, (б) сигнал нарушителям «модерация сломана, можно продолжать»). `/checkrights` остаётся способом для группы самой проверить статус в любой момент.
+
+**aiogram-детали для реализации** (проверено в venv на момент дизайна): `ChatMemberAdministrator.can_delete_messages: bool`, `ChatMemberAdministrator.can_restrict_members: bool` — оба поля существуют и покрывают все три нужных действия (удаление/мут/бан). Прочие статусы бота — `ChatMemberMember`, `ChatMemberLeft`, `ChatMemberRestricted`, `ChatMemberBanned` — все трактуются как «прав недостаточно» без дальнейшего анализа полей.
+
+## Заголовок
+
+```
+# TEMPLATE: moderator
+# USE FOR: модерация чата, антиспам, стоп-слова, лестница предупреждение-мут-бан, журнал модерации
+# CUSTOMIZE: sections marked with # CUSTOMIZE
+```
+
+## Статус на момент записи
+
+Дизайн утверждён владельцем («ок»). Код (`templates/moderator.py`) **ещё не написан** — ветка `template-moderator` существует, но содержит только этот файл (`docs/STAGE2_DESIGN.md`) поверх `master`. Следующая сессия должна: перечитать этот раздел, реализовать Task 2 (код) → Task 3 (авто-обнаружение, критично: discover_templates()/build_entry() без правок вне templates/moderator.py) → Task 4 (тест изоляции + тест на все три пункта проверки прав) → Task 5 (review-orchestrator, полный сьют, отчёт, стоп перед коммитом — тот же процесс, что уже пройден для booking_medical и inventory).
