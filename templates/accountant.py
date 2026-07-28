@@ -56,6 +56,20 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 router = Router()
 
+# Guards /excel (Workbook build + save + answer_document) against a double tap
+# starting a second export for the same bot before the first finishes writing
+# the same excel_path — same pattern as handlers/manage_bots.py's _busy_bots
+# guard for recreate/autofix/fixbug. Needed because wb.save() below now runs
+# via run_in_executor (payment-eventloop-fix): before that change the whole
+# /excel body had no `await` between building and saving the workbook, so two
+# taps could never interleave; the executor call introduces the first `await`
+# in that path, opening a window for a second tap to start a concurrent write
+# to the same file. Keyed by excel_path (already unique per bot — see
+# config_from_bot_row) rather than a bot_id field, since AccountantConfig
+# doesn't carry one directly.
+_EXCEL_BUSY_TEXT = "⏳ Выгрузка Excel уже выполняется — подожди её завершения."
+_busy_excel_exports: set[str] = set()
+
 
 # ── config (Stage 2 Phase 2) ────────────────────────────────────────────────────
 # See docs/STAGE2_DESIGN.md — "Config-контракт шаблона accountant" for the full
@@ -690,6 +704,17 @@ async def cmd_excel(msg: Message, state: FSMContext, config: AccountantConfig):
     projects = await _all_projects(config.db_path)
     if not projects:
         await msg.answer("Данных нет."); return
+    if config.excel_path in _busy_excel_exports:
+        await msg.answer(_EXCEL_BUSY_TEXT)
+        return
+    _busy_excel_exports.add(config.excel_path)
+    try:
+        await _build_and_send_excel(msg, config, projects)
+    finally:
+        _busy_excel_exports.discard(config.excel_path)
+
+
+async def _build_and_send_excel(msg: Message, config: AccountantConfig, projects: list[dict]) -> None:
     wb = Workbook()
     wb.remove(wb.active)
     hdrs = ["Тип", "Сумма", "Категория", "Комментарий", "Дата", "Создано"]
@@ -738,7 +763,7 @@ async def cmd_excel(msg: Message, state: FSMContext, config: AccountantConfig):
             )
         ws.freeze_panes = "A2"; ws.auto_filter.ref = f"A1:F{len(rows) + 1}"
 
-    wb.save(config.excel_path)
+    await asyncio.get_running_loop().run_in_executor(None, wb.save, config.excel_path)
     await msg.answer_document(FSInputFile(config.excel_path),
                               caption=f"📊 Финансовая выгрузка ({len(projects)} проектов)")
 
