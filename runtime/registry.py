@@ -93,14 +93,51 @@ def _load_template_module(template_id: str) -> ModuleType | None:
     warning but not for diagnosing WHY."""
     if template_id in _template_module_cache:
         return _template_module_cache[template_id]
-    overrides = _PRE_IMPORT_ENV_OVERRIDES.get(template_id)
-    if overrides:
-        logger.info(f"_load_template_module: applying pre-import env override for {template_id!r}: {overrides}")
-        os.environ.update(overrides)
+    _apply_pre_import_overrides(template_id, caller="_load_template_module")
     try:
         module = importlib.import_module(f"templates.{template_id}")
     except Exception:
         logger.exception(f"_load_template_module: failed to import templates.{template_id}")
+        return None
+    _template_module_cache[template_id] = module
+    return module
+
+
+def _apply_pre_import_overrides(template_id: str, *, caller: str) -> None:
+    overrides = _PRE_IMPORT_ENV_OVERRIDES.get(template_id)
+    if overrides:
+        logger.info(f"{caller}: applying pre-import env override for {template_id!r}: {overrides}")
+        os.environ.update(overrides)
+
+
+async def _load_template_module_async(template_id: str) -> ModuleType | None:
+    """Async counterpart of _load_template_module(), used only by build_entry()'s
+    runtime path (webhook processing). importlib.import_module() is a blocking
+    call — on a template's first import it can hold the shared combined_app.py
+    event loop long enough to blow Telegram's 10s answerPreCheckoutQuery window
+    for a payment on a COMPLETELY DIFFERENT bot (see payment-subsystem-inventory
+    findings). Offloading it to run_in_executor's default thread pool fixes that
+    without changing behavior: CPython's import lock is already thread-safe/
+    reentrant, so importing from a worker thread is safe.
+
+    os.environ.update() (for _PRE_IMPORT_ENV_OVERRIDES) still runs synchronously
+    on the calling coroutine, BEFORE the executor submission — os.environ is
+    process-global, not thread-local, so the worker thread sees it regardless,
+    but doing it here keeps the ordering explicit and this function's own
+    control flow simple.
+
+    Shares _template_module_cache with the sync _load_template_module — the
+    cache-hit path (every import after the first) stays fully synchronous, no
+    thread hop needed. get_template_router() (no runtime caller, only tests)
+    keeps calling the sync version unchanged."""
+    if template_id in _template_module_cache:
+        return _template_module_cache[template_id]
+    _apply_pre_import_overrides(template_id, caller="_load_template_module_async")
+    loop = asyncio.get_running_loop()
+    try:
+        module = await loop.run_in_executor(None, importlib.import_module, f"templates.{template_id}")
+    except Exception:
+        logger.exception(f"_load_template_module_async: failed to import templates.{template_id}")
         return None
     _template_module_cache[template_id] = module
     return module
@@ -241,7 +278,7 @@ async def build_entry(
     bot = Bot(token=token)
     dp = Dispatcher(storage=MemoryStorage())
 
-    module = _load_template_module(template_id) if template_id else None
+    module = await _load_template_module_async(template_id) if template_id else None
     if template_id and module is None:
         logger.warning(
             f"build_entry: bot_id={bot_id} has template_id={template_id!r} that does not "

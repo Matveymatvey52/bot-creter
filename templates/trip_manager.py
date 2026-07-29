@@ -44,6 +44,20 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 router = Router()
 
+# Guards /excel (Workbook build + save + answer_document) against a double tap
+# starting a second export for the same bot before the first finishes writing
+# the same excel_path — same pattern as handlers/manage_bots.py's _busy_bots
+# guard for recreate/autofix/fixbug. Needed because wb.save() below now runs
+# via run_in_executor (payment-eventloop-fix): before that change the whole
+# /excel body had no `await` between building and saving the workbook, so two
+# taps could never interleave; the executor call introduces the first `await`
+# in that path, opening a window for a second tap to start a concurrent write
+# to the same file. Keyed by excel_path (already unique per bot — see
+# config_from_bot_row) rather than a bot_id field, since TripManagerConfig
+# doesn't carry one directly.
+_EXCEL_BUSY_TEXT = "⏳ Выгрузка Excel уже выполняется — подожди её завершения."
+_busy_excel_exports: set[str] = set()
+
 ITEM_TYPES = {
     "flight":   "✈️ Перелёт",
     "hotel":    "🏨 Отель",
@@ -1360,6 +1374,41 @@ async def cmd_excel(msg: Message, config: TripManagerConfig):
     trips = await _all_trips(config.db_path)
     if not trips:
         await msg.answer("Данных нет."); return
+    if config.excel_path in _busy_excel_exports:
+        logger.info(f"cmd_excel: rejected concurrent tap for {config.excel_path!r} — export already in progress")
+        await msg.answer(_EXCEL_BUSY_TEXT)
+        return
+    _busy_excel_exports.add(config.excel_path)
+    try:
+        await _build_and_send_excel(msg, config, trips)
+    finally:
+        _busy_excel_exports.discard(config.excel_path)
+
+
+async def _build_and_send_excel(msg: Message, config: TripManagerConfig, trips: list[dict]) -> None:
+    trips_with_items = []
+    for trip in trips:
+        items = await _trip_items(config.db_path, trip["id"])
+        trips_with_items.append((trip, items))
+
+    await asyncio.get_running_loop().run_in_executor(
+        None, _write_excel_workbook, trips_with_items, config.excel_path
+    )
+    await msg.answer_document(FSInputFile(config.excel_path),
+                              caption=f"📊 Таблица маршрутов ({len(trips)} путешествий)")
+
+
+def _write_excel_workbook(trips_with_items: list[tuple[dict, list[dict]]], excel_path: str) -> None:
+    """Pure-sync: the ENTIRE CPU-bound part of /excel (Workbook creation, cell
+    writes, styling, auto-width, save) in one function, run as a single
+    run_in_executor call from _build_and_send_excel — see payment-eventloop-fix.
+    Split out from the async data-fetch above because aiosqlite (inside
+    _trip_items) can't be driven from a worker thread the way it's used there;
+    only the openpyxl side (no I/O, no event-loop dependency) is safe and
+    worth moving off the shared loop. Before this split, only wb.save() was
+    offloaded — the styling/auto-width loop above it (unbounded by trips/item
+    count) could still block the loop on its own for a bot with a large
+    dataset, missing the fix's actual goal."""
     wb = Workbook(); wb.remove(wb.active)
     hdrs = ["Тип", "Название", "Куда", "Дата нач.", "Время", "Дата кон.", "Ссылка",
             "Подтверждение", "Цена", "Предоплата", "Заметки", "Статус"]
@@ -1371,8 +1420,7 @@ async def cmd_excel(msg: Message, config: TripManagerConfig):
     total_fill = PatternFill("solid", fgColor="FFF2CC")
     total_font = Font(bold=True)
 
-    for trip in trips:
-        items = await _trip_items(config.db_path, trip["id"])
+    for trip, items in trips_with_items:
         ws = wb.create_sheet(title=trip["name"][:31])
         for c, h in enumerate(hdrs, 1):
             cell = ws.cell(1, c, h)
@@ -1402,9 +1450,7 @@ async def cmd_excel(msg: Message, config: TripManagerConfig):
         ws.freeze_panes = "A2"
         ws.auto_filter.ref = f"A1:L{len(items) + 1}"
 
-    wb.save(config.excel_path)
-    await msg.answer_document(FSInputFile(config.excel_path),
-                              caption=f"📊 Таблица маршрутов ({len(trips)} путешествий)")
+    wb.save(excel_path)
 
 
 # ── TELEGRAPH ─────────────────────────────────────────────────────────────────
