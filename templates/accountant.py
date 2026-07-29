@@ -705,6 +705,7 @@ async def cmd_excel(msg: Message, state: FSMContext, config: AccountantConfig):
     if not projects:
         await msg.answer("Данных нет."); return
     if config.excel_path in _busy_excel_exports:
+        logger.info(f"cmd_excel: rejected concurrent tap for {config.excel_path!r} — export already in progress")
         await msg.answer(_EXCEL_BUSY_TEXT)
         return
     _busy_excel_exports.add(config.excel_path)
@@ -715,6 +716,34 @@ async def cmd_excel(msg: Message, state: FSMContext, config: AccountantConfig):
 
 
 async def _build_and_send_excel(msg: Message, config: AccountantConfig, projects: list[dict]) -> None:
+    projects_with_rows = []
+    for project in projects:
+        async with aiosqlite.connect(config.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            rows = [dict(r) for r in await (await db.execute(
+                "SELECT * FROM transactions WHERE project_id=? ORDER BY tx_date, id",
+                (project["id"],)
+            )).fetchall()]
+        projects_with_rows.append((project, rows))
+
+    await asyncio.get_running_loop().run_in_executor(
+        None, _write_excel_workbook, projects_with_rows, config.excel_path
+    )
+    await msg.answer_document(FSInputFile(config.excel_path),
+                              caption=f"📊 Финансовая выгрузка ({len(projects)} проектов)")
+
+
+def _write_excel_workbook(projects_with_rows: list[tuple[dict, list[dict]]], excel_path: str) -> None:
+    """Pure-sync: the ENTIRE CPU-bound part of /excel (Workbook creation, cell
+    writes, styling, auto-width, save) in one function, run as a single
+    run_in_executor call from _build_and_send_excel — see payment-eventloop-fix.
+    Split out from the async data-fetch above because aiosqlite can't be driven
+    from a worker thread the way it's used there; only the openpyxl side (no
+    I/O, no event-loop dependency) is safe and worth moving off the shared
+    loop. Before this split, only wb.save() was offloaded — the styling/
+    auto-width loop above it (unbounded by projects/transaction count) could
+    still block the loop on its own for a bot with a large dataset, missing
+    the fix's actual goal."""
     wb = Workbook()
     wb.remove(wb.active)
     hdrs = ["Тип", "Сумма", "Категория", "Комментарий", "Дата", "Создано"]
@@ -727,13 +756,7 @@ async def _build_and_send_excel(msg: Message, config: AccountantConfig, projects
     total_fill = PatternFill("solid", fgColor="FFF2CC")
     total_font = Font(bold=True)
 
-    for project in projects:
-        async with aiosqlite.connect(config.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            rows = [dict(r) for r in await (await db.execute(
-                "SELECT * FROM transactions WHERE project_id=? ORDER BY tx_date, id",
-                (project["id"],)
-            )).fetchall()]
+    for project, rows in projects_with_rows:
         ws = wb.create_sheet(title=project["name"][:31])
         for c, h in enumerate(hdrs, 1):
             cell = ws.cell(1, c, h); cell.fill = hfill; cell.font = hfont; cell.border = border
@@ -763,9 +786,7 @@ async def _build_and_send_excel(msg: Message, config: AccountantConfig, projects
             )
         ws.freeze_panes = "A2"; ws.auto_filter.ref = f"A1:F{len(rows) + 1}"
 
-    await asyncio.get_running_loop().run_in_executor(None, wb.save, config.excel_path)
-    await msg.answer_document(FSInputFile(config.excel_path),
-                              caption=f"📊 Финансовая выгрузка ({len(projects)} проектов)")
+    wb.save(excel_path)
 
 
 # ── HTML REPORT ───────────────────────────────────────────────────────────────
