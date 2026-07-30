@@ -499,3 +499,69 @@ async def on_bot_membership_changed(update: ChatMemberUpdated, bot: Bot, config:
 ## Статус на момент записи
 
 Дизайн утверждён владельцем («ок»). Код (`templates/moderator.py`) **ещё не написан** — ветка `template-moderator` существует, но содержит только этот файл (`docs/STAGE2_DESIGN.md`) поверх `master`. Следующая сессия должна: перечитать этот раздел, реализовать Task 2 (код) → Task 3 (авто-обнаружение, критично: discover_templates()/build_entry() без правок вне templates/moderator.py) → Task 4 (тест изоляции + тест на все три пункта проверки прав) → Task 5 (review-orchestrator, полный сьют, отчёт, стоп перед коммитом — тот же процесс, что уже пройден для booking_medical и inventory).
+
+# Фаза B — `services/payments.py`, переиспользуемый платёжный модуль
+
+Прерогатива: Фаза A (снятие блокировки event loop, `payment-eventloop-fix`) уже слита в master — двойной синхронный блокирующий вызов (`importlib.import_module` первого импорта шаблона и полная сборка/сохранение `/excel` Workbook) снят с общего event loop `combined_app.py`, защищая 10-секундное окно `answerPreCheckoutQuery` любого бота от блокировки чужим ботом. Это предпосылка для платежей — без неё «свой» `pre_checkout_query` мог бы упереться в чужую блокировку.
+
+## Архитектурные решения владельца
+- Токен провайдера — per-bot, отдельная таблица `bot_payment_providers` (1:1 с `bots.id`), шифрование тем же Fernet-механизмом, что `BOT_TOKEN`.
+- Идемпотентность — `UNIQUE` на `telegram_payment_charge_id`, `INSERT` + `except sqlite3.IntegrityError` (паттерн как в `inventory.py`).
+- Возвраты — ТОЛЬКО ручная фиксация статуса (нет прямого API для реальных денег через провайдера), UX явно называет это «отметить как возвращённый», не «вернуть деньги».
+- Модуль экспортирует функции (`create_invoice`, `on_pre_checkout_query`, `on_successful_payment`, `record_refund`), конкретный шаблон импортирует их в СВОЙ router, не создаёт отдельный.
+- `pre_checkout_query`-хендлер максимально быстрый — минимум синхронной работы, только необходимая валидация перед `answer` (единственное окно в 10 секунд, защищённое Фазой A — новую блокировку здесь создавать нельзя).
+
+## Схема `bot_payment_providers` (в `db/database.py`, не в модуле)
+Симметрично `bots.token`: тот же файл (`bots.db`), тот же `_fernet`, та же пара `_encrypt_token`/`_decrypt_token`.
+```sql
+CREATE TABLE IF NOT EXISTS bot_payment_providers (
+    bot_id         INTEGER PRIMARY KEY REFERENCES bots(id),
+    provider_token TEXT NOT NULL,
+    created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)
+```
+`set_bot_payment_provider(bot_id, provider_token)` / `get_bot_payment_provider(bot_id)` — CRUD живёт в `db/database.py` (владелец подтвердил при дизайне: симметрично `bots.token`, не дублировать Fernet-обвязку в `services/payments.py`). Установка токена в Фазе B — только напрямую в БД/фабрикой, без бот-команды (владелец подтвердил).
+
+## Схема `payments` (per-bot БД, `config.db_path`, паттерн `inventory.py`)
+```sql
+CREATE TABLE IF NOT EXISTS payments (
+    id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+    telegram_payment_charge_id  TEXT NOT NULL UNIQUE,
+    provider_payment_charge_id  TEXT,
+    user_id                     INTEGER NOT NULL,
+    invoice_payload             TEXT NOT NULL,
+    currency                    TEXT NOT NULL,
+    total_amount                INTEGER NOT NULL,
+    status                      TEXT NOT NULL DEFAULT 'paid' CHECK(status IN ('paid','refunded')),
+    refunded_at                 TEXT,
+    refunded_by                 TEXT,
+    created_at                  TEXT DEFAULT (datetime('now','localtime'))
+)
+```
+Создаётся `init_payments_tables(db_path)`, которую шаблон вызывает из СВОЕГО `init_db()` — модуль никогда не открывает/не владеет файлом БД сам.
+
+## Форма экспортируемых функций и регистрация на router шаблона
+```python
+async def init_payments_tables(db_path: str) -> None: ...
+async def create_invoice(bot, bot_id, chat_id, title, description, payload, currency, prices) -> Message: ...
+async def on_pre_checkout_query(query: PreCheckoutQuery) -> None: ...      # ZERO I/O
+async def on_successful_payment(message: Message, config: PaymentsConfig) -> None: ...
+async def record_refund(db_path, telegram_payment_charge_id, admin_id) -> bool: ...
+```
+Шаблон:
+```python
+router.pre_checkout_query.register(on_pre_checkout_query)
+router.message.register(on_successful_payment, F.successful_payment)
+```
+`config` инжектится по имени параметра тем же `ConfigMiddleware`, что и везде — `on_successful_payment` типизирован по `Protocol` с `db_path`, поэтому работает с любым шаблонным `Config`-датаклассом без изменений в модуле.
+
+## Что было исправлено по итогам review-orchestrator (до коммита)
+- 🔴 `on_successful_payment` ловил только `IntegrityError` — таблица `payments` не имела `PRAGMA journal_mode=WAL`, риск потерять запись о платеже на `sqlite3.OperationalError` без следа. Фикс: `init_payments_tables` ставит WAL; `on_successful_payment` теперь ловит `sqlite3.Error` отдельно, логирует на ERROR с `charge_id`/суммой и **пробрасывает** исключение дальше (не глотает).
+- 🔴 Референсный фикстурный шаблон (`tests/fixtures/payment_fixture_template.py`) не проверял права на `/refund` — любой пользователь мог пометить чужой платёж возвращённым. Фикс: `_load_admins`/`admins_file`, тот же паттерн, что в `inventory.py`.
+- 🟡 Ни успешный платёж, ни рефанд не логировались (только запись в БД) — добавлены `logger.info` в `on_successful_payment`, `create_invoice`, `record_refund`, `set_bot_payment_provider`.
+- 🟡 `create_invoice`/`on_pre_checkout_query.answer()` не были обёрнуты — фикстура теперь ловит `ValueError`/`TelegramBadRequest` в `/buy` с понятным сообщением пользователю; `on_pre_checkout_query` логирует (без доп. I/O), если сам `answer()` упал.
+- 🟡 `delete_bot()` не чистил `bot_payment_providers` (SQLite FK по умолчанию выключены — `REFERENCES` без `PRAGMA foreign_keys=ON` не каскадирует) — добавлена явная очистка.
+- Подтверждено без замечаний: `on_pre_checkout_query` — действительно zero I/O (проверено вплоть до внутренностей aiogram), шифрование `provider_token` не течёт никуда, семантика `record_refund` однозначна («отметить как возвращённый», не «вернуть деньги»).
+
+## Статус на момент записи
+Дизайн утверждён владельцем («ок»), код реализован и прошёл review-orchestrator (2 блокера и 4 важных замечания устранены), полный сьют — 161/161. `templates/booking_fitness.py` **не существует** — модуль построен и протестирован на фикстурном шаблоне (`tests/fixtures/payment_fixture_template.py`), wiring в `booking_fitness` — отдельный последующий шаг.
