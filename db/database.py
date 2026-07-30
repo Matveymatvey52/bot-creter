@@ -110,6 +110,13 @@ async def init_db():
                 await db.execute(f"ALTER TABLE bots ADD COLUMN {col}")
             except aiosqlite.OperationalError:
                 pass
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS bot_payment_providers (
+                bot_id         INTEGER PRIMARY KEY REFERENCES bots(id),
+                provider_token TEXT NOT NULL,
+                created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         await db.commit()
     await migrate_encrypt_tokens()
 
@@ -229,6 +236,11 @@ async def get_bot(bot_id: int) -> dict | None:
 async def delete_bot(bot_id: int) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM bots WHERE id = ?", (bot_id,))
+        # SQLite has foreign keys OFF by default (no PRAGMA foreign_keys=ON
+        # anywhere in this module), so bot_payment_providers' REFERENCES
+        # bots(id) alone would never actually cascade — clean it up explicitly
+        # so a deleted bot doesn't leave its payment provider credential behind.
+        await db.execute("DELETE FROM bot_payment_providers WHERE bot_id = ?", (bot_id,))
         await db.commit()
 
 
@@ -236,6 +248,31 @@ async def update_bot_username(bot_id: int, username: str) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("UPDATE bots SET username = ? WHERE id = ?", (username, bot_id))
         await db.commit()
+
+
+async def set_bot_payment_provider(bot_id: int, provider_token: str) -> None:
+    """Upserts this bot's Telegram payment provider token — 1:1 with bots.id,
+    same Fernet encryption as bots.token. No admin-facing command sets this in
+    Phase B; it's written directly against the DB (factory-side), per owner."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO bot_payment_providers (bot_id, provider_token) VALUES (?, ?)
+            ON CONFLICT(bot_id) DO UPDATE SET provider_token = excluded.provider_token
+            """,
+            (bot_id, _encrypt_token(provider_token)),
+        )
+        await db.commit()
+    logger.info(f"set_bot_payment_provider: provider_token set for bot_id={bot_id}")
+
+
+async def get_bot_payment_provider(bot_id: int) -> str | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT provider_token FROM bot_payment_providers WHERE bot_id = ?", (bot_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            return _decrypt_token(row[0]) if row else None
 
 
 async def update_bot_status(bot_id: int, status: str, pid: int | None = None):
