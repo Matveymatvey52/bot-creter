@@ -1,5 +1,5 @@
 # TEMPLATE: moderator
-# USE FOR: модерация чата, антиспам, стоп-слова, лестница предупреждение-мут-бан, журнал модерации
+# USE FOR: модерация чата, антиспам, запрещённые слова, лестница предупреждение-мут-бан, журнал модерации
 # CUSTOMIZE: sections marked with # CUSTOMIZE
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -16,28 +17,27 @@ from pathlib import Path
 import aiosqlite
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramAPIError
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
-    ChatMemberAdministrator, ChatMemberUpdated, ChatPermissions, FSInputFile, Message,
+    CallbackQuery, ChatMemberAdministrator, ChatMemberUpdated, ChatPermissions, FSInputFile,
+    InlineKeyboardButton, InlineKeyboardMarkup, Message,
 )
 
 # ── CUSTOMIZE ────────────────────────────────────────────────────────────────
 # Same status as every other template's CUSTOMIZE block: per-file source-text
 # customization Claude edits when generating a specific bot, not per-bot
 # runtime state (that's config.db_path/admins_file below).
-BOT_DESCRIPTION = "Модерация группового чата: антиспам, стоп-слова, лестница предупреждение → мут → бан, журнал модерации."
+BOT_DESCRIPTION = "Модерация группового чата: антиспам, запрещённые слова, лестница предупреждение → мут → бан, журнал модерации."
 WELCOME_TEXT = (
     "🛡 <b>Модератор чата</b>\n\n"
     "Добавьте меня в группу и выдайте права администратора (пункты «Удаление "
     "сообщений» и «Блокировка пользователей») — и я начну следить за порядком: "
-    "спам-ссылки, стоп-слова, лестница предупреждение → мут → бан.\n\n"
-    "Команды внутри группы (только для администраторов группы):\n"
-    "<code>/checkrights</code> — проверить, хватает ли у меня прав\n"
-    "<code>/addstopword слово</code>, <code>/removestopword слово</code>, <code>/stopwords</code>\n"
-    "<code>/setmaxwarnings N</code> — порог предупреждений до мута\n\n"
-    "Здесь, в личных сообщениях:\n"
-    "<code>/modlog</code> — сводный журнал модерации по всем вашим группам"
+    "спам-ссылки, запрещённые слова, лестница предупреждение → мут → бан.\n\n"
+    "Настройка (запрещённые слова, порог предупреждений, проверка прав) выполняется "
+    "прямо в группе, где я состою. Здесь, в личных сообщениях, доступны кнопки ниже:"
 )
 # ── END CUSTOMIZE ─────────────────────────────────────────────────────────────
 
@@ -431,8 +431,25 @@ async def _apply_escalation(
         # stage == "banned": already banned, nothing further to do.
 
 
-@router.message(F.chat.type.in_({"group", "supergroup"}), F.text | F.caption, ~F.text.startswith("/"))
+@router.message(
+    F.chat.type.in_({"group", "supergroup"}), F.text | F.caption, ~F.text.startswith("/"),
+    StateFilter(None),
+)
 async def moderate_message(msg: Message, bot: Bot, config: ModeratorConfig):
+    # StateFilter(None) added for the button-driven admin panel below: while a
+    # SPECIFIC admin is mid-flow (e.g. just pressed "➕ Добавить запрещённое
+    # слово" and is about to type the word itself), their next plain-text
+    # reply in the group must reach the ModPanelFlow message handler, not get
+    # scanned/deleted as ordinary content here. Router dispatch stops at the
+    # FIRST handler whose entire filter set passes (see the "/addstopword"
+    # note just below) — without this, this handler's filters would still
+    # all pass for that admin's reply and "claim" the update, and the
+    # ModPanelFlow handler (filtered on that specific state) would never see
+    # it. StateFilter checks the state keyed by THIS message's own (chat,
+    # user) pair, so every other, non-flow message in the group (including
+    # from other users, or from this same admin once the flow ends) is
+    # unaffected and still scanned normally.
+
     # Review-found bypass: the old filter matched F.text only, so a spam link/
     # stopword sent as a PHOTO CAPTION (msg.caption, a completely separate
     # field from msg.text) never reached this handler at all — full antispam
@@ -491,7 +508,7 @@ async def moderate_message(msg: Message, bot: Bot, config: ModeratorConfig):
     if settings["delete_links"] and LINK_PATTERN.search(content):
         reason = "спам-ссылка"
     elif any(word and word in text_lower for word in stopwords):
-        reason = "стоп-слово"
+        reason = "запрещённое слово"
 
     if reason is None:
         return
@@ -504,6 +521,90 @@ async def moderate_message(msg: Message, bot: Bot, config: ModeratorConfig):
 
 
 # ── group settings commands (Telegram-native admin/creator only) ─────────────
+# Raw text commands (/addstopword, /removestopword, /stopwords, /setmaxwarnings)
+# stay fully functional for backward compatibility with anyone who types them
+# by hand, but the primary UI is the button panel below cmd_stopwords — see
+# docs/STAGE2_DESIGN.md "никаких сырых текстовых списков команд".
+
+async def _stopwords_for_chat(db_path: str, chat_id: int) -> list[str]:
+    async with aiosqlite.connect(db_path) as db:
+        rows = await (await db.execute(
+            "SELECT word FROM stopwords WHERE chat_id=? ORDER BY word", (chat_id,)
+        )).fetchall()
+    return [r[0] for r in rows]
+
+
+def _stopwords_panel_text(words: list[str]) -> str:
+    if not words:
+        return "Список запрещённых слов пуст."
+    return _join_bounded(["🚫 <b>Запрещённые слова:</b>\n"] + [f"• {_esc(w)}" for w in words])
+
+
+def kb_stopwords_panel() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить запрещённое слово", callback_data="mod_addword")],
+        [InlineKeyboardButton(text="➖ Убрать запрещённое слово", callback_data="mod_removeword")],
+        [InlineKeyboardButton(text="⚙️ Порог предупреждений", callback_data="mod_setwarn")],
+    ])
+
+def kb_cancel() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="❌ Отмена", callback_data="mod_cancel")
+    ]])
+
+# Kept small enough that the resulting keyboard never risks Telegram's
+# per-message inline-button limits — above this, removal falls back to the
+# "type the word" flow instead of one button per word.
+MAX_REMOVE_BUTTONS = 30
+
+def kb_remove_words(words: list[str]) -> InlineKeyboardMarkup:
+    rows = []
+    for i, w in enumerate(words):
+        label = w if len(w) <= 40 else w[:37] + "…"
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"mod_rmw:{i}")])
+    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="mod_cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+class ModPanelFlow(StatesGroup):
+    add_word = State(); remove_word_pick = State(); remove_word_text = State(); max_warnings = State()
+
+# Review-found blocker: MemoryStorage keeps a state until explicitly cleared —
+# with no expiry, an admin who presses a panel button and then gets
+# distracted has every LATER plain message they send in the group (as long
+# as it happens to look like a valid word/number) silently accepted as if it
+# were the flow's reply — e.g. an unrelated one-word chat message becomes a
+# new запрещённое слово, or a stray short number silently rewrites the
+# warning threshold. Every flow-start handler stamps `started_at`; every
+# continuation checks it first and expires the flow instead of acting on
+# stale input.
+FLOW_TIMEOUT_SECONDS = 300
+
+
+def _flow_expired(data: dict) -> bool:
+    started_at = data.get("started_at")
+    return started_at is None or (time.time() - started_at) > FLOW_TIMEOUT_SECONDS
+
+
+def _panel_chat_id(cb: CallbackQuery) -> int | None:
+    """cb.message is None if Telegram can no longer resolve the original
+    message (older than 48h, or deleted) — every panel callback needs a
+    chat_id to check admin status against, so this is checked first."""
+    return cb.message.chat.id if cb.message else None
+
+
+async def _reject_non_admin_callback(cb: CallbackQuery, bot: Bot, chat_id: int) -> bool:
+    """The /stopwords panel message is visible to the WHOLE group, not just
+    the admin who ran the command — any member can tap its buttons. Unlike a
+    private-chat FSM (only the conversation's own user can ever reply into
+    it), every callback here must re-verify the PRESSER's live Telegram
+    admin/creator status before acting. Returns True (and already answered
+    the callback with an alert) if the press was rejected."""
+    if await _is_group_admin(bot, chat_id, cb.from_user.id):
+        return False
+    await cb.answer("⛔ Команда доступна только администраторам группы.", show_alert=True)
+    return True
+
 
 @router.message(Command("addstopword"), F.chat.type.in_({"group", "supergroup"}))
 async def cmd_addstopword(msg: Message, bot: Bot, config: ModeratorConfig):
@@ -523,7 +624,7 @@ async def cmd_addstopword(msg: Message, bot: Bot, config: ModeratorConfig):
     async with aiosqlite.connect(config.db_path) as db:
         await db.execute("INSERT OR IGNORE INTO stopwords (chat_id, word) VALUES (?,?)", (msg.chat.id, word))
         await db.commit()
-    await msg.answer(f"✅ Стоп-слово «{_esc(word)}» добавлено.", parse_mode="HTML")
+    await msg.answer(f"✅ Добавлено в список запрещённых слов: «{_esc(word)}»", parse_mode="HTML")
 
 @router.message(Command("removestopword"), F.chat.type.in_({"group", "supergroup"}))
 async def cmd_removestopword(msg: Message, bot: Bot, config: ModeratorConfig):
@@ -537,20 +638,15 @@ async def cmd_removestopword(msg: Message, bot: Bot, config: ModeratorConfig):
         cur = await db.execute("DELETE FROM stopwords WHERE chat_id=? AND word=?", (msg.chat.id, word))
         await db.commit()
     if cur.rowcount == 0:
-        await msg.answer(f"Стоп-слово «{_esc(word)}» не найдено.", parse_mode="HTML"); return
-    await msg.answer(f"✅ Стоп-слово «{_esc(word)}» удалено.", parse_mode="HTML")
+        await msg.answer(f"«{_esc(word)}» не найдено в списке запрещённых слов.", parse_mode="HTML"); return
+    await msg.answer(f"✅ Убрано из списка запрещённых слов: «{_esc(word)}»", parse_mode="HTML")
 
 @router.message(Command("stopwords"), F.chat.type.in_({"group", "supergroup"}))
 async def cmd_stopwords(msg: Message, bot: Bot, config: ModeratorConfig):
     if not await _is_group_admin(bot, msg.chat.id, msg.from_user.id):
         await msg.answer("⛔ Команда доступна только администраторам группы."); return
-    async with aiosqlite.connect(config.db_path) as db:
-        rows = await (await db.execute(
-            "SELECT word FROM stopwords WHERE chat_id=? ORDER BY word", (msg.chat.id,)
-        )).fetchall()
-    if not rows:
-        await msg.answer("Список стоп-слов пуст."); return
-    await msg.answer(_join_bounded(["🚫 <b>Стоп-слова:</b>\n"] + [f"• {_esc(r[0])}" for r in rows]), parse_mode="HTML")
+    words = await _stopwords_for_chat(config.db_path, msg.chat.id)
+    await msg.answer(_stopwords_panel_text(words), parse_mode="HTML", reply_markup=kb_stopwords_panel())
 
 @router.message(Command("setmaxwarnings"), F.chat.type.in_({"group", "supergroup"}))
 async def cmd_setmaxwarnings(msg: Message, bot: Bot, config: ModeratorConfig):
@@ -572,7 +668,246 @@ async def cmd_setmaxwarnings(msg: Message, bot: Bot, config: ModeratorConfig):
     await msg.answer(f"✅ Порог предупреждений установлен: {n}.")
 
 
+# ── group settings panel: button-driven FSM (add/remove word, set threshold) ─
+
+@router.callback_query(F.data == "mod_addword")
+async def cb_addword_start(cb: CallbackQuery, bot: Bot, state: FSMContext):
+    chat_id = _panel_chat_id(cb)
+    if chat_id is None:
+        await cb.answer("⚠️ Сообщение недоступно — откройте панель заново: /stopwords", show_alert=True); return
+    if await _reject_non_admin_callback(cb, bot, chat_id):
+        return
+    await cb.answer()
+    await cb.message.edit_text("Пришлите слово, которое нужно заблокировать:", reply_markup=kb_cancel())
+    await state.update_data(started_at=time.time())
+    await state.set_state(ModPanelFlow.add_word)
+
+@router.message(ModPanelFlow.add_word, F.chat.type.in_({"group", "supergroup"}), F.text, ~F.text.startswith("/"))
+async def modpanel_add_word(msg: Message, bot: Bot, state: FSMContext, config: ModeratorConfig):
+    data = await state.get_data()
+    if _flow_expired(data):
+        await state.clear()
+        await msg.answer("⏳ Время ожидания истекло — начните заново: /stopwords"); return
+    # Review-found: admin status can change between the button press and this
+    # reply (rights revoked mid-flow) — re-verify rather than trusting the
+    # check already done when the flow started.
+    if not await _is_group_admin(bot, msg.chat.id, msg.from_user.id):
+        await state.clear()
+        await msg.answer("⛔ Действие отменено — вы больше не администратор группы."); return
+    word = msg.text.strip().lower()
+    # Same bounds as cmd_addstopword, plus a no-whitespace check — this flow's
+    # prompt explicitly asks for ONE word, unlike the raw command which simply
+    # takes everything after the command as a single (space-permitting) arg.
+    if " " in word or len(word) < 2 or len(word) > 100:
+        await msg.answer("⚠️ Пришлите одно слово (без пробелов), от 2 до 100 символов."); return
+    async with aiosqlite.connect(config.db_path) as db:
+        await db.execute("INSERT OR IGNORE INTO stopwords (chat_id, word) VALUES (?,?)", (msg.chat.id, word))
+        await db.commit()
+    await state.clear()
+    await msg.answer(f"✅ Добавлено в список запрещённых слов: «{_esc(word)}»", parse_mode="HTML")
+    words = await _stopwords_for_chat(config.db_path, msg.chat.id)
+    await msg.answer(_stopwords_panel_text(words), parse_mode="HTML", reply_markup=kb_stopwords_panel())
+
+
+@router.callback_query(F.data == "mod_removeword")
+async def cb_removeword_start(cb: CallbackQuery, bot: Bot, state: FSMContext, config: ModeratorConfig):
+    chat_id = _panel_chat_id(cb)
+    if chat_id is None:
+        await cb.answer("⚠️ Сообщение недоступно — откройте панель заново: /stopwords", show_alert=True); return
+    if await _reject_non_admin_callback(cb, bot, chat_id):
+        return
+    await cb.answer()
+    words = await _stopwords_for_chat(config.db_path, chat_id)
+    if not words:
+        await cb.message.edit_text("Список запрещённых слов пуст — убирать нечего.")
+        return
+    if len(words) <= MAX_REMOVE_BUTTONS:
+        await state.update_data(remove_words=words, started_at=time.time())
+        await cb.message.edit_text("Выберите слово для удаления:", reply_markup=kb_remove_words(words))
+        await state.set_state(ModPanelFlow.remove_word_pick)
+    else:
+        await state.update_data(started_at=time.time())
+        await cb.message.edit_text("Слов много — пришлите слово для удаления текстом:", reply_markup=kb_cancel())
+        await state.set_state(ModPanelFlow.remove_word_text)
+
+@router.callback_query(ModPanelFlow.remove_word_pick, F.data.startswith("mod_rmw:"))
+async def cb_removeword_pick(cb: CallbackQuery, bot: Bot, state: FSMContext, config: ModeratorConfig):
+    chat_id = _panel_chat_id(cb)
+    if chat_id is None:
+        await cb.answer("⚠️ Сообщение недоступно — откройте панель заново: /stopwords", show_alert=True); return
+    if await _reject_non_admin_callback(cb, bot, chat_id):
+        return
+    await cb.answer()
+    data = await state.get_data()
+    if _flow_expired(data):
+        await state.clear()
+        await cb.message.edit_text("⏳ Время ожидания истекло — откройте панель заново: /stopwords")
+        return
+    words = data.get("remove_words", [])
+    # Review-found: a malformed/stale "mod_rmw:<non-numeric>" callback_data
+    # used to raise an unhandled ValueError here — treat it the same as an
+    # out-of-range index (stale snapshot) instead of crashing the handler.
+    try:
+        idx = int(cb.data.split(":", 1)[1])
+    except ValueError:
+        idx = -1
+    if idx < 0 or idx >= len(words):
+        await state.clear()
+        await cb.message.edit_text("Список устарел — откройте заново командой /stopwords.")
+        return
+    word = words[idx]
+    async with aiosqlite.connect(config.db_path) as db:
+        cur = await db.execute("DELETE FROM stopwords WHERE chat_id=? AND word=?", (chat_id, word))
+        await db.commit()
+    await state.clear()
+    # Review-found: unlike the two other removal paths (raw command, text
+    # fallback), this used to report "✅ Убрано" unconditionally even if the
+    # word had already been removed (e.g. by another admin) between the
+    # snapshot being taken and this press — a false-success message.
+    if cur.rowcount == 0:
+        await cb.message.edit_text(f"«{_esc(word)}» уже не в списке запрещённых слов.", parse_mode="HTML")
+        return
+    await cb.message.edit_text(f"✅ Убрано из списка запрещённых слов: «{_esc(word)}»", parse_mode="HTML")
+    remaining = await _stopwords_for_chat(config.db_path, chat_id)
+    await cb.message.answer(_stopwords_panel_text(remaining), parse_mode="HTML", reply_markup=kb_stopwords_panel())
+
+@router.message(ModPanelFlow.remove_word_pick, F.chat.type.in_({"group", "supergroup"}), F.text, ~F.text.startswith("/"))
+async def modpanel_remove_word_pick_stray_text(msg: Message) -> None:
+    # Review-found gap: this state previously had NO message handler at all —
+    # an admin who types instead of tapping one of the pick-buttons got
+    # silently ignored with zero reply. Typed text is intentionally NOT
+    # accepted as a word here (unlike remove_word_text below) — the buttons
+    # are the only valid input in THIS state, since removal-by-button relies
+    # on the exact list snapshot taken when the panel was shown.
+    await msg.answer("Пожалуйста, выберите слово кнопкой выше, либо отправьте /cancel.")
+
+@router.message(ModPanelFlow.remove_word_text, F.chat.type.in_({"group", "supergroup"}), F.text, ~F.text.startswith("/"))
+async def modpanel_remove_word_text(msg: Message, bot: Bot, state: FSMContext, config: ModeratorConfig):
+    data = await state.get_data()
+    if _flow_expired(data):
+        await state.clear()
+        await msg.answer("⏳ Время ожидания истекло — начните заново: /stopwords"); return
+    if not await _is_group_admin(bot, msg.chat.id, msg.from_user.id):
+        await state.clear()
+        await msg.answer("⛔ Действие отменено — вы больше не администратор группы."); return
+    word = msg.text.strip().lower()
+    async with aiosqlite.connect(config.db_path) as db:
+        cur = await db.execute("DELETE FROM stopwords WHERE chat_id=? AND word=?", (msg.chat.id, word))
+        await db.commit()
+    await state.clear()
+    if cur.rowcount == 0:
+        await msg.answer(f"«{_esc(word)}» не найдено в списке запрещённых слов.", parse_mode="HTML"); return
+    await msg.answer(f"✅ Убрано из списка запрещённых слов: «{_esc(word)}»", parse_mode="HTML")
+    words = await _stopwords_for_chat(config.db_path, msg.chat.id)
+    await msg.answer(_stopwords_panel_text(words), parse_mode="HTML", reply_markup=kb_stopwords_panel())
+
+
+@router.callback_query(F.data == "mod_setwarn")
+async def cb_setwarn_start(cb: CallbackQuery, bot: Bot, state: FSMContext):
+    chat_id = _panel_chat_id(cb)
+    if chat_id is None:
+        await cb.answer("⚠️ Сообщение недоступно — откройте панель заново: /stopwords", show_alert=True); return
+    if await _reject_non_admin_callback(cb, bot, chat_id):
+        return
+    await cb.answer()
+    await cb.message.edit_text(
+        "Пришлите число — новый порог предупреждений до мута (целое от 1 до 100):",
+        reply_markup=kb_cancel(),
+    )
+    await state.update_data(started_at=time.time())
+    await state.set_state(ModPanelFlow.max_warnings)
+
+@router.message(ModPanelFlow.max_warnings, F.chat.type.in_({"group", "supergroup"}), F.text, ~F.text.startswith("/"))
+async def modpanel_max_warnings(msg: Message, bot: Bot, state: FSMContext, config: ModeratorConfig):
+    data = await state.get_data()
+    if _flow_expired(data):
+        await state.clear()
+        await msg.answer("⏳ Время ожидания истекло — начните заново: /stopwords"); return
+    if not await _is_group_admin(bot, msg.chat.id, msg.from_user.id):
+        await state.clear()
+        await msg.answer("⛔ Действие отменено — вы больше не администратор группы."); return
+    text = msg.text.strip()
+    # Same length-before-int() guard as cmd_setmaxwarnings (see its comment).
+    if not text.isdigit() or len(text) > 3 or not (1 <= int(text) <= 100):
+        await msg.answer("Введите целое число от 1 до 100."); return
+    n = int(text)
+    async with aiosqlite.connect(config.db_path) as db:
+        await db.execute("INSERT OR IGNORE INTO chat_settings (chat_id) VALUES (?)", (msg.chat.id,))
+        await db.execute("UPDATE chat_settings SET max_warnings=? WHERE chat_id=?", (n, msg.chat.id))
+        await db.commit()
+    await state.clear()
+    await msg.answer(f"✅ Порог предупреждений установлен: {n}.")
+
+
+@router.callback_query(F.data == "mod_cancel")
+async def cb_mod_cancel(cb: CallbackQuery, bot: Bot, state: FSMContext):
+    chat_id = _panel_chat_id(cb)
+    if chat_id is None:
+        await cb.answer(); return
+    # Review-found: this was the one panel callback that skipped the
+    # admin re-check — any group member could tap "❌ Отмена" and rewrite the
+    # shared panel message to "Отменено.", while the REAL admin's own FSM
+    # state (keyed by their own user_id, not the presser's) kept silently
+    # waiting for a reply that would never come — a misleading no-op for
+    # everyone involved.
+    if await _reject_non_admin_callback(cb, bot, chat_id):
+        return
+    await cb.answer()
+    await state.clear()
+    await cb.message.edit_text("Отменено.")
+
+@router.message(Command("cancel"), F.chat.type.in_({"group", "supergroup"}), StateFilter("*"))
+async def cmd_mod_cancel(msg: Message, state: FSMContext):
+    if await state.get_state() is None:
+        await msg.answer("Нечего отменять."); return
+    await state.clear()
+    await msg.answer("Отменено.")
+
+
 # ── private: /start, /modlog, admins_file management ──────────────────────────
+
+def kb_start_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔍 Проверить права", callback_data="mod_help:rights")],
+        [InlineKeyboardButton(text="🚫 Запрещённые слова", callback_data="mod_help:stopwords")],
+        [InlineKeyboardButton(text="👥 Админы", callback_data="mod_admins")],
+        [InlineKeyboardButton(text="📜 Журнал модерации", callback_data="mod_modlog")],
+    ])
+
+# "🔍 Проверить права" / "🚫 Запрещённые слова" only redirect (see Variant A
+# discussion): these act on a SPECIFIC group's chat_id, which a private /start
+# message has no way to know — the group itself is where /checkrights and the
+# /stopwords panel actually run. "👥 Админы" / "📜 Журнал модерации" need no
+# group context (admins_file/moderation_log are global to this bot), so their
+# buttons execute directly instead.
+_START_HELP_TEXTS = {
+    "rights": "🔍 Эта функция работает в группе, где я состою — отправьте /checkrights прямо в группе.",
+    "stopwords": "🚫 Управление запрещёнными словами (и порогом предупреждений) настраивается в группе, где я состою — отправьте /stopwords прямо в группе.",
+}
+
+
+async def _admins_list_text(config: ModeratorConfig) -> str:
+    ids = _load_admins(config.admins_file)
+    return "👥 " + ("\n".join(f"• <code>{i}</code>" for i in ids) or "Пусто")
+
+
+async def _modlog_text(config: ModeratorConfig) -> str:
+    async with aiosqlite.connect(config.db_path) as db:
+        db.row_factory = aiosqlite.Row
+        rows = await (await db.execute(
+            "SELECT chat_id, user_id, action, reason, created_at FROM moderation_log ORDER BY id DESC LIMIT 30"
+        )).fetchall()
+    if not rows:
+        return "Журнал модерации пуст."
+    icon = {"warn": "⚠️", "mute": "🔇", "ban": "🚫"}
+    lines = ["📋 <b>Журнал модерации (последние 30):</b>\n"]
+    for r in rows:
+        lines.append(
+            f"{r['created_at']} {icon.get(r['action'], '•')} чат {r['chat_id']} · "
+            f"пользователь {r['user_id']} · {_esc(r['reason']) if r['reason'] else '—'}"
+        )
+    return _join_bounded(lines)
+
 
 @router.message(Command("start"), F.chat.type == "private")
 async def cmd_start(message: Message, config: ModeratorConfig):
@@ -581,38 +916,48 @@ async def cmd_start(message: Message, config: ModeratorConfig):
     if first_time_admin:
         _save_admins(config.admins_file, {str(message.from_user.id)})
     if config.welcome_image.exists():
-        await message.answer_photo(FSInputFile(str(config.welcome_image)), caption=WELCOME_TEXT, parse_mode="HTML")
+        await message.answer_photo(
+            FSInputFile(str(config.welcome_image)), caption=WELCOME_TEXT, parse_mode="HTML",
+            reply_markup=kb_start_menu(),
+        )
     else:
-        await message.answer(WELCOME_TEXT, parse_mode="HTML")
+        await message.answer(WELCOME_TEXT, parse_mode="HTML", reply_markup=kb_start_menu())
     if first_time_admin:
         await message.answer(
             "👑 <b>Вы — администратор этого бота.</b>\n\n"
-            "Управление администраторами бота (доступ к /modlog):\n"
+            "Управление администраторами бота (доступ к журналу модерации):\n"
             "<code>/addadmin ID</code> — добавить\n"
             "<code>/removeadmin ID</code> — убрать\n"
-            "<code>/admins</code> — список",
+            "<code>/admins</code> — список (или кнопка «👥 Админы» выше)",
             parse_mode="HTML",
         )
+
+@router.callback_query(F.data.startswith("mod_help:"))
+async def cb_start_help(cb: CallbackQuery):
+    await cb.answer()
+    text = _START_HELP_TEXTS.get(cb.data.split(":", 1)[1])
+    if text:
+        await cb.message.answer(text)
+
+@router.callback_query(F.data == "mod_admins")
+async def cb_admins(cb: CallbackQuery, config: ModeratorConfig):
+    await cb.answer()
+    if str(cb.from_user.id) not in _load_admins(config.admins_file):
+        await cb.message.answer("⛔ Нет доступа"); return
+    await cb.message.answer(await _admins_list_text(config), parse_mode="HTML")
+
+@router.callback_query(F.data == "mod_modlog")
+async def cb_modlog(cb: CallbackQuery, config: ModeratorConfig):
+    await cb.answer()
+    if str(cb.from_user.id) not in _load_admins(config.admins_file):
+        await cb.message.answer("⛔ Нет доступа"); return
+    await cb.message.answer(await _modlog_text(config), parse_mode="HTML")
 
 @router.message(Command("modlog"), F.chat.type == "private")
 async def cmd_modlog(msg: Message, config: ModeratorConfig):
     if str(msg.from_user.id) not in _load_admins(config.admins_file):
         await msg.answer("⛔ Нет доступа"); return
-    async with aiosqlite.connect(config.db_path) as db:
-        db.row_factory = aiosqlite.Row
-        rows = await (await db.execute(
-            "SELECT chat_id, user_id, action, reason, created_at FROM moderation_log ORDER BY id DESC LIMIT 30"
-        )).fetchall()
-    if not rows:
-        await msg.answer("Журнал модерации пуст."); return
-    icon = {"warn": "⚠️", "mute": "🔇", "ban": "🚫"}
-    lines = ["📋 <b>Журнал модерации (последние 30):</b>\n"]
-    for r in rows:
-        lines.append(
-            f"{r['created_at']} {icon.get(r['action'], '•')} чат {r['chat_id']} · "
-            f"пользователь {r['user_id']} · {_esc(r['reason']) if r['reason'] else '—'}"
-        )
-    await msg.answer(_join_bounded(lines), parse_mode="HTML")
+    await msg.answer(await _modlog_text(config), parse_mode="HTML")
 
 @router.message(Command("addadmin"))
 async def cmd_addadmin(msg: Message, config: ModeratorConfig):
@@ -638,8 +983,7 @@ async def cmd_removeadmin(msg: Message, config: ModeratorConfig):
 @router.message(Command("admins"))
 async def cmd_admins(msg: Message, config: ModeratorConfig):
     if str(msg.from_user.id) not in _load_admins(config.admins_file): await msg.answer("⛔ Нет доступа"); return
-    ids = _load_admins(config.admins_file)
-    await msg.answer("👥 " + ("\n".join(f"• <code>{i}</code>" for i in ids) or "Пусто"), parse_mode="HTML")
+    await msg.answer(await _admins_list_text(config), parse_mode="HTML")
 
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────

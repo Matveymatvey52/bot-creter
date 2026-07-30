@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -32,7 +33,9 @@ import aiosqlite
 from aiogram import Bot, Dispatcher
 from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.methods import BanChatMember, GetChatMember, RestrictChatMember, SendMessage
+from aiogram.methods import (
+    AnswerCallbackQuery, BanChatMember, EditMessageText, GetChatMember, RestrictChatMember, SendMessage,
+)
 from aiogram.types import ChatMemberAdministrator, ChatMemberMember, User
 
 from runtime.registry import get_template_router
@@ -97,6 +100,12 @@ class FakeBotAPI:
                 out.append(c.text)
         return out
 
+    def edited_texts(self) -> list[str]:
+        return [c.text for c in self.calls if isinstance(c, EditMessageText)]
+
+    def alert_texts(self) -> list[str]:
+        return [c.text for c in self.calls if isinstance(c, AnswerCallbackQuery) and c.show_alert]
+
 
 def _group_text_update(update_id: int, chat_id: int, user_id: int, text: str) -> dict:
     return {
@@ -119,6 +128,48 @@ def _group_photo_caption_update(update_id: int, chat_id: int, user_id: int, capt
             "from": {"id": user_id, "is_bot": False, "first_name": "Test"},
             "photo": [{"file_id": "AgADfake", "file_unique_id": "u1", "width": 90, "height": 90}],
             "caption": caption,
+        },
+    }
+
+
+def _group_callback_update(update_id: int, chat_id: int, user_id: int, data: str) -> dict:
+    return {
+        "update_id": update_id,
+        "callback_query": {
+            "id": str(update_id),
+            "from": {"id": user_id, "is_bot": False, "first_name": "Test"},
+            "message": {
+                "message_id": update_id, "date": 1700000000,
+                "chat": {"id": chat_id, "type": "supergroup", "title": "Test Group"}, "text": "placeholder",
+            },
+            "chat_instance": "1", "data": data,
+        },
+    }
+
+
+def _private_text_update(update_id: int, user_id: int, text: str) -> dict:
+    return {
+        "update_id": update_id,
+        "message": {
+            "message_id": update_id, "date": 1700000000,
+            "chat": {"id": user_id, "type": "private"},
+            "from": {"id": user_id, "is_bot": False, "first_name": "Test"},
+            "text": text,
+        },
+    }
+
+
+def _private_callback_update(update_id: int, user_id: int, data: str) -> dict:
+    return {
+        "update_id": update_id,
+        "callback_query": {
+            "id": str(update_id),
+            "from": {"id": user_id, "is_bot": False, "first_name": "Test"},
+            "message": {
+                "message_id": update_id, "date": 1700000000,
+                "chat": {"id": user_id, "type": "private"}, "text": "placeholder",
+            },
+            "chat_instance": "1", "data": data,
         },
     }
 
@@ -385,7 +436,7 @@ class ModeratorEscalationLadderTests(unittest.IsolatedAsyncioTestCase):
             "SELECT reason FROM moderation_log WHERE user_id=? AND chat_id=?", (self.USER_ID, self.CHAT_ID)
         ).fetchone()
         conn.close()
-        self.assertEqual(row[0], "стоп-слово")
+        self.assertEqual(row[0], "запрещённое слово")
 
 
 class ModeratorAdminExclusionTests(unittest.IsolatedAsyncioTestCase):
@@ -666,6 +717,339 @@ class ModeratorRightsMechanism3_RuntimeFailureTests(unittest.IsolatedAsyncioTest
         conn.close()
         self.assertEqual(stage, "muted")
         self.assertEqual(actions, ["warn", "mute"])
+
+
+class ModeratorStartButtonMenuTests(unittest.IsolatedAsyncioTestCase):
+    """/start's welcome message shows buttons instead of a raw command list;
+    the group-scoped buttons (rights/stopwords) only redirect (no group
+    context available from a private chat — see Variant A discussion),
+    while /admins and /modlog buttons execute directly since they need none."""
+
+    USER_ID = 12345
+
+    async def asyncSetUp(self):
+        self.fake_api = FakeBotAPI()
+        self._patcher = patch.object(Bot, "__call__", new=self.fake_api)
+        self._patcher.start()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.data_dir = Path(self._tmp.name)
+        self.config = moderator.config_from_bot_row(
+            {"bot_id": 710, "name": "mod_start", "display_name": None, "group_chat_id": None}, self.data_dir
+        )
+        await moderator.init_db(self.config.db_path)
+        self.bot, self.dp = _build_bot_dispatcher(self.config)
+
+    async def asyncTearDown(self):
+        self._tmp.cleanup()
+        self._patcher.stop()
+
+    async def test_start_shows_buttons_not_a_raw_command_list(self):
+        await self.dp.feed_webhook_update(self.bot, _private_text_update(1, self.USER_ID, "/start"))
+        # Two sends for the very first user (welcome + one-time "you're the
+        # bot admin" onboarding note) — the welcome message is always first.
+        sends = [c for c in self.fake_api.calls if isinstance(c, SendMessage)]
+        self.assertEqual(len(sends), 2)
+        self.assertIsNotNone(sends[0].reply_markup)
+        button_texts = {
+            b.text for row in sends[0].reply_markup.inline_keyboard for b in row
+        }
+        self.assertEqual(
+            button_texts,
+            {"🔍 Проверить права", "🚫 Запрещённые слова", "👥 Админы", "📜 Журнал модерации"},
+        )
+        # No raw "/addstopword"-style command list in the welcome text itself.
+        self.assertNotIn("/addstopword", sends[0].text)
+
+    async def test_rights_button_redirects_to_the_group_not_executing_anything(self):
+        await self.dp.feed_webhook_update(self.bot, _private_text_update(1, self.USER_ID, "/start"))
+        await self.dp.feed_webhook_update(self.bot, _private_callback_update(2, self.USER_ID, "mod_help:rights"))
+        texts = self.fake_api.sent_texts(self.USER_ID)
+        self.assertTrue(any("/checkrights" in t and "группе" in t for t in texts))
+        # Nothing group-scoped was ever looked up — purely a text redirect.
+        self.assertFalse(any(isinstance(c, GetChatMember) for c in self.fake_api.calls))
+
+    async def test_stopwords_button_redirects_to_the_group(self):
+        await self.dp.feed_webhook_update(self.bot, _private_text_update(1, self.USER_ID, "/start"))
+        await self.dp.feed_webhook_update(self.bot, _private_callback_update(2, self.USER_ID, "mod_help:stopwords"))
+        texts = self.fake_api.sent_texts(self.USER_ID)
+        self.assertTrue(any("/stopwords" in t and "группе" in t for t in texts))
+
+    async def test_admins_button_executes_directly(self):
+        await self.dp.feed_webhook_update(self.bot, _private_text_update(1, self.USER_ID, "/start"))
+        await self.dp.feed_webhook_update(self.bot, _private_callback_update(2, self.USER_ID, "mod_admins"))
+        texts = self.fake_api.sent_texts(self.USER_ID)
+        self.assertTrue(any(str(self.USER_ID) in t for t in texts))
+
+    async def test_modlog_button_executes_directly(self):
+        await self.dp.feed_webhook_update(self.bot, _private_text_update(1, self.USER_ID, "/start"))
+        await self.dp.feed_webhook_update(self.bot, _private_callback_update(2, self.USER_ID, "mod_modlog"))
+        texts = self.fake_api.sent_texts(self.USER_ID)
+        self.assertTrue(any("Журнал модерации пуст" in t for t in texts))
+
+
+class ModeratorStopwordsPanelButtonTests(unittest.IsolatedAsyncioTestCase):
+    """Group-side /stopwords panel: buttons for add/remove/threshold, each
+    driving a short FSM dialog, re-verifying live group-admin status on every
+    button press (the panel message is visible to the WHOLE group, not just
+    whoever ran /stopwords)."""
+
+    CHAT_ID = -100999
+    ADMIN_ID = 501
+    OTHER_ADMIN_ID = 502
+    NON_ADMIN_ID = 503
+
+    async def asyncSetUp(self):
+        self.fake_api = FakeBotAPI()
+        self.fake_api.chat_member_responses[(self.CHAT_ID, self.ADMIN_ID)] = _admin_member(self.ADMIN_ID)
+        self.fake_api.chat_member_responses[(self.CHAT_ID, self.OTHER_ADMIN_ID)] = _admin_member(self.OTHER_ADMIN_ID)
+        self._patcher = patch.object(Bot, "__call__", new=self.fake_api)
+        self._patcher.start()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.data_dir = Path(self._tmp.name)
+        self.config = moderator.config_from_bot_row(
+            {"bot_id": 711, "name": "mod_panel", "display_name": None, "group_chat_id": None}, self.data_dir
+        )
+        await moderator.init_db(self.config.db_path)
+        self.bot, self.dp = _build_bot_dispatcher(self.config)
+
+    async def asyncTearDown(self):
+        self._tmp.cleanup()
+        self._patcher.stop()
+
+    async def test_stopwords_command_shows_panel_buttons(self):
+        await self.dp.feed_webhook_update(self.bot, _group_text_update(1, self.CHAT_ID, self.ADMIN_ID, "/stopwords"))
+        sends = [c for c in self.fake_api.calls if isinstance(c, SendMessage)]
+        self.assertEqual(len(sends), 1)
+        button_texts = {b.text for row in sends[0].reply_markup.inline_keyboard for b in row}
+        self.assertEqual(
+            button_texts,
+            {"➕ Добавить запрещённое слово", "➖ Убрать запрещённое слово", "⚙️ Порог предупреждений"},
+        )
+
+    async def test_add_word_flow_via_buttons(self):
+        uid = 1
+        await self.dp.feed_webhook_update(self.bot, _group_text_update(uid, self.CHAT_ID, self.ADMIN_ID, "/stopwords")); uid += 1
+        await self.dp.feed_webhook_update(self.bot, _group_callback_update(uid, self.CHAT_ID, self.ADMIN_ID, "mod_addword")); uid += 1
+        await self.dp.feed_webhook_update(self.bot, _group_text_update(uid, self.CHAT_ID, self.ADMIN_ID, "badword")); uid += 1
+
+        conn = sqlite3.connect(self.config.db_path)
+        rows = conn.execute("SELECT word FROM stopwords WHERE chat_id=?", (self.CHAT_ID,)).fetchall()
+        conn.close()
+        self.assertEqual(rows, [("badword",)])
+        self.assertTrue(any("Добавлено в список запрещённых слов" in t for t in self.fake_api.sent_texts(self.CHAT_ID)))
+
+    async def test_add_word_rejects_multi_word_input(self):
+        uid = 1
+        await self.dp.feed_webhook_update(self.bot, _group_callback_update(uid, self.CHAT_ID, self.ADMIN_ID, "mod_addword")); uid += 1
+        await self.dp.feed_webhook_update(self.bot, _group_text_update(uid, self.CHAT_ID, self.ADMIN_ID, "two words")); uid += 1
+        conn = sqlite3.connect(self.config.db_path)
+        count = conn.execute("SELECT COUNT(*) FROM stopwords").fetchone()[0]
+        conn.close()
+        self.assertEqual(count, 0)
+
+    async def test_non_admin_pressing_addword_is_rejected_with_alert(self):
+        await self.dp.feed_webhook_update(
+            self.bot, _group_callback_update(1, self.CHAT_ID, self.NON_ADMIN_ID, "mod_addword")
+        )
+        self.assertTrue(any("администраторам" in t for t in self.fake_api.alert_texts()))
+        # No prompt was edited in — the non-admin's press did nothing.
+        self.assertEqual(self.fake_api.edited_texts(), [])
+
+    async def test_remove_word_flow_via_pick_buttons(self):
+        async with aiosqlite.connect(self.config.db_path) as db:
+            await db.execute("INSERT INTO stopwords (chat_id, word) VALUES (?,?)", (self.CHAT_ID, "removeme"))
+            await db.commit()
+        uid = 1
+        await self.dp.feed_webhook_update(self.bot, _group_callback_update(uid, self.CHAT_ID, self.ADMIN_ID, "mod_removeword")); uid += 1
+        await self.dp.feed_webhook_update(self.bot, _group_callback_update(uid, self.CHAT_ID, self.ADMIN_ID, "mod_rmw:0")); uid += 1
+
+        conn = sqlite3.connect(self.config.db_path)
+        count = conn.execute("SELECT COUNT(*) FROM stopwords WHERE chat_id=?", (self.CHAT_ID,)).fetchone()[0]
+        conn.close()
+        self.assertEqual(count, 0)
+        self.assertTrue(any("Убрано из списка запрещённых слов" in t for t in self.fake_api.edited_texts()))
+
+    async def test_remove_word_falls_back_to_text_when_too_many_words(self):
+        async with aiosqlite.connect(self.config.db_path) as db:
+            for i in range(moderator.MAX_REMOVE_BUTTONS + 1):
+                await db.execute("INSERT INTO stopwords (chat_id, word) VALUES (?,?)", (self.CHAT_ID, f"word{i}"))
+            await db.commit()
+        uid = 1
+        await self.dp.feed_webhook_update(self.bot, _group_callback_update(uid, self.CHAT_ID, self.ADMIN_ID, "mod_removeword")); uid += 1
+        await self.dp.feed_webhook_update(self.bot, _group_text_update(uid, self.CHAT_ID, self.ADMIN_ID, "word3")); uid += 1
+
+        conn = sqlite3.connect(self.config.db_path)
+        rows = {r[0] for r in conn.execute("SELECT word FROM stopwords WHERE chat_id=?", (self.CHAT_ID,)).fetchall()}
+        conn.close()
+        self.assertNotIn("word3", rows)
+
+    async def test_set_max_warnings_flow_via_buttons(self):
+        uid = 1
+        await self.dp.feed_webhook_update(self.bot, _group_callback_update(uid, self.CHAT_ID, self.ADMIN_ID, "mod_setwarn")); uid += 1
+        await self.dp.feed_webhook_update(self.bot, _group_text_update(uid, self.CHAT_ID, self.ADMIN_ID, "10")); uid += 1
+
+        conn = sqlite3.connect(self.config.db_path)
+        n = conn.execute("SELECT max_warnings FROM chat_settings WHERE chat_id=?", (self.CHAT_ID,)).fetchone()[0]
+        conn.close()
+        self.assertEqual(n, 10)
+        self.assertTrue(any("Порог предупреждений установлен: 10" in t for t in self.fake_api.sent_texts(self.CHAT_ID)))
+
+    async def test_set_max_warnings_rejects_out_of_range(self):
+        uid = 1
+        await self.dp.feed_webhook_update(self.bot, _group_callback_update(uid, self.CHAT_ID, self.ADMIN_ID, "mod_setwarn")); uid += 1
+        await self.dp.feed_webhook_update(self.bot, _group_text_update(uid, self.CHAT_ID, self.ADMIN_ID, "0")); uid += 1
+        conn = sqlite3.connect(self.config.db_path)
+        row = conn.execute("SELECT max_warnings FROM chat_settings WHERE chat_id=?", (self.CHAT_ID,)).fetchone()
+        conn.close()
+        self.assertIsNone(row)  # never wrote a row — input was rejected first
+
+    async def test_cancel_button_clears_state(self):
+        uid = 1
+        await self.dp.feed_webhook_update(self.bot, _group_callback_update(uid, self.CHAT_ID, self.ADMIN_ID, "mod_addword")); uid += 1
+        await self.dp.feed_webhook_update(self.bot, _group_callback_update(uid, self.CHAT_ID, self.ADMIN_ID, "mod_cancel")); uid += 1
+        # A plain follow-up message must NOT be swallowed as the pending "add word" reply.
+        await self.dp.feed_webhook_update(self.bot, _group_text_update(uid, self.CHAT_ID, self.ADMIN_ID, "just chatting")); uid += 1
+        conn = sqlite3.connect(self.config.db_path)
+        count = conn.execute("SELECT COUNT(*) FROM stopwords").fetchone()[0]
+        conn.close()
+        self.assertEqual(count, 0)
+
+    async def test_non_admin_pressing_cancel_does_not_clear_the_real_admins_flow(self):
+        """Review-found: cb_mod_cancel used to be the one panel callback that
+        skipped the admin re-check — any group member could tap "❌ Отмена"
+        and edit the shared panel message, even though it's the REAL admin's
+        FSM state (keyed by the admin's own user_id) that actually matters."""
+        uid = 1
+        await self.dp.feed_webhook_update(self.bot, _group_callback_update(uid, self.CHAT_ID, self.ADMIN_ID, "mod_addword")); uid += 1
+        await self.dp.feed_webhook_update(self.bot, _group_callback_update(uid, self.CHAT_ID, self.NON_ADMIN_ID, "mod_cancel")); uid += 1
+        self.assertTrue(any("администраторам" in t for t in self.fake_api.alert_texts()))
+        # The admin's own flow must still be alive: their next word still lands.
+        await self.dp.feed_webhook_update(self.bot, _group_text_update(uid, self.CHAT_ID, self.ADMIN_ID, "stillpending")); uid += 1
+        conn = sqlite3.connect(self.config.db_path)
+        rows = conn.execute("SELECT word FROM stopwords WHERE chat_id=?", (self.CHAT_ID,)).fetchall()
+        conn.close()
+        self.assertEqual(rows, [("stillpending",)])
+
+    async def test_stale_flow_expires_instead_of_accepting_unrelated_later_message(self):
+        """Review-found blocker: ModPanelFlow states had no expiry — a distracted
+        admin's ANY later short message (unrelated ordinary chat) would silently
+        be accepted as the pending flow's reply. FLOW_TIMEOUT_SECONDS + the
+        started_at stamp fix this; simulate the clock moving past the window."""
+        uid = 1
+        await self.dp.feed_webhook_update(self.bot, _group_callback_update(uid, self.CHAT_ID, self.ADMIN_ID, "mod_addword")); uid += 1
+        with patch("templates.moderator.time") as fake_time:
+            fake_time.time.return_value = time.time() + moderator.FLOW_TIMEOUT_SECONDS + 1
+            await self.dp.feed_webhook_update(self.bot, _group_text_update(uid, self.CHAT_ID, self.ADMIN_ID, "toolate")); uid += 1
+        conn = sqlite3.connect(self.config.db_path)
+        rows = conn.execute("SELECT word FROM stopwords WHERE chat_id=?", (self.CHAT_ID,)).fetchall()
+        conn.close()
+        self.assertEqual(rows, [], "a stale flow accepted an unrelated later message as its reply")
+        self.assertTrue(any("Время ожидания истекло" in t for t in self.fake_api.sent_texts(self.CHAT_ID)))
+
+    async def test_admin_rights_revoked_mid_flow_cancels_instead_of_acting(self):
+        uid = 1
+        await self.dp.feed_webhook_update(self.bot, _group_callback_update(uid, self.CHAT_ID, self.ADMIN_ID, "mod_addword")); uid += 1
+        # Rights revoked between the button press and the reply.
+        self.fake_api.chat_member_responses[(self.CHAT_ID, self.ADMIN_ID)] = _plain_member(self.ADMIN_ID)
+        await self.dp.feed_webhook_update(self.bot, _group_text_update(uid, self.CHAT_ID, self.ADMIN_ID, "badword")); uid += 1
+        conn = sqlite3.connect(self.config.db_path)
+        count = conn.execute("SELECT COUNT(*) FROM stopwords").fetchone()[0]
+        conn.close()
+        self.assertEqual(count, 0)
+
+    async def test_stray_text_while_picking_a_word_gets_a_reply_not_silence(self):
+        async with aiosqlite.connect(self.config.db_path) as db:
+            await db.execute("INSERT INTO stopwords (chat_id, word) VALUES (?,?)", (self.CHAT_ID, "removeme"))
+            await db.commit()
+        uid = 1
+        await self.dp.feed_webhook_update(self.bot, _group_callback_update(uid, self.CHAT_ID, self.ADMIN_ID, "mod_removeword")); uid += 1
+        await self.dp.feed_webhook_update(self.bot, _group_text_update(uid, self.CHAT_ID, self.ADMIN_ID, "removeme")); uid += 1
+        self.assertTrue(any("кнопкой" in t for t in self.fake_api.sent_texts(self.CHAT_ID)))
+        conn = sqlite3.connect(self.config.db_path)
+        count = conn.execute("SELECT COUNT(*) FROM stopwords WHERE chat_id=?", (self.CHAT_ID,)).fetchone()[0]
+        conn.close()
+        self.assertEqual(count, 1, "typed text must not be accepted as a removal in the pick-button state")
+
+    async def test_removeword_pick_already_removed_reports_honestly(self):
+        async with aiosqlite.connect(self.config.db_path) as db:
+            await db.execute("INSERT INTO stopwords (chat_id, word) VALUES (?,?)", (self.CHAT_ID, "racy"))
+            await db.commit()
+        uid = 1
+        await self.dp.feed_webhook_update(self.bot, _group_callback_update(uid, self.CHAT_ID, self.ADMIN_ID, "mod_removeword")); uid += 1
+        # Someone else removes it first (raw command), between the snapshot and the button press.
+        async with aiosqlite.connect(self.config.db_path) as db:
+            await db.execute("DELETE FROM stopwords WHERE chat_id=? AND word=?", (self.CHAT_ID, "racy"))
+            await db.commit()
+        await self.dp.feed_webhook_update(self.bot, _group_callback_update(uid, self.CHAT_ID, self.ADMIN_ID, "mod_rmw:0")); uid += 1
+        self.assertTrue(any("уже не в списке" in t for t in self.fake_api.edited_texts()))
+
+    async def test_removeword_pick_malformed_callback_data_does_not_crash(self):
+        async with aiosqlite.connect(self.config.db_path) as db:
+            await db.execute("INSERT INTO stopwords (chat_id, word) VALUES (?,?)", (self.CHAT_ID, "removeme"))
+            await db.commit()
+        uid = 1
+        await self.dp.feed_webhook_update(self.bot, _group_callback_update(uid, self.CHAT_ID, self.ADMIN_ID, "mod_removeword")); uid += 1
+        await self.dp.feed_webhook_update(self.bot, _group_callback_update(uid, self.CHAT_ID, self.ADMIN_ID, "mod_rmw:not-a-number")); uid += 1
+        self.assertTrue(any("устарел" in t for t in self.fake_api.edited_texts()))
+        conn = sqlite3.connect(self.config.db_path)
+        count = conn.execute("SELECT COUNT(*) FROM stopwords WHERE chat_id=?", (self.CHAT_ID,)).fetchone()[0]
+        conn.close()
+        self.assertEqual(count, 1, "the word must survive a malformed callback instead of being guessed at")
+
+    async def test_mid_flow_reply_is_not_deleted_as_ordinary_moderated_content(self):
+        """StateFilter(None) regression guard: without it, moderate_message
+        would claim the admin's "badword" reply (group chat, not a command)
+        before the ModPanelFlow handler ever saw it."""
+        uid = 1
+        await self.dp.feed_webhook_update(self.bot, _group_callback_update(uid, self.CHAT_ID, self.ADMIN_ID, "mod_addword")); uid += 1
+        await self.dp.feed_webhook_update(self.bot, _group_text_update(uid, self.CHAT_ID, self.ADMIN_ID, "badword")); uid += 1
+        conn = sqlite3.connect(self.config.db_path)
+        rows = conn.execute("SELECT word FROM stopwords WHERE chat_id=?", (self.CHAT_ID,)).fetchall()
+        conn.close()
+        self.assertEqual(rows, [("badword",)], "the FSM reply was swallowed by moderate_message instead")
+
+    async def test_other_admin_can_independently_start_own_flow(self):
+        """FSM state is keyed per (chat, user) — a second admin pressing the
+        SAME panel buttons must not collide with the first admin's in-flight
+        flow."""
+        uid = 1
+        await self.dp.feed_webhook_update(self.bot, _group_callback_update(uid, self.CHAT_ID, self.ADMIN_ID, "mod_addword")); uid += 1
+        await self.dp.feed_webhook_update(self.bot, _group_callback_update(uid, self.CHAT_ID, self.OTHER_ADMIN_ID, "mod_setwarn")); uid += 1
+        await self.dp.feed_webhook_update(self.bot, _group_text_update(uid, self.CHAT_ID, self.OTHER_ADMIN_ID, "5")); uid += 1
+        await self.dp.feed_webhook_update(self.bot, _group_text_update(uid, self.CHAT_ID, self.ADMIN_ID, "goodword")); uid += 1
+
+        conn = sqlite3.connect(self.config.db_path)
+        max_warn = conn.execute("SELECT max_warnings FROM chat_settings WHERE chat_id=?", (self.CHAT_ID,)).fetchone()[0]
+        words = conn.execute("SELECT word FROM stopwords WHERE chat_id=?", (self.CHAT_ID,)).fetchall()
+        conn.close()
+        self.assertEqual(max_warn, 5)
+        self.assertEqual(words, [("goodword",)])
+
+
+class ModeratorTerminologyTests(unittest.TestCase):
+    """Owner requirement: the user-facing term is "запрещённое слово", never
+    the old "стоп-слово" — in buttons, confirmations, warning texts, or
+    /modlog entries. Internal identifiers (the /addstopword-family COMMAND
+    NAMES, the `stopwords` DB table/column) are explicitly allowed to keep
+    their old names per the task; only text a Telegram user actually SEES is
+    in scope here."""
+
+    def test_no_old_term_in_source_outside_the_design_doc_reference(self):
+        source_path = Path(moderator.__file__)
+        lines = source_path.read_text(encoding="utf-8").splitlines()
+        leaked = [
+            (i + 1, line) for i, line in enumerate(lines)
+            if "стоп-слов" in line.lower() and "stage2_design.md" not in line.lower()
+        ]
+        self.assertEqual(leaked, [], f"old term 'стоп-слово' leaked into source: {leaked}")
+
+    def test_bot_description_and_welcome_text_use_new_term(self):
+        self.assertNotIn("стоп", moderator.BOT_DESCRIPTION.lower())
+        self.assertNotIn("стоп", moderator.WELCOME_TEXT.lower())
+
+    def test_start_help_texts_use_new_term(self):
+        for text in moderator._START_HELP_TEXTS.values():
+            self.assertNotIn("стоп", text.lower())
 
 
 class ModeratorStandaloneSmokeTest(unittest.TestCase):
