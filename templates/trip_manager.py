@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import calendar
+import html
 import json
 import logging
 import os
@@ -176,6 +177,15 @@ def _load_admins(admins_file: Path) -> set:
 
 def _save_admins(admins_file: Path, ids: set) -> None:
     admins_file.write_text(json.dumps({"ids": list(ids)}, ensure_ascii=False))
+
+def _esc(value, max_len: int = 500) -> str:
+    """HTML-escapes AND length-bounds any user-supplied text before it goes into
+    a parse_mode="HTML" message — same helper/rationale as templates/
+    moderator.py's _esc()."""
+    text = str(value) if value is not None else ""
+    if len(text) > max_len:
+        text = text[:max_len] + "…"
+    return html.escape(text)
 
 
 # ── db ────────────────────────────────────────────────────────────────────────
@@ -1624,7 +1634,7 @@ async def cmd_removeadmin(msg: Message, config: TripManagerConfig):
     parts = msg.text.split()
     if len(parts) < 2: await msg.answer("Использование: /removeadmin <id>"); return
     ids = _load_admins(config.admins_file); ids.discard(parts[1]); _save_admins(config.admins_file, ids)
-    await msg.answer(f"✅ <code>{parts[1]}</code> удалён.", parse_mode="HTML")
+    await msg.answer(f"✅ <code>{_esc(parts[1])}</code> удалён.", parse_mode="HTML")
 
 @router.message(Command("admins"))
 async def cmd_admins(msg: Message, config: TripManagerConfig):

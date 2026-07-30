@@ -431,7 +431,7 @@ async def cmd_removeadmin(msg: Message, config: ReferralConfig):
         # would hand admin rights to whoever sends /start next.
         await msg.answer("⚠️ Нельзя удалить последнего администратора."); return
     ids.discard(parts[1]); _save_admins(config.admins_file, ids)
-    await msg.answer(f"✅ <code>{parts[1]}</code> удалён.", parse_mode="HTML")
+    await msg.answer(f"✅ <code>{_esc(parts[1])}</code> удалён.", parse_mode="HTML")
 
 @router.message(Command("admins"))
 async def cmd_admins(msg: Message, config: ReferralConfig):
