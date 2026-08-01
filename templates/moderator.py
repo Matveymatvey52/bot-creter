@@ -152,7 +152,18 @@ def _load_admins(admins_file: Path) -> set:
         return set()
 
 def _save_admins(admins_file: Path, ids: set) -> None:
-    admins_file.write_text(json.dumps({"ids": list(ids)}, ensure_ascii=False))
+    # Review-found: the admin-panel button flow added 3 more write sites on
+    # top of the pre-existing 2 (raw /addadmin, /removeadmin) — a crash mid
+    # write (process kill, disk full) on a plain write_text() truncates the
+    # file first, so a following read sees invalid JSON and _load_admins
+    # silently returns an EMPTY set. Combined with cmd_start's "first
+    # /start-er becomes the bot's admin" bootstrap, that would hand admin
+    # access to whoever happens to message the bot next. Write to a sibling
+    # temp file and atomically replace instead — a crash mid-write leaves the
+    # ORIGINAL file untouched.
+    tmp_path = admins_file.with_suffix(admins_file.suffix + ".tmp")
+    tmp_path.write_text(json.dumps({"ids": list(ids)}, ensure_ascii=False))
+    tmp_path.replace(admins_file)
 
 
 async def _is_group_admin(bot: Bot, chat_id: int, user_id: int) -> bool:
@@ -886,9 +897,113 @@ _START_HELP_TEXTS = {
 }
 
 
+async def _replace_panel(
+    bot: Bot, state: FSMContext, chat_id: int, text: str,
+    reply_markup: InlineKeyboardMarkup | None = None, parse_mode: str | None = None,
+) -> None:
+    """Private-chat panel navigation: delete the previously shown panel
+    message (if any) and send a new one, tracking its id for next time — same
+    delete-old/show-new mechanic as templates/tour_operator.py's cb_section
+    (there: `section_msg_id`; here: `panel_msg_id`). Reserved for NAVIGABLE
+    panel screens only (the rights/stopwords redirects, the admins panel and
+    its add/remove prompts, the modlog panel) — NEVER for one-off messages
+    like the /start welcome or an action confirmation ("✅ Добавлено ..."),
+    which must stay visible in the chat history instead of vanishing on the
+    next navigation.
+
+    Callers that are ENDING a flow (success, cancel, or a stale/expired
+    state) must clear flow-only state data BEFORE calling this — but through
+    `_clear_flow_keep_panel`, not a bare `state.clear()`, since a bare clear()
+    would also wipe `panel_msg_id` and make the delete-old step below a no-op
+    (review-found: every flow-completion path originally did `state.clear()`
+    THEN called this function, so `prev_id` below was always None and the
+    prompt/pick-list message from the step just finished was never deleted)."""
+    data = await state.get_data()
+    prev_id = data.get("panel_msg_id")
+    if prev_id:
+        try:
+            await bot.delete_message(chat_id, prev_id)
+        except Exception:
+            pass
+    # Review-found: unlike every other Telegram call in this file, this send
+    # had no try/except — an unbounded admin ID (see _admins_list_text) or a
+    # blocked/deactivated user would raise here unhandled, on EVERY future
+    # panel render, for every admin, until fixed by hand.
+    try:
+        msg = await bot.send_message(chat_id, text, parse_mode=parse_mode, reply_markup=reply_markup)
+    except Exception as e:
+        logger.warning(f"_replace_panel: failed to send panel to chat {chat_id}: {e}")
+        return
+    await state.update_data(panel_msg_id=msg.message_id)
+
+
+async def _clear_flow_keep_panel(state: FSMContext) -> None:
+    """Clears FSM flow state/data (the active AdminPanelFlow step, any
+    flow-only keys like remove_admin_ids/started_at) while preserving
+    panel_msg_id, so a following _replace_panel() call still knows which
+    earlier panel message to delete. See _replace_panel's docstring."""
+    data = await state.get_data()
+    panel_msg_id = data.get("panel_msg_id")
+    await state.clear()
+    if panel_msg_id is not None:
+        await state.update_data(panel_msg_id=panel_msg_id)
+
+
+def _is_bot_admin(user_id: int, config: ModeratorConfig) -> bool:
+    return str(user_id) in _load_admins(config.admins_file)
+
+
+# AdminPanelFlow reuses FLOW_TIMEOUT_SECONDS/_flow_expired (defined above,
+# next to ModPanelFlow) for the same reason: without it, a private-chat admin
+# who taps "➕ Добавить админа" and then navigates elsewhere (or just goes
+# quiet) has their next ordinary numeric-looking message (a phone number, a
+# date, anyone else's ID mentioned in conversation) silently accepted as a
+# NEW bot-admin.
+
+
+def kb_admins_panel() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить админа", callback_data="mod_addadmin")],
+        [InlineKeyboardButton(text="➖ Убрать админа", callback_data="mod_removeadmin")],
+    ])
+
+def kb_private_cancel() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="❌ Отмена", callback_data="mod_admin_cancel")
+    ]])
+
+# Same rationale as MAX_REMOVE_BUTTONS on the group stopwords panel — above
+# this, removal falls back to a "type the ID" flow instead of one button per admin.
+MAX_ADMIN_REMOVE_BUTTONS = 30
+
+def kb_remove_admins(ids: list[str]) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text=admin_id, callback_data=f"mod_rma:{i}")] for i, admin_id in enumerate(ids)]
+    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="mod_admin_cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+class AdminPanelFlow(StatesGroup):
+    add_admin = State(); remove_admin_pick = State(); remove_admin_text = State()
+
+
+def _valid_admin_id(text: str) -> bool:
+    """Same bound-length-before-treating-as-numeric guard as
+    cmd_setmaxwarnings elsewhere in this file — an unbounded "digit" string
+    still passes a bare isdigit() check, then blows past Telegram's
+    message-length limit on every future _admins_list_text render (see its
+    _join_bounded fix below) until fixed by hand. isascii() additionally
+    rejects Unicode look-alike digits (e.g. fullwidth "１２３"), which pass
+    str.isdigit() but can never match a REAL Telegram user id (always plain
+    ASCII) — silently creating a permanently-unmatchable phantom admin."""
+    core = text.lstrip("-")
+    return bool(core) and core.isascii() and core.isdigit() and len(core) <= 15
+
+
 async def _admins_list_text(config: ModeratorConfig) -> str:
     ids = _load_admins(config.admins_file)
-    return "👥 " + ("\n".join(f"• <code>{i}</code>" for i in ids) or "Пусто")
+    if not ids:
+        return "👥 Пусто"
+    return _join_bounded(["👥 <b>Администраторы бота:</b>\n"] + [f"• <code>{_esc(i)}</code>" for i in ids])
 
 
 async def _modlog_text(config: ModeratorConfig) -> str:
@@ -910,7 +1025,12 @@ async def _modlog_text(config: ModeratorConfig) -> str:
 
 
 @router.message(Command("start"), F.chat.type == "private")
-async def cmd_start(message: Message, config: ModeratorConfig):
+async def cmd_start(message: Message, state: FSMContext, config: ModeratorConfig):
+    # Same reasoning as inventory.py's cmd_start: /start must reset any
+    # dangling mid-flow FSM state (e.g. an abandoned "add admin" prompt) —
+    # otherwise the user's very next plain-text message gets silently
+    # captured as an admin ID for a flow they believed they'd left.
+    await state.clear()
     admins = _load_admins(config.admins_file)
     first_time_admin = not admins
     if first_time_admin:
@@ -925,54 +1045,82 @@ async def cmd_start(message: Message, config: ModeratorConfig):
     if first_time_admin:
         await message.answer(
             "👑 <b>Вы — администратор этого бота.</b>\n\n"
-            "Управление администраторами бота (доступ к журналу модерации):\n"
-            "<code>/addadmin ID</code> — добавить\n"
-            "<code>/removeadmin ID</code> — убрать\n"
-            "<code>/admins</code> — список (или кнопка «👥 Админы» выше)",
+            "Управление администраторами бота (доступ к журналу модерации) — "
+            "кнопка «👥 Админы» выше.",
             parse_mode="HTML",
         )
 
 @router.callback_query(F.data.startswith("mod_help:"))
-async def cb_start_help(cb: CallbackQuery):
+async def cb_start_help(cb: CallbackQuery, bot: Bot, state: FSMContext):
+    chat_id = _panel_chat_id(cb)
+    if chat_id is None:
+        await cb.answer(); return
     await cb.answer()
+    # Review-found: navigating to a DIFFERENT top-level destination must
+    # cancel any AdminPanelFlow left dangling by a previous "➕ Добавить
+    # админа"/"➖ Убрать админа" press — otherwise the next ordinary message
+    # this user sends here (or after mod_admins/mod_modlog) still gets
+    # silently captured as an admin id. _clear_flow_keep_panel (not a bare
+    # state.clear()) so the delete-old step in _replace_panel right below
+    # still knows which earlier panel message to remove.
+    await _clear_flow_keep_panel(state)
     text = _START_HELP_TEXTS.get(cb.data.split(":", 1)[1])
     if text:
-        await cb.message.answer(text)
+        await _replace_panel(bot, state, chat_id, text)
 
 @router.callback_query(F.data == "mod_admins")
-async def cb_admins(cb: CallbackQuery, config: ModeratorConfig):
+async def cb_admins(cb: CallbackQuery, bot: Bot, state: FSMContext, config: ModeratorConfig):
+    chat_id = _panel_chat_id(cb)
+    if chat_id is None:
+        await cb.answer(); return
     await cb.answer()
-    if str(cb.from_user.id) not in _load_admins(config.admins_file):
+    if not _is_bot_admin(cb.from_user.id, config):
         await cb.message.answer("⛔ Нет доступа"); return
-    await cb.message.answer(await _admins_list_text(config), parse_mode="HTML")
+    await _clear_flow_keep_panel(state)
+    await _replace_panel(
+        bot, state, chat_id, await _admins_list_text(config),
+        reply_markup=kb_admins_panel(), parse_mode="HTML",
+    )
 
 @router.callback_query(F.data == "mod_modlog")
-async def cb_modlog(cb: CallbackQuery, config: ModeratorConfig):
+async def cb_modlog(cb: CallbackQuery, bot: Bot, state: FSMContext, config: ModeratorConfig):
+    chat_id = _panel_chat_id(cb)
+    if chat_id is None:
+        await cb.answer(); return
     await cb.answer()
-    if str(cb.from_user.id) not in _load_admins(config.admins_file):
+    if not _is_bot_admin(cb.from_user.id, config):
         await cb.message.answer("⛔ Нет доступа"); return
-    await cb.message.answer(await _modlog_text(config), parse_mode="HTML")
+    await _clear_flow_keep_panel(state)
+    await _replace_panel(bot, state, chat_id, await _modlog_text(config), parse_mode="HTML")
 
 @router.message(Command("modlog"), F.chat.type == "private")
 async def cmd_modlog(msg: Message, config: ModeratorConfig):
-    if str(msg.from_user.id) not in _load_admins(config.admins_file):
+    if not _is_bot_admin(msg.from_user.id, config):
         await msg.answer("⛔ Нет доступа"); return
     await msg.answer(await _modlog_text(config), parse_mode="HTML")
 
 @router.message(Command("addadmin"))
 async def cmd_addadmin(msg: Message, config: ModeratorConfig):
-    if str(msg.from_user.id) not in _load_admins(config.admins_file): await msg.answer("⛔ Нет доступа"); return
+    if not _is_bot_admin(msg.from_user.id, config): await msg.answer("⛔ Нет доступа"); return
     parts = msg.text.split()
-    if len(parts) < 2 or not parts[1].lstrip("-").isdigit(): await msg.answer("Использование: /addadmin <id>"); return
+    if len(parts) < 2 or not _valid_admin_id(parts[1]): await msg.answer("Использование: /addadmin <id>"); return
     ids = _load_admins(config.admins_file); ids.add(parts[1]); _save_admins(config.admins_file, ids)
+    logger.info(f"cmd_addadmin: {parts[1]} added as bot admin by {msg.from_user.id}")
     await msg.answer(f"✅ <code>{parts[1]}</code> добавлен.", parse_mode="HTML")
 
 @router.message(Command("removeadmin"))
 async def cmd_removeadmin(msg: Message, config: ModeratorConfig):
-    if str(msg.from_user.id) not in _load_admins(config.admins_file): await msg.answer("⛔ Нет доступа"); return
+    if not _is_bot_admin(msg.from_user.id, config): await msg.answer("⛔ Нет доступа"); return
     parts = msg.text.split()
     if len(parts) < 2: await msg.answer("Использование: /removeadmin <id>"); return
-    ids = _load_admins(config.admins_file); ids.discard(parts[1]); _save_admins(config.admins_file, ids)
+    ids = _load_admins(config.admins_file)
+    # Review-found: removing the last remaining bot admin hands the role to
+    # whoever happens to message /start next (cmd_start's bootstrap) — refuse
+    # rather than silently emptying admins_file.
+    if parts[1] in ids and len(ids) <= 1:
+        await msg.answer("⚠️ Нельзя удалить единственного администратора."); return
+    ids.discard(parts[1]); _save_admins(config.admins_file, ids)
+    logger.info(f"cmd_removeadmin: {parts[1]} removed as bot admin by {msg.from_user.id}")
     # Review-found: unlike cmd_addadmin (validates isdigit() before this point),
     # this echoed the raw argument straight into a parse_mode="HTML" <code>
     # block — arbitrary text containing '<'/'&' would break the HTML the
@@ -982,8 +1130,216 @@ async def cmd_removeadmin(msg: Message, config: ModeratorConfig):
 
 @router.message(Command("admins"))
 async def cmd_admins(msg: Message, config: ModeratorConfig):
-    if str(msg.from_user.id) not in _load_admins(config.admins_file): await msg.answer("⛔ Нет доступа"); return
+    if not _is_bot_admin(msg.from_user.id, config): await msg.answer("⛔ Нет доступа"); return
     await msg.answer(await _admins_list_text(config), parse_mode="HTML")
+
+
+# ── admins panel: button-driven FSM (add/remove bot admin) ───────────────────
+# Private chat only, unlike the group stopwords panel — no "visible to the
+# whole group" concern here (only this one user is in this conversation with
+# the bot), so no per-press live-admin re-check is needed beyond the
+# admins_file membership check already done when each screen is entered.
+# Every continuation handler DOES re-check _flow_expired + admin membership
+# though (see FLOW_TIMEOUT_SECONDS/_flow_expired, reused from the group panel)
+# — access could still be revoked mid-flow, and the flow itself could go stale.
+
+@router.callback_query(F.data == "mod_addadmin")
+async def cb_addadmin_start(cb: CallbackQuery, bot: Bot, state: FSMContext, config: ModeratorConfig):
+    chat_id = _panel_chat_id(cb)
+    if chat_id is None:
+        await cb.answer(); return
+    await cb.answer()
+    if not _is_bot_admin(cb.from_user.id, config):
+        await cb.message.answer("⛔ Нет доступа"); return
+    await _replace_panel(
+        bot, state, chat_id,
+        "Пришлите Telegram ID пользователя, которого нужно сделать администратором:",
+        reply_markup=kb_private_cancel(),
+    )
+    await state.update_data(started_at=time.time())
+    await state.set_state(AdminPanelFlow.add_admin)
+
+@router.message(AdminPanelFlow.add_admin, F.chat.type == "private", F.text, ~F.text.startswith("/"))
+async def adminpanel_add_admin(msg: Message, bot: Bot, state: FSMContext, config: ModeratorConfig):
+    data = await state.get_data()
+    if _flow_expired(data):
+        await state.clear()
+        await msg.answer("⏳ Время ожидания истекло — начните заново кнопкой «👥 Админы»."); return
+    if not _is_bot_admin(msg.from_user.id, config):
+        await state.clear()
+        await msg.answer("⛔ Нет доступа"); return
+    text = msg.text.strip()
+    if not _valid_admin_id(text):
+        await msg.answer("Пришлите числовой Telegram ID."); return
+    ids = _load_admins(config.admins_file); ids.add(text); _save_admins(config.admins_file, ids)
+    logger.info(f"adminpanel_add_admin: {text} added as bot admin by {msg.from_user.id}")
+    await _clear_flow_keep_panel(state)
+    await msg.answer(f"✅ <code>{_esc(text)}</code> добавлен.", parse_mode="HTML")
+    await _replace_panel(
+        bot, state, msg.chat.id, await _admins_list_text(config),
+        reply_markup=kb_admins_panel(), parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data == "mod_removeadmin")
+async def cb_removeadmin_start(cb: CallbackQuery, bot: Bot, state: FSMContext, config: ModeratorConfig):
+    chat_id = _panel_chat_id(cb)
+    if chat_id is None:
+        await cb.answer(); return
+    await cb.answer()
+    if not _is_bot_admin(cb.from_user.id, config):
+        await cb.message.answer("⛔ Нет доступа"); return
+    ids = sorted(_load_admins(config.admins_file))
+    if not ids:
+        await _replace_panel(bot, state, chat_id, "Список администраторов пуст.")
+        return
+    # Review-found: same last-admin guard as cmd_removeadmin — block the
+    # no-op-but-dangerous case upfront instead of offering a picker that
+    # would empty admins_file on the very next tap.
+    if len(ids) == 1:
+        await _replace_panel(
+            bot, state, chat_id,
+            "⚠️ Вы — единственный администратор бота. Сначала добавьте ещё одного "
+            "через «➕ Добавить админа», прежде чем убирать себя.",
+            reply_markup=kb_admins_panel(), parse_mode="HTML",
+        )
+        return
+    if len(ids) <= MAX_ADMIN_REMOVE_BUTTONS:
+        await _replace_panel(
+            bot, state, chat_id, "Выберите администратора для удаления:",
+            reply_markup=kb_remove_admins(ids),
+        )
+        await state.update_data(remove_admin_ids=ids, started_at=time.time())
+        await state.set_state(AdminPanelFlow.remove_admin_pick)
+    else:
+        await _replace_panel(
+            bot, state, chat_id, "Админов много — пришлите ID для удаления текстом:",
+            reply_markup=kb_private_cancel(),
+        )
+        await state.update_data(started_at=time.time())
+        await state.set_state(AdminPanelFlow.remove_admin_text)
+
+@router.callback_query(AdminPanelFlow.remove_admin_pick, F.data.startswith("mod_rma:"))
+async def cb_removeadmin_pick(cb: CallbackQuery, bot: Bot, state: FSMContext, config: ModeratorConfig):
+    chat_id = _panel_chat_id(cb)
+    if chat_id is None:
+        await cb.answer(); return
+    await cb.answer()
+    if not _is_bot_admin(cb.from_user.id, config):
+        await state.clear()
+        await cb.message.answer("⛔ Нет доступа"); return
+    data = await state.get_data()
+    if _flow_expired(data):
+        await state.clear()
+        await _replace_panel(bot, state, chat_id, "⏳ Время ожидания истекло — откройте заново кнопкой «👥 Админы».")
+        return
+    ids = data.get("remove_admin_ids", [])
+    # Same malformed/stale-callback guard as the group panel's cb_removeword_pick.
+    try:
+        idx = int(cb.data.split(":", 1)[1])
+    except ValueError:
+        idx = -1
+    if idx < 0 or idx >= len(ids):
+        await state.clear()
+        await _replace_panel(bot, state, chat_id, "Список устарел — откройте заново кнопкой «👥 Админы».")
+        return
+    target = ids[idx]
+    admins = _load_admins(config.admins_file)
+    # Review-found: unconditionally reporting "✅ Убрано" even if the target
+    # had ALREADY been removed (stale snapshot vs. a concurrent change) was a
+    # false-success message — mirror the group panel's cb_removeword_pick,
+    # which checks this honestly instead of assuming the snapshot still holds.
+    if target not in admins:
+        await _clear_flow_keep_panel(state)
+        await cb.message.answer(f"«{_esc(target)}» уже не администратор.", parse_mode="HTML")
+        await _replace_panel(
+            bot, state, chat_id, await _admins_list_text(config),
+            reply_markup=kb_admins_panel(), parse_mode="HTML",
+        )
+        return
+    if len(admins) <= 1:
+        await _clear_flow_keep_panel(state)
+        await _replace_panel(
+            bot, state, chat_id, "⚠️ Нельзя удалить единственного администратора.",
+            reply_markup=kb_admins_panel(), parse_mode="HTML",
+        )
+        return
+    admins.discard(target)
+    _save_admins(config.admins_file, admins)
+    logger.info(f"cb_removeadmin_pick: {target} removed as bot admin by {cb.from_user.id}")
+    await _clear_flow_keep_panel(state)
+    await cb.message.answer(f"✅ <code>{_esc(target)}</code> удалён.", parse_mode="HTML")
+    await _replace_panel(
+        bot, state, chat_id, await _admins_list_text(config),
+        reply_markup=kb_admins_panel(), parse_mode="HTML",
+    )
+
+@router.message(AdminPanelFlow.remove_admin_pick, F.chat.type == "private", F.text, ~F.text.startswith("/"))
+async def adminpanel_remove_admin_pick_stray_text(msg: Message) -> None:
+    # Same gap-fix as the group panel's modpanel_remove_word_pick_stray_text —
+    # this state previously had no message handler, so typed text here was
+    # silently dropped with zero reply.
+    await msg.answer("Пожалуйста, выберите администратора кнопкой выше, либо отправьте /cancel.")
+
+@router.message(AdminPanelFlow.remove_admin_text, F.chat.type == "private", F.text, ~F.text.startswith("/"))
+async def adminpanel_remove_admin_text(msg: Message, bot: Bot, state: FSMContext, config: ModeratorConfig):
+    data = await state.get_data()
+    if _flow_expired(data):
+        await state.clear()
+        await msg.answer("⏳ Время ожидания истекло — начните заново кнопкой «👥 Админы»."); return
+    if not _is_bot_admin(msg.from_user.id, config):
+        await state.clear()
+        await msg.answer("⛔ Нет доступа"); return
+    target = msg.text.strip()
+    admins = _load_admins(config.admins_file)
+    if target not in admins:
+        await msg.answer(f"«{_esc(target)}» не найден среди администраторов.", parse_mode="HTML"); return
+    if len(admins) <= 1:
+        await _clear_flow_keep_panel(state)
+        await msg.answer("⚠️ Нельзя удалить единственного администратора.")
+        await _replace_panel(
+            bot, state, msg.chat.id, await _admins_list_text(config),
+            reply_markup=kb_admins_panel(), parse_mode="HTML",
+        )
+        return
+    admins.discard(target)
+    _save_admins(config.admins_file, admins)
+    logger.info(f"adminpanel_remove_admin_text: {target} removed as bot admin by {msg.from_user.id}")
+    await _clear_flow_keep_panel(state)
+    await msg.answer(f"✅ <code>{_esc(target)}</code> удалён.", parse_mode="HTML")
+    await _replace_panel(
+        bot, state, msg.chat.id, await _admins_list_text(config),
+        reply_markup=kb_admins_panel(), parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data == "mod_admin_cancel")
+async def cb_admin_cancel(cb: CallbackQuery, bot: Bot, state: FSMContext, config: ModeratorConfig):
+    chat_id = _panel_chat_id(cb)
+    if chat_id is None:
+        await cb.answer(); return
+    await cb.answer()
+    is_admin = _is_bot_admin(cb.from_user.id, config)
+    await _clear_flow_keep_panel(state)
+    await cb.message.answer("Отменено.")
+    if is_admin:
+        await _replace_panel(
+            bot, state, chat_id, await _admins_list_text(config),
+            reply_markup=kb_admins_panel(), parse_mode="HTML",
+        )
+
+@router.message(Command("cancel"), F.chat.type == "private", StateFilter("*"))
+async def cmd_private_cancel(msg: Message, bot: Bot, state: FSMContext, config: ModeratorConfig):
+    if await state.get_state() is None:
+        await msg.answer("Нечего отменять."); return
+    is_admin = _is_bot_admin(msg.from_user.id, config)
+    await _clear_flow_keep_panel(state)
+    await msg.answer("Отменено.")
+    if is_admin:
+        await _replace_panel(
+            bot, state, msg.chat.id, await _admins_list_text(config),
+            reply_markup=kb_admins_panel(), parse_mode="HTML",
+        )
 
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
