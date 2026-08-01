@@ -923,8 +923,11 @@ async def _replace_panel(
     if prev_id:
         try:
             await bot.delete_message(chat_id, prev_id)
-        except Exception:
-            pass
+        except Exception as e:
+            # Expected in the common case (already 48h+ old, or the user
+            # deleted it themselves) — debug level, but logged instead of a
+            # bare pass so a genuinely unexpected failure isn't invisible.
+            logger.debug(f"_replace_panel: failed to delete old panel {prev_id} in chat {chat_id}: {e}")
     # Review-found: unlike every other Telegram call in this file, this send
     # had no try/except — an unbounded admin ID (see _admins_list_text) or a
     # blocked/deactivated user would raise here unhandled, on EVERY future
@@ -994,9 +997,15 @@ def _valid_admin_id(text: str) -> bool:
     _join_bounded fix below) until fixed by hand. isascii() additionally
     rejects Unicode look-alike digits (e.g. fullwidth "１２３"), which pass
     str.isdigit() but can never match a REAL Telegram user id (always plain
-    ASCII) — silently creating a permanently-unmatchable phantom admin."""
-    core = text.lstrip("-")
-    return bool(core) and core.isascii() and core.isdigit() and len(core) <= 15
+    ASCII) — silently creating a permanently-unmatchable phantom admin.
+
+    Review-found: this used to lstrip("-") before validating, so "-5" /
+    "-999999999999" passed as a "valid" admin id even though real
+    from_user.id values are always positive — same phantom-admin trap as
+    the fullwidth-digit case above, except reachable through completely
+    ordinary input, and capable of silently burning the "last admin" slot
+    (len(ids) grows, but the new entry can never match _is_bot_admin)."""
+    return bool(text) and text.isascii() and text.isdigit() and len(text) <= 15
 
 
 async def _admins_list_text(config: ModeratorConfig) -> str:
@@ -1163,10 +1172,10 @@ async def cb_addadmin_start(cb: CallbackQuery, bot: Bot, state: FSMContext, conf
 async def adminpanel_add_admin(msg: Message, bot: Bot, state: FSMContext, config: ModeratorConfig):
     data = await state.get_data()
     if _flow_expired(data):
-        await state.clear()
+        await _clear_flow_keep_panel(state)
         await msg.answer("⏳ Время ожидания истекло — начните заново кнопкой «👥 Админы»."); return
     if not _is_bot_admin(msg.from_user.id, config):
-        await state.clear()
+        await _clear_flow_keep_panel(state)
         await msg.answer("⛔ Нет доступа"); return
     text = msg.text.strip()
     if not _valid_admin_id(text):
@@ -1226,11 +1235,11 @@ async def cb_removeadmin_pick(cb: CallbackQuery, bot: Bot, state: FSMContext, co
         await cb.answer(); return
     await cb.answer()
     if not _is_bot_admin(cb.from_user.id, config):
-        await state.clear()
+        await _clear_flow_keep_panel(state)
         await cb.message.answer("⛔ Нет доступа"); return
     data = await state.get_data()
     if _flow_expired(data):
-        await state.clear()
+        await _clear_flow_keep_panel(state)
         await _replace_panel(bot, state, chat_id, "⏳ Время ожидания истекло — откройте заново кнопкой «👥 Админы».")
         return
     ids = data.get("remove_admin_ids", [])
@@ -1240,7 +1249,7 @@ async def cb_removeadmin_pick(cb: CallbackQuery, bot: Bot, state: FSMContext, co
     except ValueError:
         idx = -1
     if idx < 0 or idx >= len(ids):
-        await state.clear()
+        await _clear_flow_keep_panel(state)
         await _replace_panel(bot, state, chat_id, "Список устарел — откройте заново кнопкой «👥 Админы».")
         return
     target = ids[idx]
@@ -1285,10 +1294,10 @@ async def adminpanel_remove_admin_pick_stray_text(msg: Message) -> None:
 async def adminpanel_remove_admin_text(msg: Message, bot: Bot, state: FSMContext, config: ModeratorConfig):
     data = await state.get_data()
     if _flow_expired(data):
-        await state.clear()
+        await _clear_flow_keep_panel(state)
         await msg.answer("⏳ Время ожидания истекло — начните заново кнопкой «👥 Админы»."); return
     if not _is_bot_admin(msg.from_user.id, config):
-        await state.clear()
+        await _clear_flow_keep_panel(state)
         await msg.answer("⛔ Нет доступа"); return
     target = msg.text.strip()
     admins = _load_admins(config.admins_file)
