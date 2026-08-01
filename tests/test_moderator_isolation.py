@@ -877,6 +877,18 @@ class ModeratorAdminsPanelButtonTests(unittest.IsolatedAsyncioTestCase):
         # No raw "/addadmin"-style instructions in the panel text itself.
         self.assertNotIn("/addadmin", sends[0].text)
 
+    async def test_admins_list_text_order_matches_removal_picker_order(self):
+        """Review-found: _admins_list_text iterated the raw set (Python
+        string-hash order) while cb_removeadmin_start's picker always builds
+        buttons from sorted(_load_admins(...)) — the displayed list and the
+        numbered removal buttons could silently disagree on order. Both must
+        now agree on sorted() order."""
+        ids = {"9", "700", "80", str(self.OTHER_ADMIN_ID)}
+        moderator._save_admins(self.config.admins_file, {str(self.OWNER_ID)} | ids)
+        text = await moderator._admins_list_text(self.config)
+        listed_order = [line.split("<code>")[1].split("</code>")[0] for line in text.splitlines() if "<code>" in line]
+        self.assertEqual(listed_order, sorted({str(self.OWNER_ID)} | ids))
+
     async def test_add_admin_flow_via_buttons(self):
         uid = 1
         await self.dp.feed_webhook_update(self.bot, _private_callback_update(uid, self.OWNER_ID, "mod_addadmin")); uid += 1
@@ -1060,6 +1072,24 @@ class ModeratorAdminsPanelButtonTests(unittest.IsolatedAsyncioTestCase):
         await self.dp.feed_webhook_update(self.bot, _private_text_update(uid, self.OWNER_ID, "１２３")); uid += 1
         ids = moderator._load_admins(self.config.admins_file)
         self.assertNotIn("１２３", ids)
+
+    async def test_add_admin_rejects_zero_and_leading_zeros(self):
+        """Review-found lockout: "0" and leading-zero strings ("007") pass a
+        bare isdigit() check but can never match a real Telegram user_id
+        (never 0, never leading-zero), so they'd inflate len(ids) past the
+        last-admin guard without ever being removable/matchable — the sole
+        admin could add "0", remove themselves (guard sees 2 admins), and
+        permanently lose admin access through the normal UI."""
+        for phantom_id in ("0", "007", "00"):
+            uid = 1
+            await self.dp.feed_webhook_update(self.bot, _private_callback_update(uid, self.OWNER_ID, "mod_addadmin")); uid += 1
+            await self.dp.feed_webhook_update(self.bot, _private_text_update(uid, self.OWNER_ID, phantom_id)); uid += 1
+            ids = moderator._load_admins(self.config.admins_file)
+            self.assertNotIn(phantom_id, ids, f"{phantom_id!r} must not be accepted as an admin id")
+            self.assertTrue(
+                any("числовой" in t for t in self.fake_api.sent_texts(self.OWNER_ID)),
+                "rejection must produce a clear message to the admin",
+            )
 
     async def test_add_admin_flow_expires_like_group_flow(self):
         uid = 1
