@@ -1004,12 +1004,31 @@ def _valid_admin_id(text: str) -> bool:
     from_user.id values are always positive — same phantom-admin trap as
     the fullwidth-digit case above, except reachable through completely
     ordinary input, and capable of silently burning the "last admin" slot
-    (len(ids) grows, but the new entry can never match _is_bot_admin)."""
-    return bool(text) and text.isascii() and text.isdigit() and len(text) <= 15
+    (len(ids) grows, but the new entry can never match _is_bot_admin).
+
+    Review-found: same trap again for "0" and leading-zero strings like
+    "007" — both pass isdigit(), but no real Telegram user_id is ever 0
+    (Telegram ids start at 1) or ever rendered with a leading zero
+    (str(user_id) never produces one), so either one is a phantom entry
+    that inflates len(ids) past the last-admin guard's count check without
+    ever being able to match _is_bot_admin. Concretely: the sole admin adds
+    "0", the guard now sees 2 admins and lets them remove themselves, and
+    the bot is left permanently admin-less through the normal UI. Requiring
+    str(int(text)) == text rejects "0" (int 0, not > 0) and every
+    leading-zero form (int(text) round-trips to a shorter string) in one
+    check, without needing a separate startswith("0") special case."""
+    if not (bool(text) and text.isascii() and text.isdigit() and len(text) <= 15):
+        return False
+    return int(text) > 0 and str(int(text)) == text
 
 
 async def _admins_list_text(config: ModeratorConfig) -> str:
-    ids = _load_admins(config.admins_file)
+    # Review-found: iterated the raw set (Python string-hash order, varies
+    # between process restarts) while cb_removeadmin_start's picker builds
+    # its numbered buttons from sorted(_load_admins(...)) — the displayed
+    # list and the button order could silently disagree. Sort both the same
+    # way so "admin #2 in the list" always means the same id as "button #2".
+    ids = sorted(_load_admins(config.admins_file))
     if not ids:
         return "👥 Пусто"
     return _join_bounded(["👥 <b>Администраторы бота:</b>\n"] + [f"• <code>{_esc(i)}</code>" for i in ids])
