@@ -16,9 +16,10 @@ See docs/STAGE2_DESIGN.md "Фабрика как житель реестра" fo
 established this (initially expected to need a two-task supervisor; turned out
 not to).
 
-NOT wired into any live deployment. main.py (long-polling) is still the actual
-start command — see start.sh/railway.toml. Switching to this file is a
-separate, later, explicitly-confirmed decision (this phase's own Task 6).
+This is the actual live prod entry point: Railway's BOT_SCRIPT is set to
+runtime/combined_app.py, webhook mode is enabled, and this has been confirmed
+in production (see docs/WEBHOOK_ACTIVATION.md). main.py (long-polling) remains
+for local development/debugging only — it is not what runs in prod.
 """
 
 from __future__ import annotations
