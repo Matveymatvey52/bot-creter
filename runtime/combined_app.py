@@ -47,7 +47,7 @@ from db.database import init_db as init_bots_db
 from handlers.admin_manager import OWNER_ID, router as admin_router
 from handlers.create_bot import router as create_router, set_bot_id, set_manager_username, set_registry
 from handlers.general import router as general_router
-from handlers.manage_bots import router as manage_router
+from handlers.manage_bots import router as manage_router, set_registry as set_manage_bots_registry
 from handlers.start import router as start_router
 from main import ManagedBotMiddleware, build_group_router, restore_bots
 from runtime.registry import FACTORY_BOT_ID, build_factory_entry, build_registry
@@ -129,6 +129,7 @@ async def _bootstrap_app() -> web.Application:
     # tenant bots into this SAME live registry directly — same process now,
     # no HTTP self-call needed. See handlers/create_bot.py's set_registry().
     set_registry(registry)
+    set_manage_bots_registry(registry)
 
     logger.info(f"Combined registry built: {len(registry)} bot(s), including the factory bot")
     return create_app(registry)

@@ -1,7 +1,18 @@
-"""Reusable Telegram Payments module — see docs/STAGE2_DESIGN.md "Фаза B —
-services/payments.py" for the approved design. A template imports these
-functions directly into its OWN router; this module never builds a Router or
-a Dispatcher of its own.
+# FEATURE: payments
+# COMPATIBLE_WITH: accountant, booking_beauty, booking_medical, campaign_tracker, inventory, manager_secretary, moderator, referral_program, tour_operator, tourist_documents, trip_manager
+"""Reusable Telegram Payments feature module — see docs/STAGE2_DESIGN.md "Фаза
+B — services/payments.py" for the original design, and feature-modules-inventory
+for how this became the library's first feature module.
+
+Exposes a module-level `router` (pre_checkout_query + successful_payment already
+registered on it) so runtime/registry.py's build_entry() can clone and attach it
+to any bot that has "payments" enabled in bot_features, the same by-convention
+mechanism templates/*.py already uses — no per-template wiring needed. A host
+template's own ConfigMiddleware still supplies `data["config"]` (with .db_path)
+to these handlers, since this router rides in the SAME Dispatcher as the host
+template's own router; this module intentionally has no config_from_bot_row of
+its own (features reuse the host's per-bot db_path — additional tables in the
+same file, not a separate db per feature).
 
 Refunds are NEVER sent back through the provider (there is no such API for
 real money on Telegram Payments) — record_refund() only flips a status flag.
@@ -14,12 +25,14 @@ import sqlite3
 from typing import Protocol
 
 import aiosqlite
-from aiogram import Bot
+from aiogram import Bot, F, Router
 from aiogram.types import LabeledPrice, Message, PreCheckoutQuery
 
 from db.database import get_bot_payment_provider
 
 logger = logging.getLogger(__name__)
+
+router = Router()
 
 
 class PaymentsConfig(Protocol):
@@ -121,6 +134,7 @@ async def on_successful_payment(message: Message, config: PaymentsConfig) -> Non
     if payment is None:
         return
     async with aiosqlite.connect(config.db_path) as db:
+        await db.execute("PRAGMA busy_timeout=5000")
         try:
             await db.execute(
                 """
@@ -145,7 +159,12 @@ async def on_successful_payment(message: Message, config: PaymentsConfig) -> Non
                 f"telegram_payment_charge_id={payment.telegram_payment_charge_id}, ignoring"
             )
             return
-        except sqlite3.Error:
+        except (sqlite3.Error, ValueError):
+            # ValueError covers e.g. an embedded null byte in a TEXT column
+            # (not a sqlite3.Error subclass) — review found it would otherwise
+            # slip past both excepts here silently: money charged, no row, no
+            # log, exactly the failure mode this function's docstring warns
+            # about.
             logger.error(
                 f"on_successful_payment: FAILED to record payment "
                 f"telegram_payment_charge_id={payment.telegram_payment_charge_id} "
@@ -166,18 +185,40 @@ async def record_refund(db_path: str, telegram_payment_charge_id: str, admin_id:
     flipped to 'refunded', False if no such charge exists or it was already
     refunded (caller turns that into its own user-facing text)."""
     async with aiosqlite.connect(db_path) as db:
-        cursor = await db.execute(
-            """
-            UPDATE payments
-            SET status = 'refunded', refunded_at = datetime('now','localtime'), refunded_by = ?
-            WHERE telegram_payment_charge_id = ? AND status = 'paid'
-            """,
-            (admin_id, telegram_payment_charge_id),
-        )
-        await db.commit()
+        await db.execute("PRAGMA busy_timeout=5000")
+        try:
+            cursor = await db.execute(
+                """
+                UPDATE payments
+                SET status = 'refunded', refunded_at = datetime('now','localtime'), refunded_by = ?
+                WHERE telegram_payment_charge_id = ? AND status = 'paid'
+                """,
+                (admin_id, telegram_payment_charge_id),
+            )
+            await db.commit()
+        except sqlite3.Error:
+            # A concurrent successful_payment insert holding the writer lock
+            # would otherwise surface as an unhandled "database is locked" —
+            # busy_timeout above should absorb most of that, but if it still
+            # happens the admin deserves a log line, not a swallowed 500.
+            logger.error(
+                f"record_refund: FAILED to update telegram_payment_charge_id={telegram_payment_charge_id} "
+                f"admin_id={admin_id}",
+                exc_info=True,
+            )
+            raise
         ok = cursor.rowcount > 0
     logger.info(
         f"record_refund: telegram_payment_charge_id={telegram_payment_charge_id} "
         f"admin_id={admin_id} ok={ok}"
     )
     return ok
+
+
+router.pre_checkout_query.register(on_pre_checkout_query)
+router.message.register(on_successful_payment, F.successful_payment)
+
+# runtime/registry.py's build_entry() expects an `init_db(db_path)` attribute
+# by convention (same as templates/*.py) — this is the same function
+# init_payments_tables already was, just under the expected name too.
+init_db = init_payments_tables

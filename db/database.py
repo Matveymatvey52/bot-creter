@@ -117,6 +117,14 @@ async def init_db():
                 created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS bot_features (
+                bot_id       INTEGER NOT NULL REFERENCES bots(id),
+                feature_name TEXT NOT NULL,
+                enabled_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (bot_id, feature_name)
+            )
+        """)
         await db.commit()
     await migrate_encrypt_tokens()
 
@@ -241,6 +249,7 @@ async def delete_bot(bot_id: int) -> None:
         # bots(id) alone would never actually cascade — clean it up explicitly
         # so a deleted bot doesn't leave its payment provider credential behind.
         await db.execute("DELETE FROM bot_payment_providers WHERE bot_id = ?", (bot_id,))
+        await db.execute("DELETE FROM bot_features WHERE bot_id = ?", (bot_id,))
         await db.commit()
 
 
@@ -273,6 +282,35 @@ async def get_bot_payment_provider(bot_id: int) -> str | None:
         ) as cursor:
             row = await cursor.fetchone()
             return _decrypt_token(row[0]) if row else None
+
+
+async def enable_bot_feature(bot_id: int, feature_name: str) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO bot_features (bot_id, feature_name) VALUES (?, ?)",
+            (bot_id, feature_name),
+        )
+        await db.commit()
+    logger.info(f"enable_bot_feature: feature_name={feature_name!r} enabled for bot_id={bot_id}")
+
+
+async def disable_bot_feature(bot_id: int, feature_name: str) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "DELETE FROM bot_features WHERE bot_id = ? AND feature_name = ?",
+            (bot_id, feature_name),
+        )
+        await db.commit()
+    logger.info(f"disable_bot_feature: feature_name={feature_name!r} disabled for bot_id={bot_id}")
+
+
+async def get_bot_features(bot_id: int) -> list[str]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT feature_name FROM bot_features WHERE bot_id = ?", (bot_id,)
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [row[0] for row in rows]
 
 
 async def update_bot_status(bot_id: int, status: str, pid: int | None = None):

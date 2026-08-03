@@ -1,4 +1,4 @@
-"""services/payments.py — Phase B tests.
+"""features/payments.py — Phase B tests.
 
 Three criteria from the owner's brief:
   - idempotency: a redelivered successful_payment must not credit twice
@@ -147,7 +147,7 @@ class SuccessfulPaymentIdempotencyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(mode.lower(), "wal")
 
     async def test_successful_payment_logs_at_info_on_credit(self):
-        with self.assertLogs("services.payments", level="INFO") as log_ctx:
+        with self.assertLogs("features.payments", level="INFO") as log_ctx:
             await self.dp.feed_webhook_update(
                 self.bot, _successful_payment_update(1, USER_ID, charge_id="charge-logged")
             )
@@ -275,7 +275,7 @@ class CreateInvoiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_create_invoice_without_configured_provider_raises(self):
         from aiogram.types import LabeledPrice
-        from services.payments import create_invoice
+        from features.payments import create_invoice
 
         with self.assertRaises(ValueError):
             await create_invoice(
