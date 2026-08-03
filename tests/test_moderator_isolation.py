@@ -33,6 +33,8 @@ from unittest.mock import patch
 import aiosqlite
 from aiogram import Bot, Dispatcher
 from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.base import StorageKey
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.methods import (
     AnswerCallbackQuery, BanChatMember, DeleteMessage, EditMessageText, GetChatMember, RestrictChatMember,
@@ -785,24 +787,10 @@ class ModeratorStartButtonMenuTests(unittest.IsolatedAsyncioTestCase):
         }
         self.assertEqual(
             button_texts,
-            {"🔍 Проверить права", "🚫 Запрещённые слова", "👥 Админы", "📜 Журнал модерации"},
+            {"⚙️ Настроить группу", "👥 Админы", "📜 Журнал модерации"},
         )
         # No raw "/addstopword"-style command list in the welcome text itself.
         self.assertNotIn("/addstopword", sends[0].text)
-
-    async def test_rights_button_redirects_to_the_group_not_executing_anything(self):
-        await self.dp.feed_webhook_update(self.bot, _private_text_update(1, self.USER_ID, "/start"))
-        await self.dp.feed_webhook_update(self.bot, _private_callback_update(2, self.USER_ID, "mod_help:rights"))
-        texts = self.fake_api.sent_texts(self.USER_ID)
-        self.assertTrue(any("/checkrights" in t and "группе" in t for t in texts))
-        # Nothing group-scoped was ever looked up — purely a text redirect.
-        self.assertFalse(any(isinstance(c, GetChatMember) for c in self.fake_api.calls))
-
-    async def test_stopwords_button_redirects_to_the_group(self):
-        await self.dp.feed_webhook_update(self.bot, _private_text_update(1, self.USER_ID, "/start"))
-        await self.dp.feed_webhook_update(self.bot, _private_callback_update(2, self.USER_ID, "mod_help:stopwords"))
-        texts = self.fake_api.sent_texts(self.USER_ID)
-        self.assertTrue(any("/stopwords" in t and "группе" in t for t in texts))
 
     async def test_admins_button_executes_directly(self):
         await self.dp.feed_webhook_update(self.bot, _private_text_update(1, self.USER_ID, "/start"))
@@ -831,7 +819,7 @@ class ModeratorStartButtonMenuTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.fake_api.deleted_message_ids(self.USER_ID), [admins_panel_id])
         modlog_panel_id = self.fake_api.last_sent_message_id(self.USER_ID)
 
-        await self.dp.feed_webhook_update(self.bot, _private_callback_update(uid, self.USER_ID, "mod_help:rights")); uid += 1
+        await self.dp.feed_webhook_update(self.bot, _private_callback_update(uid, self.USER_ID, "mod_pick_group")); uid += 1
         self.assertEqual(self.fake_api.deleted_message_ids(self.USER_ID), [admins_panel_id, modlog_panel_id])
 
     async def test_start_welcome_message_is_never_deleted_by_panel_navigation(self):
@@ -1362,9 +1350,331 @@ class ModeratorTerminologyTests(unittest.TestCase):
         self.assertNotIn("стоп", moderator.BOT_DESCRIPTION.lower())
         self.assertNotIn("стоп", moderator.WELCOME_TEXT.lower())
 
-    def test_start_help_texts_use_new_term(self):
-        for text in moderator._START_HELP_TEXTS.values():
-            self.assertNotIn("стоп", text.lower())
+
+class ModeratorGroupPickerTests(unittest.IsolatedAsyncioTestCase):
+    """"⚙️ Настроить группу" — known_groups is populated by
+    on_bot_membership_changed as the bot is added to/removed from groups; the
+    private-chat picker lists exactly those groups, and picking one requires
+    the PRESSER's own live admin status in THAT SPECIFIC group — being an
+    admin of one group the bot moderates must not grant access to another."""
+
+    CHAT_A = -100111
+    CHAT_B = -100222
+    ADMIN_A_ID = 9001   # admin of CHAT_A only
+    ADMIN_B_ID = 9002   # admin of CHAT_B only
+
+    async def asyncSetUp(self):
+        self.fake_api = FakeBotAPI()
+        self.fake_api.chat_member_responses[(self.CHAT_A, self.ADMIN_A_ID)] = _admin_member(self.ADMIN_A_ID)
+        self.fake_api.chat_member_responses[(self.CHAT_B, self.ADMIN_B_ID)] = _admin_member(self.ADMIN_B_ID)
+        self._patcher = patch.object(Bot, "__call__", new=self.fake_api)
+        self._patcher.start()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.data_dir = Path(self._tmp.name)
+        self.config = moderator.config_from_bot_row(
+            {"bot_id": 720, "name": "mod_picker", "display_name": None, "group_chat_id": None}, self.data_dir
+        )
+        await moderator.init_db(self.config.db_path)
+        self.bot, self.dp = _build_bot_dispatcher(self.config)
+        # Populate known_groups the same way production does — drive the bot
+        # being added as a member through on_bot_membership_changed, not a
+        # direct DB write.
+        await self.dp.feed_webhook_update(
+            self.bot, _my_chat_member_update(1, self.CHAT_A, _bot_user_json("left"), _bot_user_json("member")),
+        )
+        await self.dp.feed_webhook_update(
+            self.bot, _my_chat_member_update(2, self.CHAT_B, _bot_user_json("left"), _bot_user_json("member")),
+        )
+
+    async def asyncTearDown(self):
+        self._tmp.cleanup()
+        self._patcher.stop()
+
+    async def test_known_groups_persisted_on_membership_change(self):
+        groups = await moderator._known_groups(self.config.db_path)
+        self.assertEqual({g[0] for g in groups}, {self.CHAT_A, self.CHAT_B})
+
+    async def test_group_removed_from_known_groups_on_kick(self):
+        await self.dp.feed_webhook_update(
+            self.bot,
+            _my_chat_member_update(3, self.CHAT_A, _bot_user_json("member"), _bot_user_json("kicked", {"until_date": 0})),
+        )
+        groups = await moderator._known_groups(self.config.db_path)
+        self.assertEqual({g[0] for g in groups}, {self.CHAT_B})
+
+    async def test_empty_picker_when_bot_in_no_groups(self):
+        tmp2 = tempfile.TemporaryDirectory()
+        try:
+            config2 = moderator.config_from_bot_row(
+                {"bot_id": 721, "name": "mod_picker_empty", "display_name": None, "group_chat_id": None},
+                Path(tmp2.name),
+            )
+            await moderator.init_db(config2.db_path)
+            bot2, dp2 = _build_bot_dispatcher(config2)
+            await dp2.feed_webhook_update(bot2, _private_callback_update(1, self.ADMIN_A_ID, "mod_pick_group"))
+            texts = self.fake_api.sent_texts(self.ADMIN_A_ID)
+            self.assertTrue(any("не состоит ни в одной группе" in t for t in texts))
+        finally:
+            tmp2.cleanup()
+
+    async def test_picker_lists_both_known_groups(self):
+        await self.dp.feed_webhook_update(self.bot, _private_callback_update(10, self.ADMIN_A_ID, "mod_pick_group"))
+        sends = [c for c in self.fake_api.calls if isinstance(c, SendMessage) and c.chat_id == self.ADMIN_A_ID]
+        buttons = {b.callback_data for row in sends[-1].reply_markup.inline_keyboard for b in row}
+        self.assertEqual(buttons, {f"mod_group:{self.CHAT_A}", f"mod_group:{self.CHAT_B}"})
+
+    async def test_admin_of_a_can_open_a_panel(self):
+        await self.dp.feed_webhook_update(self.bot, _private_callback_update(10, self.ADMIN_A_ID, "mod_pick_group"))
+        await self.dp.feed_webhook_update(
+            self.bot, _private_callback_update(11, self.ADMIN_A_ID, f"mod_group:{self.CHAT_A}")
+        )
+        texts = self.fake_api.sent_texts(self.ADMIN_A_ID)
+        self.assertTrue(any("запрещённых слов" in t.lower() for t in texts))
+
+    async def test_admin_of_b_cannot_open_a_panel_via_picker(self):
+        """The exact scenario from the design review: an admin of group B
+        must not be able to configure group A, even though the bot moderates
+        both and both appear in the picker."""
+        await self.dp.feed_webhook_update(self.bot, _private_callback_update(10, self.ADMIN_B_ID, "mod_pick_group"))
+        await self.dp.feed_webhook_update(
+            self.bot, _private_callback_update(11, self.ADMIN_B_ID, f"mod_group:{self.CHAT_A}")
+        )
+        self.assertTrue(any("⛔" in t for t in self.fake_api.alert_texts()))
+        texts = self.fake_api.sent_texts(self.ADMIN_B_ID)
+        self.assertFalse(any("запрещённых слов" in t.lower() for t in texts))
+
+    async def test_admin_of_a_can_add_word_end_to_end(self):
+        await self.dp.feed_webhook_update(self.bot, _private_callback_update(10, self.ADMIN_A_ID, "mod_pick_group"))
+        await self.dp.feed_webhook_update(
+            self.bot, _private_callback_update(11, self.ADMIN_A_ID, f"mod_group:{self.CHAT_A}")
+        )
+        await self.dp.feed_webhook_update(self.bot, _private_callback_update(12, self.ADMIN_A_ID, "modp_addword"))
+        await self.dp.feed_webhook_update(self.bot, _private_text_update(13, self.ADMIN_A_ID, "badword"))
+        self.assertIn("badword", await moderator._stopwords_for_chat(self.config.db_path, self.CHAT_A))
+
+    async def test_word_added_via_a_panel_does_not_leak_into_b(self):
+        await self.dp.feed_webhook_update(self.bot, _private_callback_update(10, self.ADMIN_A_ID, "mod_pick_group"))
+        await self.dp.feed_webhook_update(
+            self.bot, _private_callback_update(11, self.ADMIN_A_ID, f"mod_group:{self.CHAT_A}")
+        )
+        await self.dp.feed_webhook_update(self.bot, _private_callback_update(12, self.ADMIN_A_ID, "modp_addword"))
+        await self.dp.feed_webhook_update(self.bot, _private_text_update(13, self.ADMIN_A_ID, "badword"))
+        self.assertNotIn("badword", await moderator._stopwords_for_chat(self.config.db_path, self.CHAT_B))
+
+
+class ModeratorPrivatePanelCrossGroupSecurityTests(unittest.IsolatedAsyncioTestCase):
+    """The scenario explicitly called out in review: an admin of group B must
+    be rejected on EVERY sub-action inside group A's private panel — not just
+    at the initial picker step — even when `selected_group` in their own FSM
+    state points at A through some means OTHER than the legitimate picker
+    (here: injected directly into storage, simulating a forged/stale state),
+    rather than a real "you are admin of A" pick via cb_select_group. Each
+    modp_* handler must independently call get_chat_member(A, presser) and
+    reject — this proves the check actually runs and actually blocks on every
+    single sub-action, not merely "the design says it should"."""
+
+    CHAT_A = -100333   # admin_b has NO rights here
+    CHAT_B = -100444   # admin_b's own group
+    ADMIN_B_ID = 9101
+
+    async def asyncSetUp(self):
+        self.fake_api = FakeBotAPI()
+        # admin_b IS an admin of B; for CHAT_A, no entry is registered, so
+        # FakeBotAPI's default get_chat_member answer (a plain non-admin
+        # member) applies — exactly "admin of B, not of A".
+        self.fake_api.chat_member_responses[(self.CHAT_B, self.ADMIN_B_ID)] = _admin_member(self.ADMIN_B_ID)
+        self._patcher = patch.object(Bot, "__call__", new=self.fake_api)
+        self._patcher.start()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.data_dir = Path(self._tmp.name)
+        self.config = moderator.config_from_bot_row(
+            {"bot_id": 730, "name": "mod_crossgroup", "display_name": None, "group_chat_id": None}, self.data_dir
+        )
+        await moderator.init_db(self.config.db_path)
+        # Seed group A with a pre-existing stopword and a non-default
+        # threshold, so any successful mutation from the attempts below would
+        # be immediately detectable.
+        async with aiosqlite.connect(self.config.db_path) as db:
+            await db.execute("INSERT INTO stopwords (chat_id, word) VALUES (?, ?)", (self.CHAT_A, "existingword"))
+            await db.execute("INSERT INTO chat_settings (chat_id, max_warnings) VALUES (?, ?)", (self.CHAT_A, 3))
+            await db.commit()
+        self.bot, self.dp = _build_bot_dispatcher(self.config)
+        await moderator._upsert_known_group(self.config.db_path, self.CHAT_A, "Group A")
+        await moderator._upsert_known_group(self.config.db_path, self.CHAT_B, "Group B")
+        # Forge admin_b's OWN FSM state to point selected_group at A —
+        # WITHOUT ever going through cb_select_group's live admin check. This
+        # is the "not through the legitimate picker" scenario from review.
+        key = StorageKey(bot_id=self.bot.id, chat_id=self.ADMIN_B_ID, user_id=self.ADMIN_B_ID)
+        self.forged_state = FSMContext(storage=self.dp.storage, key=key)
+        await self.forged_state.update_data(selected_group=self.CHAT_A, panel_msg_id=None)
+
+    async def asyncTearDown(self):
+        self._tmp.cleanup()
+        self._patcher.stop()
+
+    async def _gcm_calls_on_a_by_b(self):
+        return [
+            c for c in self.fake_api.calls
+            if isinstance(c, GetChatMember) and c.chat_id == self.CHAT_A and c.user_id == self.ADMIN_B_ID
+        ]
+
+    async def test_recheck_rights_denied(self):
+        await self.dp.feed_webhook_update(self.bot, _private_callback_update(1, self.ADMIN_B_ID, "modp_recheck"))
+        self.assertEqual(len(await self._gcm_calls_on_a_by_b()), 1)
+        self.assertTrue(any("⛔" in t for t in self.fake_api.alert_texts()))
+
+    async def test_addword_start_denied_no_flow_started(self):
+        await self.dp.feed_webhook_update(self.bot, _private_callback_update(1, self.ADMIN_B_ID, "modp_addword"))
+        self.assertEqual(len(await self._gcm_calls_on_a_by_b()), 1)
+        self.assertTrue(any("⛔" in t for t in self.fake_api.alert_texts()))
+        await self.dp.feed_webhook_update(self.bot, _private_text_update(2, self.ADMIN_B_ID, "sneakyword"))
+        self.assertNotIn("sneakyword", await moderator._stopwords_for_chat(self.config.db_path, self.CHAT_A))
+
+    async def test_addword_continuation_denied_even_with_flow_state_forged_too(self):
+        # Forge the FULL flow state (not just selected_group) to simulate the
+        # attacker having somehow reached the "type the word" step directly,
+        # bypassing cb_private_addword_start's own check entirely.
+        await self.forged_state.update_data(started_at=time.time())
+        await self.forged_state.set_state(moderator.PrivateModPanelFlow.add_word)
+        await self.dp.feed_webhook_update(self.bot, _private_text_update(1, self.ADMIN_B_ID, "sneakyword"))
+        self.assertEqual(len(await self._gcm_calls_on_a_by_b()), 1)
+        self.assertNotIn("sneakyword", await moderator._stopwords_for_chat(self.config.db_path, self.CHAT_A))
+
+    async def test_removeword_start_denied_no_words_removed(self):
+        await self.dp.feed_webhook_update(self.bot, _private_callback_update(1, self.ADMIN_B_ID, "modp_removeword"))
+        self.assertEqual(len(await self._gcm_calls_on_a_by_b()), 1)
+        self.assertTrue(any("⛔" in t for t in self.fake_api.alert_texts()))
+        self.assertIn("existingword", await moderator._stopwords_for_chat(self.config.db_path, self.CHAT_A))
+
+    async def test_removeword_text_continuation_denied(self):
+        await self.forged_state.update_data(started_at=time.time())
+        await self.forged_state.set_state(moderator.PrivateModPanelFlow.remove_word_text)
+        await self.dp.feed_webhook_update(self.bot, _private_text_update(1, self.ADMIN_B_ID, "existingword"))
+        self.assertEqual(len(await self._gcm_calls_on_a_by_b()), 1)
+        self.assertIn("existingword", await moderator._stopwords_for_chat(self.config.db_path, self.CHAT_A))
+
+    async def test_removeword_pick_continuation_denied(self):
+        await self.forged_state.update_data(started_at=time.time(), remove_words=["existingword"])
+        await self.forged_state.set_state(moderator.PrivateModPanelFlow.remove_word_pick)
+        await self.dp.feed_webhook_update(self.bot, _private_callback_update(1, self.ADMIN_B_ID, "modp_rmw:0"))
+        self.assertEqual(len(await self._gcm_calls_on_a_by_b()), 1)
+        self.assertIn("existingword", await moderator._stopwords_for_chat(self.config.db_path, self.CHAT_A))
+
+    async def test_setwarn_start_denied(self):
+        await self.dp.feed_webhook_update(self.bot, _private_callback_update(1, self.ADMIN_B_ID, "modp_setwarn"))
+        self.assertEqual(len(await self._gcm_calls_on_a_by_b()), 1)
+        self.assertTrue(any("⛔" in t for t in self.fake_api.alert_texts()))
+
+    async def test_setwarn_continuation_denied_threshold_unchanged(self):
+        await self.forged_state.update_data(started_at=time.time())
+        await self.forged_state.set_state(moderator.PrivateModPanelFlow.max_warnings)
+        await self.dp.feed_webhook_update(self.bot, _private_text_update(1, self.ADMIN_B_ID, "77"))
+        self.assertEqual(len(await self._gcm_calls_on_a_by_b()), 1)
+        async with aiosqlite.connect(self.config.db_path) as db:
+            row = await (await db.execute(
+                "SELECT max_warnings FROM chat_settings WHERE chat_id=?", (self.CHAT_A,)
+            )).fetchone()
+        self.assertEqual(row[0], 3)
+
+
+class ModeratorGroupSwitchFlowClearTests(unittest.IsolatedAsyncioTestCase):
+    """Review-found: switching to a different group via the picker while a
+    sub-flow (e.g. add-word) was still open for the PREVIOUSLY selected group
+    used to leave that flow's state dangling — cb_select_group overwrote
+    selected_group but never cleared it. A message meant for group A's
+    add-word prompt, arriving after the switch to B, would then be silently
+    captured by A's still-active flow — which now reads the NEW group from
+    FSM state — and land in B's stopwords instead of A's."""
+
+    CHAT_A = -100555
+    CHAT_B = -100666
+    ADMIN_ID = 9500  # admin of BOTH groups
+
+    async def asyncSetUp(self):
+        self.fake_api = FakeBotAPI()
+        self.fake_api.chat_member_responses[(self.CHAT_A, self.ADMIN_ID)] = _admin_member(self.ADMIN_ID)
+        self.fake_api.chat_member_responses[(self.CHAT_B, self.ADMIN_ID)] = _admin_member(self.ADMIN_ID)
+        self._patcher = patch.object(Bot, "__call__", new=self.fake_api)
+        self._patcher.start()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.config = moderator.config_from_bot_row(
+            {"bot_id": 740, "name": "mod_switch", "display_name": None, "group_chat_id": None}, Path(self._tmp.name)
+        )
+        await moderator.init_db(self.config.db_path)
+        self.bot, self.dp = _build_bot_dispatcher(self.config)
+        await moderator._upsert_known_group(self.config.db_path, self.CHAT_A, "Group A")
+        await moderator._upsert_known_group(self.config.db_path, self.CHAT_B, "Group B")
+
+    async def asyncTearDown(self):
+        self._tmp.cleanup()
+        self._patcher.stop()
+
+    async def test_switching_group_mid_addword_flow_does_not_leak_word_into_new_group(self):
+        await self.dp.feed_webhook_update(self.bot, _private_callback_update(1, self.ADMIN_ID, f"mod_group:{self.CHAT_A}"))
+        await self.dp.feed_webhook_update(self.bot, _private_callback_update(2, self.ADMIN_ID, "modp_addword"))
+        # Switch to B via the picker WITHOUT finishing A's add-word flow.
+        await self.dp.feed_webhook_update(self.bot, _private_callback_update(3, self.ADMIN_ID, f"mod_group:{self.CHAT_B}"))
+        # A stray plain-text message arrives — would have been captured as
+        # A's pending word before the fix, ending up in B's stopwords instead.
+        await self.dp.feed_webhook_update(self.bot, _private_text_update(4, self.ADMIN_ID, "leakyword"))
+        self.assertNotIn("leakyword", await moderator._stopwords_for_chat(self.config.db_path, self.CHAT_A))
+        self.assertNotIn("leakyword", await moderator._stopwords_for_chat(self.config.db_path, self.CHAT_B))
+
+
+class ModeratorPrivateCancelRevokedAdminTests(unittest.IsolatedAsyncioTestCase):
+    """Review-found: "❌ Отмена" and /cancel mid a private group sub-flow used
+    to render that group's rights-status + full stopwords list WITHOUT
+    re-checking the presser's live admin status — the one screen in the
+    private-panel section that skipped the "every sub-action re-verifies
+    live admin status" rule. A user kicked/demoted mid-flow could still see
+    the group's current panel content through the cancel path alone."""
+
+    CHAT_A = -100777
+    ADMIN_ID = 9600
+
+    async def asyncSetUp(self):
+        self.fake_api = FakeBotAPI()
+        self.fake_api.chat_member_responses[(self.CHAT_A, self.ADMIN_ID)] = _admin_member(self.ADMIN_ID)
+        self._patcher = patch.object(Bot, "__call__", new=self.fake_api)
+        self._patcher.start()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.config = moderator.config_from_bot_row(
+            {"bot_id": 741, "name": "mod_cancel_revoked", "display_name": None, "group_chat_id": None},
+            Path(self._tmp.name),
+        )
+        await moderator.init_db(self.config.db_path)
+        async with aiosqlite.connect(self.config.db_path) as db:
+            await db.execute("INSERT INTO stopwords (chat_id, word) VALUES (?, ?)", (self.CHAT_A, "secretword"))
+            await db.commit()
+        self.bot, self.dp = _build_bot_dispatcher(self.config)
+        await moderator._upsert_known_group(self.config.db_path, self.CHAT_A, "Group A")
+
+    async def asyncTearDown(self):
+        self._tmp.cleanup()
+        self._patcher.stop()
+
+    async def test_cancel_button_does_not_leak_panel_after_rights_revoked(self):
+        await self.dp.feed_webhook_update(self.bot, _private_callback_update(1, self.ADMIN_ID, f"mod_group:{self.CHAT_A}"))
+        await self.dp.feed_webhook_update(self.bot, _private_callback_update(2, self.ADMIN_ID, "modp_addword"))
+        del self.fake_api.chat_member_responses[(self.CHAT_A, self.ADMIN_ID)]  # rights revoked mid-flow
+        # Only what the CANCEL action itself sends is in scope — group
+        # selection legitimately showed the panel (incl. secretword) earlier,
+        # while the user was still a live admin.
+        calls_before = len(self.fake_api.calls)
+        await self.dp.feed_webhook_update(self.bot, _private_callback_update(3, self.ADMIN_ID, "modp_cancel"))
+        new_calls = self.fake_api.calls[calls_before:]
+        texts = [c.text for c in new_calls if isinstance(c, (SendMessage, EditMessageText))]
+        self.assertFalse(any("secretword" in t for t in texts))
+
+    async def test_slash_cancel_does_not_leak_panel_after_rights_revoked(self):
+        await self.dp.feed_webhook_update(self.bot, _private_callback_update(1, self.ADMIN_ID, f"mod_group:{self.CHAT_A}"))
+        await self.dp.feed_webhook_update(self.bot, _private_callback_update(2, self.ADMIN_ID, "modp_addword"))
+        del self.fake_api.chat_member_responses[(self.CHAT_A, self.ADMIN_ID)]  # rights revoked mid-flow
+        calls_before = len(self.fake_api.calls)
+        await self.dp.feed_webhook_update(self.bot, _private_text_update(3, self.ADMIN_ID, "/cancel"))
+        new_calls = self.fake_api.calls[calls_before:]
+        texts = [c.text for c in new_calls if isinstance(c, (SendMessage, EditMessageText))]
+        self.assertFalse(any("secretword" in t for t in texts))
 
 
 class ModeratorStandaloneSmokeTest(unittest.TestCase):
