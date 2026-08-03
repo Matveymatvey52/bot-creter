@@ -36,8 +36,9 @@ WELCOME_TEXT = (
     "Добавьте меня в группу и выдайте права администратора (пункты «Удаление "
     "сообщений» и «Блокировка пользователей») — и я начну следить за порядком: "
     "спам-ссылки, запрещённые слова, лестница предупреждение → мут → бан.\n\n"
-    "Настройка (запрещённые слова, порог предупреждений, проверка прав) выполняется "
-    "прямо в группе, где я состою. Здесь, в личных сообщениях, доступны кнопки ниже:"
+    "Вся настройка (запрещённые слова, порог предупреждений, проверка прав) — "
+    "прямо здесь, в личном чате: кнопка «⚙️ Настроить группу» ниже, дальше "
+    "выберите нужную группу из списка."
 )
 # ── END CUSTOMIZE ─────────────────────────────────────────────────────────────
 
@@ -217,7 +218,45 @@ async def init_db(db_path: str):
                 created_at TEXT DEFAULT (datetime('now','localtime'))
             )
         """)
+        # Groups this bot instance currently belongs to — populated/kept fresh by
+        # on_bot_membership_changed, read by the private-chat group picker (see
+        # docs/STAGE2_DESIGN.md "Настройка из личного чата с выбором группы").
+        # Row removed on leave/kick so a group the bot can no longer act in never
+        # shows up as a selectable option.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS known_groups (
+                chat_id    INTEGER PRIMARY KEY,
+                chat_title TEXT,
+                added_at   TEXT DEFAULT (datetime('now','localtime'))
+            )
+        """)
         await db.commit()
+
+
+# ── known_groups (private-chat group picker) ──────────────────────────────────
+
+async def _upsert_known_group(db_path: str, chat_id: int, chat_title: str) -> None:
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            "INSERT INTO known_groups (chat_id, chat_title) VALUES (?, ?) "
+            "ON CONFLICT(chat_id) DO UPDATE SET chat_title=excluded.chat_title",
+            (chat_id, chat_title),
+        )
+        await db.commit()
+
+
+async def _forget_known_group(db_path: str, chat_id: int) -> None:
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute("DELETE FROM known_groups WHERE chat_id=?", (chat_id,))
+        await db.commit()
+
+
+async def _known_groups(db_path: str) -> list[tuple[int, str]]:
+    async with aiosqlite.connect(db_path) as db:
+        rows = await (await db.execute(
+            "SELECT chat_id, chat_title FROM known_groups ORDER BY chat_title COLLATE NOCASE, chat_id"
+        )).fetchall()
+    return [(r[0], r[1]) for r in rows]
 
 
 # ── rights checking (see docs/STAGE2_DESIGN.md "ГЛАВНОЕ ТРЕБОВАНИЕ ВЛАДЕЛЬЦА")
@@ -243,10 +282,13 @@ RIGHTS_INSTRUCTIONS = (
 )
 
 
-async def _check_and_report_rights(bot: Bot, chat_id: int, member, silent_if_ok: bool) -> bool:
-    """`member` is a ChatMember describing the BOT's OWN status in chat_id —
-    either straight from a my_chat_member update, or freshly fetched via
-    get_chat_member. Returns whether rights are sufficient.
+def _rights_status_text(member) -> tuple[bool, str]:
+    """Pure form of the rights check — no I/O, just `member` (the BOT's OWN
+    ChatMember status in some chat) -> (has_rights, human-readable status
+    text). Split out from _check_and_report_rights so the private-chat
+    per-group panel (which must show rights status WITHOUT posting into the
+    group — see docs/STAGE2_DESIGN.md "Настройка из личного чата") can reuse
+    the exact same check without a side-effecting send.
 
     ChatMemberAdministrator.can_delete_messages + can_restrict_members is the
     one combination that covers all three moderation actions (delete via
@@ -259,27 +301,57 @@ async def _check_and_report_rights(bot: Bot, chat_id: int, member, silent_if_ok:
         and member.can_delete_messages
         and member.can_restrict_members
     )
+    if has_rights:
+        return True, "✅ Всё в порядке, у бота есть права на удаление/мут/бан."
+    return False, RIGHTS_INSTRUCTIONS
+
+
+async def _check_and_report_rights(bot: Bot, chat_id: int, member, silent_if_ok: bool) -> bool:
+    """Sends the _rights_status_text() result INTO chat_id (the group) —
+    used by the two group-facing mechanisms (on_bot_membership_changed,
+    /checkrights). Returns whether rights are sufficient."""
+    has_rights, text = _rights_status_text(member)
+    if has_rights and silent_if_ok:
+        return has_rights
     try:
-        if has_rights:
-            if not silent_if_ok:
-                await bot.send_message(chat_id, "✅ Всё в порядке, у бота есть права на удаление/мут/бан.")
-        else:
-            await bot.send_message(chat_id, RIGHTS_INSTRUCTIONS, parse_mode="HTML")
+        await bot.send_message(chat_id, text, parse_mode="HTML")
     except Exception as e:
         logger.error(f"_check_and_report_rights: failed to message chat {chat_id}: {e}")
     return has_rights
 
 
+# Statuses in which the bot is still actually present in the chat — kept in
+# known_groups. The complement (left/kicked) means the bot can no longer act
+# there at all, so the row is dropped instead of lingering as a dead option
+# in the private-chat picker.
+_PRESENT_STATUSES = {"member", "administrator", "restricted"}
+_REMOVED_STATUSES = {"left", "kicked"}
+
+
 @router.my_chat_member()
-async def on_bot_membership_changed(update: ChatMemberUpdated, bot: Bot):
+async def on_bot_membership_changed(update: ChatMemberUpdated, bot: Bot, config: ModeratorConfig):
     """No direction filter (not just IS_NOT_MEMBER >> IS_MEMBER) — on Telegram
     the bot is typically added as a plain member first, then promoted to admin
     as a SEPARATE later action; a narrower filter would miss the moment rights
     actually arrive. Reads update.new_chat_member directly instead of issuing
     a fresh get_chat_member call — the bot's new status is already IN this
-    update."""
+    update.
+
+    Also the sole write point for known_groups (see docs/STAGE2_DESIGN.md
+    "Настройка из личного чата с выбором группы") — every membership change
+    either upserts (bot still present: title kept fresh in case the group was
+    renamed) or removes (bot left/kicked) this chat's row, so the private-chat
+    picker always reflects groups the bot can currently act in."""
     if update.chat.type not in ("group", "supergroup"):
         return
+    status = update.new_chat_member.status
+    if status in _PRESENT_STATUSES:
+        title = update.chat.title or str(update.chat.id)
+        await _upsert_known_group(config.db_path, update.chat.id, title)
+        logger.info(f"on_bot_membership_changed: known_groups upsert chat_id={update.chat.id} title={title!r} status={status}")
+    elif status in _REMOVED_STATUSES:
+        await _forget_known_group(config.db_path, update.chat.id)
+        logger.info(f"on_bot_membership_changed: known_groups forget chat_id={update.chat.id} status={status}")
     await _check_and_report_rights(bot, update.chat.id, update.new_chat_member, silent_if_ok=True)
 
 
@@ -879,22 +951,22 @@ async def cmd_mod_cancel(msg: Message, state: FSMContext):
 
 def kb_start_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔍 Проверить права", callback_data="mod_help:rights")],
-        [InlineKeyboardButton(text="🚫 Запрещённые слова", callback_data="mod_help:stopwords")],
+        [InlineKeyboardButton(text="⚙️ Настроить группу", callback_data="mod_pick_group")],
         [InlineKeyboardButton(text="👥 Админы", callback_data="mod_admins")],
         [InlineKeyboardButton(text="📜 Журнал модерации", callback_data="mod_modlog")],
     ])
 
-# "🔍 Проверить права" / "🚫 Запрещённые слова" only redirect (see Variant A
-# discussion): these act on a SPECIFIC group's chat_id, which a private /start
-# message has no way to know — the group itself is where /checkrights and the
-# /stopwords panel actually run. "👥 Админы" / "📜 Журнал модерации" need no
-# group context (admins_file/moderation_log are global to this bot), so their
-# buttons execute directly instead.
-_START_HELP_TEXTS = {
-    "rights": "🔍 Эта функция работает в группе, где я состою — отправьте /checkrights прямо в группе.",
-    "stopwords": "🚫 Управление запрещёнными словами (и порогом предупреждений) настраивается в группе, где я состою — отправьте /stopwords прямо в группе.",
-}
+# "⚙️ Настроить группу" lists known_groups (populated by
+# on_bot_membership_changed) and, once a SPECIFIC group is picked and the
+# presser's own live admin status in THAT group is verified, shows the
+# per-group panel (rights status + stopwords + threshold) — see
+# docs/STAGE2_DESIGN.md "Настройка из личного чата с выбором группы". This
+# replaced the old "🔍 Проверить права"/"🚫 Запрещённые слова" buttons, which
+# used to just redirect the user back to the group with instructions to run
+# /checkrights or /stopwords there — that redirect is gone; the private
+# per-group panel now does the actual work.
+# "👥 Админы" / "📜 Журнал модерации" need no group context (admins_file/
+# moderation_log are global to this bot), so their buttons execute directly.
 
 
 async def _replace_panel(
@@ -1078,23 +1150,378 @@ async def cmd_start(message: Message, state: FSMContext, config: ModeratorConfig
             parse_mode="HTML",
         )
 
-@router.callback_query(F.data.startswith("mod_help:"))
-async def cb_start_help(cb: CallbackQuery, bot: Bot, state: FSMContext):
+# ── private: group picker + per-group config panel ────────────────────────────
+# "⚙️ Настроить группу" — see docs/STAGE2_DESIGN.md "Настройка из личного чата
+# с выбором группы". known_groups (populated by on_bot_membership_changed)
+# lists the groups the bot currently belongs to; picking one stores its
+# chat_id in FSM state (`selected_group`) for the duration of that group's
+# config session. THE security property this whole flow exists for: chat_id
+# only ever enters from callback_data at the PICK step (mod_group:<id>), and
+# is verified there via a LIVE get_chat_member(chat_id, presser's user_id)
+# before being trusted/stored — never admins_file, never "the bot happens to
+# know this group". Every downstream sub-action (add/remove word, set
+# threshold, recheck rights) re-reads chat_id from FSM state AND re-verifies
+# the presser's live admin status in THAT chat_id again, independently — not
+# relying on the entry check alone, since a stale/forged FSM state (rights
+# revoked mid-session, or state tampered with by any other means) must be
+# rejected at every single step, not just once at the door.
+
+def kb_group_list(groups: list[tuple[int, str]]) -> InlineKeyboardMarkup:
+    # Review-found: unlike kb_remove_words/kb_remove_admins elsewhere in this
+    # file, this had no cap — a bot moderating enough groups to exceed
+    # Telegram's inline-keyboard limits would have its send_message fail
+    # AFTER _replace_panel already deleted the previous screen, i.e. the
+    # user presses "⚙️ Настроить группу" and sees nothing at all. Same
+    # MAX_REMOVE_BUTTONS cap as those two (groups are pre-sorted
+    # alphabetically by _known_groups' own SQL ORDER BY).
+    rows = [
+        [InlineKeyboardButton(text=title, callback_data=f"mod_group:{chat_id}")]
+        for chat_id, title in groups[:MAX_REMOVE_BUTTONS]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _group_list_text(groups: list[tuple[int, str]]) -> str:
+    if len(groups) > MAX_REMOVE_BUTTONS:
+        return (
+            f"Выберите группу для настройки (показаны первые {MAX_REMOVE_BUTTONS} из {len(groups)}):"
+        )
+    return "Выберите группу для настройки:"
+
+def kb_group_panel() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить запрещённое слово", callback_data="modp_addword")],
+        [InlineKeyboardButton(text="➖ Убрать запрещённое слово", callback_data="modp_removeword")],
+        [InlineKeyboardButton(text="⚙️ Порог предупреждений", callback_data="modp_setwarn")],
+        [InlineKeyboardButton(text="🔄 Перепроверить права", callback_data="modp_recheck")],
+        [InlineKeyboardButton(text="⬅️ К списку групп", callback_data="mod_pick_group")],
+    ])
+
+def kb_private_group_cancel() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="❌ Отмена", callback_data="modp_cancel")
+    ]])
+
+def kb_private_remove_words(words: list[str]) -> InlineKeyboardMarkup:
+    rows = []
+    for i, w in enumerate(words):
+        label = w if len(w) <= 40 else w[:37] + "…"
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"modp_rmw:{i}")])
+    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="modp_cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _group_panel_text(bot: Bot, config: ModeratorConfig, chat_id: int) -> str:
+    """Rights status (read-only summary, via the pure _rights_status_text —
+    unlike _check_and_report_rights, this never posts INTO the group) +
+    current stopwords list, combined into one private-chat panel screen."""
+    try:
+        bot_member = await bot.get_chat_member(chat_id, bot.id)
+        _, rights_text = _rights_status_text(bot_member)
+    except Exception as e:
+        logger.warning(f"_group_panel_text: get_chat_member for bot failed in chat {chat_id}: {e}")
+        rights_text = "⚠️ Не удалось проверить права бота — попробуйте «🔄 Перепроверить права»."
+    words = await _stopwords_for_chat(config.db_path, chat_id)
+    return rights_text + "\n\n" + _stopwords_panel_text(words)
+
+
+async def _clear_flow_keep_panel_and_group(state: FSMContext) -> None:
+    """Like _clear_flow_keep_panel, but ALSO preserves selected_group — used
+    when a sub-flow below (add/remove word, set threshold) finishes and
+    returns to the SAME group's panel. Navigating away to a genuinely
+    different top-level destination (Admins/Modlog/back to the group list)
+    must drop the selection instead, via the plain _clear_flow_keep_panel."""
+    data = await state.get_data()
+    panel_msg_id = data.get("panel_msg_id")
+    selected_group = data.get("selected_group")
+    await state.clear()
+    keep: dict = {}
+    if panel_msg_id is not None:
+        keep["panel_msg_id"] = panel_msg_id
+    if selected_group is not None:
+        keep["selected_group"] = selected_group
+    if keep:
+        await state.update_data(**keep)
+
+
+class PrivateModPanelFlow(StatesGroup):
+    add_word = State(); remove_word_pick = State(); remove_word_text = State(); max_warnings = State()
+
+_PRIVATE_GROUP_FLOW_STATES = {
+    str(PrivateModPanelFlow.add_word), str(PrivateModPanelFlow.remove_word_pick),
+    str(PrivateModPanelFlow.remove_word_text), str(PrivateModPanelFlow.max_warnings),
+}
+
+
+@router.callback_query(F.data == "mod_pick_group")
+async def cb_pick_group(cb: CallbackQuery, bot: Bot, state: FSMContext, config: ModeratorConfig):
     chat_id = _panel_chat_id(cb)
     if chat_id is None:
         await cb.answer(); return
     await cb.answer()
-    # Review-found: navigating to a DIFFERENT top-level destination must
-    # cancel any AdminPanelFlow left dangling by a previous "➕ Добавить
-    # админа"/"➖ Убрать админа" press — otherwise the next ordinary message
-    # this user sends here (or after mod_admins/mod_modlog) still gets
-    # silently captured as an admin id. _clear_flow_keep_panel (not a bare
-    # state.clear()) so the delete-old step in _replace_panel right below
-    # still knows which earlier panel message to remove.
+    # Leaving to a different top-level destination (including away from a
+    # previously selected group's own panel) — drop selected_group along
+    # with any dangling flow, same reasoning as navigating to Admins/Modlog.
     await _clear_flow_keep_panel(state)
-    text = _START_HELP_TEXTS.get(cb.data.split(":", 1)[1])
-    if text:
-        await _replace_panel(bot, state, chat_id, text)
+    groups = await _known_groups(config.db_path)
+    if not groups:
+        await _replace_panel(
+            bot, state, chat_id,
+            "Бот пока не состоит ни в одной группе. Добавьте его в группу и "
+            "выдайте права администратора — тогда группа появится здесь.",
+        )
+        return
+    await _replace_panel(bot, state, chat_id, _group_list_text(groups), reply_markup=kb_group_list(groups))
+
+
+@router.callback_query(F.data.startswith("mod_group:"))
+async def cb_select_group(cb: CallbackQuery, bot: Bot, state: FSMContext, config: ModeratorConfig):
+    chat_id = _panel_chat_id(cb)
+    if chat_id is None:
+        await cb.answer(); return
+    await cb.answer()
+    try:
+        target = int(cb.data.split(":", 1)[1])
+    except ValueError:
+        await cb.answer("Некорректный выбор — откройте список заново.", show_alert=True)
+        return
+    # Live check of the PRESSER's own admin status in THIS chat_id — not
+    # admins_file, not "the bot is in this group". See section docstring.
+    if not await _is_group_admin(bot, target, cb.from_user.id):
+        logger.warning(f"cb_select_group: user {cb.from_user.id} denied access to chat {target} (not a live admin there)")
+        await cb.answer("⛔ Вы не администратор этой группы.", show_alert=True)
+        return
+    # Review-found: switching to a DIFFERENT group while a sub-flow
+    # (add/remove word, set threshold) was still open for the PREVIOUS
+    # selected_group used to leave that flow's state (and its own
+    # selected_group) dangling — a message that arrives right after the
+    # switch (e.g. a slow client, or the user retyping) would still be
+    # captured by that old flow's continuation handler, which reads
+    # chat_id from FSM state and would now silently see the NEW group
+    # instead of the one the word was actually meant for. Clearing here,
+    # same as cb_pick_group already does when leaving to the group list.
+    await _clear_flow_keep_panel(state)
+    await state.update_data(selected_group=target)
+    text = await _group_panel_text(bot, config, target)
+    await _replace_panel(bot, state, chat_id, text, reply_markup=kb_group_panel(), parse_mode="HTML")
+
+
+@router.callback_query(F.data == "modp_recheck")
+async def cb_private_recheck_rights(cb: CallbackQuery, bot: Bot, state: FSMContext, config: ModeratorConfig):
+    chat_id = _panel_chat_id(cb)
+    if chat_id is None:
+        await cb.answer(); return
+    await cb.answer()
+    data = await state.get_data()
+    target = data.get("selected_group")
+    if target is None:
+        await _replace_panel(bot, state, chat_id, "Сначала выберите группу.", reply_markup=kb_group_list(await _known_groups(config.db_path)))
+        return
+    if not await _is_group_admin(bot, target, cb.from_user.id):
+        logger.warning(f"cb_private_recheck_rights: user {cb.from_user.id} denied access to chat {target}")
+        await cb.answer("⛔ Вы не администратор этой группы.", show_alert=True)
+        return
+    text = await _group_panel_text(bot, config, target)
+    await _replace_panel(bot, state, chat_id, text, reply_markup=kb_group_panel(), parse_mode="HTML")
+
+
+@router.callback_query(F.data == "modp_addword")
+async def cb_private_addword_start(cb: CallbackQuery, bot: Bot, state: FSMContext, config: ModeratorConfig):
+    chat_id = _panel_chat_id(cb)
+    if chat_id is None:
+        await cb.answer(); return
+    await cb.answer()
+    data = await state.get_data()
+    target = data.get("selected_group")
+    if target is None or not await _is_group_admin(bot, target, cb.from_user.id):
+        logger.warning(f"cb_private_addword_start: user {cb.from_user.id} denied access to chat {target}")
+        await cb.answer("⛔ Нет доступа — выберите группу заново.", show_alert=True)
+        return
+    await _replace_panel(bot, state, chat_id, "Пришлите слово, которое нужно заблокировать:", reply_markup=kb_private_group_cancel())
+    await state.update_data(started_at=time.time())
+    await state.set_state(PrivateModPanelFlow.add_word)
+
+@router.message(PrivateModPanelFlow.add_word, F.chat.type == "private", F.text, ~F.text.startswith("/"))
+async def privatepanel_add_word(msg: Message, bot: Bot, state: FSMContext, config: ModeratorConfig):
+    data = await state.get_data()
+    target = data.get("selected_group")
+    if _flow_expired(data) or target is None:
+        await _clear_flow_keep_panel(state)
+        await msg.answer("⏳ Время ожидания истекло — начните заново кнопкой «⚙️ Настроить группу»."); return
+    if not await _is_group_admin(bot, target, msg.from_user.id):
+        logger.warning(f"privatepanel_add_word: user {msg.from_user.id} denied access to chat {target}")
+        await _clear_flow_keep_panel(state)
+        await msg.answer("⛔ Действие отменено — вы больше не администратор этой группы."); return
+    word = msg.text.strip().lower()
+    if " " in word or len(word) < 2 or len(word) > 100:
+        await msg.answer("⚠️ Пришлите одно слово (без пробелов), от 2 до 100 символов."); return
+    async with aiosqlite.connect(config.db_path) as db:
+        await db.execute("INSERT OR IGNORE INTO stopwords (chat_id, word) VALUES (?,?)", (target, word))
+        await db.commit()
+    await _clear_flow_keep_panel_and_group(state)
+    await msg.answer(f"✅ Добавлено в список запрещённых слов: «{_esc(word)}»", parse_mode="HTML")
+    text = await _group_panel_text(bot, config, target)
+    await _replace_panel(bot, state, msg.chat.id, text, reply_markup=kb_group_panel(), parse_mode="HTML")
+
+
+@router.callback_query(F.data == "modp_removeword")
+async def cb_private_removeword_start(cb: CallbackQuery, bot: Bot, state: FSMContext, config: ModeratorConfig):
+    chat_id = _panel_chat_id(cb)
+    if chat_id is None:
+        await cb.answer(); return
+    await cb.answer()
+    data = await state.get_data()
+    target = data.get("selected_group")
+    if target is None or not await _is_group_admin(bot, target, cb.from_user.id):
+        logger.warning(f"cb_private_removeword_start: user {cb.from_user.id} denied access to chat {target}")
+        await cb.answer("⛔ Нет доступа — выберите группу заново.", show_alert=True)
+        return
+    words = await _stopwords_for_chat(config.db_path, target)
+    if not words:
+        await _replace_panel(bot, state, chat_id, "Список запрещённых слов пуст — убирать нечего.", reply_markup=kb_group_panel())
+        return
+    if len(words) <= MAX_REMOVE_BUTTONS:
+        await state.update_data(remove_words=words, started_at=time.time())
+        await _replace_panel(bot, state, chat_id, "Выберите слово для удаления:", reply_markup=kb_private_remove_words(words))
+        await state.set_state(PrivateModPanelFlow.remove_word_pick)
+    else:
+        await state.update_data(started_at=time.time())
+        await _replace_panel(bot, state, chat_id, "Слов много — пришлите слово для удаления текстом:", reply_markup=kb_private_group_cancel())
+        await state.set_state(PrivateModPanelFlow.remove_word_text)
+
+@router.callback_query(PrivateModPanelFlow.remove_word_pick, F.data.startswith("modp_rmw:"))
+async def cb_private_removeword_pick(cb: CallbackQuery, bot: Bot, state: FSMContext, config: ModeratorConfig):
+    chat_id = _panel_chat_id(cb)
+    if chat_id is None:
+        await cb.answer(); return
+    await cb.answer()
+    data = await state.get_data()
+    target = data.get("selected_group")
+    if _flow_expired(data) or target is None:
+        await _clear_flow_keep_panel(state)
+        await _replace_panel(bot, state, chat_id, "⏳ Время ожидания истекло — откройте заново кнопкой «⚙️ Настроить группу».")
+        return
+    if not await _is_group_admin(bot, target, cb.from_user.id):
+        logger.warning(f"cb_private_removeword_pick: user {cb.from_user.id} denied access to chat {target}")
+        await _clear_flow_keep_panel(state)
+        await cb.message.answer("⛔ Вы больше не администратор этой группы.")
+        return
+    words = data.get("remove_words", [])
+    try:
+        idx = int(cb.data.split(":", 1)[1])
+    except ValueError:
+        idx = -1
+    if idx < 0 or idx >= len(words):
+        await _clear_flow_keep_panel_and_group(state)
+        text = await _group_panel_text(bot, config, target)
+        await _replace_panel(bot, state, chat_id, "Список устарел.\n\n" + text, reply_markup=kb_group_panel(), parse_mode="HTML")
+        return
+    word = words[idx]
+    async with aiosqlite.connect(config.db_path) as db:
+        cur = await db.execute("DELETE FROM stopwords WHERE chat_id=? AND word=?", (target, word))
+        await db.commit()
+    await _clear_flow_keep_panel_and_group(state)
+    prefix = (
+        f"«{_esc(word)}» уже не в списке запрещённых слов.\n\n" if cur.rowcount == 0
+        else f"✅ Убрано из списка запрещённых слов: «{_esc(word)}»\n\n"
+    )
+    text = await _group_panel_text(bot, config, target)
+    await _replace_panel(bot, state, chat_id, prefix + text, reply_markup=kb_group_panel(), parse_mode="HTML")
+
+@router.message(PrivateModPanelFlow.remove_word_pick, F.chat.type == "private", F.text, ~F.text.startswith("/"))
+async def privatepanel_remove_word_pick_stray_text(msg: Message) -> None:
+    await msg.answer("Пожалуйста, выберите слово кнопкой выше, либо отправьте /cancel.")
+
+@router.message(PrivateModPanelFlow.remove_word_text, F.chat.type == "private", F.text, ~F.text.startswith("/"))
+async def privatepanel_remove_word_text(msg: Message, bot: Bot, state: FSMContext, config: ModeratorConfig):
+    data = await state.get_data()
+    target = data.get("selected_group")
+    if _flow_expired(data) or target is None:
+        await _clear_flow_keep_panel(state)
+        await msg.answer("⏳ Время ожидания истекло — начните заново кнопкой «⚙️ Настроить группу»."); return
+    if not await _is_group_admin(bot, target, msg.from_user.id):
+        logger.warning(f"privatepanel_remove_word_text: user {msg.from_user.id} denied access to chat {target}")
+        await _clear_flow_keep_panel(state)
+        await msg.answer("⛔ Действие отменено — вы больше не администратор этой группы."); return
+    word = msg.text.strip().lower()
+    async with aiosqlite.connect(config.db_path) as db:
+        cur = await db.execute("DELETE FROM stopwords WHERE chat_id=? AND word=?", (target, word))
+        await db.commit()
+    await _clear_flow_keep_panel_and_group(state)
+    if cur.rowcount == 0:
+        await msg.answer(f"«{_esc(word)}» не найдено в списке запрещённых слов.", parse_mode="HTML"); return
+    await msg.answer(f"✅ Убрано из списка запрещённых слов: «{_esc(word)}»", parse_mode="HTML")
+    text = await _group_panel_text(bot, config, target)
+    await _replace_panel(bot, state, msg.chat.id, text, reply_markup=kb_group_panel(), parse_mode="HTML")
+
+
+@router.callback_query(F.data == "modp_setwarn")
+async def cb_private_setwarn_start(cb: CallbackQuery, bot: Bot, state: FSMContext):
+    chat_id = _panel_chat_id(cb)
+    if chat_id is None:
+        await cb.answer(); return
+    await cb.answer()
+    data = await state.get_data()
+    target = data.get("selected_group")
+    if target is None or not await _is_group_admin(bot, target, cb.from_user.id):
+        logger.warning(f"cb_private_setwarn_start: user {cb.from_user.id} denied access to chat {target}")
+        await cb.answer("⛔ Нет доступа — выберите группу заново.", show_alert=True)
+        return
+    await _replace_panel(
+        bot, state, chat_id,
+        "Пришлите число — новый порог предупреждений до мута (целое от 1 до 100):",
+        reply_markup=kb_private_group_cancel(),
+    )
+    await state.update_data(started_at=time.time())
+    await state.set_state(PrivateModPanelFlow.max_warnings)
+
+@router.message(PrivateModPanelFlow.max_warnings, F.chat.type == "private", F.text, ~F.text.startswith("/"))
+async def privatepanel_max_warnings(msg: Message, bot: Bot, state: FSMContext, config: ModeratorConfig):
+    data = await state.get_data()
+    target = data.get("selected_group")
+    if _flow_expired(data) or target is None:
+        await _clear_flow_keep_panel(state)
+        await msg.answer("⏳ Время ожидания истекло — начните заново кнопкой «⚙️ Настроить группу»."); return
+    if not await _is_group_admin(bot, target, msg.from_user.id):
+        logger.warning(f"privatepanel_max_warnings: user {msg.from_user.id} denied access to chat {target}")
+        await _clear_flow_keep_panel(state)
+        await msg.answer("⛔ Действие отменено — вы больше не администратор этой группы."); return
+    text_in = msg.text.strip()
+    if not text_in.isdigit() or len(text_in) > 3 or not (1 <= int(text_in) <= 100):
+        await msg.answer("Введите целое число от 1 до 100."); return
+    n = int(text_in)
+    async with aiosqlite.connect(config.db_path) as db:
+        await db.execute("INSERT OR IGNORE INTO chat_settings (chat_id) VALUES (?)", (target,))
+        await db.execute("UPDATE chat_settings SET max_warnings=? WHERE chat_id=?", (n, target))
+        await db.commit()
+    await _clear_flow_keep_panel_and_group(state)
+    await msg.answer(f"✅ Порог предупреждений установлен: {n}.")
+    text = await _group_panel_text(bot, config, target)
+    await _replace_panel(bot, state, msg.chat.id, text, reply_markup=kb_group_panel(), parse_mode="HTML")
+
+
+@router.callback_query(F.data == "modp_cancel")
+async def cb_private_mod_cancel(cb: CallbackQuery, bot: Bot, state: FSMContext, config: ModeratorConfig):
+    chat_id = _panel_chat_id(cb)
+    if chat_id is None:
+        await cb.answer(); return
+    await cb.answer()
+    data = await state.get_data()
+    target = data.get("selected_group")
+    # Review-found: rendering the group panel here without re-checking admin
+    # status leaked that group's rights status + full stopwords list to a
+    # user whose admin rights were revoked (or who was kicked) mid-flow — the
+    # one screen in this section that skipped the "every sub-action
+    # re-verifies live admin status" rule the whole flow is built on.
+    still_admin = target is not None and await _is_group_admin(bot, target, cb.from_user.id)
+    if still_admin:
+        await _clear_flow_keep_panel_and_group(state)
+        text = await _group_panel_text(bot, config, target)
+        await _replace_panel(bot, state, chat_id, text, reply_markup=kb_group_panel(), parse_mode="HTML")
+    else:
+        await _clear_flow_keep_panel(state)
+        await _replace_panel(bot, state, chat_id, "Отменено.")
+
 
 @router.callback_query(F.data == "mod_admins")
 async def cb_admins(cb: CallbackQuery, bot: Bot, state: FSMContext, config: ModeratorConfig):
@@ -1358,8 +1785,28 @@ async def cb_admin_cancel(cb: CallbackQuery, bot: Bot, state: FSMContext, config
 
 @router.message(Command("cancel"), F.chat.type == "private", StateFilter("*"))
 async def cmd_private_cancel(msg: Message, bot: Bot, state: FSMContext, config: ModeratorConfig):
-    if await state.get_state() is None:
+    current_state = await state.get_state()
+    if current_state is None:
         await msg.answer("Нечего отменять."); return
+    # A raw /cancel mid a per-group sub-flow (add/remove word, set threshold)
+    # must return to THAT group's panel, not unconditionally fall through to
+    # the admins panel below — same distinction _clear_flow_keep_panel_and_group
+    # vs _clear_flow_keep_panel draws elsewhere in this section.
+    if current_state in _PRIVATE_GROUP_FLOW_STATES:
+        data = await state.get_data()
+        target = data.get("selected_group")
+        # Same re-check as cb_private_mod_cancel — showing the group panel
+        # here without it would leak that group's rights/stopwords to a user
+        # whose admin status was revoked mid-flow.
+        still_admin = target is not None and await _is_group_admin(bot, target, msg.from_user.id)
+        await msg.answer("Отменено.")
+        if still_admin:
+            await _clear_flow_keep_panel_and_group(state)
+            text = await _group_panel_text(bot, config, target)
+            await _replace_panel(bot, state, msg.chat.id, text, reply_markup=kb_group_panel(), parse_mode="HTML")
+        else:
+            await _clear_flow_keep_panel(state)
+        return
     is_admin = _is_bot_admin(msg.from_user.id, config)
     await _clear_flow_keep_panel(state)
     await msg.answer("Отменено.")
