@@ -15,8 +15,19 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from config import ASSEMBLYAI_API_KEY
-from db.database import delete_bot, get_all_bots, get_bot, get_bot_by_name, update_bot_status, update_bot_username
+from db.database import (
+    delete_bot,
+    disable_bot_feature,
+    enable_bot_feature,
+    get_all_bots,
+    get_bot,
+    get_bot_by_name,
+    get_bot_features,
+    update_bot_status,
+    update_bot_username,
+)
 from handlers.admin_manager import _is_owner
+from runtime.registry import discover_features, infer_template_id
 from services.bot_runner import _make_extra_env, get_bot_logs, is_running, start_bot, stop_bot
 from services.claude_service import fix_bot_code, generate_bot_code, improve_bot_code
 from services.github_sync import push_bot_to_github
@@ -31,6 +42,17 @@ _BUSY_TEXT = "⏳ Для этого бота уже выполняется оп�
 # Guards recreate/autofix/fixbug (expensive Claude calls + file writes) against
 # a double click starting a second call for the same bot before the first finishes.
 _busy_bots: set[int] = set()
+
+# The live webhook Registry, set once by runtime/combined_app.py's bootstrap —
+# same pattern as handlers/create_bot.py's own _registry/set_registry(). Needed
+# so toggling a feature can call reload_one(bot_id) and have it take effect
+# immediately, instead of only on the next full registry rebuild.
+_registry = None
+
+
+def set_registry(registry) -> None:
+    global _registry
+    _registry = registry
 
 
 class FixBotStates(StatesGroup):
@@ -108,6 +130,9 @@ def _bot_keyboard(bot_id: int) -> InlineKeyboardMarkup:
     ])
     rows.append([
         InlineKeyboardButton(text="🔄 Перегенерировать (немного улучшим код)", callback_data=f"recreate:{bot_id}"),
+    ])
+    rows.append([
+        InlineKeyboardButton(text="🧩 Фичи", callback_data=f"features:{bot_id}"),
     ])
     rows.append([
         InlineKeyboardButton(text="◀ К списку", callback_data="list"),
@@ -285,6 +310,94 @@ async def cb_info(callback: CallbackQuery):
         parse_mode="HTML",
         reply_markup=_bot_keyboard(bot_id),
     )
+
+
+def _features_keyboard(bot_id: int, compatible: list[dict], enabled: set[str]) -> InlineKeyboardMarkup:
+    rows = []
+    for feature in compatible:
+        name = feature["name"]
+        icon = "✅" if name in enabled else "⬜"
+        rows.append([
+            InlineKeyboardButton(text=f"{icon} {name}", callback_data=f"togglefeature:{bot_id}:{name}"),
+        ])
+    rows.append([InlineKeyboardButton(text="◀ Назад", callback_data=f"info:{bot_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _compatible_features(template_id: str | None) -> list[dict]:
+    """Features whose # COMPATIBLE_WITH: header explicitly lists this bot's
+    template_id — never "all" (see runtime/registry.py's discover_features()),
+    so a bot with an unrecognized/missing template_id simply has none."""
+    return [f for f in discover_features() if template_id in f["compatible_with"]]
+
+
+@router.callback_query(F.data.startswith("features:"))
+async def cb_features_list(callback: CallbackQuery):
+    if not _is_owner(callback.from_user.id):
+        await _deny_callback(callback)
+        return
+    await callback.answer()
+    bot_id = int(callback.data.split(":")[1])
+    b = await get_bot(bot_id)
+    if not b:
+        await callback.message.answer("Бот не найден.")
+        return
+    template_id = infer_template_id(b.get("file_path"))
+    compatible = await _compatible_features(template_id)
+    enabled = set(await get_bot_features(bot_id))
+    text = "🧩 <b>Фичи для этого бота</b> — нажми, чтобы включить/выключить:"
+    if not compatible:
+        text = "🧩 Для этого бота пока нет доступных фич (нет совместимых по шаблону)."
+    await _edit_or_resend(
+        callback, text, parse_mode="HTML", reply_markup=_features_keyboard(bot_id, compatible, enabled)
+    )
+
+
+@router.callback_query(F.data.startswith("togglefeature:"))
+async def cb_toggle_feature(callback: CallbackQuery):
+    if not _is_owner(callback.from_user.id):
+        await _deny_callback(callback)
+        return
+    _, bot_id_str, feature_name = callback.data.split(":", 2)
+    bot_id = int(bot_id_str)
+    if bot_id in _busy_bots:
+        await callback.answer(_BUSY_TEXT, show_alert=True)
+        return
+    _busy_bots.add(bot_id)
+    try:
+        b = await get_bot(bot_id)
+        if not b:
+            await callback.answer("Бот не найден.", show_alert=True)
+            return
+        template_id = infer_template_id(b.get("file_path"))
+        feature = next((f for f in discover_features() if f["name"] == feature_name), None)
+        if feature is None:
+            await callback.answer("Фича не найдена.", show_alert=True)
+            return
+        enabled = set(await get_bot_features(bot_id))
+        is_enabled = feature_name in enabled
+        if not is_enabled and template_id not in feature["compatible_with"]:
+            await callback.answer("⛔ Эта фича не подходит шаблону этого бота.", show_alert=True)
+            return
+        if is_enabled:
+            await disable_bot_feature(bot_id, feature_name)
+        else:
+            await enable_bot_feature(bot_id, feature_name)
+        if _registry is not None:
+            await _registry.reload_one(bot_id)
+        else:
+            logger.debug(f"cb_toggle_feature: no live registry available — bot_id={bot_id} feature={feature_name!r} toggled in DB only")
+        await callback.answer("✅ Включено" if not is_enabled else "🔴 Выключено")
+        compatible = await _compatible_features(template_id)
+        new_enabled = set(await get_bot_features(bot_id))
+        await _edit_or_resend(
+            callback,
+            "🧩 <b>Фичи для этого бота</b> — нажми, чтобы включить/выключить:",
+            parse_mode="HTML",
+            reply_markup=_features_keyboard(bot_id, compatible, new_enabled),
+        )
+    finally:
+        _busy_bots.discard(bot_id)
 
 
 @router.callback_query(F.data.startswith("start:"))

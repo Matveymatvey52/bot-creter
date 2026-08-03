@@ -1,4 +1,4 @@
-"""Test-only fixture template — exercises services/payments.py the way a real
+"""Test-only fixture template — exercises features/payments.py the way a real
 template would, without being a real template (deliberately NOT in templates/,
 so it is never picked up by discover_templates()/the registry). booking_fitness
 does not exist yet; this fixture stands in for "some template that sells
@@ -15,7 +15,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.types import LabeledPrice, Message
 
-from services.payments import (
+from features.payments import (
     create_invoice,
     init_payments_tables,
     on_pre_checkout_query,

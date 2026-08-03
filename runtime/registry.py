@@ -21,7 +21,7 @@ from aiogram import BaseMiddleware, Bot, Dispatcher, Router
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import TelegramObject
 
-from db.database import get_all_bots, get_bot
+from db.database import get_all_bots, get_bot, get_bot_features
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +50,49 @@ def infer_template_id(file_path: str | None) -> str | None:
         return None
     m = _TEMPLATE_MARKER_RE.search(head)
     return m.group(1) if m else None
+
+
+_FEATURES_DIR = Path(__file__).parent.parent / "features"
+_FEATURE_HEADER_MAX_LINES = 10
+_FEATURE_LINE_RE = re.compile(r"^#\s*FEATURE:\s*(\S+)", re.MULTILINE)
+_COMPATIBLE_WITH_RE = re.compile(r"^#\s*COMPATIBLE_WITH:\s*(.+)$", re.MULTILINE)
+
+
+def discover_features() -> list[dict[str, Any]]:
+    """Scans features/*.py for '# FEATURE: <name>' / '# COMPATIBLE_WITH: <template_id,
+    template_id, ...>' header comments and returns [{"name": ..., "compatible_with":
+    [...]}, ...] for every file that has both. Deliberately a SEPARATE parser from
+    services/claude_service.py's discover_templates() (copied pattern, not shared code
+    — see feature-modules-inventory findings): that function lives in LLM-prompt
+    territory and its USE FOR: is free text for a model to read, while COMPATIBLE_WITH:
+    here is a strict, explicit list of template_id's checked programmatically before a
+    feature can be enabled for a bot — no "all" sentinel, by design (adding a 13th
+    template must never silently make it compatible with every existing feature).
+
+    A file missing either marker (or unreadable) is skipped with a warning, not fatal.
+    Files whose name starts with "_" are skipped silently — same convention as
+    discover_templates(), for the same reason (a future features/_common.py helper
+    module shouldn't warn on every call)."""
+    results: list[dict[str, Any]] = []
+    if not _FEATURES_DIR.exists():
+        return results
+    for path in sorted(_FEATURES_DIR.glob("*.py")):
+        if path.stem.startswith("_"):
+            continue
+        try:
+            with path.open(encoding="utf-8") as f:
+                head = "".join(next(f, "") for _ in range(_FEATURE_HEADER_MAX_LINES))
+        except (OSError, UnicodeDecodeError) as e:
+            logger.warning(f"discover_features: could not read {path.name}: {e}")
+            continue
+        name_match = _FEATURE_LINE_RE.search(head)
+        compat_match = _COMPATIBLE_WITH_RE.search(head)
+        if not name_match or not compat_match:
+            logger.warning(f"discover_features: {path.name} missing # FEATURE:/# COMPATIBLE_WITH: header — skipped")
+            continue
+        compatible_with = [t.strip() for t in compat_match.group(1).split(",") if t.strip()]
+        results.append({"name": name_match.group(1), "compatible_with": compatible_with})
+    return results
 
 
 # Some templates read an env var at MODULE IMPORT TIME to decide their own
@@ -143,6 +186,28 @@ async def _load_template_module_async(template_id: str) -> ModuleType | None:
     return module
 
 
+_feature_module_cache: dict[str, ModuleType] = {}
+
+
+async def _load_feature_module_async(feature_name: str) -> ModuleType | None:
+    """Async counterpart of _load_template_module_async, for features/<feature_name>.py.
+    Same event-loop-safety rationale: importlib.import_module() blocks, and a feature's
+    first import must not stall the shared combined_app.py event loop long enough to
+    blow another bot's answerPreCheckoutQuery window. Separate cache from
+    _template_module_cache — feature_name and template_id are different namespaces, a
+    name collision between the two must never resolve to the same cached module."""
+    if feature_name in _feature_module_cache:
+        return _feature_module_cache[feature_name]
+    loop = asyncio.get_running_loop()
+    try:
+        module = await loop.run_in_executor(None, importlib.import_module, f"features.{feature_name}")
+    except Exception:
+        logger.exception(f"_load_feature_module_async: failed to import features.{feature_name}")
+        return None
+    _feature_module_cache[feature_name] = module
+    return module
+
+
 def _clone_router(source: Router) -> Router:
     """Returns a fresh Router carrying the same handler registrations as `source`.
 
@@ -198,7 +263,7 @@ class ConfigMiddleware(BaseMiddleware):
         return await handler(event, data)
 
 
-async def _build_generic_middleware(bot_row: dict[str, Any], module: ModuleType) -> BaseMiddleware:
+async def _build_generic_middleware(bot_row: dict[str, Any], module: ModuleType) -> tuple[BaseMiddleware, Any]:
     """Generalizes what used to be five near-identical _build_*_middleware
     functions (one per template) into one, using the same by-convention
     attribute names _load_template_module relies on: config_from_bot_row,
@@ -214,12 +279,59 @@ async def _build_generic_middleware(bot_row: dict[str, Any], module: ModuleType)
     idempotent (CREATE TABLE IF NOT EXISTS), safe to call on every
     registration/reload. If it raises, build_entry()'s caller
     (add_or_replace/reload_all) already wraps this in try/except — the bot
-    simply doesn't get registered."""
+    simply doesn't get registered.
+
+    Returns (middleware, typed_config) rather than just the middleware —
+    build_entry() needs the typed config's own .db_path to hand to any feature
+    modules enabled for this bot (see _load_and_include_features), since
+    features intentionally reuse the host template's own per-bot db_path
+    (feature-modules-inventory decision: additional tables in the existing
+    db_path, not a separate db file per feature)."""
     from config import DATA_DIR
 
     config = module.config_from_bot_row(bot_row, DATA_DIR)
     await module.init_db(config.db_path)
-    return module.ConfigMiddleware(config)
+    return module.ConfigMiddleware(config), config
+
+
+async def _load_and_include_features(dp: Dispatcher, bot_id: int, db_path: str) -> None:
+    """Loads and wires every feature enabled for this bot (db/database.py's
+    bot_features table) into its Dispatcher, the same clone-then-include_router
+    pattern as the main template (see _clone_router). Each feature is isolated
+    in its own try/except — one broken/misconfigured feature module must not
+    take the bot's main template down with it (unlike an unresolved
+    template_id, which already aborts the whole build_entry() call via the
+    caller's try/except in add_or_replace()/reload_all()).
+
+    A bot with no enabled features (the overwhelming majority, at least until
+    this system sees adoption) costs one extra DB query and nothing else —
+    get_bot_features() returns an empty list and this loop body never runs."""
+    feature_names = await get_bot_features(bot_id)
+    for feature_name in feature_names:
+        try:
+            module = await _load_feature_module_async(feature_name)
+            if module is None:
+                logger.warning(
+                    f"_load_and_include_features: bot_id={bot_id} feature={feature_name!r} "
+                    "failed to import — skipped, bot continues without it"
+                )
+                continue
+            init_db = getattr(module, "init_db", None)
+            if init_db is not None:
+                await init_db(db_path)
+            raw_router = getattr(module, "router", None)
+            if raw_router is None:
+                logger.warning(
+                    f"_load_and_include_features: bot_id={bot_id} feature={feature_name!r} "
+                    "module has no 'router' attribute — skipped"
+                )
+                continue
+            dp.include_router(_clone_router(raw_router))
+        except Exception:
+            logger.exception(
+                f"_load_and_include_features: bot_id={bot_id} feature={feature_name!r} "
+                "raised while loading — skipped, bot continues without it"
+            )
 
 
 @dataclass
@@ -287,7 +399,11 @@ async def build_entry(
             "fixed or a matching template is added"
         )
 
-    middleware = await _build_generic_middleware(config, module) if module is not None else ConfigMiddleware(config)
+    typed_config = None
+    if module is not None:
+        middleware, typed_config = await _build_generic_middleware(config, module)
+    else:
+        middleware = ConfigMiddleware(config)
     dp.update.outer_middleware(middleware)
 
     router = None
@@ -308,6 +424,12 @@ async def build_entry(
             router = _clone_router(raw_router)
     if router is not None:
         dp.include_router(router)
+
+    # Feature routers ride on top of an already-working template — no db_path
+    # to give them (and nothing meaningful to attach to) if the template itself
+    # never resolved.
+    if typed_config is not None:
+        await _load_and_include_features(dp, bot_id, typed_config.db_path)
 
     return BotEntry(bot=bot, dispatcher=dp, template_id=template_id, config=config)
 
