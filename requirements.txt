@@ -6,3 +6,4 @@ assemblyai==0.64.31
 openpyxl==3.1.5
 aiohttp==3.10.11
 cryptography==49.0.0
+gspread==6.2.1

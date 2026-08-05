@@ -4,6 +4,7 @@ import asyncio
 import functools
 import html
 import logging
+import re
 import tempfile
 from pathlib import Path
 
@@ -23,9 +24,12 @@ from db.database import (
     get_bot,
     get_bot_by_name,
     get_bot_features,
+    get_bot_sheets_config,
+    set_bot_sheets_config,
     update_bot_status,
     update_bot_username,
 )
+from features.sheets import get_service_account_email, verify_access
 from handlers.admin_manager import _is_owner
 from runtime.registry import discover_features, infer_template_id
 from services.bot_runner import _make_extra_env, get_bot_logs, is_running, start_bot, stop_bot
@@ -57,6 +61,10 @@ def set_registry(registry) -> None:
 
 class FixBotStates(StatesGroup):
     describing_bug = State()
+
+
+class SheetsConnectFlow(StatesGroup):
+    waiting_for_link = State()
 
 router = Router()
 
@@ -312,7 +320,9 @@ async def cb_info(callback: CallbackQuery):
     )
 
 
-def _features_keyboard(bot_id: int, compatible: list[dict], enabled: set[str]) -> InlineKeyboardMarkup:
+def _features_keyboard(
+    bot_id: int, compatible: list[dict], enabled: set[str], sheets_config: dict | None = None
+) -> InlineKeyboardMarkup:
     rows = []
     for feature in compatible:
         name = feature["name"]
@@ -320,6 +330,22 @@ def _features_keyboard(bot_id: int, compatible: list[dict], enabled: set[str]) -
         rows.append([
             InlineKeyboardButton(text=f"{icon} {name}", callback_data=f"togglefeature:{bot_id}:{name}"),
         ])
+        # "sheets" needs a spreadsheet_id per bot beyond a plain on/off toggle
+        # (unlike payments, which is wired factory-side against the DB with
+        # no button UI at all — see sheets-feature-inventory) — this second
+        # row only appears once the feature itself is enabled.
+        if name == "sheets" and name in enabled:
+            label = "📊 Подключить Google Таблицу"
+            if sheets_config:
+                # Telegram caps inline button text at 64 chars — a real
+                # spreadsheet title (unbounded, comes from Google) can
+                # easily blow that and make edit_text/send raise
+                # BUTTON_TEXT_INVALID on every future render of this panel.
+                shown = sheets_config["sheet_title"] or sheets_config["spreadsheet_id"]
+                if len(shown) > 30:
+                    shown = shown[:29] + "…"
+                label = f"📊 Таблица: {shown} (изменить)"
+            rows.append([InlineKeyboardButton(text=label, callback_data=f"sheetsconnect:{bot_id}")])
     rows.append([InlineKeyboardButton(text="◀ Назад", callback_data=f"info:{bot_id}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -345,11 +371,15 @@ async def cb_features_list(callback: CallbackQuery):
     template_id = infer_template_id(b.get("file_path"))
     compatible = await _compatible_features(template_id)
     enabled = set(await get_bot_features(bot_id))
+    sheets_config = await get_bot_sheets_config(bot_id) if "sheets" in enabled else None
     text = "🧩 <b>Фичи для этого бота</b> — нажми, чтобы включить/выключить:"
     if not compatible:
         text = "🧩 Для этого бота пока нет доступных фич (нет совместимых по шаблону)."
     await _edit_or_resend(
-        callback, text, parse_mode="HTML", reply_markup=_features_keyboard(bot_id, compatible, enabled)
+        callback,
+        text,
+        parse_mode="HTML",
+        reply_markup=_features_keyboard(bot_id, compatible, enabled, sheets_config),
     )
 
 
@@ -390,14 +420,162 @@ async def cb_toggle_feature(callback: CallbackQuery):
         await callback.answer("✅ Включено" if not is_enabled else "🔴 Выключено")
         compatible = await _compatible_features(template_id)
         new_enabled = set(await get_bot_features(bot_id))
+        new_sheets_config = await get_bot_sheets_config(bot_id) if "sheets" in new_enabled else None
         await _edit_or_resend(
             callback,
             "🧩 <b>Фичи для этого бота</b> — нажми, чтобы включить/выключить:",
             parse_mode="HTML",
-            reply_markup=_features_keyboard(bot_id, compatible, new_enabled),
+            reply_markup=_features_keyboard(bot_id, compatible, new_enabled, new_sheets_config),
         )
     finally:
         _busy_bots.discard(bot_id)
+
+
+_SPREADSHEET_ID_RE = re.compile(r"/d/([a-zA-Z0-9_-]{20,})")
+_BARE_SPREADSHEET_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{20,}$")
+
+
+def _parse_spreadsheet_id(text: str) -> str | None:
+    text = text.strip()
+    m = _SPREADSHEET_ID_RE.search(text)
+    if m:
+        return m.group(1)
+    if _BARE_SPREADSHEET_ID_RE.match(text):
+        return text
+    return None
+
+
+_SHEETS_CONNECT_TEXT_TEMPLATE = (
+    "📊 <b>Подключение Google Таблицы</b>\n\n"
+    "⚠️ Доступ к таблице получит <b>общий сервисный аккаунт фабрики</b> — "
+    "один и тот же для ВСЕХ ботов на этой платформе, а не отдельный робот "
+    "лично под твоего бота. Он уже имеет доступ ко всем таблицам, которые "
+    "расшарили другие владельцы ботов через эту же фабрику. Если это "
+    "неприемлемо (например, в таблице чувствительные данные) — не "
+    "подключай её сюда.\n\n"
+    "Как подключить:\n"
+    "1. Открой свою Google Таблицу → «Настройки доступа» → «Добавить пользователей».\n"
+    "2. Вставь этот email, выдай роль «Редактор»:\n"
+    "<code>{sa_email}</code>\n"
+    "3. Пришли сюда ссылку на таблицу.\n\n"
+    "Для отмены — кнопка ниже."
+)
+
+
+def _sheets_cancel_keyboard(bot_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data=f"sheetscancel:{bot_id}")]
+    ])
+
+
+async def _back_to_features_panel(bot_id: int, edit_target) -> None:
+    b = await get_bot(bot_id)
+    if not b:
+        await edit_target.answer("Бот не найден.")
+        return
+    template_id = infer_template_id(b.get("file_path"))
+    compatible = await _compatible_features(template_id)
+    enabled = set(await get_bot_features(bot_id))
+    sheets_config = await get_bot_sheets_config(bot_id) if "sheets" in enabled else None
+    await edit_target.answer(
+        "🧩 <b>Фичи для этого бота</b> — нажми, чтобы включить/выключить:",
+        parse_mode="HTML",
+        reply_markup=_features_keyboard(bot_id, compatible, enabled, sheets_config),
+    )
+
+
+@router.callback_query(F.data.startswith("sheetsconnect:"))
+async def cb_sheets_connect_start(callback: CallbackQuery, state: FSMContext):
+    if not _is_owner(callback.from_user.id):
+        await _deny_callback(callback)
+        return
+    await callback.answer()
+    bot_id = int(callback.data.split(":")[1])
+    sa_email = await get_service_account_email()
+    if not sa_email:
+        await callback.message.answer(
+            "⚠️ Фича sheets не настроена на сервере (нет GOOGLE_SHEETS_SA_KEY_PATH). "
+            "Обратитесь к администратору фабрики."
+        )
+        return
+    await state.set_state(SheetsConnectFlow.waiting_for_link)
+    await state.update_data(bot_id=bot_id)
+    await _edit_or_resend(
+        callback,
+        _SHEETS_CONNECT_TEXT_TEMPLATE.format(sa_email=sa_email),
+        parse_mode="HTML",
+        reply_markup=_sheets_cancel_keyboard(bot_id),
+    )
+
+
+@router.callback_query(F.data.startswith("sheetscancel:"))
+async def cb_sheets_connect_cancel(callback: CallbackQuery, state: FSMContext):
+    if not _is_owner(callback.from_user.id):
+        await _deny_callback(callback)
+        return
+    await callback.answer()
+    bot_id = int(callback.data.split(":")[1])
+    await state.clear()
+    await _back_to_features_panel(bot_id, callback.message)
+
+
+@router.message(SheetsConnectFlow.waiting_for_link, F.text, ~F.text.startswith("/"))
+async def msg_sheets_connect_link(message: Message, state: FSMContext):
+    if not _is_owner(message.from_user.id):
+        return
+    data = await state.get_data()
+    bot_id = data.get("bot_id")
+    if bot_id is None:
+        await state.clear()
+        return
+    spreadsheet_id = _parse_spreadsheet_id(message.text)
+    if spreadsheet_id is None:
+        await message.answer(
+            "⚠️ Не похоже на ссылку или ID Google Таблицы. Пришли ссылку вида "
+            "https://docs.google.com/spreadsheets/d/.../ или сам ID."
+        )
+        return
+    if bot_id in _busy_bots:
+        await message.answer(_BUSY_TEXT)
+        return
+    _busy_bots.add(bot_id)
+    try:
+        sa_email = await get_service_account_email()
+        title = await verify_access(spreadsheet_id)
+
+        # verify_access() is a slow network round trip — the owner could tap
+        # "❌ Отмена" (or start connecting a different bot) while it's in
+        # flight. Re-check the FSM is still exactly where we left it before
+        # writing anything or claiming success against a screen the owner
+        # has already navigated away from.
+        current_state = await state.get_state()
+        current_data = await state.get_data()
+        if current_state != SheetsConnectFlow.waiting_for_link.state or current_data.get("bot_id") != bot_id:
+            logger.info(f"msg_sheets_connect_link: bot_id={bot_id} flow state changed during verify_access — discarding result")
+            return
+
+        if title is None:
+            await message.answer(
+                f"⚠️ Не удалось открыть таблицу. Либо ссылка/ID неверны, либо доступ ещё "
+                f"не выдан {sa_email}. Проверь и пришли ссылку ещё раз, либо нажми ❌ Отмена."
+            )
+            return
+        await set_bot_sheets_config(bot_id, spreadsheet_id, title)
+        await state.clear()
+        await message.answer(
+            f"✅ Подключено: «{title}». Бот теперь может читать и писать в эту таблицу "
+            "через общий сервисный аккаунт фабрики."
+        )
+        await _back_to_features_panel(bot_id, message)
+    finally:
+        _busy_bots.discard(bot_id)
+
+
+@router.message(SheetsConnectFlow.waiting_for_link)
+async def msg_sheets_connect_invalid(message: Message) -> None:
+    if not _is_owner(message.from_user.id):
+        return
+    await message.answer("Пришли ссылку на Google Таблицу текстом, либо нажми ❌ Отмена.")
 
 
 @router.callback_query(F.data.startswith("start:"))

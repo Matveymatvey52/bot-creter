@@ -125,6 +125,14 @@ async def init_db():
                 PRIMARY KEY (bot_id, feature_name)
             )
         """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS bot_sheets_config (
+                bot_id         INTEGER PRIMARY KEY REFERENCES bots(id),
+                spreadsheet_id TEXT NOT NULL,
+                sheet_title    TEXT,
+                connected_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         await db.commit()
     await migrate_encrypt_tokens()
 
@@ -250,6 +258,7 @@ async def delete_bot(bot_id: int) -> None:
         # so a deleted bot doesn't leave its payment provider credential behind.
         await db.execute("DELETE FROM bot_payment_providers WHERE bot_id = ?", (bot_id,))
         await db.execute("DELETE FROM bot_features WHERE bot_id = ?", (bot_id,))
+        await db.execute("DELETE FROM bot_sheets_config WHERE bot_id = ?", (bot_id,))
         await db.commit()
 
 
@@ -302,6 +311,35 @@ async def disable_bot_feature(bot_id: int, feature_name: str) -> None:
         )
         await db.commit()
     logger.info(f"disable_bot_feature: feature_name={feature_name!r} disabled for bot_id={bot_id}")
+
+
+async def set_bot_sheets_config(bot_id: int, spreadsheet_id: str, sheet_title: str | None) -> None:
+    """Upserts this bot's connected Google Sheet — 1:1 with bots.id, same
+    ON CONFLICT pattern as set_bot_payment_provider. No credential here: the
+    Service Account key is a shared factory-side secret (config.py's
+    GOOGLE_SHEETS_SA_KEY_PATH), not a per-bot DB column."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO bot_sheets_config (bot_id, spreadsheet_id, sheet_title) VALUES (?, ?, ?)
+            ON CONFLICT(bot_id) DO UPDATE SET spreadsheet_id = excluded.spreadsheet_id,
+                sheet_title = excluded.sheet_title, connected_at = CURRENT_TIMESTAMP
+            """,
+            (bot_id, spreadsheet_id, sheet_title),
+        )
+        await db.commit()
+    logger.info(f"set_bot_sheets_config: bot_id={bot_id} spreadsheet_id={spreadsheet_id}")
+
+
+async def get_bot_sheets_config(bot_id: int) -> dict | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT spreadsheet_id, sheet_title, connected_at FROM bot_sheets_config WHERE bot_id = ?",
+            (bot_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else None
 
 
 async def get_bot_features(bot_id: int) -> list[str]:
