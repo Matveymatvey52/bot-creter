@@ -128,7 +128,7 @@ class DiscoverTemplatesRegressionOnRealTemplates(unittest.TestCase):
         names = {t["name"] for t in found}
         self.assertEqual(
             names,
-            {"accountant", "booking_beauty", "booking_fitness", "booking_medical", "campaign_tracker", "inventory", "manager_secretary", "moderator", "orders_tracker", "referral_program", "tour_operator", "tourist_documents", "trip_manager"},
+            {"accountant", "booking_beauty", "booking_fitness", "booking_medical", "campaign_tracker", "inventory", "manager_secretary", "moderator", "orders_tracker", "referral_program", "shop_catalog", "tour_operator", "tourist_documents", "trip_manager"},
         )
 
     def test_tour_operator_use_for_is_parsed_despite_missing_customize_line(self):
@@ -140,7 +140,7 @@ class DiscoverTemplatesRegressionOnRealTemplates(unittest.TestCase):
 
     def test_prompt_lists_all_real_templates(self):
         prompt = claude_service._build_template_select_prompt()
-        for name in ("accountant", "booking_beauty", "booking_fitness", "booking_medical", "campaign_tracker", "inventory", "manager_secretary", "moderator", "referral_program", "tour_operator", "tourist_documents", "trip_manager"):
+        for name in ("accountant", "booking_beauty", "booking_fitness", "booking_medical", "campaign_tracker", "inventory", "manager_secretary", "moderator", "orders_tracker", "referral_program", "shop_catalog", "tour_operator", "tourist_documents", "trip_manager"):
             self.assertIn(f"- {name} —", prompt)
 
 
