@@ -282,17 +282,31 @@ async def cmd_cancel(message: Message, state: FSMContext):
 
 # ── /create ───────────────────────────────────────────────────────────────────
 
-@router.message(Command("create"))
-async def cmd_create(message: Message, state: FSMContext):
-    _pending.pop(message.from_user.id, None)
+async def _start_create_flow(user_id: int, answer, state: FSMContext) -> None:
+    """Shared by /create (Message) and the "➕ Создать бота" button on /start
+    (CallbackQuery) — callers pass their own user_id and an answer() sink
+    (message.answer / callback.message.answer) so this never reads
+    callback.message.from_user, which is the BOT, not the presser."""
+    _pending.pop(user_id, None)
     await state.clear()
     await state.set_state(CreateBotStates.gathering)
     await state.update_data(conversation=[])
-    await message.answer(
+    await answer(
         "Расскажите, какого бота хотите создать.\n"
         "Опишите его назначение и функции.\n\n"
         "Можно текстом или голосовым сообщением 🎤"
     )
+
+
+@router.message(Command("create"))
+async def cmd_create(message: Message, state: FSMContext):
+    await _start_create_flow(message.from_user.id, message.answer, state)
+
+
+@router.callback_query(F.data == "start_create")
+async def cb_start_create(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await _start_create_flow(callback.from_user.id, callback.message.answer, state)
 
 
 # ── gathering ─────────────────────────────────────────────────────────────────
