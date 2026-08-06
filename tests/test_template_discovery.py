@@ -119,17 +119,18 @@ class DiscoverTemplatesRegressionOnRealTemplates(unittest.TestCase):
     """Regression: all existing templates/*.py files must still be found and
     correctly parsed — including tour_operator.py, whose third header line is
     "# STANDALONE" instead of "# CUSTOMIZE" (a known, accepted format divergence
-    that must not affect TEMPLATE:/USE FOR: parsing). booking_medical and
-    event_manager were each added after this test was first written — every
-    new template added purely by dropping a file into templates/, with zero
-    changes to claude_service.py, needs this set updated to match."""
+    that must not affect TEMPLATE:/USE FOR: parsing). booking_medical,
+    event_manager, debtors, and vehicle_service were each added after this
+    test was first written — every new template added purely by dropping a
+    file into templates/, with zero changes to claude_service.py, needs this
+    set updated to match."""
 
     def test_all_real_templates_are_discovered(self):
         found = claude_service.discover_templates()
         names = {t["name"] for t in found}
         self.assertEqual(
             names,
-            {"accountant", "booking_beauty", "booking_fitness", "booking_medical", "campaign_tracker", "debtors", "event_manager", "inventory", "manager_secretary", "moderator", "orders_tracker", "referral_program", "shop_catalog", "tour_operator", "tourist_documents", "trip_manager"},
+            {"accountant", "booking_beauty", "booking_fitness", "booking_medical", "campaign_tracker", "debtors", "event_manager", "inventory", "manager_secretary", "moderator", "orders_tracker", "referral_program", "shop_catalog", "tour_operator", "tourist_documents", "trip_manager", "vehicle_service"},
         )
 
     def test_tour_operator_use_for_is_parsed_despite_missing_customize_line(self):
