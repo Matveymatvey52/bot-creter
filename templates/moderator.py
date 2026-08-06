@@ -230,6 +230,22 @@ async def init_db(db_path: str):
                 added_at   TEXT DEFAULT (datetime('now','localtime'))
             )
         """)
+        # Tracks which groups have already received the ONE-TIME "напишите мне
+        # /start в личку" fallback notice (see _notify_recipient_privately_
+        # with_group_fallback below) — a Telegram platform limit means a bot
+        # can't DM someone who's never opened a chat with it first, so on
+        # DM failure this template posts that single instruction into the
+        # group instead. Without this table, EVERY subsequent rights-related
+        # event in a group whose admin still hasn't DMed the bot (membership
+        # changes, repeated /checkrights) would post the same notice again,
+        # right back to the group-spam problem this whole feature exists to
+        # avoid.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS dm_fallback_sent (
+                chat_id INTEGER PRIMARY KEY,
+                sent_at TEXT DEFAULT (datetime('now','localtime'))
+            )
+        """)
         await db.commit()
 
 
@@ -270,6 +286,14 @@ async def _known_groups(db_path: str) -> list[tuple[int, str]]:
 #  2. /checkrights — manual re-check at any time.
 #  3. _moderate_safely — explicit failure notice (to admins_file admins, not
 #     the group) if a real moderation action fails at the moment it runs.
+#
+# All three DM the relevant admin(s) privately rather than posting into the
+# group (see _notify_recipient_privately_with_group_fallback) — the owner's
+# requirement is that rights/status notices reach a specific admin, not the
+# whole group. Telegram, however, never lets a bot message-first a user who
+# hasn't opened a chat with it — so #1 and #2 fall back to ONE short group
+# notice ("write me /start first") if that specific DM bounces, tracked in
+# dm_fallback_sent so it's posted at most once per group ever.
 
 RIGHTS_INSTRUCTIONS = (
     "⚠️ <b>У бота недостаточно прав для модерации в этой группе.</b>\n\n"
@@ -306,17 +330,130 @@ def _rights_status_text(member) -> tuple[bool, str]:
     return False, RIGHTS_INSTRUCTIONS
 
 
-async def _check_and_report_rights(bot: Bot, chat_id: int, member, silent_if_ok: bool) -> bool:
-    """Sends the _rights_status_text() result INTO chat_id (the group) —
-    used by the two group-facing mechanisms (on_bot_membership_changed,
-    /checkrights). Returns whether rights are sufficient."""
+DM_UNREACHABLE_FALLBACK_TEXT = (
+    "Не могу написать вам в личку — сначала напишите мне /start в личных "
+    "сообщениях, тогда все уведомления будут приходить только вам."
+)
+
+
+def _is_dm_unreachable_error(e: Exception) -> bool:
+    """True for the Telegram error shapes that specifically mean 'this user
+    can't currently be DMed first' — either they've never opened a chat with
+    the bot (TelegramForbiddenError "bot can't initiate conversation with a
+    user", TelegramBadRequest "chat not found") or they blocked the bot after
+    previously using it (TelegramForbiddenError "bot was blocked by the
+    user" — same practical dead end: Telegram won't deliver anything to them
+    either way, and the admin needs to /start or unblock the bot again
+    before it can reach them). Anything else (rate limits, network errors,
+    server errors) must NOT trigger the group fallback — that would turn a
+    transient blip into unnecessary group spam."""
+    text = str(e).lower()
+    return (
+        "can't initiate conversation" in text
+        or "chat not found" in text
+        or "bot was blocked by the user" in text
+    )
+
+
+async def _claim_dm_fallback_slot(db_path: str, chat_id: int) -> bool:
+    """Atomically claims the one-time group-fallback slot for chat_id —
+    returns True iff THIS call is the one that should actually post the
+    fallback message (a later caller, or one that lost the race, gets
+    False). BEGIN IMMEDIATE takes SQLite's write lock before the read, so a
+    concurrent caller's own BEGIN IMMEDIATE blocks (up to `timeout` below)
+    until this transaction's commit() releases it — same pattern as
+    _apply_escalation's warn/mute/ban race fix elsewhere in this file, and
+    for the same reason: two near-simultaneous rights events for the same
+    group (e.g. "added" immediately followed by "promoted") must never both
+    read the slot as unclaimed.
+
+    The slot is marked claimed BEFORE the group send is attempted (not
+    after) — the only way to guarantee two concurrent callers can't both
+    win. Trade-off: if the send itself then fails (bot kicked mid-send,
+    network error), the slot stays claimed and won't be retried on a later
+    event. Accepted deliberately: the alternative (marking after a
+    successful send) reopens the exact TOCTOU gap this function exists to
+    close, in exchange for guarding against a rarer failure."""
+    async with aiosqlite.connect(db_path, timeout=10) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        row = await (await db.execute(
+            "SELECT 1 FROM dm_fallback_sent WHERE chat_id=?", (chat_id,)
+        )).fetchone()
+        if row is not None:
+            await db.commit()
+            return False
+        await db.execute("INSERT INTO dm_fallback_sent (chat_id) VALUES (?)", (chat_id,))
+        await db.commit()
+    return True
+
+
+async def _forget_dm_fallback_sent(db_path: str, chat_id: int) -> None:
+    """Companion to _forget_known_group — called on the same bot-left/kicked
+    event. Without this, a group the bot was removed from and later re-added
+    to (a different admin, a repurposed group, or the same admin trying
+    again after fixing the DM issue) would inherit the OLD instance's
+    fallback-already-sent state forever, even though this is functionally a
+    fresh membership and deserves its own one-time notice if the new admin
+    also can't be DMed."""
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute("DELETE FROM dm_fallback_sent WHERE chat_id=?", (chat_id,))
+        await db.commit()
+
+
+async def _notify_recipient_privately_with_group_fallback(
+    bot: Bot, config: ModeratorConfig, group_chat_id: int, recipient_id: int, text: str, *, parse_mode: str | None = None,
+) -> None:
+    """DMs `text` to recipient_id. Telegram's platform limit means a bot can
+    never message-first a user who hasn't opened a chat with it — if THAT is
+    why the DM failed, falls back to posting DM_UNREACHABLE_FALLBACK_TEXT
+    into group_chat_id, but only the FIRST time this happens for that group
+    (see _claim_dm_fallback_slot/dm_fallback_sent) so a group whose admin
+    still hasn't DMed the bot doesn't get the same instruction re-posted on
+    every later rights event."""
+    try:
+        await bot.send_message(recipient_id, text, parse_mode=parse_mode)
+        return
+    except TelegramAPIError as e:
+        if not _is_dm_unreachable_error(e):
+            logger.error(f"_notify_recipient_privately_with_group_fallback: DM to {recipient_id} failed (group {group_chat_id}): {e}")
+            return
+        logger.info(
+            f"_notify_recipient_privately_with_group_fallback: DM to {recipient_id} unreachable ({e}) — "
+            f"considering group fallback for chat {group_chat_id}"
+        )
+    except Exception as e:
+        logger.error(f"_notify_recipient_privately_with_group_fallback: unexpected error DMing {recipient_id} (group {group_chat_id}): {e}")
+        return
+
+    try:
+        won_the_slot = await _claim_dm_fallback_slot(config.db_path, group_chat_id)
+    except Exception as e:
+        # Fails CLOSED (no notification at all this time) rather than risking
+        # a duplicate post on a DB hiccup — matches every other failure path
+        # in this function, which logs and gives up rather than guessing.
+        logger.error(f"_notify_recipient_privately_with_group_fallback: failed to check/claim fallback slot for chat {group_chat_id}: {e}")
+        return
+    if not won_the_slot:
+        logger.info(f"_notify_recipient_privately_with_group_fallback: fallback already sent for chat {group_chat_id} — skipping")
+        return
+    try:
+        await bot.send_message(group_chat_id, DM_UNREACHABLE_FALLBACK_TEXT)
+    except Exception as e:
+        logger.error(f"_notify_recipient_privately_with_group_fallback: group fallback to {group_chat_id} also failed: {e}")
+
+
+async def _check_and_report_rights(
+    bot: Bot, config: ModeratorConfig, chat_id: int, member, recipient_id: int, silent_if_ok: bool,
+) -> bool:
+    """DMs the _rights_status_text() result to recipient_id (falling back to
+    a one-time group notice per _notify_recipient_privately_with_group_
+    fallback if that DM can't be delivered) — used by the two group-facing
+    mechanisms (on_bot_membership_changed, /checkrights). Returns whether
+    rights are sufficient."""
     has_rights, text = _rights_status_text(member)
     if has_rights and silent_if_ok:
         return has_rights
-    try:
-        await bot.send_message(chat_id, text, parse_mode="HTML")
-    except Exception as e:
-        logger.error(f"_check_and_report_rights: failed to message chat {chat_id}: {e}")
+    await _notify_recipient_privately_with_group_fallback(bot, config, chat_id, recipient_id, text, parse_mode="HTML")
     return has_rights
 
 
@@ -341,7 +478,19 @@ async def on_bot_membership_changed(update: ChatMemberUpdated, bot: Bot, config:
     "Настройка из личного чата с выбором группы") — every membership change
     either upserts (bot still present: title kept fresh in case the group was
     renamed) or removes (bot left/kicked) this chat's row, so the private-chat
-    picker always reflects groups the bot can currently act in."""
+    picker always reflects groups the bot can currently act in. A removal
+    also clears dm_fallback_sent for the same chat_id (see
+    _forget_dm_fallback_sent) — a later re-add is a fresh membership and
+    deserves its own one-time fallback notice if it hits the same DM problem.
+
+    The rights notice (if any) is DMed to update.from_user — the Telegram
+    user who actually performed this membership change (added the bot,
+    promoted/demoted it), delivered directly in the my_chat_member event
+    itself, so no extra API call is needed to find them. update.from_user is
+    a REQUIRED field on Telegram's my_chat_member update (aiogram's
+    ChatMemberUpdated model enforces this at parse time — a payload missing
+    it would fail validation before ever reaching this handler), so there's
+    no "no actor" case to guard against here."""
     if update.chat.type not in ("group", "supergroup"):
         return
     status = update.new_chat_member.status
@@ -349,14 +498,25 @@ async def on_bot_membership_changed(update: ChatMemberUpdated, bot: Bot, config:
         title = update.chat.title or str(update.chat.id)
         await _upsert_known_group(config.db_path, update.chat.id, title)
         logger.info(f"on_bot_membership_changed: known_groups upsert chat_id={update.chat.id} title={title!r} status={status}")
+        # Only check/report rights while the bot is actually still present —
+        # for a left/kicked event below there is nothing to have rights
+        # OVER anymore. Review-found: with the OLD group-posting behavior
+        # this was harmless (the bot can't post into a group it was just
+        # removed from, so the send silently failed and got logged); but now
+        # that the notice is DMed to update.from_user, running this
+        # unconditionally would successfully deliver a confusing "insufficient
+        # rights" DM to whoever just KICKED the bot.
+        await _check_and_report_rights(
+            bot, config, update.chat.id, update.new_chat_member, update.from_user.id, silent_if_ok=True,
+        )
     elif status in _REMOVED_STATUSES:
         await _forget_known_group(config.db_path, update.chat.id)
+        await _forget_dm_fallback_sent(config.db_path, update.chat.id)
         logger.info(f"on_bot_membership_changed: known_groups forget chat_id={update.chat.id} status={status}")
-    await _check_and_report_rights(bot, update.chat.id, update.new_chat_member, silent_if_ok=True)
 
 
 @router.message(Command("checkrights"), F.chat.type.in_({"group", "supergroup"}))
-async def cmd_checkrights(msg: Message, bot: Bot):
+async def cmd_checkrights(msg: Message, bot: Bot, config: ModeratorConfig):
     if not await _is_group_admin(bot, msg.chat.id, msg.from_user.id):
         await msg.answer("⛔ Команда доступна только администраторам группы.")
         return
@@ -366,7 +526,7 @@ async def cmd_checkrights(msg: Message, bot: Bot):
         logger.error(f"cmd_checkrights: get_chat_member for bot failed in chat {msg.chat.id}: {e}")
         await msg.answer("⚠️ Не удалось проверить права — попробуйте ещё раз позже.")
         return
-    await _check_and_report_rights(bot, msg.chat.id, bot_member, silent_if_ok=False)
+    await _check_and_report_rights(bot, config, msg.chat.id, bot_member, msg.from_user.id, silent_if_ok=False)
 
 
 async def _moderate_safely(bot: Bot, config: ModeratorConfig, chat_id: int, action: str, coro) -> bool:
