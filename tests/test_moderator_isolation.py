@@ -78,7 +78,12 @@ class FakeBotAPI:
     by (chat_id, user_id)), defaulting to a plain non-admin member. Method
     TYPES listed in .fail_methods raise TelegramForbiddenError instead of
     succeeding — simulates the bot losing rights at the moment of a real
-    moderation action (mechanism #3)."""
+    moderation action (mechanism #3). chat_id VALUES listed in
+    .dm_unreachable_chat_ids make a SendMessage TO that chat_id raise
+    TelegramForbiddenError with Telegram's real "can't initiate conversation"
+    wording — simulates a user who has never opened a private chat with the
+    bot (so it can't DM them first), the platform limit the DM-with-group-
+    fallback mechanism exists to work around."""
 
     def __init__(self):
         self.calls: list = []
@@ -86,6 +91,7 @@ class FakeBotAPI:
         self.chat_member_responses: dict[tuple[int, int], object] = {}
         self.fail_methods: set[type] = set()
         self.retry_after_methods: set[type] = set()
+        self.dm_unreachable_chat_ids: set[int] = set()
         self._next_message_id = 1
 
     async def __call__(self, request, **kwargs):
@@ -98,6 +104,9 @@ class FakeBotAPI:
         if type(request) in self.retry_after_methods:
             self.responses.append(None)
             raise TelegramRetryAfter(method=request, message="Too Many Requests: retry later", retry_after=1)
+        if isinstance(request, SendMessage) and request.chat_id in self.dm_unreachable_chat_ids:
+            self.responses.append(None)
+            raise TelegramForbiddenError(method=request, message="Forbidden: bot can't initiate conversation with a user")
         if type(request) in self.fail_methods:
             self.responses.append(None)
             raise TelegramForbiddenError(method=request, message="Forbidden: bot has no rights")
@@ -331,6 +340,26 @@ class ModeratorIsolationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(log_b, 1)  # bot B's own violation from the link above
         self.assertEqual(log_a, 0)  # bot A never processed anything in this chat
 
+    async def test_dm_fallback_sent_not_mixed_between_bots(self):
+        """dm_fallback_sent (the DM-with-group-fallback dedup table) is
+        per-bot data on the same db_path split as every other table above —
+        two bots on the SAME shared chat_id must track the fallback
+        independently, same as stopwords/chat_settings/moderation_log."""
+        SHARED_CHAT = -100777111
+        await moderator._claim_dm_fallback_slot(self.config_a.db_path, SHARED_CHAT)
+
+        claimed_by_b = await moderator._claim_dm_fallback_slot(self.config_b.db_path, SHARED_CHAT)
+        self.assertTrue(claimed_by_b, "bot B's own dm_fallback_sent row must be independent of bot A's")
+
+        conn_a = sqlite3.connect(self.config_a.db_path)
+        count_a = conn_a.execute("SELECT COUNT(*) FROM dm_fallback_sent WHERE chat_id=?", (SHARED_CHAT,)).fetchone()[0]
+        conn_a.close()
+        conn_b = sqlite3.connect(self.config_b.db_path)
+        count_b = conn_b.execute("SELECT COUNT(*) FROM dm_fallback_sent WHERE chat_id=?", (SHARED_CHAT,)).fetchone()[0]
+        conn_b.close()
+        self.assertEqual(count_a, 1)
+        self.assertEqual(count_b, 1)
+
 
 class ModeratorCaptionBypassTests(unittest.IsolatedAsyncioTestCase):
     """Review-found blocker: the antispam filter used to match F.text only, so
@@ -553,9 +582,18 @@ class ModeratorGroupCommandAuthorityTests(unittest.IsolatedAsyncioTestCase):
 class ModeratorRightsMechanism1_MyChatMemberTests(unittest.IsolatedAsyncioTestCase):
     """Mechanism #1: on_bot_membership_changed reacts to ANY status change of
     the bot itself — insufficient rights get instructions (even on the very
-    first "added as plain member" step), sufficient rights stay silent."""
+    first "added as plain member" step), sufficient rights stay silent.
+
+    The rights notice is DMed to whoever performed the change
+    (_my_chat_member_update's hardcoded from_user, id=555 — "the admin who
+    added/promoted the bot"), NOT posted into the group — see
+    docs/STAGE2_DESIGN.md / the owner's DM-first requirement. FakeBotAPI's
+    default SendMessage behavior succeeds, i.e. this simulates that admin
+    having already DMed the bot at least once (real Telegram would otherwise
+    refuse a bot-initiated DM)."""
 
     CHAT_ID = -100444
+    ADDER_ID = 555  # matches _my_chat_member_update's hardcoded from_user id
 
     async def asyncSetUp(self):
         self.fake_api = FakeBotAPI()
@@ -573,14 +611,16 @@ class ModeratorRightsMechanism1_MyChatMemberTests(unittest.IsolatedAsyncioTestCa
         self._tmp.cleanup()
         self._patcher.stop()
 
-    async def test_added_as_plain_member_sends_instructions(self):
+    async def test_added_as_plain_member_sends_instructions_to_adder_privately(self):
         await self.dp.feed_webhook_update(
             self.bot,
             _my_chat_member_update(1, self.CHAT_ID, _bot_user_json("left"), _bot_user_json("member")),
         )
-        texts = self.fake_api.sent_texts(self.CHAT_ID)
-        self.assertEqual(len(texts), 1)
-        self.assertIn("недостаточно прав", texts[0])
+        dm_texts = self.fake_api.sent_texts(self.ADDER_ID)
+        self.assertEqual(len(dm_texts), 1)
+        self.assertIn("недостаточно прав", dm_texts[0])
+        # The group itself must stay untouched — the whole point of DMing.
+        self.assertEqual(self.fake_api.sent_texts(self.CHAT_ID), [])
 
     async def test_promoted_to_full_admin_stays_silent(self):
         await self.dp.feed_webhook_update(
@@ -588,8 +628,9 @@ class ModeratorRightsMechanism1_MyChatMemberTests(unittest.IsolatedAsyncioTestCa
             _my_chat_member_update(1, self.CHAT_ID, _bot_user_json("member"), _bot_user_json("administrator", _FULL_ADMIN_RIGHTS_JSON)),
         )
         self.assertEqual(self.fake_api.sent_texts(self.CHAT_ID), [])
+        self.assertEqual(self.fake_api.sent_texts(self.ADDER_ID), [])
 
-    async def test_demoted_to_partial_admin_rights_sends_instructions_again(self):
+    async def test_demoted_to_partial_admin_rights_sends_instructions_again_privately(self):
         await self.dp.feed_webhook_update(
             self.bot,
             _my_chat_member_update(
@@ -598,9 +639,143 @@ class ModeratorRightsMechanism1_MyChatMemberTests(unittest.IsolatedAsyncioTestCa
                 _bot_user_json("administrator", _PARTIAL_ADMIN_RIGHTS_JSON),
             ),
         )
-        texts = self.fake_api.sent_texts(self.CHAT_ID)
-        self.assertEqual(len(texts), 1)
-        self.assertIn("недостаточно прав", texts[0])
+        dm_texts = self.fake_api.sent_texts(self.ADDER_ID)
+        self.assertEqual(len(dm_texts), 1)
+        self.assertIn("недостаточно прав", dm_texts[0])
+        self.assertEqual(self.fake_api.sent_texts(self.CHAT_ID), [])
+
+    async def test_adder_never_started_bot_falls_back_to_one_group_notice(self):
+        """The owner's personal test scenario never needs this (he always
+        /start's the bot first), but it's the general case for future
+        clients: Telegram refuses a bot-initiated DM to someone who's never
+        opened a chat with it. On that specific failure, exactly ONE short
+        instruction notice goes into the group instead — not the actual
+        rights text."""
+        self.fake_api.dm_unreachable_chat_ids.add(self.ADDER_ID)
+        await self.dp.feed_webhook_update(
+            self.bot,
+            _my_chat_member_update(1, self.CHAT_ID, _bot_user_json("left"), _bot_user_json("member")),
+        )
+        # The DM attempt itself is still recorded in .calls even though it
+        # raised (FakeBotAPI logs the request before checking failure
+        # conditions) — what matters is that it never actually reached the
+        # recipient's chat and that the group got exactly one fallback notice.
+        group_texts = self.fake_api.sent_texts(self.CHAT_ID)
+        self.assertEqual(len(group_texts), 1)
+        self.assertIn("/start", group_texts[0])
+        self.assertIn("личку", group_texts[0])
+
+    async def test_group_fallback_notice_is_never_repeated_for_the_same_group(self):
+        """Requirement: once the fallback notice has been posted for a group,
+        later rights events for that SAME group (DM still failing) must NOT
+        post it again."""
+        self.fake_api.dm_unreachable_chat_ids.add(self.ADDER_ID)
+        await self.dp.feed_webhook_update(
+            self.bot,
+            _my_chat_member_update(1, self.CHAT_ID, _bot_user_json("left"), _bot_user_json("member")),
+        )
+        await self.dp.feed_webhook_update(
+            self.bot,
+            _my_chat_member_update(
+                2, self.CHAT_ID,
+                _bot_user_json("administrator", _FULL_ADMIN_RIGHTS_JSON),
+                _bot_user_json("administrator", _PARTIAL_ADMIN_RIGHTS_JSON),
+            ),
+        )
+        group_texts = self.fake_api.sent_texts(self.CHAT_ID)
+        self.assertEqual(len(group_texts), 1, "the group fallback notice must be posted at most once per group")
+
+    async def test_concurrent_dm_failures_for_same_group_post_fallback_only_once(self):
+        """Review-found race: _dm_fallback_already_sent/_mark_dm_fallback_sent
+        used to be two separate unlocked DB calls — two near-simultaneous
+        rights events for the SAME group (e.g. "added" immediately followed
+        by "promoted") could both pass the check before either committed the
+        row, posting the fallback notice twice. Fired via asyncio.gather to
+        actually interleave at the `await` points inside
+        _notify_recipient_privately_with_group_fallback, not just called
+        sequentially (same technique as the escalation ladder's own
+        concurrency test). Fixed by atomically claiming the slot (BEGIN
+        IMMEDIATE) before the group send — exactly one of the two concurrent
+        calls must win and post, the other must silently skip."""
+        other_recipient_id = self.ADDER_ID + 1
+        self.fake_api.dm_unreachable_chat_ids.add(self.ADDER_ID)
+        self.fake_api.dm_unreachable_chat_ids.add(other_recipient_id)
+        await asyncio.gather(
+            moderator._notify_recipient_privately_with_group_fallback(
+                self.bot, self.config, self.CHAT_ID, self.ADDER_ID, "rights text A", parse_mode="HTML",
+            ),
+            moderator._notify_recipient_privately_with_group_fallback(
+                self.bot, self.config, self.CHAT_ID, other_recipient_id, "rights text B", parse_mode="HTML",
+            ),
+        )
+        group_texts = self.fake_api.sent_texts(self.CHAT_ID)
+        self.assertEqual(len(group_texts), 1, "the group fallback notice must be posted at most once even under concurrent DM failures")
+
+    async def test_bot_leaving_and_rejoining_group_resets_fallback_dedup(self):
+        """_forget_dm_fallback_sent clears the dedup row when the bot leaves a
+        group (see on_bot_membership_changed) — a later re-add is a fresh
+        membership and deserves its own one-time fallback notice if it hits
+        the same DM problem again."""
+        self.fake_api.dm_unreachable_chat_ids.add(self.ADDER_ID)
+        await self.dp.feed_webhook_update(
+            self.bot,
+            _my_chat_member_update(1, self.CHAT_ID, _bot_user_json("left"), _bot_user_json("member")),
+        )
+        self.assertEqual(len(self.fake_api.sent_texts(self.CHAT_ID)), 1)
+
+        # Bot gets kicked — dm_fallback_sent for this chat must be cleared.
+        # (No further rights check/DM fires on this transition itself — see
+        # on_bot_membership_changed's comment on why that would otherwise
+        # confusingly DM whoever just kicked the bot.)
+        await self.dp.feed_webhook_update(
+            self.bot,
+            _my_chat_member_update(2, self.CHAT_ID, _bot_user_json("member"), _bot_user_json("kicked", {"until_date": 0})),
+        )
+        self.assertEqual(len(self.fake_api.sent_texts(self.CHAT_ID)), 1, "leaving the group must not itself trigger another rights DM/fallback")
+
+        # Re-added later, same DM problem — must get a fresh fallback notice.
+        await self.dp.feed_webhook_update(
+            self.bot,
+            _my_chat_member_update(3, self.CHAT_ID, _bot_user_json("left"), _bot_user_json("member")),
+        )
+        self.assertEqual(len(self.fake_api.sent_texts(self.CHAT_ID)), 2, "re-adding the bot after it left must post a fresh fallback notice")
+
+
+class ModeratorDmUnreachableErrorClassificationTests(unittest.TestCase):
+    """Pure unit tests for _is_dm_unreachable_error — no I/O, no Bot/Dispatcher
+    needed. Covers all THREE Telegram error shapes that must trigger the
+    group fallback (never-DMed, blocked-after-DMing, and Telegram's other
+    "chat not found" wording), plus confirms an unrelated failure (rate
+    limiting, a generic server error) must NOT be misclassified as
+    DM-unreachable — that would turn a transient blip into unnecessary group
+    spam."""
+
+    def test_never_initiated_conversation_is_unreachable(self):
+        self.assertTrue(moderator._is_dm_unreachable_error(
+            Exception("Forbidden: bot can't initiate conversation with a user")
+        ))
+
+    def test_chat_not_found_is_unreachable(self):
+        self.assertTrue(moderator._is_dm_unreachable_error(
+            Exception("Bad Request: chat not found")
+        ))
+
+    def test_blocked_by_user_is_unreachable(self):
+        """Review-found gap: an admin who DID /start the bot at some point but
+        later blocked it hits this exact wording, not "can't initiate
+        conversation" — without this, the group would silently never get the
+        fallback notice for a very common real-world case."""
+        self.assertTrue(moderator._is_dm_unreachable_error(
+            Exception("Forbidden: bot was blocked by the user")
+        ))
+
+    def test_unrelated_telegram_error_is_not_unreachable(self):
+        self.assertFalse(moderator._is_dm_unreachable_error(
+            Exception("Too Many Requests: retry later")
+        ))
+        self.assertFalse(moderator._is_dm_unreachable_error(
+            Exception("Internal Server Error")
+        ))
 
 
 class ModeratorRightsMechanism2_CheckRightsCommandTests(unittest.IsolatedAsyncioTestCase):
@@ -639,21 +814,36 @@ class ModeratorRightsMechanism2_CheckRightsCommandTests(unittest.IsolatedAsyncio
         self.assertEqual(gcm_calls[0].user_id, self.NON_ADMIN_ID)
         self.assertTrue(any("⛔" in t for t in self.fake_api.sent_texts(self.CHAT_ID)))
 
-    async def test_admin_caller_bot_insufficient_rights(self):
+    async def test_admin_caller_bot_insufficient_rights_dmed_to_caller_not_group(self):
         self.fake_api.chat_member_responses[(self.CHAT_ID, BOT_USER_ID)] = _plain_member(BOT_USER_ID)
         await self.dp.feed_webhook_update(
             self.bot, _group_text_update(1, self.CHAT_ID, self.GROUP_ADMIN_ID, "/checkrights")
         )
-        texts = self.fake_api.sent_texts(self.CHAT_ID)
-        self.assertTrue(any("недостаточно прав" in t for t in texts))
+        dm_texts = self.fake_api.sent_texts(self.GROUP_ADMIN_ID)
+        self.assertTrue(any("недостаточно прав" in t for t in dm_texts))
+        self.assertEqual(self.fake_api.sent_texts(self.CHAT_ID), [])
 
-    async def test_admin_caller_bot_sufficient_rights(self):
+    async def test_admin_caller_bot_sufficient_rights_dmed_to_caller_not_group(self):
         self.fake_api.chat_member_responses[(self.CHAT_ID, BOT_USER_ID)] = _admin_member(BOT_USER_ID)
         await self.dp.feed_webhook_update(
             self.bot, _group_text_update(1, self.CHAT_ID, self.GROUP_ADMIN_ID, "/checkrights")
         )
-        texts = self.fake_api.sent_texts(self.CHAT_ID)
-        self.assertTrue(any("Всё в порядке" in t for t in texts))
+        dm_texts = self.fake_api.sent_texts(self.GROUP_ADMIN_ID)
+        self.assertTrue(any("Всё в порядке" in t for t in dm_texts))
+        self.assertEqual(self.fake_api.sent_texts(self.CHAT_ID), [])
+
+    async def test_admin_caller_never_started_bot_falls_back_to_one_group_notice(self):
+        self.fake_api.chat_member_responses[(self.CHAT_ID, BOT_USER_ID)] = _plain_member(BOT_USER_ID)
+        self.fake_api.dm_unreachable_chat_ids.add(self.GROUP_ADMIN_ID)
+        await self.dp.feed_webhook_update(
+            self.bot, _group_text_update(1, self.CHAT_ID, self.GROUP_ADMIN_ID, "/checkrights")
+        )
+        # The DM attempt is still recorded in .calls despite raising (see the
+        # mechanism #1 fallback test's comment) — the group's fallback notice
+        # is what actually matters here.
+        group_texts = self.fake_api.sent_texts(self.CHAT_ID)
+        self.assertEqual(len(group_texts), 1)
+        self.assertIn("/start", group_texts[0])
 
 
 class ModeratorRightsMechanism3_RuntimeFailureTests(unittest.IsolatedAsyncioTestCase):
