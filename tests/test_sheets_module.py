@@ -17,8 +17,12 @@ Run with: python -m unittest tests.test_sheets_module
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
+import tempfile
 import time
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import gspread
@@ -152,6 +156,80 @@ class WriteRowDoesNotBlockEventLoopTests(unittest.IsolatedAsyncioTestCase):
             f"regressed (pre-fix) path only took {elapsed_other:.3f}s — "
             "test no longer reproduces the blocking bug",
         )
+
+
+class LoadCredentialsInfoTests(unittest.TestCase):
+    """_load_credentials_info() — GOOGLE_SHEETS_SA_KEY_B64 (in-memory, added
+    because pasting raw JSON through Railway's Console proved unreliable)
+    vs the legacy GOOGLE_SHEETS_SA_KEY_PATH file, and priority between them."""
+
+    FAKE_INFO = {"type": "service_account", "client_email": "fake@example.iam.gserviceaccount.com"}
+
+    def setUp(self):
+        self._b64_patcher = patch.object(sheets_module, "GOOGLE_SHEETS_SA_KEY_B64", None)
+        self._path_patcher = patch.object(sheets_module, "GOOGLE_SHEETS_SA_KEY_PATH", None)
+        self._b64_patcher.start()
+        self._path_patcher.start()
+
+    def tearDown(self):
+        self._path_patcher.stop()
+        self._b64_patcher.stop()
+
+    def test_decodes_b64_env_var_into_credentials_dict(self):
+        b64_value = base64.b64encode(json.dumps(self.FAKE_INFO).encode()).decode()
+        with patch.object(sheets_module, "GOOGLE_SHEETS_SA_KEY_B64", b64_value):
+            self.assertEqual(sheets_module._load_credentials_info(), self.FAKE_INFO)
+
+    def test_invalid_b64_returns_none_instead_of_raising(self):
+        with patch.object(sheets_module, "GOOGLE_SHEETS_SA_KEY_B64", "not valid base64!!!"):
+            self.assertIsNone(sheets_module._load_credentials_info())
+
+    def test_falls_back_to_file_path_when_b64_not_set(self):
+        # Regression: the pre-existing route must keep working unchanged now
+        # that _B64 is checked first.
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(self.FAKE_INFO, f)
+            key_path = f.name
+        try:
+            with patch.object(sheets_module, "GOOGLE_SHEETS_SA_KEY_PATH", key_path):
+                self.assertEqual(sheets_module._load_credentials_info(), self.FAKE_INFO)
+        finally:
+            Path(key_path).unlink(missing_ok=True)
+
+    def test_b64_takes_priority_over_file_path_when_both_are_set(self):
+        b64_info = {**self.FAKE_INFO, "client_email": "from-b64@example.iam.gserviceaccount.com"}
+        b64_value = base64.b64encode(json.dumps(b64_info).encode()).decode()
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(self.FAKE_INFO, f)  # different email — proves which source actually won
+            key_path = f.name
+        try:
+            with patch.object(sheets_module, "GOOGLE_SHEETS_SA_KEY_B64", b64_value), \
+                 patch.object(sheets_module, "GOOGLE_SHEETS_SA_KEY_PATH", key_path):
+                self.assertEqual(sheets_module._load_credentials_info(), b64_info)
+        finally:
+            Path(key_path).unlink(missing_ok=True)
+
+    def test_returns_none_when_neither_is_set(self):
+        self.assertIsNone(sheets_module._load_credentials_info())
+
+
+class GetServiceAccountEmailUsesB64WhenSetTests(unittest.IsolatedAsyncioTestCase):
+    """End-to-end through the async public function, not just the sync helper."""
+
+    async def asyncSetUp(self):
+        sheets_module._sa_email = None  # module-level cache from a previous test/call
+        info = {"type": "service_account", "client_email": "b64-email@example.iam.gserviceaccount.com"}
+        b64_value = base64.b64encode(json.dumps(info).encode()).decode()
+        self._patcher = patch.object(sheets_module, "GOOGLE_SHEETS_SA_KEY_B64", b64_value)
+        self._patcher.start()
+
+    async def asyncTearDown(self):
+        self._patcher.stop()
+        sheets_module._sa_email = None
+
+    async def test_returns_email_decoded_from_b64_var(self):
+        email = await sheets_module.get_service_account_email()
+        self.assertEqual(email, "b64-email@example.iam.gserviceaccount.com")
 
 
 if __name__ == "__main__":

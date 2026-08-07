@@ -5,11 +5,13 @@ the design decisions behind this file.
 
 Unlike features/payments.py, this module has NO Config Protocol and NO
 init_db: it never writes into a host template's own db_path. All state it
-needs is either (a) a shared, factory-wide Service Account credential
-(config.GOOGLE_SHEETS_SA_KEY_PATH — one robot for every bot on the
-platform, not per-bot) or (b) db/database.py's bot_sheets_config table
-(which bot is connected to which spreadsheet_id — factory-side, same tier
-as bot_payment_providers, not host-template data). Callers pass bot_id
+needs is either (a) a shared, factory-wide Service Account credential —
+config.GOOGLE_SHEETS_SA_KEY_B64 (base64 JSON, decoded in memory) if set,
+else config.GOOGLE_SHEETS_SA_KEY_PATH (a key file on disk); see
+_load_credentials_info() — one robot for every bot on the platform, not
+per-bot — or (b) db/database.py's bot_sheets_config table (which bot is
+connected to which spreadsheet_id — factory-side, same tier as
+bot_payment_providers, not host-template data). Callers pass bot_id
 explicitly to every function, exactly like features/payments.py's
 create_invoice(bot, bot_id, ...) — see tests/fixtures/payment_fixture_template.py
 for the established convention of a host template threading its own
@@ -42,13 +44,14 @@ smoke-tested limitation above.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 
 import gspread
 from aiogram import Router
 
-from config import GOOGLE_SHEETS_SA_KEY_PATH
+from config import GOOGLE_SHEETS_SA_KEY_B64, GOOGLE_SHEETS_SA_KEY_PATH
 from db.database import get_bot_sheets_config
 
 logger = logging.getLogger(__name__)
@@ -65,51 +68,66 @@ _client_lock = asyncio.Lock()
 _sa_email: str | None = None
 
 
+def _load_credentials_info() -> dict | None:
+    """Resolves the Service Account credential as a dict, in priority order:
+    GOOGLE_SHEETS_SA_KEY_B64 first (base64 of the JSON key, decoded here in
+    memory and NEVER written to disk — added because pasting the raw JSON key
+    file through Railway's Console proved unreliable while Railway Variables
+    did not), then the legacy GOOGLE_SHEETS_SA_KEY_PATH file, for backward
+    compatibility. Returns None if neither is set, or the one that is set is
+    unreadable/invalid — callers treat that the same as "not configured"."""
+    if GOOGLE_SHEETS_SA_KEY_B64:
+        try:
+            return json.loads(base64.b64decode(GOOGLE_SHEETS_SA_KEY_B64))
+        except (ValueError, json.JSONDecodeError):
+            logger.error("_load_credentials_info: GOOGLE_SHEETS_SA_KEY_B64 is not valid base64/JSON", exc_info=True)
+            return None
+    if not GOOGLE_SHEETS_SA_KEY_PATH:
+        return None
+    try:
+        with open(GOOGLE_SHEETS_SA_KEY_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        logger.error(f"_load_credentials_info: could not read {GOOGLE_SHEETS_SA_KEY_PATH!r}", exc_info=True)
+        return None
+
+
 async def get_service_account_email() -> str | None:
-    """Reads client_email out of the key file — the connect FSM
+    """Reads client_email out of the resolved credential — the connect FSM
     (handlers/manage_bots.py) shows this so the owner knows exactly which
-    account to share their spreadsheet with. Returns None if
-    GOOGLE_SHEETS_SA_KEY_PATH isn't set (same "feature unavailable" signal
-    _get_client() would raise on, but this one is read on every panel
-    render, not just on first use — a missing/unreadable key file must not
-    crash the features panel, just hide the sheets connect option)."""
+    account to share their spreadsheet with. Returns None if no credential
+    is configured/readable (same "feature unavailable" signal _get_client()
+    would raise on, but this one is read on every panel render, not just on
+    first use — an unreadable credential must not crash the features panel,
+    just hide the sheets connect option)."""
     global _sa_email
     if _sa_email is not None:
         return _sa_email
-    if not GOOGLE_SHEETS_SA_KEY_PATH:
+    info = await asyncio.to_thread(_load_credentials_info)
+    if info is None:
         return None
-
-    def _read() -> str | None:
-        try:
-            with open(GOOGLE_SHEETS_SA_KEY_PATH, encoding="utf-8") as f:
-                return json.load(f).get("client_email")
-        except (OSError, json.JSONDecodeError):
-            logger.error(f"get_service_account_email: could not read {GOOGLE_SHEETS_SA_KEY_PATH!r}", exc_info=True)
-            return None
-
-    _sa_email = await asyncio.to_thread(_read)
+    _sa_email = info.get("client_email")
     return _sa_email
 
 
 async def _get_client() -> gspread.Client:
-    """Lazy singleton — built once from the shared Service Account key, then
-    reused for every bot. asyncio.Lock guards against two concurrent callers
-    both building it on first use; gspread.service_account() itself is
-    synchronous (reads+parses the key file), hence the to_thread wrap even
-    for this one-time setup."""
+    """Lazy singleton — built once from the shared Service Account
+    credential, then reused for every bot. asyncio.Lock guards against two
+    concurrent callers both building it on first use; both reading the
+    credential and gspread.service_account_from_dict() are synchronous,
+    hence the to_thread wraps even for this one-time setup."""
     global _client
     if _client is not None:
         return _client
     async with _client_lock:
         if _client is None:
-            if not GOOGLE_SHEETS_SA_KEY_PATH:
+            info = await asyncio.to_thread(_load_credentials_info)
+            if info is None:
                 raise ValueError(
-                    "GOOGLE_SHEETS_SA_KEY_PATH is not set in .env — "
-                    "the sheets feature has no Service Account to act as."
+                    "Neither GOOGLE_SHEETS_SA_KEY_B64 nor GOOGLE_SHEETS_SA_KEY_PATH is set/readable "
+                    "in .env — the sheets feature has no Service Account to act as."
                 )
-            _client = await asyncio.to_thread(
-                gspread.service_account, filename=GOOGLE_SHEETS_SA_KEY_PATH, scopes=_SCOPES
-            )
+            _client = await asyncio.to_thread(gspread.service_account_from_dict, info, scopes=_SCOPES)
     return _client
 
 
