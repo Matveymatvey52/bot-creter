@@ -311,6 +311,176 @@ class OrdersTrackerContactLinkSecurityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(linked, CUSTOMER_TG_ID)
 
 
+class OrdersTrackerSheetsIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    """features/sheets.py integration: a status change writes a row to the
+    connected spreadsheet (if any), and a "📊 Таблица заказов" main-menu
+    button is shown/hidden based on whether bot_sheets_config has a row for
+    this bot_id. get_bot_sheets_config/write_row are patched at the
+    templates.orders_tracker module level (where they were imported) rather
+    than exercising real gspread/network calls — same boundary
+    test_sheets_module.py/test_sheets_connect_flow.py already draw."""
+
+    async def asyncSetUp(self):
+        self._bot_call = AsyncMock(return_value=MagicMock())
+        self._bot_call_patcher = patch.object(Bot, "__call__", new=self._bot_call)
+        self._bot_call_patcher.start()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.data_dir = Path(self._tmp.name)
+        self.config = orders_tracker.config_from_bot_row(
+            {"bot_id": 905, "name": "orders_sheets_bot", "display_name": None, "group_chat_id": None}, self.data_dir
+        )
+        await orders_tracker.init_db(self.config.db_path)
+        self.bot, self.dp = _build_bot_dispatcher(self.config)
+        await self.dp.feed_webhook_update(self.bot, _text_update(1, ADMIN_ID, "/start"))
+
+    async def asyncTearDown(self):
+        self._tmp.cleanup()
+        self._bot_call_patcher.stop()
+
+    async def _order_id(self) -> int:
+        conn = sqlite3.connect(self.config.db_path)
+        order_id = conn.execute("SELECT id FROM orders ORDER BY id DESC LIMIT 1").fetchone()[0]
+        conn.close()
+        return order_id
+
+    def _order_status(self, order_id: int) -> str:
+        conn = sqlite3.connect(self.config.db_path)
+        status = conn.execute("SELECT status FROM orders WHERE id=?", (order_id,)).fetchone()[0]
+        conn.close()
+        return status
+
+    def _last_markup_to(self, chat_id: int):
+        for call in reversed(self._bot_call.call_args_list):
+            request = call.args[0] if call.args else None
+            if getattr(request, "chat_id", None) == chat_id:
+                markup = getattr(request, "reply_markup", None)
+                if markup is not None:
+                    return markup
+        return None
+
+    @patch("templates.orders_tracker.write_row", new_callable=AsyncMock)
+    @patch("templates.orders_tracker.get_bot_sheets_config", new_callable=AsyncMock)
+    async def test_status_change_writes_row_when_sheets_connected(self, mock_get_config, mock_write_row):
+        mock_get_config.return_value = {"spreadsheet_id": "SHEET123", "sheet_title": "Orders", "connected_at": "now"}
+        await _create_order_via_flow(self.dp, self.bot, ADMIN_ID, PHONE, "Widget", "1", 10, customer_name="Ann")
+        order_id = await self._order_id()
+
+        await self.dp.feed_webhook_update(
+            self.bot, _callback_update(100, ADMIN_ID, f"ord_status:{order_id}:in_progress")
+        )
+
+        mock_write_row.assert_awaited_once()
+        bot_id, worksheet, row = mock_write_row.call_args.args
+        self.assertEqual(bot_id, self.config.bot_id)
+        self.assertEqual(worksheet, orders_tracker.SHEETS_WORKSHEET)
+        self.assertEqual(row[0], order_id)
+        self.assertEqual(row[1], orders_tracker.STATUS_LABELS["in_progress"])
+        self.assertEqual(row[2], "Ann")
+        self.assertEqual(row[3], orders_tracker._normalize_phone(PHONE))
+
+    @patch("templates.orders_tracker.write_row", new_callable=AsyncMock)
+    @patch("templates.orders_tracker.get_bot_sheets_config", new_callable=AsyncMock)
+    async def test_status_change_does_not_write_when_sheets_not_connected(self, mock_get_config, mock_write_row):
+        mock_get_config.return_value = None
+        await _create_order_via_flow(self.dp, self.bot, ADMIN_ID, PHONE, "Widget", "1", 10)
+        order_id = await self._order_id()
+
+        await self.dp.feed_webhook_update(
+            self.bot, _callback_update(100, ADMIN_ID, f"ord_status:{order_id}:in_progress")
+        )
+
+        mock_write_row.assert_not_awaited()
+        self.assertEqual(self._order_status(order_id), "in_progress")
+
+    @patch("templates.orders_tracker.write_row", new_callable=AsyncMock)
+    @patch("templates.orders_tracker.get_bot_sheets_config", new_callable=AsyncMock)
+    async def test_sheets_write_failure_does_not_break_status_change(self, mock_get_config, mock_write_row):
+        mock_get_config.return_value = {"spreadsheet_id": "SHEET123", "sheet_title": "Orders", "connected_at": "now"}
+        mock_write_row.side_effect = RuntimeError("gspread boom")
+        await _create_order_via_flow(self.dp, self.bot, ADMIN_ID, PHONE, "Widget", "1", 10)
+        order_id = await self._order_id()
+
+        # Must not raise/propagate — the status change is committed before
+        # the sheets write is even attempted.
+        await self.dp.feed_webhook_update(
+            self.bot, _callback_update(100, ADMIN_ID, f"ord_status:{order_id}:in_progress")
+        )
+
+        self.assertEqual(self._order_status(order_id), "in_progress")
+
+    @patch("templates.orders_tracker.get_bot_sheets_config", new_callable=AsyncMock)
+    async def test_menu_shows_sheet_button_only_when_connected(self, mock_get_config):
+        mock_get_config.return_value = {"spreadsheet_id": "SHEET123", "sheet_title": "Orders", "connected_at": "now"}
+        await self.dp.feed_webhook_update(self.bot, _callback_update(50, ADMIN_ID, "main_menu"))
+        markup = self._last_markup_to(ADMIN_ID)
+        self.assertTrue(any(
+            btn.callback_data == "ord_sheet_link" for row in markup.inline_keyboard for btn in row
+        ), "sheet-connected bot did not show the '📊 Таблица заказов' menu button")
+
+        mock_get_config.return_value = None
+        await self.dp.feed_webhook_update(self.bot, _callback_update(51, ADMIN_ID, "main_menu"))
+        markup = self._last_markup_to(ADMIN_ID)
+        self.assertFalse(any(
+            btn.callback_data == "ord_sheet_link" for row in markup.inline_keyboard for btn in row
+        ), "sheet-disconnected bot still showed the '📊 Таблица заказов' menu button")
+
+    @patch("templates.orders_tracker.get_bot_sheets_config", new_callable=AsyncMock)
+    async def test_sheet_link_button_sends_spreadsheet_url(self, mock_get_config):
+        mock_get_config.return_value = {"spreadsheet_id": "SHEET123", "sheet_title": "Orders", "connected_at": "now"}
+        await self.dp.feed_webhook_update(self.bot, _callback_update(60, ADMIN_ID, "ord_sheet_link"))
+
+        sent_urls = [
+            getattr(call.args[0], "text", "")
+            for call in self._bot_call.call_args_list
+            if getattr(call.args[0], "chat_id", None) == ADMIN_ID
+        ]
+        self.assertTrue(
+            any("docs.google.com/spreadsheets/d/SHEET123" in text for text in sent_urls),
+            f"no message contained the spreadsheet link: {sent_urls}",
+        )
+
+    @patch("templates.orders_tracker.get_bot_sheets_config", new_callable=AsyncMock)
+    async def test_sheet_link_tap_after_disconnect_reraces_to_main_menu(self, mock_get_config):
+        """The button is only ever rendered when connected (see
+        test_menu_shows_sheet_button_only_when_connected), but a tap can still
+        land after the owner disconnects the sheet in between render and tap
+        — cb_ord_sheet_link must re-render the main menu, not send a broken
+        link or crash."""
+        mock_get_config.return_value = None
+        await self.dp.feed_webhook_update(self.bot, _callback_update(60, ADMIN_ID, "ord_sheet_link"))
+
+        sent_texts = [
+            getattr(call.args[0], "text", "")
+            for call in self._bot_call.call_args_list
+            if getattr(call.args[0], "chat_id", None) == ADMIN_ID
+        ]
+        self.assertFalse(any("docs.google.com" in text for text in sent_texts))
+
+    @patch("templates.orders_tracker.write_row", new_callable=AsyncMock)
+    @patch("templates.orders_tracker.get_bot_sheets_config", new_callable=AsyncMock)
+    async def test_customer_name_starting_with_equals_is_neutralized_before_writing(
+        self, mock_get_config, mock_write_row
+    ):
+        """Spreadsheet-formula-injection guard: a customer name an admin typed
+        as free text must never reach write_row able to be interpreted as a
+        Sheets formula by whoever later opens the connected spreadsheet."""
+        mock_get_config.return_value = {"spreadsheet_id": "SHEET123", "sheet_title": "Orders", "connected_at": "now"}
+        await _create_order_via_flow(
+            self.dp, self.bot, ADMIN_ID, PHONE, "Widget", "1", 10,
+            customer_name='=HYPERLINK("http://evil.example","click")',
+        )
+        order_id = await self._order_id()
+
+        await self.dp.feed_webhook_update(
+            self.bot, _callback_update(100, ADMIN_ID, f"ord_status:{order_id}:in_progress")
+        )
+
+        mock_write_row.assert_awaited_once()
+        _, _, row = mock_write_row.call_args.args
+        self.assertFalse(row[2].startswith("="), f"formula-triggering cell was NOT neutralized: {row[2]!r}")
+        self.assertTrue(row[2].startswith("'="), f"expected an apostrophe-escaped formula, got: {row[2]!r}")
+
+
 class OrdersTrackerStandaloneSmokeTest(unittest.TestCase):
     def test_config_from_env_matches_legacy_constant_shape(self):
         config = orders_tracker.config_from_env()
