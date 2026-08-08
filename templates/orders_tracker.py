@@ -25,6 +25,9 @@ from aiogram.types import (
     KeyboardButton, Message, ReplyKeyboardMarkup, ReplyKeyboardRemove,
 )
 
+from db.database import get_bot_sheets_config
+from features.sheets import write_row
+
 # ── CUSTOMIZE ────────────────────────────────────────────────────────────────
 # Same status as every other template's CUSTOMIZE block: per-file source-text
 # customization Claude edits when generating a specific bot, not per-bot
@@ -85,6 +88,12 @@ class OrdersTrackerConfig:
     welcome_image: Path
     display_name: str | None = None
     group_chat_id: str | None = None
+    # None in standalone/subprocess mode (config_from_env — no row in `bots`
+    # to be an id of); set from bots.id in webhook mode (config_from_bot_row).
+    # Threaded into features/sheets.py calls exactly like FixtureConfig.bot_id
+    # in tests/fixtures/payment_fixture_template.py — sheets integration is a
+    # no-op wherever bot_id is None.
+    bot_id: int | None = None
 
 
 def _paths_for(name: str, data_dir: Path) -> OrdersTrackerConfig:
@@ -118,6 +127,7 @@ def config_from_bot_row(bot_row: dict, data_dir: Path) -> OrdersTrackerConfig:
     )
     config.display_name = bot_row.get("display_name")
     config.group_chat_id = bot_row.get("group_chat_id")
+    config.bot_id = bot_id
     return config
 
 
@@ -170,6 +180,64 @@ def _join_bounded(lines: list[str], limit: int = 3500) -> str:
         out.append(line)
         total += len(line) + 1
     return "\n".join(out)
+
+
+# ── sheets integration (feature module, see features/sheets.py) ────────────────
+# Optional: only active when this bot_id has a row in db.database's
+# bot_sheets_config (set by the connect FSM in handlers/manage_bots.py).
+# Absent that, every function below is a no-op — orders_tracker works exactly
+# as before for bots that never connected the sheets feature.
+
+SHEETS_WORKSHEET = "Заказы"
+
+
+async def _sheet_config_for(bot_id: int | None) -> dict | None:
+    if bot_id is None:
+        return None
+    return await get_bot_sheets_config(bot_id)
+
+
+def _sheet_safe(value: str) -> str:
+    """Neutralizes spreadsheet-formula injection: customer_name/phone here
+    come from free text an admin typed (order_item_name et al. have no
+    formula filter — they're meant for product names, not spreadsheet cell
+    content). Google Sheets, like Excel, evaluates a cell starting with
+    =+-@ as a formula — e.g. an admin (any first /start becomes an admin,
+    see cmd_start) entering a customer named '=HYPERLINK("evil","x")' would
+    have it silently execute for whoever opens the connected spreadsheet.
+    Prefixing with an apostrophe forces Sheets to treat the cell as plain
+    text, same mitigation OWASP recommends for CSV injection."""
+    if value and value[0] in ("=", "+", "-", "@"):
+        return "'" + value
+    return value
+
+
+async def _write_status_to_sheet(
+    bot_id: int | None, order_id: int, status: str, customer_name: str, phone: str
+) -> None:
+    """Appends a row for this status change to the connected spreadsheet, if
+    any. Never raises: a Sheets/network failure must not roll back or block
+    the status change itself, which has already been committed to the bot's
+    own db by the time this is called — same "log, don't propagate" contract
+    features/sheets.py's own write_row() already documents at its call site."""
+    if bot_id is None:
+        return
+    try:
+        if await get_bot_sheets_config(bot_id) is None:
+            return
+        await write_row(
+            bot_id,
+            SHEETS_WORKSHEET,
+            # phone is NOT free text — _normalize_phone() always produces
+            # "+7 (...) ...-..-.." server-side, so it's not escaped (doing so
+            # would defeat the format, since it always starts with "+").
+            [order_id, STATUS_LABELS.get(status, status), _sheet_safe(customer_name), phone,
+             time.strftime("%Y-%m-%d %H:%M:%S")],
+        )
+    except Exception:
+        logger.error(
+            f"orders_tracker: failed to write sheets row for bot_id={bot_id} order={order_id}", exc_info=True
+        )
 
 
 # ── phone normalization ────────────────────────────────────────────────────────
@@ -307,12 +375,26 @@ def _parse_price(text: str) -> float | None:
 
 # ── keyboards ─────────────────────────────────────────────────────────────────
 
-def kb_main_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
+def kb_main_menu(sheet_connected: bool = False) -> InlineKeyboardMarkup:
+    # NOTE for future call sites: the default False means a caller that
+    # forgets to look up sheet_connected silently HIDES the button rather
+    # than erroring — cheap to get wrong. Every FSM-timeout/"session
+    # expired" fallback screen in this file intentionally takes that default
+    # (scope-limited: not worth an extra db round trip on an error path);
+    # cmd_start/cb_main_menu/cb_order_flow_cancel are the ones that look it
+    # up via _sheet_config_for(config.bot_id) first.
+    rows = [
         [InlineKeyboardButton(text="📦 Заказы", callback_data="ord_menu")],
         [InlineKeyboardButton(text="👤 Клиенты", callback_data="cust_menu")],
         [InlineKeyboardButton(text="👥 Админы", callback_data="adm_menu")],
-    ])
+    ]
+    # Only rendered when a spreadsheet is actually connected for this bot_id —
+    # sheet_connected is looked up (get_bot_sheets_config) by the caller before
+    # building this keyboard, same "check, then render" shape as every other
+    # feature-gated UI element in this factory (see moderator.py's panel).
+    if sheet_connected:
+        rows.append([InlineKeyboardButton(text="📊 Таблица заказов", callback_data="ord_sheet_link")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def kb_back(callback_data: str = "main_menu") -> InlineKeyboardButton:
     return InlineKeyboardButton(text="◀️ Назад", callback_data=callback_data)
@@ -465,13 +547,14 @@ async def cmd_start(message: Message, state: FSMContext, config: OrdersTrackerCo
         admins = {str(message.from_user.id)}
 
     if str(message.from_user.id) in admins:
+        sheet_connected = await _sheet_config_for(config.bot_id) is not None
         if config.welcome_image.exists():
             await message.answer_photo(
                 FSInputFile(str(config.welcome_image)), caption=WELCOME_TEXT,
-                parse_mode="HTML", reply_markup=kb_main_menu(),
+                parse_mode="HTML", reply_markup=kb_main_menu(sheet_connected),
             )
         else:
-            await message.answer(WELCOME_TEXT, parse_mode="HTML", reply_markup=kb_main_menu())
+            await message.answer(WELCOME_TEXT, parse_mode="HTML", reply_markup=kb_main_menu(sheet_connected))
         if first_time_admin:
             await message.answer(
                 "👑 <b>Вы — администратор этого бота.</b>\n\n"
@@ -488,7 +571,8 @@ async def cb_main_menu(cb: CallbackQuery, state: FSMContext, config: OrdersTrack
     if not _is_admin(cb.from_user.id, config):
         return
     await state.clear()
-    await cb.message.edit_text(WELCOME_TEXT, parse_mode="HTML", reply_markup=kb_main_menu())
+    sheet_connected = await _sheet_config_for(config.bot_id) is not None
+    await cb.message.edit_text(WELCOME_TEXT, parse_mode="HTML", reply_markup=kb_main_menu(sheet_connected))
 
 
 # ── customer-side: link phone via shared Contact ──────────────────────────────
@@ -633,10 +717,16 @@ async def cb_ord_status(cb: CallbackQuery, bot: Bot, config: OrdersTrackerConfig
             (order_id, old_status, new_status, cb.from_user.id),
         )
         customer = await (await db.execute(
-            "SELECT telegram_user_id FROM customers c JOIN orders o ON o.customer_id=c.id WHERE o.id=?",
+            "SELECT c.telegram_user_id, c.name, c.phone FROM customers c JOIN orders o ON o.customer_id=c.id "
+            "WHERE o.id=?",
             (order_id,),
         )).fetchone()
         await db.commit()
+
+    await _write_status_to_sheet(
+        config.bot_id, order_id, new_status,
+        customer[1] if customer else "", customer[2] if customer else "",
+    )
 
     note = None
     telegram_user_id = customer[0] if customer else None
@@ -846,7 +936,24 @@ async def cb_order_flow_cancel(cb: CallbackQuery, state: FSMContext, config: Ord
     await state.clear()
     if not _is_admin(cb.from_user.id, config):
         return
-    await cb.message.edit_text("Отменено.", reply_markup=kb_main_menu())
+    sheet_connected = await _sheet_config_for(config.bot_id) is not None
+    await cb.message.edit_text("Отменено.", reply_markup=kb_main_menu(sheet_connected))
+
+
+@router.callback_query(F.data == "ord_sheet_link")
+async def cb_ord_sheet_link(cb: CallbackQuery, config: OrdersTrackerConfig):
+    await cb.answer()
+    if not _is_admin(cb.from_user.id, config):
+        return
+    sheet_config = await _sheet_config_for(config.bot_id)
+    if sheet_config is None:
+        # Button is only rendered when connected (see kb_main_menu), so this
+        # is a disconnect-between-render-and-tap race, not the common path —
+        # same "stale button, re-render" principle as cb_ord_status below.
+        await cb.message.edit_text(WELCOME_TEXT, parse_mode="HTML", reply_markup=kb_main_menu(False))
+        return
+    url = f"https://docs.google.com/spreadsheets/d/{sheet_config['spreadsheet_id']}"
+    await cb.message.answer(f"📊 <b>Таблица заказов:</b>\n{url}", parse_mode="HTML")
 
 
 # ── CUSTOMERS menu ─────────────────────────────────────────────────────────────
