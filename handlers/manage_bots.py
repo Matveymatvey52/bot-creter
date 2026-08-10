@@ -350,6 +350,30 @@ def _features_keyboard(
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+async def _reload_registry(bot_id: int) -> None:
+    if _registry is not None:
+        await _registry.reload_one(bot_id)
+    else:
+        logger.debug(f"_reload_registry: no live registry available — bot_id={bot_id} DB-only change")
+
+
+async def enable_feature_and_reload(bot_id: int, feature_name: str) -> None:
+    """Enables `feature_name` for `bot_id` and reloads it in the live registry —
+    the exact state-change cb_toggle_feature's "turn on" branch performs. Shared
+    by cb_toggle_feature (button path) and handlers/feature_connect.py's confirm
+    callback (conversational path) so enabling a feature does the identical thing
+    regardless of which entry point triggered it — not two independent copies."""
+    await enable_bot_feature(bot_id, feature_name)
+    await _reload_registry(bot_id)
+
+
+async def disable_feature_and_reload(bot_id: int, feature_name: str) -> None:
+    """Symmetric with enable_feature_and_reload — extracted from cb_toggle_feature's
+    "turn off" branch for the same reason (single implementation, not duplicated)."""
+    await disable_bot_feature(bot_id, feature_name)
+    await _reload_registry(bot_id)
+
+
 async def _compatible_features(template_id: str | None) -> list[dict]:
     """Features whose # COMPATIBLE_WITH: header explicitly lists this bot's
     template_id — never "all" (see runtime/registry.py's discover_features()),
@@ -410,13 +434,9 @@ async def cb_toggle_feature(callback: CallbackQuery):
             await callback.answer("⛔ Эта фича не подходит шаблону этого бота.", show_alert=True)
             return
         if is_enabled:
-            await disable_bot_feature(bot_id, feature_name)
+            await disable_feature_and_reload(bot_id, feature_name)
         else:
-            await enable_bot_feature(bot_id, feature_name)
-        if _registry is not None:
-            await _registry.reload_one(bot_id)
-        else:
-            logger.debug(f"cb_toggle_feature: no live registry available — bot_id={bot_id} feature={feature_name!r} toggled in DB only")
+            await enable_feature_and_reload(bot_id, feature_name)
         await callback.answer("✅ Включено" if not is_enabled else "🔴 Выключено")
         compatible = await _compatible_features(template_id)
         new_enabled = set(await get_bot_features(bot_id))
@@ -484,6 +504,38 @@ async def _back_to_features_panel(bot_id: int, edit_target) -> None:
     )
 
 
+async def begin_sheets_connect(bot_id: int, state: FSMContext, present) -> bool:
+    """Starts the sheets-link collection step: sends the SA-email instructions and
+    puts the FSM into SheetsConnectFlow.waiting_for_link with bot_id stored — the
+    exact state msg_sheets_connect_link (below) expects. `present` is an
+    async (text, **kwargs) -> None sink (matches the existing _send_list/_send_logs
+    convention in this module), so the caller controls whether that lands as an
+    edited message (button path, via functools.partial(_edit_or_resend, callback))
+    or a fresh one (conversational path, via message.answer). Shared by
+    cb_sheets_connect_start (button path) and handlers/feature_connect.py's confirm
+    callback (conversational path) — both reach the SAME FSM state through the SAME
+    function, so the next message either path is followed by is handled by the one
+    existing msg_sheets_connect_link handler, not a second implementation.
+
+    Returns False (message sent, FSM untouched) if sheets isn't configured
+    server-side — same guard cb_sheets_connect_start always had."""
+    sa_email = await get_service_account_email()
+    if not sa_email:
+        await present(
+            "⚠️ Фича sheets не настроена на сервере (нет GOOGLE_SHEETS_SA_KEY_PATH). "
+            "Обратитесь к администратору фабрики."
+        )
+        return False
+    await state.set_state(SheetsConnectFlow.waiting_for_link)
+    await state.update_data(bot_id=bot_id)
+    await present(
+        _SHEETS_CONNECT_TEXT_TEMPLATE.format(sa_email=sa_email),
+        parse_mode="HTML",
+        reply_markup=_sheets_cancel_keyboard(bot_id),
+    )
+    return True
+
+
 @router.callback_query(F.data.startswith("sheetsconnect:"))
 async def cb_sheets_connect_start(callback: CallbackQuery, state: FSMContext):
     if not _is_owner(callback.from_user.id):
@@ -491,21 +543,7 @@ async def cb_sheets_connect_start(callback: CallbackQuery, state: FSMContext):
         return
     await callback.answer()
     bot_id = int(callback.data.split(":")[1])
-    sa_email = await get_service_account_email()
-    if not sa_email:
-        await callback.message.answer(
-            "⚠️ Фича sheets не настроена на сервере (нет GOOGLE_SHEETS_SA_KEY_PATH). "
-            "Обратитесь к администратору фабрики."
-        )
-        return
-    await state.set_state(SheetsConnectFlow.waiting_for_link)
-    await state.update_data(bot_id=bot_id)
-    await _edit_or_resend(
-        callback,
-        _SHEETS_CONNECT_TEXT_TEMPLATE.format(sa_email=sa_email),
-        parse_mode="HTML",
-        reply_markup=_sheets_cancel_keyboard(bot_id),
-    )
+    await begin_sheets_connect(bot_id, state, functools.partial(_edit_or_resend, callback))
 
 
 @router.callback_query(F.data.startswith("sheetscancel:"))
