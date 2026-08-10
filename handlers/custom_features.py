@@ -329,6 +329,12 @@ async def cb_apply_custom_feature(callback: CallbackQuery, state: FSMContext) ->
         # pure AST walk, no I/O. generate_custom_feature() already guarantees
         # patch_code parses, so a SyntaxError here would be a genuine surprise;
         # treated as a hard failure rather than silently proceeding.
+        #
+        # This check rejects UNVETTED imports only, not what an allowed one
+        # (os/aiosqlite/aiohttp) can do once wired into the live Dispatcher —
+        # see services/claude_service.py's _ALLOWED_ROOT_MODULES comment for
+        # the real blast radius (env secrets, cross-bot token exfiltration
+        # via the shared bots.db, arbitrary outbound HTTP).
         try:
             forbidden = check_forbidden_imports(patch_code)
         except SyntaxError:

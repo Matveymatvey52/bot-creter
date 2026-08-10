@@ -1355,6 +1355,34 @@ Return ONLY valid Python code. No markdown fences. No explanations."""
 # blocklist of the "FORBIDDEN PACKAGES" named above: a blocklist only catches
 # names someone thought to write down, an allowlist rejects everything not
 # already vetted, including packages nobody has thought to forbid yet.
+#
+# THIS IS NOT A SANDBOX — it blocks importing UNVETTED packages, it does
+# nothing to restrict what the VETTED ones can do once this code is running
+# inside the live factory-bot process (runtime/registry.py wires the router
+# straight into a real Dispatcher, no subprocess/container isolation). The
+# real, concrete blast radius of every package left in this set:
+#   - os + pathlib: arbitrary filesystem read/write with this process's own
+#     permissions, INCLUDING os.environ — every secret this process holds
+#     (ENCRYPTION_KEY, ANTHROPIC_API_KEY, GITHUB_TOKEN, BOT_TOKEN) is a plain
+#     os.getenv() call away from generated code.
+#   - aiosqlite: direct read/write access to the SHARED data/bots.db — not
+#     just this bot's own rows. Every bot's Telegram token lives there,
+#     Fernet-encrypted (db/database.py's _encrypt_token) — encrypted is not
+#     the same as inaccessible: combined with the os.environ access above
+#     (ENCRYPTION_KEY is one of the env vars readable that way), a
+#     deliberately malicious patch can decrypt and exfiltrate every bot's
+#     token on the factory, not only the one it was generated for.
+#   - aiohttp: arbitrary outbound HTTP from inside this trusted process — the
+#     exfiltration channel for anything read above, plus reaches whatever
+#     network the factory process itself can reach.
+# Accepted today ONLY because the sole trigger for custom_features is the
+# factory owner's own request, generated fresh each time and shown to them
+# for approval before it's written — there is no untrusted third party in
+# this loop. This stops being an acceptable trade-off the moment that
+# assumption changes (e.g. a bot's own end users being able to influence what
+# gets generated). See backlog_custom_features_known_gaps memory for the
+# cheap partial mitigation not yet implemented (AST-flagging os.system/eval/
+# exec/__import__) and the real fix (actual process/container isolation).
 _ALLOWED_ROOT_MODULES = {
     "aiogram", "aiosqlite", "openpyxl", "aiohttp",
     "asyncio", "os", "logging", "datetime", "pathlib", "csv", "json", "re",
@@ -1388,7 +1416,12 @@ def check_forbidden_imports(code: str) -> list[str]:
     isolated-import subprocess check, as defense in depth against anything
     changing between generation and the owner pressing "Применить". Raises
     SyntaxError if `code` doesn't parse — callers that already validated syntax
-    separately won't hit this; callers that haven't should check syntax first."""
+    separately won't hit this; callers that haven't should check syntax first.
+
+    This rejects UNVETTED imports only — it is not a sandbox, see
+    _ALLOWED_ROOT_MODULES' own comment above for the real blast radius of the
+    packages it does allow (os.environ/data.db/network access from inside the
+    live factory process)."""
     return _forbidden_imports_from_tree(_ast.parse(code))
 
 
