@@ -1176,9 +1176,18 @@ _TEMPLATE_SELECT_PROMPT_HEADER = (
     'matching template or return "none".\n\nAvailable templates:\n'
 )
 _TEMPLATE_SELECT_PROMPT_FOOTER = (
-    '\n\nReturn ONLY the template name (e.g. "trip_manager") or "none" if nothing matches 60%+.\n'
-    'Do NOT return "none" if 60%+ of core functionality is covered by a template.\n'
-    'Return ONLY one word, nothing else.'
+    '\n\nDecide how many templates to return:\n'
+    '- ONE template name if it alone covers 60%+ of the request\'s core functionality — '
+    'even if a second template touches some minor part of it. A dominant template plus '
+    'a small bolt-on feature is still ONE template.\n'
+    '- TWO template names, comma-separated with no space (e.g. "shop_catalog,loyalty_program"), '
+    'ONLY if the request clearly describes two distinct business domains and NEITHER template '
+    'alone covers 60%+ of the request — each of the two must independently cover a substantial, '
+    'largely non-overlapping share of the requirements.\n'
+    '- "none" if nothing matches 60%+ combined.\n'
+    'When in doubt between one template and two, prefer ONE — a false-positive merge is more '
+    'expensive than picking the closest single template.\n'
+    'Return ONLY the template name(s) or "none", nothing else — no explanation.'
 )
 
 
@@ -1188,6 +1197,44 @@ def _build_template_select_prompt() -> str:
     manually typed, so adding a templates/*.py file needs no edit here."""
     lines = "\n".join(f"- {t['name']} — {t['use_for']}" for t in discover_templates())
     return _TEMPLATE_SELECT_PROMPT_HEADER + lines + _TEMPLATE_SELECT_PROMPT_FOOTER
+
+MERGE_TEMPLATES_EXTRA = """
+
+SYNTHESIS MODE — the user's requirements span two existing bot domains. You will receive two working reference templates below. Do NOT concatenate or copy them as-is — design ONE new, internally consistent bot that covers both domains as a single coherent product.
+
+Reference templates are for STYLE and PROVEN PATTERNS ONLY (DB schema shapes, FSM structures, keyboard patterns, admin helpers, Excel export). Reuse the sub-patterns you need, then adapt everything so the result reads as one bot, not two files stapled together.
+
+Resolve naming conflicts explicitly:
+- If both templates define a StatesGroup covering the same step (e.g. both have a "waiting_phone" state), merge into ONE state chain — never keep duplicate parallel states.
+- If both templates create a table with the same name for different data (e.g. both have "orders" or "clients"), rename one — never let two unrelated tables share a name, and never let one silently overwrite the other's schema.
+- If both templates use the same callback_data string for different actions (e.g. both use "confirm"/"cancel"), prefix them by domain so handlers cannot cross-fire.
+- If both templates define admin helpers (_load_admins/_save_admins) or a users table, KEEP ONLY ONE COPY.
+
+Single coherent identity and menu:
+- Build ONE /start menu exposing both domains as sections of the SAME bot — never a menu that forks into "template A mode" vs "template B mode".
+- If both domains track the same real-world person (e.g. a customer who both buys and earns points), they MUST share one identity/record — never split the same user across two disconnected tables with no link between them.
+
+Do not drop functionality: every core feature described in the requirements for BOTH domains must be present in the final bot. Do not include a reference template's feature that the requirements don't call for.
+
+Return ONLY the complete, single Python file. No markdown fences, no explanations."""
+
+
+MERGE_REVIEW_SYSTEM_PROMPT = """You are a senior Python code reviewer specializing in aiogram 3.13 Telegram bots. You are reviewing a bot that was SYNTHESIZED from two different template domains into one file.
+
+Your job is to find and fix problems specific to merging two domains into one bot BEFORE it is deployed. Check for these specific problems:
+
+1. DUPLICATE/COLLIDING TABLE NAMES — two unrelated tables sharing a name (one silently overwriting the other's schema), or the same real-world entity (e.g. a customer) split across two disconnected tables with no shared key
+2. DUPLICATE STATE GROUPS — two StatesGroup classes covering the same step that should have been merged into one chain
+3. COLLIDING CALLBACK_DATA — the two domains using the same callback_data string for different actions, causing the wrong handler to fire
+4. DUPLICATED ADMIN/SHARED HELPERS — _load_admins/_save_admins, users table, or other shared infrastructure defined twice instead of once
+5. FORKED MENU — a /start menu that just splits into "domain A mode" / "domain B mode" instead of one integrated menu
+6. LOST FUNCTIONALITY — a feature required by either domain that is missing from the merged code
+7. UNUSED LEFTOVER CODE — helpers/constants copied from a reference template but never called
+
+If you find issues: fix them and return the complete corrected code.
+If the code looks correct: return it unchanged.
+Return ONLY valid Python code. No markdown, no explanations."""
+
 
 CUSTOMIZE_TEMPLATE_PROMPT = """You are a Telegram bot customizer. You receive a working bot template and user requirements.
 
@@ -1210,21 +1257,38 @@ DO NOT change:
 Return ONLY the complete modified Python code. No markdown fences. No explanations."""
 
 
-async def _select_template(summary: str) -> str | None:
-    """Returns template name like 'trip_manager', or None if no match."""
+async def _select_template(summary: str) -> list[str]:
+    """Returns 0, 1, or 2 template names (e.g. ['trip_manager'] or
+    ['shop_catalog', 'loyalty_program']), per the threshold in
+    _TEMPLATE_SELECT_PROMPT_FOOTER. Any response that doesn't cleanly resolve
+    to real template files — garbage text, a name that doesn't exist on disk,
+    more than 2 names — falls back to an empty list rather than guessing,
+    since generate_bot_code's caller treats [] the same as the old None (fall
+    through to generating from scratch)."""
     if not _TEMPLATES_DIR.exists():
-        return None
+        return []
     response = await client.messages.create(
         model="claude-haiku-4-5-20251001",
-        max_tokens=20,
+        max_tokens=30,
         system=_build_template_select_prompt(),
         messages=[{"role": "user", "content": summary}],
     )
-    result = response.content[0].text.strip().lower().split()[0]
-    if result == "none":
-        return None
-    template_file = _TEMPLATES_DIR / f"{result}.py"
-    return result if template_file.exists() else None
+    text = response.content[0].text.strip().lower()
+    if not text:
+        return []  # blank/garbage response — never guess, fall through to scratch generation
+    # Collapse whitespace around commas BEFORE taking the first whitespace-delimited
+    # token — otherwise a model response like "shop_catalog, loyalty_program" (a space
+    # after the comma despite the prompt saying not to) would have its second name cut
+    # off by .split()[0] alone, silently degrading a two-template response into a
+    # single-template one instead of failing closed to [] as intended.
+    raw = re.sub(r"\s*,\s*", ",", text).split()[0]
+    if raw == "none":
+        return []
+    names = [n for n in dict.fromkeys(part.strip() for part in raw.split(",")) if n]
+    if not names or len(names) > 2:
+        return []
+    valid = [n for n in names if (_TEMPLATES_DIR / f"{n}.py").exists()]
+    return valid if len(valid) == len(names) else []
 
 
 async def _customize_from_template(template_name: str, requirements: str) -> str:
@@ -1248,12 +1312,74 @@ async def _customize_from_template(template_name: str, requirements: str) -> str
         return template_code  # fallback to unmodified template
 
 
+async def _synthesize_from_templates(template_names: list[str], requirements: str) -> str:
+    """Synthesizes ONE new bot from two reference templates (SYNTHESIS MODE).
+    Unlike _customize_from_template, this is allowed to change schema/FSM/
+    handlers freely — that's the whole point, see MERGE_TEMPLATES_EXTRA."""
+    name_a, name_b = template_names
+    code_a = (_TEMPLATES_DIR / f"{name_a}.py").read_text(encoding="utf-8")
+    code_b = (_TEMPLATES_DIR / f"{name_b}.py").read_text(encoding="utf-8")
+    response = await client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=25000,
+        system=GENERATE_SYSTEM_PROMPT + MERGE_TEMPLATES_EXTRA,
+        messages=[{
+            "role": "user",
+            "content": (
+                f"User requirements:\n{requirements}\n\n"
+                f"Reference template A ({name_a}):\n{code_a}\n\n"
+                f"Reference template B ({name_b}):\n{code_b}"
+            ),
+        }],
+    )
+    code = _strip_code_fences(response.content[0].text)
+    try:
+        _ast.parse(code)
+        return code
+    except SyntaxError:
+        return ""  # caller checks for asyncio.run(main()); empty string falls through to scratch generation
+
+
+async def _review_merged_bot_code(code: str, requirements: str) -> str:
+    """Merge-specific review pass — catches defects unique to synthesizing two
+    domains (duplicate tables/FSM groups, colliding callback_data, forked
+    menus) that the generic _review_bot_code checklist doesn't cover. Must run
+    BEFORE _review_bot_code so the generic pass reviews the final, already
+    de-duplicated structure rather than a pre-fix draft."""
+    response = await client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=25000,
+        system=MERGE_REVIEW_SYSTEM_PROMPT,
+        messages=[{
+            "role": "user",
+            "content": f"Bot requirements (for context):\n{requirements}\n\nSynthesized code to review:\n{code}",
+        }],
+    )
+    reviewed = _strip_code_fences(response.content[0].text)
+    try:
+        _ast.parse(reviewed)
+        return reviewed
+    except SyntaxError:
+        return code  # review broke the code — keep pre-review version
+
+
 async def generate_bot_code(requirements_summary: str) -> str:
-    # Try template first — saves 5-10x tokens vs generating from scratch
-    template_name = await _select_template(requirements_summary)
-    if template_name:
-        code = await _customize_from_template(template_name, requirements_summary)
+    # Try template(s) first — saves 5-10x tokens vs generating from scratch
+    templates = await _select_template(requirements_summary)
+
+    if len(templates) == 1:
+        code = await _customize_from_template(templates[0], requirements_summary)
         if "asyncio.run(main())" in code:
+            bot_type = await classify_bot_type(requirements_summary)
+            code = await _review_bot_code(code, requirements_summary, bot_type=bot_type)
+            return code
+
+    elif len(templates) == 2:
+        code = await _synthesize_from_templates(templates, requirements_summary)
+        if "asyncio.run(main())" in code:
+            code = await _review_merged_bot_code(code, requirements_summary)
+            bot_type = await classify_bot_type(requirements_summary)
+            code = await _review_bot_code(code, requirements_summary, bot_type=bot_type)
             return code
 
     bot_type = await classify_bot_type(requirements_summary)
