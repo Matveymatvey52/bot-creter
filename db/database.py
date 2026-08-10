@@ -126,6 +126,14 @@ async def init_db():
             )
         """)
         await db.execute("""
+            CREATE TABLE IF NOT EXISTS bot_custom_features (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                bot_id      INTEGER NOT NULL REFERENCES bots(id),
+                description TEXT NOT NULL,
+                applied_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS bot_sheets_config (
                 bot_id         INTEGER PRIMARY KEY REFERENCES bots(id),
                 spreadsheet_id TEXT NOT NULL,
@@ -259,6 +267,7 @@ async def delete_bot(bot_id: int) -> None:
         await db.execute("DELETE FROM bot_payment_providers WHERE bot_id = ?", (bot_id,))
         await db.execute("DELETE FROM bot_features WHERE bot_id = ?", (bot_id,))
         await db.execute("DELETE FROM bot_sheets_config WHERE bot_id = ?", (bot_id,))
+        await db.execute("DELETE FROM bot_custom_features WHERE bot_id = ?", (bot_id,))
         await db.commit()
 
 
@@ -349,6 +358,38 @@ async def get_bot_features(bot_id: int) -> list[str]:
         ) as cursor:
             rows = await cursor.fetchall()
             return [row[0] for row in rows]
+
+
+async def add_custom_feature_record(bot_id: int, description: str) -> None:
+    """Append-only audit log entry for one applied custom_features/bot_<id>.py
+    patch — bot_id is NOT unique/PK here (unlike bot_sheets_config), so a bot
+    re-patched multiple times over its lifetime accumulates one row per
+    successful apply. Purely a history trail for the owner; runtime/registry.py
+    never queries this table — it loads custom_features/bot_<id>.py by file
+    existence alone."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO bot_custom_features (bot_id, description) VALUES (?, ?)",
+            (bot_id, description),
+        )
+        await db.commit()
+    logger.info(f"add_custom_feature_record: bot_id={bot_id} description={description!r}")
+
+
+async def get_custom_feature_history(bot_id: int) -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            # id DESC as the real tiebreaker — applied_at is CURRENT_TIMESTAMP
+            # at second resolution, so two applies within the same second
+            # would otherwise sort in an unspecified order; id is
+            # AUTOINCREMENT and always reflects true insertion order.
+            "SELECT id, description, applied_at FROM bot_custom_features "
+            "WHERE bot_id = ? ORDER BY id DESC",
+            (bot_id,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
 
 
 async def update_bot_status(bot_id: int, status: str, pid: int | None = None):

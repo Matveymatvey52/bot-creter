@@ -46,6 +46,7 @@ from config import BOT_TOKEN
 from db.database import init_db as init_bots_db
 from handlers.admin_manager import OWNER_ID, router as admin_router
 from handlers.create_bot import router as create_router, set_bot_id, set_manager_username, set_registry
+from handlers.custom_features import router as custom_features_router, set_registry as set_custom_features_registry
 from handlers.general import router as general_router
 from handlers.manage_bots import router as manage_router, set_registry as set_manage_bots_registry
 from handlers.start import router as start_router
@@ -72,6 +73,7 @@ async def _build_factory_dispatcher() -> Dispatcher:
     dp.include_router(start_router)
     dp.include_router(create_router)
     dp.include_router(manage_router)
+    dp.include_router(custom_features_router)
     dp.include_router(general_router)  # must be last — catch-all
     dp.include_router(build_group_router())
     return dp
@@ -130,6 +132,7 @@ async def _bootstrap_app() -> web.Application:
     # no HTTP self-call needed. See handlers/create_bot.py's set_registry().
     set_registry(registry)
     set_manage_bots_registry(registry)
+    set_custom_features_registry(registry)
 
     logger.info(f"Combined registry built: {len(registry)} bot(s), including the factory bot")
     return create_app(registry)

@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import importlib.util
 import logging
 import os
 import re
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import ModuleType
@@ -21,6 +23,7 @@ from aiogram import BaseMiddleware, Bot, Dispatcher, Router
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import TelegramObject
 
+from config import DATA_DIR
 from db.database import get_all_bots, get_bot, get_bot_features
 
 logger = logging.getLogger(__name__)
@@ -334,6 +337,110 @@ async def _load_and_include_features(dp: Dispatcher, bot_id: int, db_path: str) 
             )
 
 
+# Lives under DATA_DIR — the ONLY location in this project that survives a
+# Railway redeploy (see db/database.py's DB_PATH and handlers/create_bot.py's
+# GENERATED_BOTS_DIR, both DATA_DIR-relative; .railwayignore excludes the repo
+# checkout's own working tree from persistence). A path under the repo
+# checkout (BASE_DIR) would be wiped by nixpacks' fresh git-checkout on every
+# deploy, silently deleting every applied custom_features patch with no
+# recovery path (bot_custom_features only logs a text description, never the
+# code itself). Loaded via importlib.util.spec_from_file_location rather than
+# the `custom_features` namespace package used by templates/ and features/:
+# DATA_DIR is not guaranteed to be on sys.path or under this repo's root, so
+# plain package-relative import_module("custom_features.bot_<id>") could not
+# reliably find it there; loading straight from a known file path sidesteps
+# that entirely and matches how the file is already located (module_path.exists()).
+_CUSTOM_FEATURES_DIR = DATA_DIR / "custom_features"
+_custom_feature_module_cache: dict[int, ModuleType] = {}
+
+
+def _load_custom_feature_module_sync(bot_id: int, module_path: Path) -> ModuleType:
+    module_name = f"custom_features_bot_{bot_id}"
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(module_name, None)
+        raise
+    return module
+
+
+async def _load_custom_feature_module_async(bot_id: int) -> ModuleType | None:
+    """Loads custom_features/bot_<id>.py for this bot, if it exists — the ONLY
+    place in this registry where the module backing a cache entry can be
+    REWRITTEN ON DISK while this process is still running (templates/ and
+    features/ only ever change via a deploy+process-restart; custom_features
+    changes live, via handlers/custom_features.py's "✅ Применить" step).
+
+    Checks file existence with a plain stat() BEFORE attempting the import —
+    the overwhelming majority of bots have no customization at all, same
+    zero-cost-for-the-common-case reasoning _load_and_include_features'
+    docstring gives for a bot with no enabled features. Cached per bot_id
+    once imported; the cache is intentionally NOT invalidated by mtime
+    (polling mtime on every webhook update would cost a stat() per update
+    for a case that almost never happens) — see invalidate_custom_feature_cache
+    below, which the only writer of these files calls explicitly instead."""
+    if bot_id in _custom_feature_module_cache:
+        return _custom_feature_module_cache[bot_id]
+    module_path = _CUSTOM_FEATURES_DIR / f"bot_{bot_id}.py"
+    if not module_path.exists():
+        return None
+    loop = asyncio.get_running_loop()
+    try:
+        module = await loop.run_in_executor(None, _load_custom_feature_module_sync, bot_id, module_path)
+    except Exception:
+        logger.exception(f"_load_custom_feature_module_async: failed to import custom_features/bot_{bot_id}.py")
+        return None
+    _custom_feature_module_cache[bot_id] = module
+    return module
+
+
+def invalidate_custom_feature_cache(bot_id: int) -> None:
+    """Must be called whenever custom_features/bot_<id>.py is (re)written on
+    disk, BEFORE the next reload_one(bot_id) — handlers/custom_features.py's
+    apply step is the only caller. Clears BOTH this module's own cache dict
+    AND sys.modules[f"custom_features_bot_{bot_id}"]: a stale sys.modules entry
+    would otherwise never get re-executed from the rewritten file. No other
+    module in this registry needs this — templates/ and features/ are never
+    rewritten by a live, running process."""
+    _custom_feature_module_cache.pop(bot_id, None)
+    sys.modules.pop(f"custom_features_bot_{bot_id}", None)
+
+
+async def _load_and_include_custom_feature(dp: Dispatcher, bot_id: int, db_path: str) -> None:
+    """Loads and wires this bot's own custom_features/bot_<id>.py (if any)
+    into its Dispatcher — same clone-then-include_router pattern and per-bot
+    try/except isolation as _load_and_include_features, so one broken custom
+    patch can never take the bot's main template router down with it.
+
+    Deliberately WEBHOOK-ONLY: only called from build_entry() below.
+    services/bot_runner.py's subprocess model does not load this — the same
+    known gap regular bot_features already has there (feature-modules-
+    inventory), not widened further by this addition."""
+    try:
+        module = await _load_custom_feature_module_async(bot_id)
+        if module is None:
+            return
+        init_db = getattr(module, "init_db", None)
+        if init_db is not None:
+            await init_db(db_path)
+        raw_router = getattr(module, "router", None)
+        if raw_router is None:
+            logger.warning(
+                f"_load_and_include_custom_feature: bot_id={bot_id} "
+                "custom_features module has no 'router' attribute — skipped"
+            )
+            return
+        dp.include_router(_clone_router(raw_router))
+    except Exception:
+        logger.exception(
+            f"_load_and_include_custom_feature: bot_id={bot_id} "
+            "raised while loading — skipped, bot continues without it"
+        )
+
+
 @dataclass
 class BotEntry:
     bot: Bot
@@ -427,9 +534,10 @@ async def build_entry(
 
     # Feature routers ride on top of an already-working template — no db_path
     # to give them (and nothing meaningful to attach to) if the template itself
-    # never resolved.
+    # never resolved. Same condition covers the per-bot custom_features patch.
     if typed_config is not None:
         await _load_and_include_features(dp, bot_id, typed_config.db_path)
+        await _load_and_include_custom_feature(dp, bot_id, typed_config.db_path)
 
     return BotEntry(bot=bot, dispatcher=dp, template_id=template_id, config=config)
 
