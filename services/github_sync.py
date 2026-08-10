@@ -13,12 +13,12 @@ GITHUB_REPO = os.getenv("GITHUB_REPO", "")  # "username/repo-name"
 _API = "https://api.github.com"
 
 
-async def push_bot_to_github(bot_name: str, code: str) -> bool:
+async def push_bot_to_github(bot_name: str, code: str, subdir: str = "bots") -> bool:
     if not GITHUB_TOKEN or not GITHUB_REPO:
         logger.info("GITHUB_TOKEN/GITHUB_REPO not set — skipping GitHub sync")
         return False
 
-    path = f"bots/{bot_name}.py"
+    path = f"{subdir}/{bot_name}.py"
     url = f"{_API}/repos/{GITHUB_REPO}/contents/{path}"
     headers = {
         "Authorization": f"Bearer {GITHUB_TOKEN}",
@@ -43,7 +43,7 @@ async def push_bot_to_github(bot_name: str, code: str) -> bool:
 
         async with session.put(url, headers=headers, json=body) as resp:
             if resp.status in (200, 201):
-                logger.info(f"GitHub sync: pushed bots/{bot_name}.py to {GITHUB_REPO}")
+                logger.info(f"GitHub sync: pushed {path} to {GITHUB_REPO}")
                 return True
             error = await resp.text()
             logger.error(f"GitHub sync failed ({resp.status}): {error[:300]}")
