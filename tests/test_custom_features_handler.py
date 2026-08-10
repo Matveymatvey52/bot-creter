@@ -1,0 +1,320 @@
+"""handlers/custom_features.py's owner flow — the first pre-apply confirmation
+step in the codebase (preview with "✅ Применить"/"❌ Отмена" before anything is
+written), plus its two safety gates: the forbidden-imports AST re-check and
+the isolated-import subprocess smoke check, both at apply time.
+
+Handlers are called directly, not through a real Dispatcher — same convention
+as tests/test_manage_bots_features.py and tests/test_start_buttons.py (aiogram
+Router objects can only attach to one Dispatcher for their whole process
+lifetime).
+"""
+from __future__ import annotations
+
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
+
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.base import StorageKey
+from aiogram.fsm.storage.memory import MemoryStorage
+
+import handlers.custom_features as cf_module
+import runtime.registry as reg
+from db.database import create_bot_record_with_admins, delete_bot, get_custom_feature_history, init_db
+from services.claude_service import CustomFeatureGenerationError
+
+FAKE_TOKEN = "123456789:AAHfakeTokenButShapedRight1234567890"
+
+_CLEAN_PATCH_SOURCE = (
+    "from aiogram import Router\n\n"
+    "router = Router()\n\n"
+    "@router.message()\n"
+    "async def _noop(message):\n"
+    "    pass\n"
+)
+
+_BROKEN_IMPORT_PATCH_SOURCE = (
+    "import this_module_does_not_exist_anywhere_xyz\n"
+    "from aiogram import Router\n\n"
+    "router = Router()\n"
+)
+
+_FORBIDDEN_IMPORT_PATCH_SOURCE = (
+    "import pandas\n"
+    "from aiogram import Router\n\n"
+    "router = Router()\n"
+)
+
+
+def _make_callback(user_id: int, data: str) -> MagicMock:
+    callback = MagicMock()
+    callback.from_user.id = user_id
+    callback.data = data
+    callback.answer = AsyncMock()
+    callback.message.edit_text = AsyncMock()
+    callback.message.answer = AsyncMock()
+    return callback
+
+
+def _make_message(user_id: int, text: str) -> MagicMock:
+    message = MagicMock()
+    message.from_user.id = user_id
+    message.text = text
+    status = MagicMock()
+    status.delete = AsyncMock()
+    message.answer = AsyncMock(return_value=status)
+    return message
+
+
+def _make_fsm_context(user_id: int) -> FSMContext:
+    storage = MemoryStorage()
+    key = StorageKey(bot_id=0, chat_id=user_id, user_id=user_id)
+    return FSMContext(storage=storage, key=key)
+
+
+class _CustomFeatureHandlerTestBase(unittest.IsolatedAsyncioTestCase):
+    owner_id = 0  # overridden per subclass so parallel tests don't share an owner id
+
+    async def asyncSetUp(self):
+        # Idempotent (CREATE TABLE IF NOT EXISTS) — see test_custom_feature_db.py's
+        # identical comment for why this is here (self-sufficiency, not a fix
+        # of the separately-tracked real-DB-isolation gap).
+        await init_db()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.cf_dir = Path(self._tmp.name) / "custom_features"
+        self.cf_dir.mkdir()
+        self._cf_dir_patcher = patch.object(cf_module, "_CUSTOM_FEATURES_DIR", self.cf_dir)
+        self._cf_dir_patcher.start()
+        self._registry_cf_dir_patcher = patch.object(reg, "_CUSTOM_FEATURES_DIR", self.cf_dir)
+        self._registry_cf_dir_patcher.start()
+
+        self._owner_patcher = patch.object(cf_module, "_is_owner", lambda uid: uid == self.owner_id)
+        self._owner_patcher.start()
+
+        self._fake_registry = MagicMock()
+        self._fake_registry.reload_one = AsyncMock()
+        cf_module.set_registry(self._fake_registry)
+
+        self.bot_file = Path(self._tmp.name) / "fake_bot.py"
+        self.bot_file.write_text("# fake bot file for custom_features handler tests\n", encoding="utf-8")
+        self.bot_id = await create_bot_record_with_admins(
+            name=f"cf_handler_bot_{self.owner_id}", description="test", token=FAKE_TOKEN,
+            file_path=str(self.bot_file), admin_ids=[str(self.owner_id)],
+        )
+
+    async def asyncTearDown(self):
+        cf_module.set_registry(None)
+        self._owner_patcher.stop()
+        self._registry_cf_dir_patcher.stop()
+        self._cf_dir_patcher.stop()
+        reg._custom_feature_module_cache.pop(self.bot_id, None)
+        sys.modules.pop(f"custom_features_bot_{self.bot_id}", None)
+        cf_module._busy_bots.discard(self.bot_id)
+        await delete_bot(self.bot_id)
+        self._tmp.cleanup()
+
+
+class NonOwnerCannotStartOrActOnCustomFeatureTests(_CustomFeatureHandlerTestBase):
+    owner_id = 600001
+
+    async def test_non_owner_start_is_denied(self):
+        non_owner = 999001
+        state = _make_fsm_context(non_owner)
+        callback = _make_callback(non_owner, f"customfeature:{self.bot_id}")
+        await cf_module.cb_start_custom_feature(callback, state)
+        callback.answer.assert_awaited()
+        self.assertIsNone(await state.get_state())
+
+    async def test_non_owner_apply_is_denied_and_writes_nothing(self):
+        non_owner = 999002
+        state = _make_fsm_context(non_owner)
+        callback = _make_callback(non_owner, f"applycustom:{self.bot_id}")
+        await cf_module.cb_apply_custom_feature(callback, state)
+        self.assertFalse((self.cf_dir / f"bot_{self.bot_id}.py").exists())
+
+
+class HappyPathAppliesPatchTests(_CustomFeatureHandlerTestBase):
+    owner_id = 600002
+
+    async def test_full_flow_writes_file_records_history_and_reloads(self):
+        state = _make_fsm_context(self.owner_id)
+
+        start_callback = _make_callback(self.owner_id, f"customfeature:{self.bot_id}")
+        await cf_module.cb_start_custom_feature(start_callback, state)
+        self.assertEqual(await state.get_state(), cf_module.CustomFeatureStates.describing_request.state)
+
+        message = _make_message(self.owner_id, "добавь команду /ping")
+        with patch.object(cf_module, "generate_custom_feature", AsyncMock(return_value=_CLEAN_PATCH_SOURCE)), \
+             patch.object(cf_module, "explain_custom_feature", AsyncMock(return_value="Бот научится отвечать на /ping.")):
+            await cf_module.msg_custom_feature_text(message, state)
+
+        data = await state.get_data()
+        self.assertEqual(data["cf_pending_code"], _CLEAN_PATCH_SOURCE)
+        self.assertEqual(data["cf_pending_request"], "добавь команду /ping")
+
+        apply_callback = _make_callback(self.owner_id, f"applycustom:{self.bot_id}")
+        await cf_module.cb_apply_custom_feature(apply_callback, state)
+
+        module_path = self.cf_dir / f"bot_{self.bot_id}.py"
+        self.assertTrue(module_path.exists())
+        self.assertEqual(module_path.read_text(encoding="utf-8"), _CLEAN_PATCH_SOURCE)
+        self._fake_registry.reload_one.assert_awaited_once_with(self.bot_id)
+
+        history = await get_custom_feature_history(self.bot_id)
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]["description"], "добавь команду /ping")
+        self.assertIsNone(await state.get_state())
+
+
+class GenerationErrorOffersRetryTests(_CustomFeatureHandlerTestBase):
+    owner_id = 600003
+
+    async def test_generation_error_clears_state_without_a_pending_preview(self):
+        state = _make_fsm_context(self.owner_id)
+        await cf_module.cb_start_custom_feature(
+            _make_callback(self.owner_id, f"customfeature:{self.bot_id}"), state
+        )
+
+        message = _make_message(self.owner_id, "нечто невозможное")
+        with patch.object(
+            cf_module, "generate_custom_feature",
+            AsyncMock(side_effect=CustomFeatureGenerationError("boom")),
+        ):
+            await cf_module.msg_custom_feature_text(message, state)
+
+        self.assertIsNone(await state.get_state())
+        data = await state.get_data()
+        self.assertNotIn("cf_pending_code", data)
+        self.assertFalse((self.cf_dir / f"bot_{self.bot_id}.py").exists())
+
+
+class BrokenImportIsRejectedAtApplyTests(_CustomFeatureHandlerTestBase):
+    owner_id = 600004
+
+    async def test_broken_import_deletes_file_and_skips_reload(self):
+        state = _make_fsm_context(self.owner_id)
+        await state.set_state(cf_module.CustomFeatureStates.describing_request)
+        await state.update_data(
+            cf_bot_id=self.bot_id, cf_pending_code=_BROKEN_IMPORT_PATCH_SOURCE, cf_pending_request="test",
+        )
+        callback = _make_callback(self.owner_id, f"applycustom:{self.bot_id}")
+        await cf_module.cb_apply_custom_feature(callback, state)
+
+        self.assertFalse((self.cf_dir / f"bot_{self.bot_id}.py").exists())
+        self._fake_registry.reload_one.assert_not_awaited()
+        self.assertEqual(await get_custom_feature_history(self.bot_id), [])
+
+
+class StaleMainFileIsRejectedAtApplyTests(_CustomFeatureHandlerTestBase):
+    """Review-driven fix: the busy-lock only spans generation + apply, not the
+    open-ended time a preview sits waiting for the owner's tap — in that gap
+    /recreate or "Исправить баг" (handlers/manage_bots.py) can freely rewrite
+    the main bot file out from under an already-generated patch. The stored
+    cf_main_code_hash must catch that instead of silently applying a patch
+    against assumptions that no longer hold."""
+    owner_id = 600009
+
+    async def test_changed_main_file_blocks_apply(self):
+        state = _make_fsm_context(self.owner_id)
+        await state.set_state(cf_module.CustomFeatureStates.describing_request)
+        await state.update_data(
+            cf_bot_id=self.bot_id, cf_pending_code=_CLEAN_PATCH_SOURCE, cf_pending_request="test",
+            cf_main_code_hash="deliberately-wrong-hash-simulating-a-since-changed-main-file",
+        )
+        callback = _make_callback(self.owner_id, f"applycustom:{self.bot_id}")
+        await cf_module.cb_apply_custom_feature(callback, state)
+
+        self.assertFalse((self.cf_dir / f"bot_{self.bot_id}.py").exists())
+        self._fake_registry.reload_one.assert_not_awaited()
+        (text,), kwargs = callback.message.edit_text.call_args
+        self.assertIn("изменился", text)
+        self.assertIsNotNone(kwargs.get("reply_markup"), "must offer a way to regenerate")
+
+    async def test_unchanged_main_file_allows_apply(self):
+        state = _make_fsm_context(self.owner_id)
+        await state.set_state(cf_module.CustomFeatureStates.describing_request)
+        current_hash = cf_module._hash_main_code(self.bot_file.read_text(encoding="utf-8"))
+        await state.update_data(
+            cf_bot_id=self.bot_id, cf_pending_code=_CLEAN_PATCH_SOURCE, cf_pending_request="test",
+            cf_main_code_hash=current_hash,
+        )
+        callback = _make_callback(self.owner_id, f"applycustom:{self.bot_id}")
+        await cf_module.cb_apply_custom_feature(callback, state)
+
+        self.assertTrue((self.cf_dir / f"bot_{self.bot_id}.py").exists())
+        self._fake_registry.reload_one.assert_awaited_once_with(self.bot_id)
+
+
+class ForbiddenImportIsRejectedAtApplyTests(_CustomFeatureHandlerTestBase):
+    """Defense in depth (design point 5): even if a forbidden import somehow
+    reached cf_pending_code bypassing generate_custom_feature's own retry
+    loop, the apply-time re-check must still catch it before any write."""
+    owner_id = 600005
+
+    async def test_forbidden_import_never_written_to_disk(self):
+        state = _make_fsm_context(self.owner_id)
+        await state.set_state(cf_module.CustomFeatureStates.describing_request)
+        await state.update_data(
+            cf_bot_id=self.bot_id, cf_pending_code=_FORBIDDEN_IMPORT_PATCH_SOURCE, cf_pending_request="test",
+        )
+        callback = _make_callback(self.owner_id, f"applycustom:{self.bot_id}")
+        await cf_module.cb_apply_custom_feature(callback, state)
+
+        self.assertFalse((self.cf_dir / f"bot_{self.bot_id}.py").exists())
+        self._fake_registry.reload_one.assert_not_awaited()
+
+
+class CancelDiscardsPendingPatchTests(_CustomFeatureHandlerTestBase):
+    owner_id = 600006
+
+    async def test_cancel_clears_state_and_writes_nothing(self):
+        state = _make_fsm_context(self.owner_id)
+        await state.set_state(cf_module.CustomFeatureStates.describing_request)
+        await state.update_data(
+            cf_bot_id=self.bot_id, cf_pending_code=_CLEAN_PATCH_SOURCE, cf_pending_request="test",
+        )
+        callback = _make_callback(self.owner_id, f"cancelcustom:{self.bot_id}")
+        await cf_module.cb_cancel_custom_feature(callback, state)
+
+        self.assertIsNone(await state.get_state())
+        self.assertFalse((self.cf_dir / f"bot_{self.bot_id}.py").exists())
+
+
+class BusyBotRejectsApplyTests(_CustomFeatureHandlerTestBase):
+    owner_id = 600007
+
+    async def test_busy_bot_apply_is_rejected(self):
+        state = _make_fsm_context(self.owner_id)
+        await state.set_state(cf_module.CustomFeatureStates.describing_request)
+        await state.update_data(
+            cf_bot_id=self.bot_id, cf_pending_code=_CLEAN_PATCH_SOURCE, cf_pending_request="test",
+        )
+        cf_module._busy_bots.add(self.bot_id)
+        try:
+            callback = _make_callback(self.owner_id, f"applycustom:{self.bot_id}")
+            await cf_module.cb_apply_custom_feature(callback, state)
+            self.assertFalse((self.cf_dir / f"bot_{self.bot_id}.py").exists())
+        finally:
+            cf_module._busy_bots.discard(self.bot_id)
+
+
+class ApplyWithoutMatchingPendingDataIsRejectedTests(_CustomFeatureHandlerTestBase):
+    owner_id = 600008
+
+    async def test_apply_with_no_pending_state_shows_stale_message(self):
+        state = _make_fsm_context(self.owner_id)  # nothing set — e.g. stale button from an old message
+        callback = _make_callback(self.owner_id, f"applycustom:{self.bot_id}")
+        await cf_module.cb_apply_custom_feature(callback, state)
+
+        callback.answer.assert_awaited_once()
+        callback.message.edit_text.assert_awaited_once()
+        (text,), _ = callback.message.edit_text.call_args
+        self.assertIn("устарела", text)
+        self.assertFalse((self.cf_dir / f"bot_{self.bot_id}.py").exists())
+        self.assertNotIn(self.bot_id, cf_module._busy_bots, "busy lock must be released even on the stale path")
+
+
+if __name__ == "__main__":
+    unittest.main()
