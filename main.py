@@ -12,6 +12,7 @@ from config import BOT_TOKEN
 from db.database import get_all_bots, init_db, set_bot_group, update_bot_status
 from handlers.admin_manager import OWNER_ID, router as admin_router
 from handlers.create_bot import auto_launch_managed_bot, router as create_router, set_bot_id, set_manager_username
+from handlers.feature_connect import router as feature_connect_router
 from handlers.general import router as general_router
 from handlers.manage_bots import router as manage_router
 from handlers.start import router as start_router
@@ -210,6 +211,7 @@ async def main():
     dp.include_router(start_router)
     dp.include_router(create_router)
     dp.include_router(manage_router)
+    dp.include_router(feature_connect_router)  # fconn_* callbacks only — order-independent
     dp.include_router(general_router)  # must be last — catch-all
 
     dp.include_router(build_group_router())

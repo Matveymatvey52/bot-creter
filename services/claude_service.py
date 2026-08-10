@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast as _ast
+import json
 import logging
 import re
 
@@ -810,6 +811,74 @@ async def classify_bot_type(summary: str) -> str:
     )
     result = response.content[0].text.strip().lower().split()[0]
     return result if result in _BOT_TYPE_EXTRAS else "general"
+
+
+# handlers/feature_connect.py's narrow classifier — decides whether a free-form
+# owner message (text, or a voice transcript run through the exact same path)
+# is a request to CONNECT an already-existing platform feature (sheets/payments)
+# to one of the owner's already-created bots, as opposed to /create-style talk
+# about building something new, or ordinary conversation that belongs to
+# ask_assistant(). This is called ONLY after a cheap keyword pre-filter
+# (handlers/feature_connect.py's _looks_like_feature_request) already matched —
+# see that module for the cost-control rationale — so it does not run on every
+# message, only on ones that already look feature-connect-shaped.
+CONNECT_FEATURE_CLASSIFY_PROMPT = """You classify a single message from the owner of a Telegram-bot factory (Bot-creter). Decide whether the message is a request to CONNECT an already-existing platform feature to one of the owner's already-created bots.
+
+Available features (exactly these two, no others exist):
+- "sheets" — Google Sheets / Google Таблицы integration (bot reads/writes a connected spreadsheet)
+- "payments" — Telegram Payments (bot can accept payments)
+
+Respond with ONLY a single line of valid JSON, no markdown fences, no explanation, in exactly this shape:
+{"is_connect_request": true or false, "feature": "sheets" or "payments" or null, "bot_query": "<verbatim bot name/username the user referenced, or null>"}
+
+Rules:
+- is_connect_request is true ONLY when the user is clearly asking to turn on / connect / link / attach one of the two features above to a bot they already own. Examples that ARE connect requests: "подключи таблицы к моему боту", "включи оплату у Ромы", "хочу чтобы бот писал в гугл таблицу", "connect sheets to my shop bot".
+- is_connect_request is false for: requests to CREATE a new bot or build NEW custom functionality (that's a different flow, not this one), questions about how something works, general chit-chat, status/log requests, anything not clearly a connect-an-existing-feature request. When unsure, prefer false — a false negative just falls back to normal conversation, which is safe.
+- feature must be exactly "sheets", "payments", or null if the message doesn't clearly name one of these two (e.g. it names some other capability, or names none at all).
+- bot_query is the bot's name/username/nickname exactly as the user referred to it (e.g. "магазин", "@my_shop_bot", "Рома", "мой бот для записи") — null if the user did not reference a specific bot.
+- Never invent a feature or bot_query that isn't actually implied by the text."""
+
+
+def _parse_connect_feature_intent(raw: str) -> dict:
+    """Best-effort JSON parse of the classifier's output — any malformed or
+    unexpected shape degrades to "not a connect request" (never raises), since
+    a parsing hiccup here must fall back to ordinary conversation, not surface
+    an error to the owner or silently misroute to the wrong bot/feature."""
+    fallback = {"is_connect_request": False, "feature": None, "bot_query": None}
+    try:
+        data = json.loads(_strip_code_fences(raw))
+    except (json.JSONDecodeError, ValueError):
+        return fallback
+    if not isinstance(data, dict):
+        return fallback
+    feature = data.get("feature")
+    if feature not in ("sheets", "payments"):
+        feature = None
+    bot_query = data.get("bot_query")
+    if not isinstance(bot_query, str) or not bot_query.strip():
+        bot_query = None
+    else:
+        bot_query = bot_query.strip()
+    return {
+        "is_connect_request": bool(data.get("is_connect_request")),
+        "feature": feature,
+        "bot_query": bot_query,
+    }
+
+
+async def classify_connect_feature_intent(text: str) -> dict:
+    """Returns {"is_connect_request": bool, "feature": "sheets"|"payments"|None,
+    "bot_query": str|None}. Haiku, tiny max_tokens — same cost tier as
+    classify_bot_type()/extract_bot_name(), not the sonnet model used for code
+    generation. Callers must have already run a cheap local pre-filter (see
+    handlers/feature_connect.py) before invoking this — see that module for why."""
+    response = await client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=150,
+        system=CONNECT_FEATURE_CLASSIFY_PROMPT,
+        messages=[{"role": "user", "content": text}],
+    )
+    return _parse_connect_feature_intent(response.content[0].text)
 
 
 REVIEW_SYSTEM_PROMPT = """You are a senior Python code reviewer specializing in aiogram 3.13 Telegram bots.
