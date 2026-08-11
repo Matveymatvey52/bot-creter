@@ -22,7 +22,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 
 import handlers.custom_features as cf_module
 import runtime.registry as reg
-from db.database import create_bot_record_with_admins, delete_bot, get_custom_feature_history, init_db
+from db.database import add_custom_feature_record, create_bot_record_with_admins, delete_bot, get_custom_feature_history, init_db
 from services.claude_service import CustomFeatureGenerationError
 
 FAKE_TOKEN = "123456789:AAHfakeTokenButShapedRight1234567890"
@@ -314,6 +314,55 @@ class ApplyWithoutMatchingPendingDataIsRejectedTests(_CustomFeatureHandlerTestBa
         self.assertIn("устарела", text)
         self.assertFalse((self.cf_dir / f"bot_{self.bot_id}.py").exists())
         self.assertNotIn(self.bot_id, cf_module._busy_bots, "busy lock must be released even on the stale path")
+
+
+class CustomFeatureHistoryTests(_CustomFeatureHandlerTestBase):
+    """Owner-facing view of bot_custom_features — data layer existed
+    (get_custom_feature_history) but was previously unreachable from any UI."""
+    owner_id = 600010
+
+    async def test_non_owner_is_denied(self):
+        non_owner = 999010
+        callback = _make_callback(non_owner, f"customfeaturehistory:{self.bot_id}")
+        await cf_module.cb_custom_feature_history(callback)
+        callback.answer.assert_awaited_once()
+        callback.message.edit_text.assert_not_awaited()
+
+    async def test_empty_history_says_so(self):
+        callback = _make_callback(self.owner_id, f"customfeaturehistory:{self.bot_id}")
+        await cf_module.cb_custom_feature_history(callback)
+        (text,), _ = callback.message.edit_text.call_args
+        self.assertIn("Пока пусто", text)
+
+    async def test_populated_history_lists_description_and_date_newest_first(self):
+        await add_custom_feature_record(self.bot_id, "добавь команду /ping")
+        await add_custom_feature_record(self.bot_id, "добавь экспорт в CSV")
+        callback = _make_callback(self.owner_id, f"customfeaturehistory:{self.bot_id}")
+        await cf_module.cb_custom_feature_history(callback)
+        (text,), kwargs = callback.message.edit_text.call_args
+        self.assertIn("добавь команду /ping", text)
+        self.assertIn("добавь экспорт в CSV", text)
+        self.assertLess(
+            text.index("добавь экспорт в CSV"), text.index("добавь команду /ping"),
+            "most recently applied request must be listed first",
+        )
+        self.assertIsNotNone(kwargs.get("reply_markup"), "must offer a way back to the bot card")
+
+    async def test_history_beyond_display_limit_is_truncated_with_a_note(self):
+        for i in range(cf_module._HISTORY_DISPLAY_LIMIT + 3):
+            await add_custom_feature_record(self.bot_id, f"доработка №{i}")
+        callback = _make_callback(self.owner_id, f"customfeaturehistory:{self.bot_id}")
+        await cf_module.cb_custom_feature_history(callback)
+        (text,), _ = callback.message.edit_text.call_args
+        self.assertIn(f"последние {cf_module._HISTORY_DISPLAY_LIMIT}", text)
+
+    async def test_description_with_html_special_chars_is_escaped_not_broken(self):
+        await add_custom_feature_record(self.bot_id, "добавь кнопку <script>alert(1)</script>")
+        callback = _make_callback(self.owner_id, f"customfeaturehistory:{self.bot_id}")
+        await cf_module.cb_custom_feature_history(callback)
+        (text,), kwargs = callback.message.edit_text.call_args
+        self.assertNotIn("<script>", text)
+        self.assertIn("&lt;script&gt;", text)
 
 
 if __name__ == "__main__":

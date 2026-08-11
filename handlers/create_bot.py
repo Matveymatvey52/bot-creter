@@ -17,6 +17,7 @@ from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, Inli
 
 from config import ASSEMBLYAI_API_KEY, BOT_TOKEN, DATA_DIR
 from db.database import create_bot_record_with_admins, get_bot, set_bot_display_name, update_bot_status
+from runtime.registry_holder import RegistryHandle
 from runtime.webhook_setup import build_webhook_url, set_webhook_for_bot
 from services.bot_runner import start_bot
 from services.claude_service import chat_gather_requirements, extract_bot_name, generate_bot_code, generate_bot_guide
@@ -58,13 +59,14 @@ def set_bot_id(bid: int) -> None:
 # 2's "фабрика как житель реестра"). Still None when running under main.py's
 # separate long-polling process, since no Registry exists there — new bots
 # then rely purely on services.bot_runner.start_bot() (subprocess model,
-# unchanged) to actually respond, exactly as they do today.
-_registry = None
+# unchanged) to actually respond, exactly as they do today. See
+# runtime/registry_holder.py for why this is a RegistryHandle instead of a
+# bare module global.
+_registry_handle = RegistryHandle()
 
 
 def set_registry(registry) -> None:
-    global _registry
-    _registry = registry
+    _registry_handle.set(registry)
 
 
 async def _register_new_bot_in_registry(bot_id: int, bot_name: str) -> None:
@@ -76,7 +78,7 @@ async def _register_new_bot_in_registry(bot_id: int, bot_name: str) -> None:
     (subprocess model) is what actually makes the bot respond today regardless
     of registry state; a bot present in the DB but missing from the registry
     is recoverable later via a manual reload, not a data-loss scenario."""
-    if _registry is None:
+    if _registry_handle.value is None:
         logger.debug(
             f"No live registry available (polling-only process) — bot id={bot_id} "
             f"({bot_name}) not registered; use /admin/reload/{bot_id} once the "
@@ -88,7 +90,7 @@ async def _register_new_bot_in_registry(bot_id: int, bot_name: str) -> None:
         if fresh_row is None:
             logger.error(f"Registry registration skipped for bot id={bot_id} ({bot_name}) — row vanished after creation")
             return
-        entry = await _registry.add_or_replace(fresh_row)
+        entry = await _registry_handle.value.add_or_replace(fresh_row)
         if entry is None:
             logger.warning(
                 f"Bot id={bot_id} ({bot_name}) created but registry registration failed — "
