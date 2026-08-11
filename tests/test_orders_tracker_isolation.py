@@ -481,6 +481,73 @@ class OrdersTrackerSheetsIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(row[2].startswith("'="), f"expected an apostrophe-escaped formula, got: {row[2]!r}")
 
 
+class OrdersTrackerPriceValidationTests(unittest.IsolatedAsyncioTestCase):
+    """Regression test for the nan-price bug: float("nan") does not raise
+    ValueError, and NaN comparisons are always False, so "nan"/"NaN"/"-nan"
+    used to slip past _parse_price's bounds check and get stored as an order
+    item's price, poisoning every downstream SUM(qty*price) total. Same
+    defect, same fix (math.isfinite), as vehicle_service.py's _parse_price."""
+
+    async def asyncSetUp(self):
+        self._bot_call = AsyncMock(return_value=MagicMock())
+        self._bot_call_patcher = patch.object(Bot, "__call__", new=self._bot_call)
+        self._bot_call_patcher.start()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.data_dir = Path(self._tmp.name)
+        self.config = orders_tracker.config_from_bot_row(
+            {"bot_id": 906, "name": "orders_price_bot", "display_name": None, "group_chat_id": None}, self.data_dir
+        )
+        await orders_tracker.init_db(self.config.db_path)
+        self.bot, self.dp = _build_bot_dispatcher(self.config)
+        await self.dp.feed_webhook_update(self.bot, _text_update(1, ADMIN_ID, "/start"))
+
+    async def asyncTearDown(self):
+        self._tmp.cleanup()
+        self._bot_call_patcher.stop()
+
+    def _sent_texts_to(self, chat_id: int) -> list[str]:
+        texts = []
+        for call in self._bot_call.call_args_list:
+            request = call.args[0] if call.args else None
+            text = getattr(request, "text", None)
+            cid = getattr(request, "chat_id", None)
+            if text and cid == chat_id:
+                texts.append(text)
+        return texts
+
+    def test_parse_price_rejects_nan_variants_without_raising(self):
+        for text in ("nan", "NaN", "-nan", "NAN", "inf", "-inf", "Infinity"):
+            with self.subTest(text=text):
+                self.assertIsNone(orders_tracker._parse_price(text))
+
+    async def test_nan_price_input_is_rejected_with_guidance_and_not_saved(self):
+        """Drives the real FSM up to the price step and types "nan" — must not
+        raise, must re-prompt with the same "enter a number" guidance as any
+        other bad input, and the item must never be persisted with that
+        price."""
+        uid = 10
+        await self.dp.feed_webhook_update(self.bot, _callback_update(uid, ADMIN_ID, "ord_new")); uid += 1
+        await self.dp.feed_webhook_update(self.bot, _text_update(uid, ADMIN_ID, PHONE)); uid += 1
+        await self.dp.feed_webhook_update(self.bot, _text_update(uid, ADMIN_ID, "Test Customer")); uid += 1
+        await self.dp.feed_webhook_update(self.bot, _text_update(uid, ADMIN_ID, "Widget")); uid += 1
+        await self.dp.feed_webhook_update(self.bot, _text_update(uid, ADMIN_ID, "1")); uid += 1
+
+        await self.dp.feed_webhook_update(self.bot, _text_update(uid, ADMIN_ID, "nan")); uid += 1
+
+        texts = self._sent_texts_to(ADMIN_ID)
+        self.assertIn("Введите число, например: 199.90, или нажмите «Без цены»", texts)
+        # Confirm the FSM did NOT advance past the price step: finishing the
+        # item now (skip price) must produce exactly one item, not a
+        # duplicate/finalized one from the rejected "nan" input.
+        await self.dp.feed_webhook_update(self.bot, _callback_update(uid, ADMIN_ID, "ord_price_skip")); uid += 1
+        await self.dp.feed_webhook_update(self.bot, _callback_update(uid, ADMIN_ID, "ord_item_done")); uid += 1
+
+        conn = sqlite3.connect(self.config.db_path)
+        items = conn.execute("SELECT name, qty, price FROM order_items").fetchall()
+        conn.close()
+        self.assertEqual(items, [("Widget", 1, None)])
+
+
 class OrdersTrackerStandaloneSmokeTest(unittest.TestCase):
     def test_config_from_env_matches_legacy_constant_shape(self):
         config = orders_tracker.config_from_env()

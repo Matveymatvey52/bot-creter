@@ -7,6 +7,7 @@ import asyncio
 import html
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -368,7 +369,10 @@ def _parse_price(text: str) -> float | None:
         price = float(text.strip().replace(",", "."))
     except ValueError:
         return None
-    if price < 0 or price > 1_000_000_000:
+    # Review-found: float("nan") doesn't raise ValueError, and NaN comparisons
+    # are always False — without this check "nan"/"NaN" would pass the bounds
+    # check below and silently poison every SUM(qty*price) total downstream.
+    if not math.isfinite(price) or price < 0 or price > 1_000_000_000:
         return None
     return price
 
