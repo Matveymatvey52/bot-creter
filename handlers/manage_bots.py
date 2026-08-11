@@ -31,7 +31,7 @@ from db.database import (
 )
 from features.sheets import get_service_account_email, verify_access
 from handlers.admin_manager import _is_owner
-from runtime.registry import discover_features, infer_template_id
+from runtime.registry import _CUSTOM_FEATURES_DIR, discover_features, infer_template_id, invalidate_custom_feature_cache
 from services.bot_runner import _make_extra_env, get_bot_logs, is_running, start_bot, stop_bot
 from services.claude_service import fix_bot_code, generate_bot_code, improve_bot_code
 from services.github_sync import push_bot_to_github
@@ -116,6 +116,16 @@ def _list_keyboard(bots: list[dict]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def _delete_custom_feature_file(bot_id: int) -> None:
+    """Deletes this bot's custom_features/bot_<id>.py (if any) and evicts it
+    from the registry's module cache — cb_delete's own cleanup, since
+    delete_bot() only clears the bot_custom_features DB row, not the file on
+    disk or runtime.registry's in-memory cache of it (found in review:
+    without this, a deleted bot_id leaves an orphaned file behind forever)."""
+    invalidate_custom_feature_cache(bot_id)
+    (_CUSTOM_FEATURES_DIR / f"bot_{bot_id}.py").unlink(missing_ok=True)
+
+
 def _bot_keyboard(bot_id: int) -> InlineKeyboardMarkup:
     running = is_running(bot_id)
     rows = []
@@ -141,6 +151,7 @@ def _bot_keyboard(bot_id: int) -> InlineKeyboardMarkup:
     ])
     rows.append([
         InlineKeyboardButton(text="🧩 Фичи", callback_data=f"features:{bot_id}"),
+        InlineKeyboardButton(text="🧩➕ Доработка", callback_data=f"customfeature:{bot_id}"),
     ])
     rows.append([
         InlineKeyboardButton(text="◀ К списку", callback_data="list"),
@@ -740,8 +751,16 @@ async def cb_delete(callback: CallbackQuery):
     if not _is_owner(callback.from_user.id):
         await _deny_callback(callback)
         return
-    await callback.answer()
     bot_id = int(callback.data.split(":")[1])
+    # Was previously the only mutating handler in this file with no
+    # _busy_bots check at all — a bot could be deleted mid-generation or
+    # mid-apply of a custom feature (or mid-recreate/autofix/fixbug),
+    # racing whichever of those was about to write to the very bot row/file
+    # this deletes.
+    if bot_id in _busy_bots:
+        await callback.answer(_BUSY_TEXT, show_alert=True)
+        return
+    await callback.answer()
     b = await get_bot(bot_id)
     if not b:
         await callback.message.answer("Бот не найден.")
@@ -749,6 +768,7 @@ async def cb_delete(callback: CallbackQuery):
     name = b["name"]
     await stop_bot(bot_id)
     await delete_bot(bot_id)
+    _delete_custom_feature_file(bot_id)
     await callback.message.edit_text(
         f"✅ Бот <b>{name}</b> удалён.\n\nСоздай нового: /create",
         parse_mode="HTML",
@@ -963,7 +983,7 @@ async def _recognize_voice_fix(message: Message, bot: Bot) -> str | None:
     if not text.strip():
         await message.answer("Не удалось разобрать голосовое, попробуй ещё раз.")
         return None
-    await message.answer(f"🎤 Распознал: <i>{text}</i>", parse_mode="HTML")
+    await message.answer(f"🎤 Распознал: <i>{html.escape(text)}</i>", parse_mode="HTML")
     return text
 
 

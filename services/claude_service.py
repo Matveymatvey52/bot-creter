@@ -1500,3 +1500,209 @@ async def generate_bot_code(requirements_summary: str) -> str:
     code = await _review_bot_code(code, requirements_summary, bot_type=bot_type)
 
     return code
+
+
+# ── custom_features (point doctoring of one specific bot) ──────────────────────
+#
+# Distinct from generate_bot_code/fix_bot_code/improve_bot_code above: those all
+# read AND write the whole bot file (thousands of lines both ways). This writes
+# only a small, additive custom_features/bot_<id>.py module (see
+# runtime/registry.py's _load_and_include_custom_feature) — the main bot file is
+# given as READ-ONLY context so Claude can match its DB_PATH/admin-check/naming
+# conventions, but is never touched, so a future template re-customization of
+# generated_bots/<name>.py never clobbers this file.
+
+CUSTOM_FEATURE_SYSTEM_PROMPT = """You write ONE small, self-contained aiogram 3.13 Router module that adds a single point feature to an ALREADY WORKING Telegram bot.
+
+You will be given: (1) the full existing bot code (READ-ONLY — for context and naming conventions only, do NOT reproduce or modify it), (2) a description of the feature to add.
+
+Output contract:
+- Return ONLY the new module's code — nothing from the existing bot file.
+- Must define a module-level `router = Router()`.
+- If new persistent data is needed, also define `async def init_db(db_path: str) -> None` using aiosqlite, CREATE TABLE IF NOT EXISTS with table names that do not collide with any CREATE TABLE already present in the existing bot code shown to you.
+- Reuse the existing bot's conventions exactly: same DB_PATH/DATA_DIR resolution, same parse_mode="HTML" style.
+- Do NOT redefine any command/callback handler that already exists in the shown code — this module is additive only, never a replacement.
+- This module CANNOT import anything from the existing bot file — it is a separate script, not a package, and has no importable name. If the existing code has an admin-check pattern (e.g. loading admin IDs from a JSON file), REIMPLEMENT the same logic inline in this module using the same underlying data source (e.g. the same admins JSON file path) — never call a function that only exists in the other file, that will crash with NameError the first time a real user reaches it.
+
+AVAILABLE PACKAGES — ONLY use these external libraries (everything else will crash with ImportError):
+  - aiogram 3.13 — Telegram bot framework
+  - aiosqlite — async SQLite
+  - openpyxl — create/read Excel .xlsx files
+  - aiohttp — async HTTP requests
+  - Python stdlib: asyncio, os, logging, datetime, pathlib, csv, json, re, collections, itertools, functools, math, random, string, time, uuid, io
+
+FORBIDDEN PACKAGES — not installed, will cause immediate crash:
+  - requests, httpx, urllib3 → use aiohttp instead
+  - pandas, numpy → use openpyxl or csv module instead
+  - xlrd, xlwt, xlsxwriter → use openpyxl instead
+  - PIL, Pillow → not available
+  - apscheduler, schedule → not available; use asyncio.create_task + asyncio.sleep for delayed jobs
+  - sqlalchemy, peewee, tortoise → use aiosqlite directly
+  - pydantic → not available
+  - Any other third-party library not listed above
+
+Return ONLY valid Python code. No markdown fences. No explanations."""
+
+
+# Same allowlist as CUSTOM_FEATURE_SYSTEM_PROMPT's "AVAILABLE PACKAGES" section
+# above, turned into a real set instead of only prose — the prompt asking
+# Claude nicely is not a control, this is. Deliberately an ALLOWLIST, not a
+# blocklist of the "FORBIDDEN PACKAGES" named above: a blocklist only catches
+# names someone thought to write down, an allowlist rejects everything not
+# already vetted, including packages nobody has thought to forbid yet.
+#
+# THIS IS NOT A SANDBOX — it blocks importing UNVETTED packages, it does
+# nothing to restrict what the VETTED ones can do once this code is running
+# inside the live factory-bot process (runtime/registry.py wires the router
+# straight into a real Dispatcher, no subprocess/container isolation). The
+# real, concrete blast radius of every package left in this set:
+#   - os + pathlib: arbitrary filesystem read/write with this process's own
+#     permissions, INCLUDING os.environ — every secret this process holds
+#     (ENCRYPTION_KEY, ANTHROPIC_API_KEY, GITHUB_TOKEN, BOT_TOKEN) is a plain
+#     os.getenv() call away from generated code.
+#   - aiosqlite: direct read/write access to the SHARED data/bots.db — not
+#     just this bot's own rows. Every bot's Telegram token lives there,
+#     Fernet-encrypted (db/database.py's _encrypt_token) — encrypted is not
+#     the same as inaccessible: combined with the os.environ access above
+#     (ENCRYPTION_KEY is one of the env vars readable that way), a
+#     deliberately malicious patch can decrypt and exfiltrate every bot's
+#     token on the factory, not only the one it was generated for.
+#   - aiohttp: arbitrary outbound HTTP from inside this trusted process — the
+#     exfiltration channel for anything read above, plus reaches whatever
+#     network the factory process itself can reach.
+# Accepted today ONLY because the sole trigger for custom_features is the
+# factory owner's own request, generated fresh each time and shown to them
+# for approval before it's written — there is no untrusted third party in
+# this loop. This stops being an acceptable trade-off the moment that
+# assumption changes (e.g. a bot's own end users being able to influence what
+# gets generated). See backlog_custom_features_known_gaps memory for the
+# cheap partial mitigation not yet implemented (AST-flagging os.system/eval/
+# exec/__import__) and the real fix (actual process/container isolation).
+_ALLOWED_ROOT_MODULES = {
+    "aiogram", "aiosqlite", "openpyxl", "aiohttp",
+    "asyncio", "os", "logging", "datetime", "pathlib", "csv", "json", "re",
+    "collections", "itertools", "functools", "math", "random", "string", "time",
+    "uuid", "io",
+}
+
+
+def _forbidden_imports_from_tree(tree: _ast.AST) -> list[str]:
+    violations: list[str] = []
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.Import):
+            violations += [
+                n.name.split(".")[0] for n in node.names
+                if n.name.split(".")[0] not in _ALLOWED_ROOT_MODULES
+            ]
+        elif isinstance(node, _ast.ImportFrom) and node.module:
+            root = node.module.split(".")[0]
+            if root not in _ALLOWED_ROOT_MODULES:
+                violations.append(root)
+    return violations
+
+
+def check_forbidden_imports(code: str) -> list[str]:
+    """Public entry point — parses `code` fresh and returns the root module
+    names of any import not in _ALLOWED_ROOT_MODULES (empty list = clean).
+    Called twice in the custom_features flow: once inside
+    generate_custom_feature's own retry loop (via _forbidden_imports_from_tree,
+    reusing the AST already parsed for the syntax check — no second parse), and
+    again by handlers/custom_features.py's apply-time gate right before the
+    isolated-import subprocess check, as defense in depth against anything
+    changing between generation and the owner pressing "Применить". Raises
+    SyntaxError if `code` doesn't parse — callers that already validated syntax
+    separately won't hit this; callers that haven't should check syntax first.
+
+    This rejects UNVETTED imports only — it is not a sandbox, see
+    _ALLOWED_ROOT_MODULES' own comment above for the real blast radius of the
+    packages it does allow (os.environ/data.db/network access from inside the
+    live factory process)."""
+    return _forbidden_imports_from_tree(_ast.parse(code))
+
+
+class CustomFeatureGenerationError(Exception):
+    """Raised by generate_custom_feature when Claude can't produce a
+    syntactically valid, allowlist-compliant patch even after one retry.
+    Callers (handlers/custom_features.py) must treat this as a generation
+    failure — show the owner a retry prompt, never fall back to showing a
+    broken/non-compliant preview."""
+
+
+def _custom_feature_violations(code: str) -> tuple[str | None, list[str]]:
+    """Returns (syntax_error_message, forbidden_imports). forbidden_imports is
+    only meaningful when syntax_error_message is None — code that doesn't
+    parse can't be AST-walked for imports either."""
+    try:
+        tree = _ast.parse(code)
+    except SyntaxError as e:
+        return f"SyntaxError on line {e.lineno}: {e.msg}", []
+    return None, _forbidden_imports_from_tree(tree)
+
+
+async def generate_custom_feature(main_code: str, request_text: str) -> str:
+    """Generates one custom_features/bot_<id>.py module. `main_code` is the
+    bot's full existing file, given as read-only context only (never modified,
+    never returned) — see the module-level comment above for why the whole
+    file is sent rather than a hand-extracted excerpt. One retry on syntax
+    error OR forbidden import, same one-shot-retry shape as fix_bot_code's
+    SyntaxError handling; raises CustomFeatureGenerationError if the retry
+    still doesn't come back clean."""
+    user_msg = (
+        f"Feature request from the bot owner:\n{request_text}\n\n"
+        f"Existing bot code (READ-ONLY — for context and conventions only):\n{main_code}"
+    )
+    response = await client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=8000,
+        system=CUSTOM_FEATURE_SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": user_msg}],
+    )
+    code = _strip_code_fences(response.content[0].text)
+
+    syntax_err, forbidden = _custom_feature_violations(code)
+    if syntax_err or forbidden:
+        problem = syntax_err or (
+            f"You used forbidden imports: {', '.join(forbidden)}. "
+            "Rewrite using ONLY the allowed packages listed in the system prompt."
+        )
+        retry_response = await client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=8000,
+            system=CUSTOM_FEATURE_SYSTEM_PROMPT,
+            messages=[
+                {"role": "user", "content": user_msg},
+                {"role": "assistant", "content": code},
+                {"role": "user", "content": f"{problem} Return ONLY corrected Python code, no markdown."},
+            ],
+        )
+        code = _strip_code_fences(retry_response.content[0].text)
+        syntax_err, forbidden = _custom_feature_violations(code)
+        if syntax_err or forbidden:
+            raise CustomFeatureGenerationError(syntax_err or f"forbidden imports: {', '.join(forbidden)}")
+
+    return code
+
+
+EXPLAIN_CUSTOM_FEATURE_PROMPT = """Ты объясняешь владельцу Telegram-бота, что изменится в его боте после точечной доработки — ДО того, как изменение применится.
+
+Пиши по-русски, 3-5 строк, простым языком, без кода и технических терминов (не говори "роутер", "хендлер", "aiosqlite", "модуль" и т.п.). Опиши, что теперь сможет делать бот или его пользователи, с точки зрения обычного человека. Используй HTML-теги (<b>, <i>) для акцентов.
+
+Если в коде появляется новая команда (например /excel) — обязательно назови её."""
+
+
+async def explain_custom_feature(patch_code: str, request_text: str) -> str:
+    """Haiku-sized plain-language translation of a generated custom_features
+    patch, shown to the owner alongside "✅ Применить"/"❌ Отмена" BEFORE the
+    patch is written to disk — see generate_bot_guide for the closest existing
+    analog (same idea, but that one runs AFTER creation; this is the first
+    pre-apply confirmation step in the codebase)."""
+    response = await client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=500,
+        system=EXPLAIN_CUSTOM_FEATURE_PROMPT,
+        messages=[{
+            "role": "user",
+            "content": f"Владелец попросил:\n{request_text}\n\nСгенерированный код доработки:\n{patch_code}",
+        }],
+    )
+    return response.content[0].text.strip()
