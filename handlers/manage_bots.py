@@ -32,6 +32,7 @@ from db.database import (
 from features.sheets import get_service_account_email, verify_access
 from handlers.admin_manager import _is_owner
 from runtime.registry import _CUSTOM_FEATURES_DIR, discover_features, infer_template_id, invalidate_custom_feature_cache
+from runtime.registry_holder import RegistryHandle
 from services.bot_runner import _make_extra_env, get_bot_logs, is_running, start_bot, stop_bot
 from services.claude_service import fix_bot_code, generate_bot_code, improve_bot_code
 from services.github_sync import push_bot_to_github
@@ -48,15 +49,14 @@ _BUSY_TEXT = "⏳ Для этого бота уже выполняется оп�
 _busy_bots: set[int] = set()
 
 # The live webhook Registry, set once by runtime/combined_app.py's bootstrap —
-# same pattern as handlers/create_bot.py's own _registry/set_registry(). Needed
-# so toggling a feature can call reload_one(bot_id) and have it take effect
-# immediately, instead of only on the next full registry rebuild.
-_registry = None
+# same pattern as handlers/create_bot.py's own RegistryHandle/set_registry().
+# Needed so toggling a feature can call reload_one(bot_id) and have it take
+# effect immediately, instead of only on the next full registry rebuild.
+_registry_handle = RegistryHandle()
 
 
 def set_registry(registry) -> None:
-    global _registry
-    _registry = registry
+    _registry_handle.set(registry)
 
 
 class FixBotStates(StatesGroup):
@@ -152,6 +152,9 @@ def _bot_keyboard(bot_id: int) -> InlineKeyboardMarkup:
     rows.append([
         InlineKeyboardButton(text="🧩 Фичи", callback_data=f"features:{bot_id}"),
         InlineKeyboardButton(text="🧩➕ Доработка", callback_data=f"customfeature:{bot_id}"),
+    ])
+    rows.append([
+        InlineKeyboardButton(text="🕘 История доработок", callback_data=f"customfeaturehistory:{bot_id}"),
     ])
     rows.append([
         InlineKeyboardButton(text="◀ К списку", callback_data="list"),
@@ -424,8 +427,8 @@ async def cb_toggle_feature(callback: CallbackQuery):
             await disable_bot_feature(bot_id, feature_name)
         else:
             await enable_bot_feature(bot_id, feature_name)
-        if _registry is not None:
-            await _registry.reload_one(bot_id)
+        if _registry_handle.value is not None:
+            await _registry_handle.value.reload_one(bot_id)
         else:
             logger.debug(f"cb_toggle_feature: no live registry available — bot_id={bot_id} feature={feature_name!r} toggled in DB only")
         await callback.answer("✅ Включено" if not is_enabled else "🔴 Выключено")

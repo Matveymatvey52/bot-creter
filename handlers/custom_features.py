@@ -33,10 +33,11 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-from db.database import add_custom_feature_record, get_bot
+from db.database import add_custom_feature_record, get_bot, get_custom_feature_history
 from handlers.admin_manager import _is_owner
 from handlers.manage_bots import _bot_keyboard, _busy_bots, _recognize_voice_fix
 from runtime.registry import _CUSTOM_FEATURES_DIR, invalidate_custom_feature_cache
+from runtime.registry_holder import RegistryHandle
 from services.claude_service import (
     CustomFeatureGenerationError,
     check_forbidden_imports,
@@ -65,16 +66,15 @@ _ISOLATED_IMPORT_CHECK_SCRIPT = (
     "spec.loader.exec_module(module)\n"
 )
 
-# Same live webhook Registry as handlers/manage_bots.py's own _registry —
-# separate global, separate set_registry(), same convention handlers/create_bot.py
+# Same live webhook Registry as handlers/manage_bots.py's own RegistryHandle —
+# separate instance, separate set_registry(), same convention handlers/create_bot.py
 # established first (each handler module that needs registry access owns its
 # own pointer, wired up individually by runtime/combined_app.py's bootstrap).
-_registry = None
+_registry_handle = RegistryHandle()
 
 
 def set_registry(registry) -> None:
-    global _registry
-    _registry = registry
+    _registry_handle.set(registry)
 
 
 class CustomFeatureStates(StatesGroup):
@@ -397,8 +397,8 @@ async def cb_apply_custom_feature(callback: CallbackQuery, state: FSMContext) ->
 
         await add_custom_feature_record(bot_id, request_text)
         invalidate_custom_feature_cache(bot_id)
-        if _registry is not None:
-            await _registry.reload_one(bot_id)
+        if _registry_handle.value is not None:
+            await _registry_handle.value.reload_one(bot_id)
         else:
             logger.debug(f"cb_apply_custom_feature: no live registry available — bot_id={bot_id} written to disk only")
         asyncio.create_task(push_bot_to_github(f"bot_{bot_id}", patch_code, subdir="custom_features"))
@@ -410,6 +410,62 @@ async def cb_apply_custom_feature(callback: CallbackQuery, state: FSMContext) ->
         )
     finally:
         _busy_bots.discard(bot_id)
+
+
+# bot_custom_features can grow unbounded over a bot's lifetime (one row per
+# successful apply, never pruned) — cap what one message shows so it stays
+# readable and can't approach Telegram's 4096-char message limit; the DB
+# layer itself still returns the full history (get_custom_feature_history has
+# no LIMIT), only this display is truncated.
+_HISTORY_DISPLAY_LIMIT = 15
+_HISTORY_DESCRIPTION_CHAR_LIMIT = 300
+
+
+def _truncate(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+@router.callback_query(F.data.startswith("customfeaturehistory:"))
+async def cb_custom_feature_history(callback: CallbackQuery) -> None:
+    if not _is_owner(callback.from_user.id):
+        await _deny_callback(callback)
+        return
+    bot_id = int(callback.data.split(":")[1])
+    b = await get_bot(bot_id)
+    if not b:
+        await callback.answer()
+        await callback.message.edit_text("❌ Бот не найден.")
+        return
+    await callback.answer()
+
+    history = await get_custom_feature_history(bot_id)
+    header = f"🕘 История доработок для <b>{html.escape(b['name'])}</b>\n\n"
+    if not history:
+        text = header + "Пока пусто — доработок ещё не применялось."
+    else:
+        shown = history[:_HISTORY_DISPLAY_LIMIT]
+        lines = [
+            f"• {html.escape(entry['applied_at'][:16])} — "
+            f"{html.escape(_truncate(entry['description'], _HISTORY_DESCRIPTION_CHAR_LIMIT))}"
+            for entry in shown
+        ]
+        footer = ""
+        if len(history) > len(shown):
+            footer = f"\n\n<i>Показаны последние {len(shown)} из {len(history)}.</i>"
+        text = header + "\n".join(lines) + footer
+
+    back_keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="◀ Назад", callback_data=f"info:{bot_id}"),
+    ]])
+    try:
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=back_keyboard)
+    except TelegramBadRequest:
+        # description is the owner's own free-form request text — if it
+        # contains something HTML can't parse (stray '<', unbalanced tag),
+        # fall back to plain text rather than losing the history view, same
+        # pattern as _generate_and_preview's explanation fallback above.
+        logger.warning(f"cb_custom_feature_history: bot_id={bot_id} history HTML failed to parse, sending as plain text")
+        await callback.message.edit_text(text, reply_markup=back_keyboard)
 
 
 @router.callback_query(F.data.startswith("cancelcustom:"))
