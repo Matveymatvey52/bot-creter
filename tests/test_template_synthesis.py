@@ -228,7 +228,7 @@ class GenerateBotCodeTwoTemplateBranch(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         self._patcher.stop()
 
-    async def test_merge_review_runs_before_general_review(self):
+    async def test_merge_review_runs_before_narrow_risk_before_general_review(self):
         select_prompt = claude_service._build_template_select_prompt()
         synth_system = claude_service.GENERATE_SYSTEM_PROMPT + claude_service.MERGE_TEMPLATES_EXTRA
         call_order: list[str] = []
@@ -243,6 +243,9 @@ class GenerateBotCodeTwoTemplateBranch(unittest.IsolatedAsyncioTestCase):
             if system == claude_service.MERGE_REVIEW_SYSTEM_PROMPT:
                 call_order.append("merge_review")
                 return _fake_response("MERGE_REVIEWED\nasyncio.run(main())")
+            if system == claude_service.NARROW_RISK_REVIEW_SYSTEM_PROMPT:
+                call_order.append("narrow_risk_review")
+                return _fake_response("NARROW_REVIEWED\nasyncio.run(main())")
             if system == claude_service.BOT_TYPE_CLASSIFY_PROMPT:
                 call_order.append("classify")
                 return _fake_response("general")
@@ -256,7 +259,8 @@ class GenerateBotCodeTwoTemplateBranch(unittest.IsolatedAsyncioTestCase):
         result = await claude_service.generate_bot_code("sells products and rewards loyalty points")
 
         self.assertEqual(
-            call_order, ["select", "synthesize", "merge_review", "classify", "general_review"]
+            call_order,
+            ["select", "synthesize", "merge_review", "narrow_risk_review", "classify", "general_review"],
         )
         self.assertEqual(result, "FINAL_REVIEWED\nasyncio.run(main())")
 
@@ -278,13 +282,18 @@ class SynthesisModeIsolatedFromSingleTemplateRequests(unittest.IsolatedAsyncioTe
             claude_service, "_review_merged_bot_code", new=AsyncMock()
         )
         self.mock_merge_review = self._merge_review_patcher.start()
+        self._narrow_review_patcher = patch.object(
+            claude_service, "_review_narrow_risk_code", new=AsyncMock()
+        )
+        self.mock_narrow_review = self._narrow_review_patcher.start()
 
     async def asyncTearDown(self):
         self._client_patcher.stop()
         self._synth_patcher.stop()
         self._merge_review_patcher.stop()
+        self._narrow_review_patcher.stop()
 
-    async def test_single_template_never_calls_synthesis_or_merge_review(self):
+    async def test_single_template_never_calls_synthesis_merge_or_narrow_review(self):
         select_prompt = claude_service._build_template_select_prompt()
 
         async def fake_create(*, model, max_tokens, system, messages):
@@ -304,12 +313,16 @@ class SynthesisModeIsolatedFromSingleTemplateRequests(unittest.IsolatedAsyncioTe
 
         self.mock_synth.assert_not_called()
         self.mock_merge_review.assert_not_called()
+        # The narrow risk/FSM/SQL-safety/dedup review is reserved for
+        # synthesis and custom_features — ordinary single-template
+        # customization must never touch it.
+        self.mock_narrow_review.assert_not_called()
         # Regression check for the gap found during design: the single-template
         # customize path used to return right after customization, with no
         # general review pass at all.
         self.assertEqual(result, "REVIEWED\nasyncio.run(main())")
 
-    async def test_no_template_match_never_calls_synthesis_or_merge_review(self):
+    async def test_no_template_match_never_calls_synthesis_merge_or_narrow_review(self):
         select_prompt = claude_service._build_template_select_prompt()
 
         async def fake_create(*, model, max_tokens, system, messages):
@@ -329,6 +342,7 @@ class SynthesisModeIsolatedFromSingleTemplateRequests(unittest.IsolatedAsyncioTe
 
         self.mock_synth.assert_not_called()
         self.mock_merge_review.assert_not_called()
+        self.mock_narrow_review.assert_not_called()
         self.assertEqual(result, "SCRATCH_REVIEWED\nasyncio.run(main())")
 
 
