@@ -1432,6 +1432,72 @@ async def _review_merged_bot_code(code: str, requirements: str) -> str:
         return code  # review broke the code — keep pre-review version
 
 
+# Narrow, risk-targeted review pass — reserved for the two riskiest generation
+# paths (synthesis and custom_features, see their call sites below). Checks
+# three things neither _review_bot_code nor _review_merged_bot_code cover as
+# a dedicated concern: FSM state-transition correctness, SQL parameterization
+# / cross-bot data isolation (not checked ANYWHERE else in the pipeline
+# today), and duplication/dead code. Deliberately not run for plain
+# single-template customization or from-scratch generation — those paths
+# reuse a previously-reviewed template or already get the full generic pass;
+# this is extra spend only where the generated code is least proven.
+NARROW_RISK_REVIEW_SYSTEM_PROMPT = """You are a senior Python code reviewer specializing in aiogram 3.13 Telegram bots. You are reviewing code from one of the two highest-risk generation paths in an automated bot-factory: either synthesized from two templates, or a from-scratch patch written for one specific bot's unique request. Focus ONLY on these three risk categories — do not comment on anything else, do not restyle, do not "improve" unrelated code:
+
+1. FSM STATE-TRANSITION CORRECTNESS
+   - Every state a handler/keyboard can put the FSM into must have a handler that consumes it and either advances to the next state or clears state — no dead ends.
+   - No handler silently skips, re-enters, or double-advances a state.
+   - Every cancel/back/completion path calls state.clear() (or the equivalent) — no orphaned FSM state left behind after a flow ends.
+
+2. DATA ISOLATION / SQL SAFETY
+   - Every SQL query must interpolate any user-supplied or bot-instance value via aiosqlite parameter placeholders (?) — flag ANY query built with f-strings, .format(), %-formatting, or string concatenation of a variable into SQL text.
+   - Any query against a table that could be shared or reused across bot instances must filter by this bot's own identifying column — flag anything that could read or write another bot's/another instance's rows.
+   - Flag any write path that could expand this code's reach beyond its own bot's own data.
+
+3. DUPLICATION / DEAD CODE
+   - Two functions/handlers doing materially the same thing where one should just call the other.
+   - Copy-pasted blocks that should be one shared helper.
+   - Any defined function, constant, import, or handler that is never referenced anywhere in the file.
+
+For each real issue found in these three categories: fix it directly in the code, minimally, without touching anything else. If nothing in these three categories is wrong, return the code unchanged — do not invent problems to justify a change.
+
+Return ONLY valid Python code. No markdown, no explanations."""
+
+
+async def _review_narrow_risk_code(code: str, context: str, reference_code: str = "") -> str:
+    """FSM-transition / SQL-safety-and-data-isolation / duplication pass. See
+    NARROW_RISK_REVIEW_SYSTEM_PROMPT's comment above for scope and why it's
+    reserved for synthesis and custom_features. `context` is free-form —
+    the requirements summary for synthesis, or the owner's feature-request
+    text for custom_features. `reference_code`, when given, is the existing
+    bot's main file shown READ-ONLY so the reviewer can also flag new
+    table/callback names that collide with it — used for custom_features
+    only; synthesis already gets collision checking from
+    _review_merged_bot_code so it calls this with reference_code empty.
+    Same auto-apply contract as _review_bot_code/_review_merged_bot_code:
+    returns the full corrected file, or the pre-review code unchanged if the
+    reviewed output doesn't parse."""
+    user_content = f"Context (for reference, not to be reproduced):\n{context}\n\n"
+    if reference_code:
+        user_content += (
+            f"Existing bot code shown READ-ONLY, for collision checks only — "
+            f"do not reproduce or modify it:\n{reference_code}\n\n"
+        )
+    user_content += f"Code to review:\n{code}"
+
+    response = await client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=25000 if not reference_code else 8000,  # custom_features patches are small modules
+        system=NARROW_RISK_REVIEW_SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": user_content}],
+    )
+    reviewed = _strip_code_fences(response.content[0].text)
+    try:
+        _ast.parse(reviewed)
+        return reviewed
+    except SyntaxError:
+        return code  # review broke the code — keep pre-review version
+
+
 async def generate_bot_code(requirements_summary: str) -> str:
     # Try template(s) first — saves 5-10x tokens vs generating from scratch
     templates = await _select_template(requirements_summary)
@@ -1447,6 +1513,7 @@ async def generate_bot_code(requirements_summary: str) -> str:
         code = await _synthesize_from_templates(templates, requirements_summary)
         if "asyncio.run(main())" in code:
             code = await _review_merged_bot_code(code, requirements_summary)
+            code = await _review_narrow_risk_code(code, requirements_summary)
             bot_type = await classify_bot_type(requirements_summary)
             code = await _review_bot_code(code, requirements_summary, bot_type=bot_type)
             return code
@@ -1646,7 +1713,17 @@ async def generate_custom_feature(main_code: str, request_text: str) -> str:
     file is sent rather than a hand-extracted excerpt. One retry on syntax
     error OR forbidden import, same one-shot-retry shape as fix_bot_code's
     SyntaxError handling; raises CustomFeatureGenerationError if the retry
-    still doesn't come back clean."""
+    still doesn't come back clean.
+
+    Once the code passes that hard gate, it also gets one
+    _review_narrow_risk_code pass — this from-scratch path is otherwise the
+    only generation path in the whole pipeline with zero LLM-based code
+    review. If that pass's own output fails the same hard gate (should be
+    rare — it only ever edits code that already passed), the narrow-review
+    edit is discarded and the pre-review code (already known-good) is
+    returned instead — no second retry, so this can't turn into an unbounded
+    loop, and no exception, since the pre-review code is already a valid
+    result."""
     user_msg = (
         f"Feature request from the bot owner:\n{request_text}\n\n"
         f"Existing bot code (READ-ONLY — for context and conventions only):\n{main_code}"
@@ -1679,6 +1756,12 @@ async def generate_custom_feature(main_code: str, request_text: str) -> str:
         syntax_err, forbidden = _custom_feature_violations(code)
         if syntax_err or forbidden:
             raise CustomFeatureGenerationError(syntax_err or f"forbidden imports: {', '.join(forbidden)}")
+
+    pre_review_code = code
+    code = await _review_narrow_risk_code(code, request_text, reference_code=main_code)
+    syntax_err, forbidden = _custom_feature_violations(code)
+    if syntax_err or forbidden:
+        code = pre_review_code  # narrow review broke the hard gate — keep the already-valid pre-review code
 
     return code
 
