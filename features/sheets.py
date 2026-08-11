@@ -1,5 +1,5 @@
 # FEATURE: sheets
-# COMPATIBLE_WITH: accountant, booking_beauty, booking_fitness, booking_medical, campaign_tracker, event_manager, inventory, loyalty_program, manager_secretary, moderator, orders_tracker, referral_program, shop_catalog, tour_operator, tourist_documents, trip_manager
+# COMPATIBLE_WITH: accountant, booking_beauty, booking_fitness, booking_medical, campaign_tracker, event_manager, expense_tracker, inventory, loyalty_program, manager_secretary, moderator, orders_tracker, referral_program, shop_catalog, tour_operator, tourist_documents, trip_manager
 """Reusable Google Sheets feature module — see sheets-feature-inventory for
 the design decisions behind this file.
 
