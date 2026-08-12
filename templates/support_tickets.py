@@ -1,5 +1,5 @@
 # TEMPLATE: support_tickets
-# USE FOR: техподдержка/хелпдеск с тикетами — категории обращений с приоритетом и SLA, поиск по базе знаний перед созданием тикета, статус-флоу тикета (открыт → в работе → ждём ответа клиента → закрыт, плюс эскалация к специалисту), автоуведомление клиента при ответе поддержки и закрытии тикета, оценка удовлетворённости после закрытия
+# USE FOR: тикет-система поддержки клиентов — база знаний для самообслуживания перед созданием тикета, категории с эскалацией к живому агенту, статус-флоу нового тикета (новый → отвечен → эскалирован → закрыт), очередь для админа по возрасту заявки (SLA), оценка удовлетворённости клиентом после закрытия тикета
 # CUSTOMIZE: sections marked with # CUSTOMIZE
 from __future__ import annotations
 
@@ -8,80 +8,70 @@ import html
 import json
 import logging
 import os
-import re
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta
 from pathlib import Path
 
 import aiosqlite
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
-from aiogram.exceptions import TelegramAPIError
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import (
-    CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message,
-)
+from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 # ── CUSTOMIZE ────────────────────────────────────────────────────────────────
 # Same status as every other template's CUSTOMIZE block: per-file source-text
 # customization Claude edits when generating a specific bot, not per-bot
 # runtime state (that's config.db_path/admins_file below).
-BOT_DESCRIPTION = "Техподдержка с тикетами: категории/приоритет/SLA, база знаний перед созданием тикета, эскалация к специалисту, оценка после закрытия."
+BOT_DESCRIPTION = (
+    "Тикет-система поддержки: база знаний для самостоятельного поиска ответа, "
+    "создание тикета с категорией, статус-флоу и эскалация к живому агенту, "
+    "SLA-очередь по возрасту заявки для админа, оценка удовлетворённости после закрытия."
+)
 WELCOME_TEXT = (
-    "🎫 <b>Служба поддержки</b>\n\n"
-    "Тикеты клиентов с категорией, приоритетом и SLA. База знаний для "
-    "самопомощи, эскалация к специалисту по кнопке, автоуведомление клиента "
-    "об ответе и закрытии, оценка удовлетворённости.\n\nВыберите действие:"
+    "🎫 <b>Поддержка клиентов</b>\n\n"
+    "Тикеты со статус-флоу: 🆕 новый → 💬 отвечен → 🔺 эскалирован → ✅ закрыт. "
+    "База знаний для самообслуживания клиентов, очередь по возрасту заявки, "
+    "оценка после закрытия.\n\nВыберите действие:"
 )
-CLIENT_WELCOME_TEXT = (
-    "👋 Здравствуйте! Это служба поддержки.\n\n"
-    "Можете создать новый тикет или посмотреть свои текущие обращения."
-)
-# code -> {label, priority, sla_hours}. Priority and SLA are DERIVED from the
-# category the client picks — this is the single place that mapping lives.
-TICKET_CATEGORIES = {
-    "technical": {"label": "🛠 Техническая проблема", "priority": "high", "sla_hours": 4},
-    "billing": {"label": "💳 Оплата и биллинг", "priority": "high", "sla_hours": 4},
-    "account": {"label": "👤 Аккаунт и доступ", "priority": "medium", "sla_hours": 12},
-    "general": {"label": "❓ Общий вопрос", "priority": "low", "sla_hours": 24},
-}
-PRIORITY_LABELS = {"high": "🔴 Высокий", "medium": "🟡 Средний", "low": "🟢 Низкий"}
+CLIENT_WELCOME_TEXT = "👋 Здравствуйте! Это бот поддержки.\n\nВыберите действие:"
+
 STATUS_LABELS = {
-    "open": "🆕 Открыт",
-    "in_progress": "⚙️ В работе",
-    "waiting_response": "⏳ Ждём вашего ответа",
-    "escalated": "📞 Эскалирован специалисту",
+    "new": "🆕 Новый",
+    "answered": "💬 Отвечен",
+    "escalated": "🔺 Эскалирован",
     "closed": "✅ Закрыт",
 }
-# Text sent to the CLIENT (not the admin) when their ticket crosses into this
-# status. Only the transitions the client actually cares about — same
-# philosophy as templates/vehicle_service.py's STATUS_NOTIFY_TEXT (don't spam
-# on every internal state change).
-STATUS_NOTIFY_TEXT = {
-    "waiting_response": "💬 По вашему тикету №{ticket_id} есть новая информация от поддержки — загляните в «📋 Мои тикеты».",
-    "closed": "✅ Ваш тикет №{ticket_id} закрыт. Спасибо за обращение!",
-}
+
+# Ticket/KB-article category codes shown as buttons on both the client's
+# self-service search and the admin's knowledge-base editor — kept as short
+# ascii codes (not the label text) so callback_data stays stable even if the
+# Russian label wording is tweaked later.
+TICKET_CATEGORIES = [
+    ("billing", "💳 Оплата и биллинг"),
+    ("technical", "🔧 Технические проблемы"),
+    ("account", "👤 Аккаунт и доступ"),
+    ("other", "❓ Другое"),
+]
+TICKET_CATEGORY_LABELS = dict(TICKET_CATEGORIES)
+
+# Sent to the CLIENT when an admin replies (status -> 'answered').
+NEW_REPLY_NOTIFY_TEXT = "💬 Новый ответ по вашему тикету №{ticket_id} ({category}):\n\n{text}"
+# Sent to the CLIENT immediately when their ticket is closed — the bot itself
+# asks for the 1-5 rating, per the design brief.
+RATING_PROMPT_TEXT = "✅ Ваш тикет №{ticket_id} закрыт. Оцените, пожалуйста, качество поддержки:"
+# Sent to every ADMIN when a client creates a new ticket or follows up on an
+# open one — an SLA-conscious queue is useless if admins have to keep
+# refreshing "Активные тикеты" to notice new activity.
+NEW_TICKET_ADMIN_NOTIFY = "🆘 Новый тикет №{ticket_id} от {client_name}\nКатегория: {category}\n\n{text}"
+FOLLOWUP_ADMIN_NOTIFY = "💬 Новое сообщение по тикету №{ticket_id} от {client_name}:\n\n{text}"
 # ── END CUSTOMIZE ─────────────────────────────────────────────────────────────
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 router = Router()
-
-# Explicit forward-only flow, same shape as templates/vehicle_service.py's
-# STATUS_TRANSITIONS: no backward moves except the deliberate in_progress <->
-# waiting_response cycle (an admin asks something, client replies, admin
-# keeps working — a real back-and-forth, not a status regression). "closed"
-# is reachable from every non-terminal status and is itself terminal.
-STATUS_TRANSITIONS = {
-    "open": ["in_progress", "waiting_response", "escalated", "closed"],
-    "in_progress": ["waiting_response", "escalated", "closed"],
-    "waiting_response": ["in_progress", "escalated", "closed"],
-    "escalated": ["in_progress", "closed"],
-    "closed": [],
-}
 
 
 # ── config ───────────────────────────────────────────────────────────────────
@@ -182,101 +172,58 @@ def _join_bounded(lines: list[str], limit: int = 3500) -> str:
     return "\n".join(out)
 
 
-# ── db ────────────────────────────────────────────────────────────────────────
-
-async def init_db(db_path: str):
-    async with aiosqlite.connect(db_path) as db:
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS tickets (
-                id                   INTEGER PRIMARY KEY AUTOINCREMENT,
-                client_user_id       INTEGER NOT NULL,
-                client_name          TEXT NOT NULL,
-                category             TEXT NOT NULL,
-                priority             TEXT NOT NULL CHECK(priority IN ('low','medium','high')),
-                description          TEXT NOT NULL,
-                status               TEXT NOT NULL DEFAULT 'open'
-                                     CHECK(status IN ('open','in_progress','waiting_response','escalated','closed')),
-                sla_deadline         TEXT NOT NULL,
-                satisfaction_rating  INTEGER CHECK(satisfaction_rating IS NULL OR satisfaction_rating BETWEEN 1 AND 5),
-                created_at           TEXT DEFAULT (datetime('now','localtime')),
-                updated_at           TEXT DEFAULT (datetime('now','localtime'))
-            )
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS ticket_status_log (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                ticket_id   INTEGER NOT NULL,
-                old_status  TEXT,
-                new_status  TEXT NOT NULL,
-                changed_by  INTEGER,
-                notified    INTEGER DEFAULT 0,
-                changed_at  TEXT DEFAULT (datetime('now','localtime'))
-            )
-        """)
-        # The "conversation": client's initial description is logged here as
-        # the first row (author='client') at ticket creation, and any admin
-        # reply is appended (author='admin') and forwarded to the client as a
-        # bot message — the SIMPLER option the design brief allows instead of
-        # a full chat-thread UI, while still satisfying "ответ администратора
-        # с уведомлением клиенту".
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS ticket_log (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                ticket_id   INTEGER NOT NULL,
-                author      TEXT NOT NULL CHECK(author IN ('client','admin')),
-                body        TEXT NOT NULL,
-                created_at  TEXT DEFAULT (datetime('now','localtime'))
-            )
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS kb_articles (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                title       TEXT NOT NULL,
-                keywords    TEXT,
-                body        TEXT NOT NULL,
-                active      INTEGER NOT NULL DEFAULT 1,
-                created_at  TEXT DEFAULT (datetime('now','localtime'))
-            )
-        """)
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_tickets_status ON tickets(status)")
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_tickets_client ON tickets(client_user_id)")
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_ticket_log_ticket ON ticket_log(ticket_id)")
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_kb_active ON kb_articles(active)")
-        await db.commit()
+def _cap_html(text: str, limit: int = 3900) -> str:
+    """Final length guard applied to an ALREADY html.escape()-d, fully
+    assembled message — right before it goes into edit_text/answer. Bounding
+    only the raw pre-escape field (as _esc()'s max_len does) is not enough:
+    html.escape() can expand a string up to ~6x (each '&'/'<'/'>'/'"' becomes
+    a multi-char entity), so a field that passed its _esc() bound can still
+    push the assembled message over Telegram's ~4096-char cap and make
+    edit_text raise uncaught. Every caller here only wraps a short, fixed-size
+    prefix (category label, "❓ <b>question</b>") in tags before this cap is
+    applied, so a truncation always lands in trailing plain-escaped text, not
+    mid-tag."""
+    if len(text) > limit:
+        return text[:limit] + "…"
+    return text
 
 
-# ── FSM staleness guard ─────────────────────────────────────────────────────────
-# Same mechanic as templates/vehicle_service.py's FLOW_TIMEOUT_SECONDS/_flow_expired.
-FLOW_TIMEOUT_SECONDS = 300
+async def _safe_edit_text(message: Message, text: str, **kwargs) -> None:
+    """edit_text wrapper that swallows Telegram's "message is not modified"
+    error — a real outcome (not a bug) when a CAS-guarded action is a no-op
+    (e.g. a stale double-tap on an already-escalated/already-closed ticket
+    re-renders byte-identical content) and would otherwise raise uncaught."""
+    try:
+        await message.edit_text(text, **kwargs)
+    except TelegramBadRequest as e:
+        if "message is not modified" not in str(e).lower():
+            raise
+        logger.debug(f"support_tickets: ignored no-op edit_text: {e}")
 
-MAX_DESCRIPTION_LEN = 1500
+
+async def _notify_admins(bot: Bot, config: SupportTicketsConfig, text: str) -> None:
+    """Best-effort broadcast to every registered admin — a blocked/deleted
+    admin account must never break notifying the others, same
+    try/except-per-recipient rationale as event_manager.py's broadcast loop."""
+    for admin_id in _load_admins(config.admins_file):
+        try:
+            await bot.send_message(int(admin_id), text, parse_mode="HTML")
+        except (TelegramAPIError, ValueError) as e:
+            logger.warning(f"support_tickets: failed to notify admin {admin_id}: {e}")
+
+
+# ── input length bounds ─────────────────────────────────────────────────────
+MAX_PROBLEM_LEN = 2000
 MAX_REPLY_LEN = 2000
-MAX_KB_TITLE_LEN = 120
-MAX_KB_KEYWORDS_LEN = 200
-MAX_KB_BODY_LEN = 2000
+MAX_QUESTION_LEN = 300
+MAX_ANSWER_LEN = 2000
 
 
-def _flow_expired(data: dict) -> bool:
-    started_at = data.get("started_at")
-    return started_at is None or (time.time() - started_at) > FLOW_TIMEOUT_SECONDS
-
-
-# ── FSM states ───────────────────────────────────────────────────────────────
-
-class TicketFlow(StatesGroup):
-    description = State()   # client: free-text problem description, after category pick
-
-class AdminReplyFlow(StatesGroup):
-    text = State()           # admin: free-text reply forwarded to the client
-
-class KbFlow(StatesGroup):
-    title = State()
-    keywords = State()
-    body = State()
-
-class AdminMgmtFlow(StatesGroup):
-    add_admin = State()
-    remove_admin_pick = State()
+def _valid_text(text: str, max_len: int) -> str | None:
+    text = text.strip()
+    if not text or len(text) > max_len:
+        return None
+    return text
 
 
 def _valid_admin_id(text: str) -> bool:
@@ -286,181 +233,169 @@ def _valid_admin_id(text: str) -> bool:
     return int(text) > 0 and str(int(text)) == text
 
 
-# ── knowledge-base search ────────────────────────────────────────────────────
-# Simple LIKE match against title/keywords — no need for real full-text
-# search per the design brief. The dynamic SQL below only ever interpolates a
-# FIXED "(lower(title) LIKE ? OR ...)" fragment repeated N times (N = number
-# of search terms, capped at 8 by _kb_search_terms) — every actual VALUE
-# still goes through a "?" placeholder, so this is not a SQL-injection risk
-# despite the f-string.
-
-def _kb_search_terms(text: str) -> list[str]:
-    words = re.findall(r"\w{3,}", text.lower())
-    seen: list[str] = []
-    for w in words:
-        if w not in seen:
-            seen.append(w)
-    return seen[:8]
+def _valid_rating(text: str) -> int | None:
+    try:
+        score = int(text.strip())
+    except ValueError:
+        return None
+    return score if 1 <= score <= 5 else None
 
 
-async def _search_kb(db_path: str, query_text: str, limit: int = 3) -> list:
-    terms = _kb_search_terms(query_text)
-    if not terms:
-        return []
-    conditions = " OR ".join(["(lower(title) LIKE ? OR lower(COALESCE(keywords,'')) LIKE ?)"] * len(terms))
-    params: list = []
-    for t in terms:
-        params.extend([f"%{t}%", f"%{t}%"])
+# ── db ────────────────────────────────────────────────────────────────────────
+
+async def init_db(db_path: str):
     async with aiosqlite.connect(db_path) as db:
-        db.row_factory = aiosqlite.Row
-        rows = await (await db.execute(
-            f"SELECT id, title, body FROM kb_articles WHERE active=1 AND ({conditions}) ORDER BY id DESC LIMIT ?",
-            (*params, limit),
-        )).fetchall()
-    return rows
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS kb_articles (
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                category  TEXT NOT NULL,
+                question  TEXT NOT NULL,
+                answer    TEXT NOT NULL,
+                active    INTEGER NOT NULL DEFAULT 1
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS tickets (
+                id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+                client_user_id        INTEGER NOT NULL,
+                client_name           TEXT,
+                category              TEXT NOT NULL,
+                status                TEXT NOT NULL DEFAULT 'new'
+                                      CHECK(status IN ('new','answered','escalated','closed')),
+                satisfaction_rating   INTEGER,
+                created_at            TEXT DEFAULT (datetime('now','localtime')),
+                updated_at            TEXT DEFAULT (datetime('now','localtime'))
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS ticket_messages (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticket_id   INTEGER NOT NULL REFERENCES tickets(id),
+                sender      TEXT NOT NULL CHECK(sender IN ('client','admin')),
+                text        TEXT NOT NULL,
+                created_at  TEXT DEFAULT (datetime('now','localtime'))
+            )
+        """)
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_tickets_status ON tickets(status)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_tickets_client ON tickets(client_user_id)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_messages_ticket ON ticket_messages(ticket_id)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_kb_category_active ON kb_articles(category, active)")
+        await db.commit()
+
+
+# ── FSM staleness guard ─────────────────────────────────────────────────────────
+# Same mechanic as templates/vehicle_service.py's FLOW_TIMEOUT_SECONDS/_flow_expired.
+FLOW_TIMEOUT_SECONDS = 300
+
+
+def _flow_expired(data: dict) -> bool:
+    started_at = data.get("started_at")
+    return started_at is None or (time.time() - started_at) > FLOW_TIMEOUT_SECONDS
+
+
+# ── FSM states ───────────────────────────────────────────────────────────────
+
+class ClientTicketFlow(StatesGroup):
+    problem_text = State()   # "Это не помогло" -> free-text problem description
+    reply_text = State()     # client follow-up message on an open ticket
+
+class AdminReplyFlow(StatesGroup):
+    reply_text = State()
+
+class KBFlow(StatesGroup):
+    # Shared by BOTH "add article" and "edit article" — the answer-step
+    # handler branches on whether state data carries an edit_id (UPDATE) or
+    # not (INSERT). Keeps the FSM surface small instead of duplicating a
+    # near-identical 2-step chain twice.
+    question = State()
+    answer = State()
+
+class AdminMgmtFlow(StatesGroup):
+    add_admin = State()
+    remove_admin_pick = State()
 
 
 # ── keyboards ─────────────────────────────────────────────────────────────────
 
-def kb_main_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🎫 Тикеты", callback_data="adm_tkt_menu")],
-        [InlineKeyboardButton(text="📚 База знаний", callback_data="adm_kb_menu")],
-        [InlineKeyboardButton(text="👥 Админы", callback_data="adm_menu")],
-    ])
-
-def kb_client_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🆕 Создать тикет", callback_data="tkt_new")],
-        [InlineKeyboardButton(text="📋 Мои тикеты", callback_data="tkt_my")],
-    ])
+MAX_LIST_BUTTONS = 25
+MAX_ADMIN_REMOVE_BUTTONS = 30
 
 def kb_back(callback_data: str = "main_menu") -> InlineKeyboardButton:
     return InlineKeyboardButton(text="◀️ Назад", callback_data=callback_data)
 
-def kb_flow_cancel() -> InlineKeyboardMarkup:
-    # Admin-only flows' shared cancel button — same principle as
-    # vehicle_service.py's kb_flow_cancel(). Client flows use
-    # kb_tkt_flow_cancel() instead since flow_cancel is admin-gated.
+def kb_flow_cancel(back_to: str = "flow_cancel") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data=back_to)]])
+
+# ── admin main menu ──
+def kb_main_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="❌ Отмена", callback_data="flow_cancel")],
+        [InlineKeyboardButton(text="🎫 Тикеты", callback_data="tk_menu")],
+        [InlineKeyboardButton(text="📚 База знаний", callback_data="kb_menu")],
+        [InlineKeyboardButton(text="👥 Админы", callback_data="adm_menu")],
     ])
 
-def kb_tkt_flow_cancel() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="❌ Отмена", callback_data="tkt_flow_cancel")],
-    ])
-
-MAX_LIST_BUTTONS = 25
-MAX_ADMIN_REMOVE_BUTTONS = 30
-
-# ── tickets menu (admin) ──
+# ── admin tickets ──
 def kb_tickets_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📋 Список тикетов", callback_data="adm_tkt_list")],
+        [InlineKeyboardButton(text="🎫 Активные (по возрасту)", callback_data="tk_filter:active")],
+        [InlineKeyboardButton(text="📁 Закрытые", callback_data="tk_filter:closed")],
+        [InlineKeyboardButton(text="📋 Все", callback_data="tk_filter:all")],
         [kb_back()],
     ])
-
-_STATUS_FILTERS = [
-    ("open", "🆕 Открытые"), ("in_progress", "⚙️ В работе"),
-    ("waiting_response", "⏳ Ждут клиента"), ("escalated", "📞 Эскалированные"),
-    ("closed", "✅ Закрытые"), ("all", "📋 Все"),
-]
-
-def kb_status_filters() -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(text=label, callback_data=f"adm_tkt_filter:{code}")]
-            for code, label in _STATUS_FILTERS]
-    rows.append([kb_back("adm_tkt_menu")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def kb_ticket_list(rows: list[tuple]) -> InlineKeyboardMarkup:
     btns = [
         [InlineKeyboardButton(
-            text=f"№{tid} · {STATUS_LABELS.get(status, status)} · {PRIORITY_LABELS.get(priority, priority)}",
-            callback_data=f"adm_tkt_view:{tid}",
-        )]
-        for tid, status, category, priority in rows[:MAX_LIST_BUTTONS]
-    ]
-    btns.append([kb_back("adm_tkt_list")])
-    return InlineKeyboardMarkup(inline_keyboard=btns)
-
-def kb_admin_ticket_detail(ticket_id: int, status: str) -> InlineKeyboardMarkup:
-    rows = []
-    for target in STATUS_TRANSITIONS.get(status, []):
-        icon = {"closed": "✅ Закрыть", "escalated": "📞 Эскалировать"}.get(
-            target, f"▶️ {STATUS_LABELS.get(target, target)}"
-        )
-        rows.append([InlineKeyboardButton(text=icon, callback_data=f"adm_tkt_status:{ticket_id}:{target}")])
-    if status != "closed":
-        rows.append([InlineKeyboardButton(text="✉️ Ответить клиенту", callback_data=f"adm_tkt_reply:{ticket_id}")])
-    rows.append([kb_back("adm_tkt_list")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-# ── category / ticket-creation (client) ──
-def kb_category_pick() -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(text=info["label"], callback_data=f"tkt_cat:{code}")]
-            for code, info in TICKET_CATEGORIES.items()]
-    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="tkt_flow_cancel")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-def kb_search_results() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Это помогло, закрыть", callback_data="tkt_kb_helped")],
-        [InlineKeyboardButton(text="❌ Не помогло, создать тикет", callback_data="tkt_kb_create")],
-    ])
-
-# ── my tickets (client) ──
-def kb_my_ticket_list(rows: list[tuple]) -> InlineKeyboardMarkup:
-    btns = [
-        [InlineKeyboardButton(
-            text=f"№{tid} · {STATUS_LABELS.get(status, status)} · {TICKET_CATEGORIES.get(cat, {}).get('label', cat)}",
-            callback_data=f"tkt_my_view:{tid}",
+            text=f"№{tid} · {STATUS_LABELS.get(status, status)} · {TICKET_CATEGORY_LABELS.get(cat, cat)}",
+            callback_data=f"tk_view:{tid}",
         )]
         for tid, status, cat in rows[:MAX_LIST_BUTTONS]
     ]
-    btns.append([InlineKeyboardButton(text="◀️ Назад", callback_data="tkt_client_menu")])
+    btns.append([kb_back("tk_menu")])
     return InlineKeyboardMarkup(inline_keyboard=btns)
 
-def kb_client_ticket_detail(ticket_id: int, status: str, rating_set: bool = False) -> InlineKeyboardMarkup:
+def kb_ticket_admin_detail(ticket_id: int, status: str) -> InlineKeyboardMarkup:
     rows = []
-    if status in ("open", "in_progress"):
-        rows.append([InlineKeyboardButton(text="📞 Эскалировать к специалисту", callback_data=f"tkt_escalate:{ticket_id}")])
-    if status == "closed" and not rating_set:
-        rows.append(_rating_buttons(ticket_id))
-    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="tkt_my")])
+    if status != "closed":
+        rows.append([InlineKeyboardButton(text="✍️ Ответить", callback_data=f"tk_reply:{ticket_id}")])
+        if status != "escalated":
+            rows.append([InlineKeyboardButton(text="🔺 Эскалировать", callback_data=f"tk_escalate:{ticket_id}")])
+        rows.append([InlineKeyboardButton(text="✅ Закрыть", callback_data=f"tk_close:{ticket_id}")])
+    rows.append([kb_back("tk_menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-def _rating_buttons(ticket_id: int) -> list[InlineKeyboardButton]:
-    return [InlineKeyboardButton(text=str(n), callback_data=f"tkt_rate:{ticket_id}:{n}") for n in range(1, 6)]
-
-def kb_rating_only(ticket_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[_rating_buttons(ticket_id)])
-
-# ── knowledge base (admin) ──
+# ── admin knowledge base ──
 def kb_kb_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Добавить статью", callback_data="adm_kb_new")],
-        [InlineKeyboardButton(text="📋 Список статей", callback_data="adm_kb_list")],
-        [kb_back()],
-    ])
+    rows = [[InlineKeyboardButton(text=label, callback_data=f"kb_cat:{code}")] for code, label in TICKET_CATEGORIES]
+    rows.append([InlineKeyboardButton(text="➕ Добавить статью", callback_data="kb_add")])
+    rows.append([kb_back()])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
-def kb_kb_list(rows: list[tuple]) -> InlineKeyboardMarkup:
+def kb_category_pick(prefix: str) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text=label, callback_data=f"{prefix}:{code}")] for code, label in TICKET_CATEGORIES]
+    rows.append([kb_back("kb_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def kb_kb_article_list(rows: list[tuple], category: str) -> InlineKeyboardMarkup:
+    """rows are (id, question, active) — admin-side browse deliberately
+    includes hidden (active=0) articles, marked with a 🗑 prefix, so a
+    soft-deleted article stays reachable for editing (see cb_kb_hide's
+    comment) instead of vanishing from every admin list."""
     btns = [
         [InlineKeyboardButton(
-            text=("🙈 " if not active else "") + _esc(title, 40),
-            callback_data=f"adm_kb_view:{aid}",
+            text=("🗑 " if not active else "") + _esc(question, 40), callback_data=f"kb_view:{aid}",
         )]
-        for aid, title, active in rows[:MAX_LIST_BUTTONS]
+        for aid, question, active in rows[:MAX_LIST_BUTTONS]
     ]
-    btns.append([kb_back("adm_kb_menu")])
+    btns.append([InlineKeyboardButton(text="➕ Добавить статью", callback_data=f"kb_add_cat:{category}")])
+    btns.append([kb_back("kb_menu")])
     return InlineKeyboardMarkup(inline_keyboard=btns)
 
-def kb_kb_detail(article_id: int, active: bool) -> InlineKeyboardMarkup:
-    toggle_text = "🙈 Скрыть" if active else "👁 Показать"
+def kb_kb_article_detail(article_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✏️ Редактировать", callback_data=f"adm_kb_edit:{article_id}")],
-        [InlineKeyboardButton(text=toggle_text, callback_data=f"adm_kb_toggle:{article_id}")],
-        [kb_back("adm_kb_list")],
+        [InlineKeyboardButton(text="✏️ Редактировать", callback_data=f"kb_edit:{article_id}")],
+        [InlineKeyboardButton(text="🗑 Скрыть", callback_data=f"kb_hide:{article_id}")],
+        [kb_back("kb_menu")],
     ])
 
 # ── admins menu ──
@@ -476,43 +411,83 @@ def kb_remove_admins(ids: list[str]) -> InlineKeyboardMarkup:
     rows.append([kb_back("adm_menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
+# ── client-side ──
+def kb_client_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🆘 Поддержка", callback_data="cli_support")],
+        [InlineKeyboardButton(text="📋 Мои тикеты", callback_data="cli_tickets")],
+    ])
+
+def kb_client_categories() -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text=label, callback_data=f"cli_cat:{code}")] for code, label in TICKET_CATEGORIES]
+    rows.append([kb_back("cli_main")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def kb_client_kb_list(rows: list[tuple], category: str) -> InlineKeyboardMarkup:
+    btns = [[InlineKeyboardButton(text=_esc(question, 40), callback_data=f"cli_kb_view:{aid}")] for aid, question in rows[:MAX_LIST_BUTTONS]]
+    btns.append([InlineKeyboardButton(text="🙁 Это не помогло", callback_data=f"cli_new_ticket:{category}")])
+    btns.append([kb_back("cli_support")])
+    return InlineKeyboardMarkup(inline_keyboard=btns)
+
+def kb_client_kb_article(category: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🙁 Это не помогло", callback_data=f"cli_new_ticket:{category}")],
+        [kb_back(f"cli_cat:{category}")],
+    ])
+
+def kb_client_ticket_list(rows: list[tuple]) -> InlineKeyboardMarkup:
+    btns = [
+        [InlineKeyboardButton(
+            text=f"№{tid} · {STATUS_LABELS.get(status, status)} · {TICKET_CATEGORY_LABELS.get(cat, cat)}",
+            callback_data=f"cli_ticket_view:{tid}",
+        )]
+        for tid, status, cat in rows[:MAX_LIST_BUTTONS]
+    ]
+    btns.append([kb_back("cli_main")])
+    return InlineKeyboardMarkup(inline_keyboard=btns)
+
+def kb_client_ticket_detail(ticket_id: int, status: str, needs_rating: bool) -> InlineKeyboardMarkup:
+    rows = []
+    if status != "closed":
+        rows.append([InlineKeyboardButton(text="✍️ Ответить", callback_data=f"cli_ticket_reply:{ticket_id}")])
+    if needs_rating:
+        rows.append(kb_rating_buttons_row(ticket_id))
+    rows.append([kb_back("cli_tickets")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def kb_rating_buttons_row(ticket_id: int) -> list[InlineKeyboardButton]:
+    return [InlineKeyboardButton(text=str(n), callback_data=f"sup_rate:{ticket_id}:{n}") for n in range(1, 6)]
+
+def kb_rating_prompt(ticket_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[kb_rating_buttons_row(ticket_id)])
+
 
 # ── rendering helpers ────────────────────────────────────────────────────────
 
-async def _ticket_detail_text(db_path: str, ticket_id: int, extra_note: str | None = None) -> str | None:
+async def _ticket_detail_text(db_path: str, ticket_id: int) -> tuple[str, dict] | tuple[None, None]:
     async with aiosqlite.connect(db_path) as db:
         db.row_factory = aiosqlite.Row
-        t = await (await db.execute("SELECT * FROM tickets WHERE id=?", (ticket_id,))).fetchone()
-        if not t:
-            return None
-        log_rows = await (await db.execute(
-            "SELECT author, body FROM ticket_log WHERE ticket_id=? ORDER BY id", (ticket_id,)
+        ticket = await (await db.execute("SELECT * FROM tickets WHERE id=?", (ticket_id,))).fetchone()
+        if not ticket:
+            return None, None
+        messages = await (await db.execute(
+            "SELECT sender, text, created_at FROM ticket_messages WHERE ticket_id=? ORDER BY id", (ticket_id,)
         )).fetchall()
 
-    # Fall back to the raw category code if the bot was reconfigured after
-    # this ticket was created (TICKET_CATEGORIES no longer has that key) —
-    # _esc() here is defense-in-depth since t["category"] is normally only
-    # ever one of our own trusted CUSTOMIZE dict keys, never client text.
-    info = TICKET_CATEGORIES.get(t["category"], {"label": _esc(t["category"])})
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    sla_breached = t["status"] != "closed" and t["sla_deadline"] < now_str
+    ticket = dict(ticket)
     lines = [
-        f"🎫 <b>Тикет №{t['id']}</b> · {STATUS_LABELS.get(t['status'], t['status'])}\n",
-        f"{info.get('label', _esc(t['category']))} · {PRIORITY_LABELS.get(t['priority'], t['priority'])}",
-        f"👤 {_esc(t['client_name'])}",
-        f"🕐 Создан: {t['created_at']}",
+        f"🎫 <b>Тикет №{ticket['id']}</b> · {STATUS_LABELS.get(ticket['status'], ticket['status'])}\n",
+        f"🏷 {TICKET_CATEGORY_LABELS.get(ticket['category'], ticket['category'])}",
+        f"👤 {_esc(ticket['client_name'])}",
+        f"🕐 Создан: {ticket['created_at']}\n",
+        "<b>Переписка:</b>",
     ]
-    if t["status"] != "closed":
-        lines.append("⚠️ SLA просрочен" if sla_breached else f"⏰ Ответить до {t['sla_deadline']}")
-    if t["satisfaction_rating"] is not None:
-        lines.append(f"⭐ Оценка клиента: {t['satisfaction_rating']}/5")
-    lines.append("\n<b>Обращение:</b>")
-    author_labels = {"client": "👤 Клиент", "admin": "🛠 Поддержка"}
-    for row in log_rows:
-        lines.append(f"• {author_labels.get(row['author'], row['author'])}: {_esc(row['body'], 400)}")
-    if extra_note:
-        lines.append(f"\n{extra_note}")
-    return _join_bounded(lines)
+    for m in messages:
+        who = "🙋 Клиент" if m["sender"] == "client" else "🛟 Поддержка"
+        lines.append(f"{who} ({m['created_at']}):\n{_esc(m['text'], 1000)}")
+    if ticket["satisfaction_rating"]:
+        lines.append(f"\n⭐ Оценка клиента: {ticket['satisfaction_rating']}/5")
+    return _join_bounded(lines), ticket
 
 
 # ── /start ────────────────────────────────────────────────────────────────────
@@ -543,6 +518,9 @@ async def cmd_start(message: Message, state: FSMContext, config: SupportTicketsC
                 parse_mode="HTML",
             )
     else:
+        # No phone/Contact-linking needed here (unlike vehicle_service.py) —
+        # a ticket's client identity IS the Telegram user id directly, so any
+        # first-time visitor can go straight into the support menu.
         await message.answer(CLIENT_WELCOME_TEXT, reply_markup=kb_client_menu())
 
 
@@ -555,8 +533,8 @@ async def cb_main_menu(cb: CallbackQuery, state: FSMContext, config: SupportTick
     await cb.message.edit_text(WELCOME_TEXT, parse_mode="HTML", reply_markup=kb_main_menu())
 
 
-@router.callback_query(F.data == "tkt_client_menu")
-async def cb_tkt_client_menu(cb: CallbackQuery, state: FSMContext):
+@router.callback_query(F.data == "cli_main")
+async def cb_client_main(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
     await state.clear()
     await cb.message.edit_text(CLIENT_WELCOME_TEXT, reply_markup=kb_client_menu())
@@ -566,284 +544,16 @@ async def cb_tkt_client_menu(cb: CallbackQuery, state: FSMContext):
 async def cb_flow_cancel(cb: CallbackQuery, state: FSMContext, config: SupportTicketsConfig):
     await cb.answer()
     await state.clear()
-    if not _is_admin(cb.from_user.id, config):
-        return
-    await cb.message.edit_text("Отменено.", reply_markup=kb_main_menu())
-
-
-@router.callback_query(F.data == "tkt_flow_cancel")
-async def cb_tkt_flow_cancel(cb: CallbackQuery, state: FSMContext):
-    await cb.answer()
-    await state.clear()
-    await cb.message.edit_text("Отменено.", reply_markup=kb_client_menu())
-
-
-# ── NEW TICKET flow (client): category -> description -> KB search -> create ──
-
-@router.callback_query(F.data == "tkt_new")
-async def cb_tkt_new(cb: CallbackQuery, state: FSMContext):
-    await cb.answer()
-    await state.clear()
-    await cb.message.edit_text("Выберите категорию обращения:", reply_markup=kb_category_pick())
-
-
-@router.callback_query(F.data.startswith("tkt_cat:"))
-async def cb_tkt_cat(cb: CallbackQuery, state: FSMContext):
-    await cb.answer()
-    code = cb.data.split(":", 1)[1]
-    if code not in TICKET_CATEGORIES:
-        return
-    await state.set_state(TicketFlow.description)
-    await state.update_data(started_at=time.time(), category=code)
-    await cb.message.edit_text(
-        f"{TICKET_CATEGORIES[code]['label']}\n\n📝 Опишите проблему подробнее:",
-        reply_markup=kb_tkt_flow_cancel(),
-    )
-
-
-async def _finalize_ticket(
-    message_answer, state: FSMContext, config: SupportTicketsConfig, bot: Bot,
-    client_user_id: int, client_name: str,
-) -> None:
-    data = await state.get_data()
-    category = data.get("category")
-    description = data.get("description")
-    if not category or category not in TICKET_CATEGORIES or not description:
-        # Double-tap guard, same principle as vehicle_service.py's
-        # cb_request_item_done: a second concurrent tap sees empty/cleared
-        # data and hits this branch instead of creating a duplicate ticket.
-        await state.clear()
-        await message_answer("Тикет уже создан или сессия устарела.", reply_markup=kb_client_menu())
-        return
-    await state.clear()
-    info = TICKET_CATEGORIES[category]
-    sla_deadline = (datetime.now() + timedelta(hours=info["sla_hours"])).strftime("%Y-%m-%d %H:%M:%S")
-    async with aiosqlite.connect(config.db_path) as db:
-        cur = await db.execute(
-            "INSERT INTO tickets (client_user_id, client_name, category, priority, description, sla_deadline) "
-            "VALUES (?,?,?,?,?,?)",
-            (client_user_id, client_name, category, info["priority"], description, sla_deadline),
-        )
-        ticket_id = cur.lastrowid
-        await db.execute(
-            "INSERT INTO ticket_log (ticket_id, author, body) VALUES (?, 'client', ?)",
-            (ticket_id, description),
-        )
-        await db.commit()
-
-    text = await _ticket_detail_text(config.db_path, ticket_id)
-    await message_answer(
-        f"✅ Тикет создан!\n\n{text}", parse_mode="HTML",
-        reply_markup=kb_client_ticket_detail(ticket_id, "open"),
-    )
-    for admin_id in _load_admins(config.admins_file):
-        try:
-            await bot.send_message(
-                int(admin_id),
-                f"🆕 <b>Новый тикет №{ticket_id}</b> · {PRIORITY_LABELS.get(info['priority'], info['priority'])}\n"
-                f"{info['label']}\n👤 {_esc(client_name)}\n\n{_esc(description, 300)}",
-                parse_mode="HTML",
-            )
-        except Exception as e:
-            logger.warning(f"support_tickets: failed to notify admin {admin_id} of new ticket {ticket_id}: {e}")
-
-
-@router.message(TicketFlow.description, F.text, ~F.text.startswith("/"))
-async def tkt_description(msg: Message, state: FSMContext, config: SupportTicketsConfig, bot: Bot):
-    data = await state.get_data()
-    if _flow_expired(data):
-        await state.clear()
-        await msg.answer("Сессия истекла, начните заново.", reply_markup=kb_client_menu())
-        return
-    description = msg.text.strip()
-    if not description:
-        await msg.answer("Описание не может быть пустым. Опишите проблему:", reply_markup=kb_tkt_flow_cancel())
-        return
-    if len(description) > MAX_DESCRIPTION_LEN:
-        await msg.answer(
-            f"⚠️ Слишком длинное описание (макс {MAX_DESCRIPTION_LEN} симв.). Сократите и отправьте снова:",
-            reply_markup=kb_tkt_flow_cancel(),
-        )
-        return
-    category = data.get("category")
-    if category not in TICKET_CATEGORIES:
-        await state.clear()
-        await msg.answer("Сессия устарела, начните заново.", reply_markup=kb_client_menu())
-        return
-    await state.update_data(description=description)
-
-    matches = await _search_kb(config.db_path, f"{TICKET_CATEGORIES[category]['label']} {description}")
-    if matches:
-        # Waiting on a button tap next, not more text — clear the STATE but
-        # keep the DATA (category/description/started_at), same pattern as
-        # vehicle_service.py's _finalize_item setting state to None mid-flow.
-        await state.set_state(None)
-        lines = ["📚 <b>Возможно, вам поможет:</b>\n"]
-        for m in matches:
-            lines.append(f"<b>{_esc(m['title'])}</b>\n{_esc(m['body'], 300)}\n")
-        await msg.answer(_join_bounded(lines), parse_mode="HTML", reply_markup=kb_search_results())
+    if _is_admin(cb.from_user.id, config):
+        await cb.message.edit_text("Отменено.", reply_markup=kb_main_menu())
     else:
-        await _finalize_ticket(msg.answer, state, config, bot, msg.from_user.id, msg.from_user.full_name)
+        await cb.message.edit_text("Отменено.", reply_markup=kb_client_menu())
 
 
-@router.callback_query(F.data == "tkt_kb_helped")
-async def cb_tkt_kb_helped(cb: CallbackQuery, state: FSMContext):
-    await cb.answer()
-    data = await state.get_data()
-    if _flow_expired(data):
-        await state.clear()
-        await cb.message.edit_text("Сессия истекла, начните заново.", reply_markup=kb_client_menu())
-        return
-    await state.clear()
-    await cb.message.edit_text(
-        "Рады, что помогли! Обращайтесь, если понадобится ещё что-то.", reply_markup=kb_client_menu(),
-    )
+# ── ADMIN: tickets ───────────────────────────────────────────────────────────
 
-
-@router.callback_query(F.data == "tkt_kb_create")
-async def cb_tkt_kb_create(cb: CallbackQuery, state: FSMContext, config: SupportTicketsConfig, bot: Bot):
-    await cb.answer()
-    data = await state.get_data()
-    if _flow_expired(data):
-        await state.clear()
-        await cb.message.edit_text("Сессия истекла, начните заново.", reply_markup=kb_client_menu())
-        return
-    await _finalize_ticket(cb.message.answer, state, config, bot, cb.from_user.id, cb.from_user.full_name)
-
-
-# ── MY TICKETS (client) ──────────────────────────────────────────────────────
-
-@router.callback_query(F.data == "tkt_my")
-async def cb_tkt_my(cb: CallbackQuery, state: FSMContext, config: SupportTicketsConfig):
-    await cb.answer()
-    await state.clear()
-    async with aiosqlite.connect(config.db_path) as db:
-        rows = await (await db.execute(
-            "SELECT id, status, category FROM tickets WHERE client_user_id=? ORDER BY id DESC LIMIT ?",
-            (cb.from_user.id, MAX_LIST_BUTTONS),
-        )).fetchall()
-    if not rows:
-        await cb.message.edit_text("У вас пока нет тикетов.", reply_markup=kb_client_menu())
-        return
-    await cb.message.edit_text("📋 Ваши тикеты:", reply_markup=kb_my_ticket_list(rows))
-
-
-@router.callback_query(F.data.startswith("tkt_my_view:"))
-async def cb_tkt_my_view(cb: CallbackQuery, config: SupportTicketsConfig):
-    await cb.answer()
-    try:
-        ticket_id = int(cb.data.split(":", 1)[1])
-    except ValueError:
-        return
-    async with aiosqlite.connect(config.db_path) as db:
-        row = await (await db.execute(
-            "SELECT client_user_id, status, satisfaction_rating FROM tickets WHERE id=?", (ticket_id,)
-        )).fetchone()
-    # Ownership check: same response for "doesn't exist" and "belongs to
-    # someone else" so a client can't fish for which ticket IDs exist by
-    # probing tkt_my_view:<id> with arbitrary ids.
-    if not row or row[0] != cb.from_user.id:
-        await cb.message.edit_text("Тикет не найден.", reply_markup=kb_client_menu())
-        return
-    text = await _ticket_detail_text(config.db_path, ticket_id)
-    await cb.message.edit_text(
-        text, parse_mode="HTML",
-        reply_markup=kb_client_ticket_detail(ticket_id, row[1], rating_set=row[2] is not None),
-    )
-
-
-@router.callback_query(F.data.startswith("tkt_escalate:"))
-async def cb_tkt_escalate(cb: CallbackQuery, bot: Bot, config: SupportTicketsConfig):
-    await cb.answer()
-    try:
-        ticket_id = int(cb.data.split(":", 1)[1])
-    except ValueError:
-        return
-    async with aiosqlite.connect(config.db_path) as db:
-        row = await (await db.execute(
-            "SELECT client_user_id, status FROM tickets WHERE id=?", (ticket_id,)
-        )).fetchone()
-        if not row or row[0] != cb.from_user.id:
-            await cb.message.edit_text("Тикет не найден.", reply_markup=kb_client_menu())
-            return
-        old_status = row[1]
-        if old_status not in ("open", "in_progress", "waiting_response"):
-            text = await _ticket_detail_text(config.db_path, ticket_id)
-            await cb.message.edit_text(text, parse_mode="HTML",
-                                        reply_markup=kb_client_ticket_detail(ticket_id, old_status))
-            return
-        # Compare-and-swap: double-tap-safe, same principle as
-        # vehicle_service.py's cb_req_status.
-        cur = await db.execute(
-            "UPDATE tickets SET status='escalated', updated_at=datetime('now','localtime') WHERE id=? AND status=?",
-            (ticket_id, old_status),
-        )
-        if cur.rowcount == 0:
-            await db.commit()
-            text = await _ticket_detail_text(config.db_path, ticket_id)
-            await cb.message.edit_text(text, parse_mode="HTML",
-                                        reply_markup=kb_client_ticket_detail(ticket_id, "escalated"))
-            return
-        await db.execute(
-            "INSERT INTO ticket_status_log (ticket_id, old_status, new_status, changed_by) VALUES (?,?,?,?)",
-            (ticket_id, old_status, "escalated", cb.from_user.id),
-        )
-        await db.commit()
-
-    text = await _ticket_detail_text(config.db_path, ticket_id, extra_note="📞 Запрос передан специалисту.")
-    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=kb_client_ticket_detail(ticket_id, "escalated"))
-
-    for admin_id in _load_admins(config.admins_file):
-        try:
-            await bot.send_message(
-                int(admin_id),
-                f"🚨 <b>Эскалация тикета №{ticket_id}</b> — клиент запросил специалиста.",
-                parse_mode="HTML",
-            )
-        except Exception as e:
-            logger.warning(f"support_tickets: failed to notify admin {admin_id} of escalation on ticket {ticket_id}: {e}")
-
-
-@router.callback_query(F.data.startswith("tkt_rate:"))
-async def cb_tkt_rate(cb: CallbackQuery, config: SupportTicketsConfig):
-    await cb.answer()
-    try:
-        _, ticket_id_s, score_s = cb.data.split(":", 2)
-        ticket_id = int(ticket_id_s)
-        score = int(score_s)
-    except ValueError:
-        return
-    if score < 1 or score > 5:
-        return
-    async with aiosqlite.connect(config.db_path) as db:
-        row = await (await db.execute(
-            "SELECT client_user_id, status FROM tickets WHERE id=?", (ticket_id,)
-        )).fetchone()
-        if not row or row[0] != cb.from_user.id:
-            await cb.message.edit_text("Тикет не найден.", reply_markup=kb_client_menu())
-            return
-        if row[1] != "closed":
-            return
-        # Compare-and-swap on "still unrated" — double-tap-safe, same
-        # principle as every other status-mutating callback in this file.
-        cur = await db.execute(
-            "UPDATE tickets SET satisfaction_rating=? WHERE id=? AND satisfaction_rating IS NULL",
-            (score, ticket_id),
-        )
-        await db.commit()
-        rated_now = cur.rowcount > 0
-
-    text = await _ticket_detail_text(
-        config.db_path, ticket_id, extra_note="⭐ Спасибо за оценку!" if rated_now else None,
-    )
-    await cb.message.edit_text(text, parse_mode="HTML",
-                                reply_markup=kb_client_ticket_detail(ticket_id, "closed", rating_set=True))
-
-
-# ── TICKETS menu (admin) ──────────────────────────────────────────────────────
-
-@router.callback_query(F.data == "adm_tkt_menu")
-async def cb_adm_tkt_menu(cb: CallbackQuery, state: FSMContext, config: SupportTicketsConfig):
+@router.callback_query(F.data == "tk_menu")
+async def cb_tk_menu(cb: CallbackQuery, state: FSMContext, config: SupportTicketsConfig):
     await cb.answer()
     if not _is_admin(cb.from_user.id, config):
         return
@@ -851,269 +561,317 @@ async def cb_adm_tkt_menu(cb: CallbackQuery, state: FSMContext, config: SupportT
     await cb.message.edit_text("🎫 <b>Тикеты</b>", parse_mode="HTML", reply_markup=kb_tickets_menu())
 
 
-@router.callback_query(F.data == "adm_tkt_list")
-async def cb_adm_tkt_list(cb: CallbackQuery, config: SupportTicketsConfig):
+@router.callback_query(F.data.startswith("tk_filter:"))
+async def cb_tk_filter(cb: CallbackQuery, state: FSMContext, config: SupportTicketsConfig):
     await cb.answer()
     if not _is_admin(cb.from_user.id, config):
         return
-    await cb.message.edit_text("Выберите фильтр по статусу:", reply_markup=kb_status_filters())
-
-
-@router.callback_query(F.data.startswith("adm_tkt_filter:"))
-async def cb_adm_tkt_filter(cb: CallbackQuery, config: SupportTicketsConfig):
-    await cb.answer()
-    if not _is_admin(cb.from_user.id, config):
-        return
-    status = cb.data.split(":", 1)[1]
+    await state.clear()
+    filter_code = cb.data.split(":", 1)[1]
     async with aiosqlite.connect(config.db_path) as db:
-        if status == "all":
+        if filter_code == "active":
+            # Oldest first — an SLA-conscious queue surfaces the
+            # longest-waiting ticket at the top, not the newest.
             rows = await (await db.execute(
-                "SELECT id, status, category, priority FROM tickets ORDER BY id DESC LIMIT ?", (MAX_LIST_BUTTONS,)
+                "SELECT id, status, category FROM tickets WHERE status != 'closed' "
+                "ORDER BY created_at ASC, id ASC LIMIT ?", (MAX_LIST_BUTTONS,)
+            )).fetchall()
+        elif filter_code == "closed":
+            rows = await (await db.execute(
+                "SELECT id, status, category FROM tickets WHERE status = 'closed' "
+                "ORDER BY id DESC LIMIT ?", (MAX_LIST_BUTTONS,)
             )).fetchall()
         else:
             rows = await (await db.execute(
-                "SELECT id, status, category, priority FROM tickets WHERE status=? ORDER BY id DESC LIMIT ?",
-                (status, MAX_LIST_BUTTONS),
+                "SELECT id, status, category FROM tickets ORDER BY id DESC LIMIT ?", (MAX_LIST_BUTTONS,)
             )).fetchall()
     if not rows:
-        await cb.message.edit_text("Тикетов не найдено.", reply_markup=kb_status_filters())
+        await cb.message.edit_text("Тикетов не найдено.", reply_markup=kb_tickets_menu())
         return
-    await cb.message.edit_text(f"📋 Тикеты (последние {len(rows)}):", reply_markup=kb_ticket_list(rows))
+    await cb.message.edit_text(f"🎫 Тикеты (последние {len(rows)}):", reply_markup=kb_ticket_list(rows))
 
 
-@router.callback_query(F.data.startswith("adm_tkt_view:"))
-async def cb_adm_tkt_view(cb: CallbackQuery, config: SupportTicketsConfig):
+@router.callback_query(F.data.startswith("tk_view:"))
+async def cb_tk_view(cb: CallbackQuery, state: FSMContext, config: SupportTicketsConfig):
     await cb.answer()
     if not _is_admin(cb.from_user.id, config):
-        return
-    try:
-        ticket_id = int(cb.data.split(":", 1)[1])
-    except ValueError:
-        return
-    async with aiosqlite.connect(config.db_path) as db:
-        row = await (await db.execute("SELECT status FROM tickets WHERE id=?", (ticket_id,))).fetchone()
-    if not row:
-        await cb.message.edit_text("Тикет не найден.", reply_markup=kb_status_filters())
-        return
-    text = await _ticket_detail_text(config.db_path, ticket_id)
-    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=kb_admin_ticket_detail(ticket_id, row[0]))
-
-
-@router.callback_query(F.data.startswith("adm_tkt_status:"))
-async def cb_adm_tkt_status(cb: CallbackQuery, bot: Bot, config: SupportTicketsConfig):
-    await cb.answer()
-    if not _is_admin(cb.from_user.id, config):
-        return
-    try:
-        _, ticket_id_s, new_status = cb.data.split(":", 2)
-        ticket_id = int(ticket_id_s)
-    except ValueError:
-        return
-    if new_status not in STATUS_LABELS:
-        return
-
-    async with aiosqlite.connect(config.db_path) as db:
-        row = await (await db.execute(
-            "SELECT status, client_user_id FROM tickets WHERE id=?", (ticket_id,)
-        )).fetchone()
-        if not row:
-            await cb.message.edit_text("Тикет не найден.", reply_markup=kb_status_filters())
-            return
-        old_status, client_user_id = row
-        if new_status not in STATUS_TRANSITIONS.get(old_status, []):
-            # Stale button (already transitioned, or a double-tap on an
-            # already-applied transition) — re-render instead of a silent
-            # no-op, same principle as vehicle_service.py's cb_req_status.
-            text = await _ticket_detail_text(config.db_path, ticket_id)
-            await cb.message.edit_text(text, parse_mode="HTML",
-                                        reply_markup=kb_admin_ticket_detail(ticket_id, old_status))
-            return
-        # Compare-and-swap: WHERE status=old_status makes a double-tap a
-        # no-op on the second write instead of double-logging/notifying.
-        cur = await db.execute(
-            "UPDATE tickets SET status=?, updated_at=datetime('now','localtime') WHERE id=? AND status=?",
-            (new_status, ticket_id, old_status),
-        )
-        if cur.rowcount == 0:
-            await db.commit()
-            text = await _ticket_detail_text(config.db_path, ticket_id)
-            await cb.message.edit_text(text, parse_mode="HTML",
-                                        reply_markup=kb_admin_ticket_detail(ticket_id, new_status))
-            return
-        await db.execute(
-            "INSERT INTO ticket_status_log (ticket_id, old_status, new_status, changed_by) VALUES (?,?,?,?)",
-            (ticket_id, old_status, new_status, cb.from_user.id),
-        )
-        await db.commit()
-
-    note = None
-    notify_text = STATUS_NOTIFY_TEXT.get(new_status)
-    if notify_text:
-        try:
-            await bot.send_message(client_user_id, notify_text.format(ticket_id=ticket_id))
-            note = "🔔 Клиент уведомлён."
-        except TelegramAPIError as e:
-            logger.warning(f"support_tickets: failed to notify client for ticket {ticket_id}: {e}")
-            note = "⚠️ Не удалось уведомить клиента (возможно, заблокировал бота)."
-        async with aiosqlite.connect(config.db_path) as db:
-            await db.execute(
-                "UPDATE ticket_status_log SET notified=? WHERE ticket_id=? AND new_status=? "
-                "AND id=(SELECT MAX(id) FROM ticket_status_log WHERE ticket_id=? AND new_status=?)",
-                (1 if note == "🔔 Клиент уведомлён." else 0, ticket_id, new_status, ticket_id, new_status),
-            )
-            await db.commit()
-
-    if new_status == "closed":
-        # Ask for a satisfaction rating as a SEPARATE message with its own
-        # inline buttons — deliberately not merged into notify_text above
-        # since it carries a keyboard, not just plain text.
-        try:
-            await bot.send_message(
-                client_user_id,
-                f"⭐ Оцените, пожалуйста, качество поддержки по тикету №{ticket_id}:",
-                reply_markup=kb_rating_only(ticket_id),
-            )
-        except TelegramAPIError as e:
-            logger.warning(f"support_tickets: failed to send rating prompt for ticket {ticket_id}: {e}")
-
-    text = await _ticket_detail_text(config.db_path, ticket_id, extra_note=note)
-    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=kb_admin_ticket_detail(ticket_id, new_status))
-
-
-@router.callback_query(F.data.startswith("adm_tkt_reply:"))
-async def cb_adm_tkt_reply(cb: CallbackQuery, state: FSMContext, config: SupportTicketsConfig):
-    await cb.answer()
-    if not _is_admin(cb.from_user.id, config):
-        return
-    try:
-        ticket_id = int(cb.data.split(":", 1)[1])
-    except ValueError:
-        return
-    async with aiosqlite.connect(config.db_path) as db:
-        row = await (await db.execute("SELECT status FROM tickets WHERE id=?", (ticket_id,))).fetchone()
-    if not row:
-        await cb.message.edit_text("Тикет не найден.", reply_markup=kb_status_filters())
-        return
-    if row[0] == "closed":
-        text = await _ticket_detail_text(config.db_path, ticket_id)
-        await cb.message.edit_text(text, parse_mode="HTML", reply_markup=kb_admin_ticket_detail(ticket_id, "closed"))
         return
     await state.clear()
-    await state.set_state(AdminReplyFlow.text)
+    try:
+        ticket_id = int(cb.data.split(":", 1)[1])
+    except ValueError:
+        return
+    text, ticket = await _ticket_detail_text(config.db_path, ticket_id)
+    if text is None:
+        await cb.message.edit_text("Тикет не найден.", reply_markup=kb_tickets_menu())
+        return
+    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=kb_ticket_admin_detail(ticket_id, ticket["status"]))
+
+
+@router.callback_query(F.data.startswith("tk_reply:"))
+async def cb_tk_reply(cb: CallbackQuery, state: FSMContext, config: SupportTicketsConfig):
+    await cb.answer()
+    if not _is_admin(cb.from_user.id, config):
+        return
+    try:
+        ticket_id = int(cb.data.split(":", 1)[1])
+    except ValueError:
+        return
+    async with aiosqlite.connect(config.db_path) as db:
+        row = await (await db.execute("SELECT status FROM tickets WHERE id=?", (ticket_id,))).fetchone()
+    if not row:
+        await cb.message.edit_text("Тикет не найден.", reply_markup=kb_tickets_menu())
+        return
+    if row[0] == "closed":
+        text, ticket = await _ticket_detail_text(config.db_path, ticket_id)
+        await cb.message.edit_text(text, parse_mode="HTML", reply_markup=kb_ticket_admin_detail(ticket_id, ticket["status"]))
+        return
+    await state.clear()
+    await state.set_state(AdminReplyFlow.reply_text)
     await state.update_data(started_at=time.time(), ticket_id=ticket_id)
-    await cb.message.edit_text("✉️ Введите ответ клиенту:", reply_markup=kb_flow_cancel())
+    await cb.message.edit_text("✍️ Введите ответ клиенту:", reply_markup=kb_flow_cancel())
 
 
-@router.message(AdminReplyFlow.text, F.text, ~F.text.startswith("/"))
+@router.message(AdminReplyFlow.reply_text, F.text, ~F.text.startswith("/"))
 async def admin_reply_text(msg: Message, state: FSMContext, bot: Bot, config: SupportTicketsConfig):
     data = await state.get_data()
     if _flow_expired(data):
         await state.clear()
         await msg.answer("Сессия истекла, начните заново.", reply_markup=kb_main_menu())
         return
+    text = _valid_text(msg.text, MAX_REPLY_LEN)
+    if text is None:
+        await msg.answer(f"Ответ не может быть пустым и должен быть короче {MAX_REPLY_LEN} символов.",
+                          reply_markup=kb_flow_cancel())
+        return
     ticket_id = data.get("ticket_id")
-    reply_text = msg.text.strip()
-    if not reply_text:
-        await msg.answer("Ответ не может быть пустым. Введите текст ответа:", reply_markup=kb_flow_cancel())
-        return
-    if len(reply_text) > MAX_REPLY_LEN:
-        await msg.answer(f"⚠️ Слишком длинный ответ (макс {MAX_REPLY_LEN} симв.).", reply_markup=kb_flow_cancel())
-        return
-    if not ticket_id:
-        await state.clear()
-        await msg.answer("Сессия устарела, начните заново.", reply_markup=kb_main_menu())
-        return
     await state.clear()
 
     async with aiosqlite.connect(config.db_path) as db:
-        row = await (await db.execute(
-            "SELECT client_user_id, status FROM tickets WHERE id=?", (ticket_id,)
-        )).fetchone()
+        row = await (await db.execute("SELECT status FROM tickets WHERE id=?", (ticket_id,))).fetchone()
         if not row:
-            await msg.answer("Тикет не найден.", reply_markup=kb_status_filters())
+            await msg.answer("Тикет не найден.", reply_markup=kb_main_menu())
             return
-        client_user_id, status = row
-        await db.execute(
-            "INSERT INTO ticket_log (ticket_id, author, body) VALUES (?, 'admin', ?)",
-            (ticket_id, reply_text),
+        old_status = row[0]
+        if old_status == "closed":
+            await msg.answer("⚠️ Тикет уже закрыт, ответ не отправлен.", reply_markup=kb_tickets_menu())
+            return
+        # An escalated ticket stays escalated on a plain reply — a reply must
+        # not silently erase the escalation signal another admin set. Only
+        # new/answered move to 'answered'; escalated -> escalated (self-loop,
+        # message still recorded, client still notified).
+        new_status = "answered" if old_status != "escalated" else "escalated"
+        # Compare-and-swap, same double-tap-safety principle as
+        # vehicle_service.py's cb_req_status.
+        cur = await db.execute(
+            "UPDATE tickets SET status=?, updated_at=datetime('now','localtime') WHERE id=? AND status=?",
+            (new_status, ticket_id, old_status),
         )
+        if cur.rowcount == 0:
+            await db.commit()
+            await msg.answer("⚠️ Тикет уже изменён другим действием, ответ не отправлен.", reply_markup=kb_tickets_menu())
+            return
+        await db.execute(
+            "INSERT INTO ticket_messages (ticket_id, sender, text) VALUES (?, 'admin', ?)", (ticket_id, text)
+        )
+        client_row = await (await db.execute(
+            "SELECT client_user_id, category FROM tickets WHERE id=?", (ticket_id,)
+        )).fetchone()
         await db.commit()
 
     note = None
-    try:
-        await bot.send_message(
-            client_user_id,
-            f"✉️ <b>Ответ по тикету №{ticket_id}:</b>\n\n{_esc(reply_text)}",
-            parse_mode="HTML",
-        )
-        note = "🔔 Ответ отправлен клиенту."
-    except TelegramAPIError as e:
-        logger.warning(f"support_tickets: failed to deliver admin reply for ticket {ticket_id}: {e}")
-        note = "⚠️ Не удалось доставить ответ клиенту (возможно, заблокировал бота)."
+    if client_row:
+        client_user_id, category = client_row
+        try:
+            await bot.send_message(
+                client_user_id,
+                NEW_REPLY_NOTIFY_TEXT.format(
+                    ticket_id=ticket_id, category=TICKET_CATEGORY_LABELS.get(category, category), text=_esc(text, 1000)
+                ),
+                parse_mode="HTML",
+            )
+            note = "🔔 Клиент уведомлён."
+        except TelegramAPIError as e:
+            logger.warning(f"support_tickets: failed to notify client for ticket {ticket_id}: {e}")
+            note = "⚠️ Не удалось уведомить клиента (возможно, заблокировал бота)."
 
-    text = await _ticket_detail_text(config.db_path, ticket_id, extra_note=note)
-    await msg.answer(text, parse_mode="HTML", reply_markup=kb_admin_ticket_detail(ticket_id, status))
-
-
-# ── KNOWLEDGE BASE (admin) ────────────────────────────────────────────────────
-
-async def _kb_detail_text_and_kb(db_path: str, article_id: int):
-    async with aiosqlite.connect(db_path) as db:
-        db.row_factory = aiosqlite.Row
-        row = await (await db.execute("SELECT * FROM kb_articles WHERE id=?", (article_id,))).fetchone()
-    if not row:
-        return None, None
-    status = "👁 Видна клиентам" if row["active"] else "🙈 Скрыта"
-    text = (
-        f"📚 <b>{_esc(row['title'])}</b> · {status}\n\n"
-        f"{_esc(row['body'], 1000)}\n\n"
-        f"🔑 Ключевые слова: {_esc(row['keywords']) if row['keywords'] else '—'}"
-    )
-    return text, bool(row["active"])
+    ticket_text, ticket = await _ticket_detail_text(config.db_path, ticket_id)
+    if note:
+        ticket_text = f"{ticket_text}\n\n{note}"
+    await msg.answer(ticket_text, parse_mode="HTML", reply_markup=kb_ticket_admin_detail(ticket_id, ticket["status"]))
 
 
-@router.callback_query(F.data == "adm_kb_menu")
-async def cb_adm_kb_menu(cb: CallbackQuery, state: FSMContext, config: SupportTicketsConfig):
+@router.callback_query(F.data.startswith("tk_escalate:"))
+async def cb_tk_escalate(cb: CallbackQuery, state: FSMContext, config: SupportTicketsConfig):
     await cb.answer()
     if not _is_admin(cb.from_user.id, config):
         return
     await state.clear()
-    await cb.message.edit_text("📚 <b>База знаний</b>", parse_mode="HTML", reply_markup=kb_kb_menu())
-
-
-@router.callback_query(F.data == "adm_kb_list")
-async def cb_adm_kb_list(cb: CallbackQuery, config: SupportTicketsConfig):
-    await cb.answer()
-    if not _is_admin(cb.from_user.id, config):
+    try:
+        ticket_id = int(cb.data.split(":", 1)[1])
+    except ValueError:
         return
+    # Single exit point: whether the transition applies (old_status in
+    # new/answered and the CAS succeeds) or not (already escalated/closed, or
+    # a lost race), we always fall through to the SAME final read+render
+    # below — no nested aiosqlite.connect() while this block's connection is
+    # still open, matching every other call site in the file.
     async with aiosqlite.connect(config.db_path) as db:
-        rows = await (await db.execute(
-            "SELECT id, title, active FROM kb_articles ORDER BY id DESC LIMIT ?", (MAX_LIST_BUTTONS,)
-        )).fetchall()
-    if not rows:
-        await cb.message.edit_text("Статей пока нет.", reply_markup=kb_kb_menu())
-        return
-    await cb.message.edit_text("📋 Статьи базы знаний:", reply_markup=kb_kb_list(rows))
+        row = await (await db.execute("SELECT status FROM tickets WHERE id=?", (ticket_id,))).fetchone()
+        if not row:
+            await cb.message.edit_text("Тикет не найден.", reply_markup=kb_tickets_menu())
+            return
+        old_status = row[0]
+        if old_status in ("new", "answered"):
+            cur = await db.execute(
+                "UPDATE tickets SET status='escalated', updated_at=datetime('now','localtime') WHERE id=? AND status=?",
+                (ticket_id, old_status),
+            )
+            if cur.rowcount:
+                # Distinct service note in the transcript — NOT a normal
+                # admin reply, so it must not trigger NEW_REPLY_NOTIFY_TEXT.
+                await db.execute(
+                    "INSERT INTO ticket_messages (ticket_id, sender, text) VALUES (?, 'admin', ?)",
+                    (ticket_id, "🔺 Тикет эскалирован на живого агента."),
+                )
+            await db.commit()
+
+    text, ticket = await _ticket_detail_text(config.db_path, ticket_id)
+    await _safe_edit_text(cb.message, text, parse_mode="HTML", reply_markup=kb_ticket_admin_detail(ticket_id, ticket["status"]))
 
 
-@router.callback_query(F.data.startswith("adm_kb_view:"))
-async def cb_adm_kb_view(cb: CallbackQuery, config: SupportTicketsConfig):
+@router.callback_query(F.data.startswith("tk_close:"))
+async def cb_tk_close(cb: CallbackQuery, state: FSMContext, bot: Bot, config: SupportTicketsConfig):
     await cb.answer()
     if not _is_admin(cb.from_user.id, config):
         return
+    await state.clear()
+    try:
+        ticket_id = int(cb.data.split(":", 1)[1])
+    except ValueError:
+        return
+    closed_now = False
+    client_user_id = None
+    # Same single-exit-point / no-nested-connect shape as cb_tk_escalate.
+    async with aiosqlite.connect(config.db_path) as db:
+        row = await (await db.execute("SELECT status FROM tickets WHERE id=?", (ticket_id,))).fetchone()
+        if not row:
+            await cb.message.edit_text("Тикет не найден.", reply_markup=kb_tickets_menu())
+            return
+        old_status = row[0]
+        if old_status != "closed":
+            cur = await db.execute(
+                "UPDATE tickets SET status='closed', updated_at=datetime('now','localtime') WHERE id=? AND status=?",
+                (ticket_id, old_status),
+            )
+            if cur.rowcount:
+                closed_now = True
+                client_row = await (await db.execute(
+                    "SELECT client_user_id FROM tickets WHERE id=?", (ticket_id,)
+                )).fetchone()
+                client_user_id = client_row[0] if client_row else None
+            await db.commit()
+
+    note = None
+    if closed_now and client_user_id:
+        try:
+            await bot.send_message(
+                client_user_id, RATING_PROMPT_TEXT.format(ticket_id=ticket_id),
+                reply_markup=kb_rating_prompt(ticket_id),
+            )
+            note = "🔔 Клиенту отправлен запрос оценки."
+        except TelegramAPIError as e:
+            logger.warning(f"support_tickets: failed to send rating prompt for ticket {ticket_id}: {e}")
+            note = "⚠️ Не удалось отправить клиенту запрос оценки (возможно, заблокировал бота)."
+
+    text, ticket = await _ticket_detail_text(config.db_path, ticket_id)
+    if note:
+        text = f"{text}\n\n{note}"
+    await _safe_edit_text(cb.message, text, parse_mode="HTML", reply_markup=kb_ticket_admin_detail(ticket_id, ticket["status"]))
+
+
+# ── ADMIN: knowledge base ────────────────────────────────────────────────────
+
+@router.callback_query(F.data == "kb_menu")
+async def cb_kb_menu(cb: CallbackQuery, state: FSMContext, config: SupportTicketsConfig):
+    await cb.answer()
+    if not _is_admin(cb.from_user.id, config):
+        return
+    await state.clear()
+    await cb.message.edit_text("📚 <b>База знаний</b>\n\nВыберите категорию:", parse_mode="HTML", reply_markup=kb_kb_menu())
+
+
+@router.callback_query(F.data.startswith("kb_cat:"))
+async def cb_kb_cat(cb: CallbackQuery, state: FSMContext, config: SupportTicketsConfig):
+    await cb.answer()
+    if not _is_admin(cb.from_user.id, config):
+        return
+    await state.clear()
+    category = cb.data.split(":", 1)[1]
+    async with aiosqlite.connect(config.db_path) as db:
+        # No active=1 filter here (unlike the client-facing query below) —
+        # admins need to see hidden articles too, to be able to reach/edit
+        # them again (kb_kb_article_list marks them with 🗑).
+        rows = await (await db.execute(
+            "SELECT id, question, active FROM kb_articles WHERE category=? ORDER BY id DESC LIMIT ?",
+            (category, MAX_LIST_BUTTONS),
+        )).fetchall()
+    label = TICKET_CATEGORY_LABELS.get(category, category)
+    text = f"📚 {label}" if rows else f"📚 {label}\n\nСтатей пока нет."
+    await cb.message.edit_text(text, reply_markup=kb_kb_article_list(rows, category))
+
+
+@router.callback_query(F.data.startswith("kb_view:"))
+async def cb_kb_view(cb: CallbackQuery, state: FSMContext, config: SupportTicketsConfig):
+    await cb.answer()
+    if not _is_admin(cb.from_user.id, config):
+        return
+    await state.clear()
     try:
         article_id = int(cb.data.split(":", 1)[1])
     except ValueError:
         return
-    text, active = await _kb_detail_text_and_kb(config.db_path, article_id)
-    if text is None:
+    async with aiosqlite.connect(config.db_path) as db:
+        row = await (await db.execute(
+            "SELECT category, question, answer, active FROM kb_articles WHERE id=?", (article_id,)
+        )).fetchone()
+    if not row:
         await cb.message.edit_text("Статья не найдена.", reply_markup=kb_kb_menu())
         return
-    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=kb_kb_detail(article_id, active))
+    category, question, answer, active = row
+    status_note = "" if active else "\n\n🗑 <i>скрыта</i>"
+    text = _cap_html(
+        f"🏷 {TICKET_CATEGORY_LABELS.get(category, category)}\n\n"
+        f"❓ <b>{_esc(question, MAX_QUESTION_LEN)}</b>\n\n{_esc(answer, MAX_ANSWER_LEN)}{status_note}"
+    )
+    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=kb_kb_article_detail(article_id))
 
 
-@router.callback_query(F.data.startswith("adm_kb_toggle:"))
-async def cb_adm_kb_toggle(cb: CallbackQuery, config: SupportTicketsConfig):
+@router.callback_query(F.data == "kb_add")
+async def cb_kb_add(cb: CallbackQuery, state: FSMContext, config: SupportTicketsConfig):
+    await cb.answer()
+    if not _is_admin(cb.from_user.id, config):
+        return
+    await state.clear()
+    await cb.message.edit_text("Выберите категорию новой статьи:", reply_markup=kb_category_pick("kb_add_cat"))
+
+
+@router.callback_query(F.data.startswith("kb_add_cat:"))
+async def cb_kb_add_cat(cb: CallbackQuery, state: FSMContext, config: SupportTicketsConfig):
+    await cb.answer()
+    if not _is_admin(cb.from_user.id, config):
+        return
+    category = cb.data.split(":", 1)[1]
+    if category not in TICKET_CATEGORY_LABELS:
+        return
+    await state.clear()
+    await state.set_state(KBFlow.question)
+    await state.update_data(started_at=time.time(), category=category)
+    await cb.message.edit_text("❓ Введите вопрос статьи:", reply_markup=kb_flow_cancel("kb_menu"))
+
+
+@router.callback_query(F.data.startswith("kb_edit:"))
+async def cb_kb_edit(cb: CallbackQuery, state: FSMContext, config: SupportTicketsConfig):
     await cb.answer()
     if not _is_admin(cb.from_user.id, config):
         return
@@ -1122,130 +880,108 @@ async def cb_adm_kb_toggle(cb: CallbackQuery, config: SupportTicketsConfig):
     except ValueError:
         return
     async with aiosqlite.connect(config.db_path) as db:
-        row = await (await db.execute("SELECT active FROM kb_articles WHERE id=?", (article_id,))).fetchone()
+        row = await (await db.execute("SELECT category FROM kb_articles WHERE id=?", (article_id,))).fetchone()
+    if not row:
+        await cb.message.edit_text("Статья не найдена.", reply_markup=kb_kb_menu())
+        return
+    await state.clear()
+    await state.set_state(KBFlow.question)
+    await state.update_data(started_at=time.time(), category=row[0], edit_id=article_id)
+    await cb.message.edit_text("❓ Введите новый текст вопроса:", reply_markup=kb_flow_cancel("kb_menu"))
+
+
+@router.callback_query(F.data.startswith("kb_hide:"))
+async def cb_kb_hide(cb: CallbackQuery, config: SupportTicketsConfig):
+    await cb.answer()
+    if not _is_admin(cb.from_user.id, config):
+        return
+    try:
+        article_id = int(cb.data.split(":", 1)[1])
+    except ValueError:
+        return
+    async with aiosqlite.connect(config.db_path) as db:
+        row = await (await db.execute("SELECT category FROM kb_articles WHERE id=?", (article_id,))).fetchone()
         if not row:
             await cb.message.edit_text("Статья не найдена.", reply_markup=kb_kb_menu())
             return
-        new_active = 0 if row[0] else 1
-        await db.execute("UPDATE kb_articles SET active=? WHERE id=?", (new_active, article_id))
+        # Soft-delete: active=0, row and history preserved — invisible to the
+        # client-side self-service search but still viewable/editable here
+        # (admin-side kb_kb_article_list shows it too, marked with 🗑).
+        await db.execute("UPDATE kb_articles SET active=0 WHERE id=?", (article_id,))
         await db.commit()
-    text, active = await _kb_detail_text_and_kb(config.db_path, article_id)
-    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=kb_kb_detail(article_id, active))
-
-
-@router.callback_query(F.data == "adm_kb_new")
-async def cb_adm_kb_new(cb: CallbackQuery, state: FSMContext, config: SupportTicketsConfig):
-    await cb.answer()
-    if not _is_admin(cb.from_user.id, config):
-        return
-    await state.clear()
-    await state.set_state(KbFlow.title)
-    await state.update_data(started_at=time.time())
-    await cb.message.edit_text("📝 Введите заголовок статьи:", reply_markup=kb_flow_cancel())
-
-
-@router.callback_query(F.data.startswith("adm_kb_edit:"))
-async def cb_adm_kb_edit(cb: CallbackQuery, state: FSMContext, config: SupportTicketsConfig):
-    await cb.answer()
-    if not _is_admin(cb.from_user.id, config):
-        return
-    try:
-        article_id = int(cb.data.split(":", 1)[1])
-    except ValueError:
-        return
+    category = row[0]
     async with aiosqlite.connect(config.db_path) as db:
-        row = await (await db.execute("SELECT id FROM kb_articles WHERE id=?", (article_id,))).fetchone()
-    if not row:
-        await cb.message.edit_text("Статья не найдена.", reply_markup=kb_kb_menu())
-        return
-    await state.clear()
-    await state.set_state(KbFlow.title)
-    await state.update_data(started_at=time.time(), kb_edit_id=article_id)
-    await cb.message.edit_text("📝 Введите новый заголовок статьи:", reply_markup=kb_flow_cancel())
+        rows = await (await db.execute(
+            "SELECT id, question, active FROM kb_articles WHERE category=? ORDER BY id DESC LIMIT ?",
+            (category, MAX_LIST_BUTTONS),
+        )).fetchall()
+    label = TICKET_CATEGORY_LABELS.get(category, category)
+    await cb.message.edit_text(f"🗑 Статья скрыта.\n\n📚 {label}", reply_markup=kb_kb_article_list(rows, category))
 
 
-@router.message(KbFlow.title, F.text, ~F.text.startswith("/"))
-async def kb_flow_title(msg: Message, state: FSMContext):
+@router.message(KBFlow.question, F.text, ~F.text.startswith("/"))
+async def kb_question_text(msg: Message, state: FSMContext):
     data = await state.get_data()
     if _flow_expired(data):
         await state.clear()
         await msg.answer("Сессия истекла, начните заново.", reply_markup=kb_main_menu())
         return
-    title = msg.text.strip()
-    if not title:
-        await msg.answer("Заголовок не может быть пустым. Введите заголовок статьи:", reply_markup=kb_flow_cancel())
+    question = _valid_text(msg.text, MAX_QUESTION_LEN)
+    if question is None:
+        await msg.answer(f"Вопрос не может быть пустым и должен быть короче {MAX_QUESTION_LEN} символов.",
+                          reply_markup=kb_flow_cancel("kb_menu"))
         return
-    if len(title) > MAX_KB_TITLE_LEN:
-        await msg.answer(f"⚠️ Слишком длинный заголовок (макс {MAX_KB_TITLE_LEN} симв.).", reply_markup=kb_flow_cancel())
-        return
-    await state.update_data(pending_title=title)
-    await state.set_state(KbFlow.keywords)
-    await msg.answer("🔑 Ключевые слова через пробел (или «-», чтобы пропустить):", reply_markup=kb_flow_cancel())
+    await state.update_data(pending_question=question)
+    await state.set_state(KBFlow.answer)
+    await msg.answer("💬 Введите текст ответа:", reply_markup=kb_flow_cancel("kb_menu"))
 
 
-@router.message(KbFlow.keywords, F.text, ~F.text.startswith("/"))
-async def kb_flow_keywords(msg: Message, state: FSMContext):
+@router.message(KBFlow.answer, F.text, ~F.text.startswith("/"))
+async def kb_answer_text(msg: Message, state: FSMContext, config: SupportTicketsConfig):
     data = await state.get_data()
     if _flow_expired(data):
         await state.clear()
         await msg.answer("Сессия истекла, начните заново.", reply_markup=kb_main_menu())
         return
-    raw = msg.text.strip()
-    if len(raw) > MAX_KB_KEYWORDS_LEN:
-        await msg.answer(
-            f"⚠️ Слишком длинный список ключевых слов (макс {MAX_KB_KEYWORDS_LEN} симв.).",
-            reply_markup=kb_flow_cancel(),
-        )
+    answer = _valid_text(msg.text, MAX_ANSWER_LEN)
+    if answer is None:
+        await msg.answer(f"Ответ не может быть пустым и должен быть короче {MAX_ANSWER_LEN} символов.",
+                          reply_markup=kb_flow_cancel("kb_menu"))
         return
-    keywords = None if raw == "-" else raw
-    await state.update_data(pending_keywords=keywords)
-    await state.set_state(KbFlow.body)
-    await msg.answer("📄 Введите текст ответа (тело статьи):", reply_markup=kb_flow_cancel())
-
-
-@router.message(KbFlow.body, F.text, ~F.text.startswith("/"))
-async def kb_flow_body(msg: Message, state: FSMContext, config: SupportTicketsConfig):
-    data = await state.get_data()
-    if _flow_expired(data):
-        await state.clear()
-        await msg.answer("Сессия истекла, начните заново.", reply_markup=kb_main_menu())
-        return
-    body = msg.text.strip()
-    if not body:
-        await msg.answer("Текст ответа не может быть пустым. Введите текст:", reply_markup=kb_flow_cancel())
-        return
-    if len(body) > MAX_KB_BODY_LEN:
-        await msg.answer(f"⚠️ Слишком длинный текст (макс {MAX_KB_BODY_LEN} симв.).", reply_markup=kb_flow_cancel())
-        return
-    title = data.get("pending_title")
-    if not title:
+    category = data.get("category")
+    question = data.get("pending_question")
+    edit_id = data.get("edit_id")
+    if not category or not question:
         await state.clear()
         await msg.answer("Сессия устарела, начните заново.", reply_markup=kb_main_menu())
         return
-    keywords = data.get("pending_keywords")
-    edit_id = data.get("kb_edit_id")
     await state.clear()
-
     async with aiosqlite.connect(config.db_path) as db:
         if edit_id:
             cur = await db.execute(
-                "UPDATE kb_articles SET title=?, keywords=?, body=? WHERE id=?",
-                (title, keywords, body, edit_id),
+                "UPDATE kb_articles SET question=?, answer=? WHERE id=?", (question, answer, edit_id)
             )
+            await db.commit()
             if cur.rowcount == 0:
-                await db.commit()
-                await msg.answer("⚠️ Статья была удалена во время редактирования.", reply_markup=kb_kb_menu())
+                await msg.answer("⚠️ Статья была удалена до сохранения.", reply_markup=kb_kb_menu())
                 return
+            confirm = "✅ Статья обновлена."
         else:
             await db.execute(
-                "INSERT INTO kb_articles (title, keywords, body) VALUES (?,?,?)",
-                (title, keywords, body),
+                "INSERT INTO kb_articles (category, question, answer) VALUES (?, ?, ?)", (category, question, answer)
             )
-        await db.commit()
-    await msg.answer(f"✅ Статья сохранена: {_esc(title)}", parse_mode="HTML", reply_markup=kb_kb_menu())
+            await db.commit()
+            confirm = "✅ Статья добавлена."
+    async with aiosqlite.connect(config.db_path) as db:
+        rows = await (await db.execute(
+            "SELECT id, question, active FROM kb_articles WHERE category=? ORDER BY id DESC LIMIT ?",
+            (category, MAX_LIST_BUTTONS),
+        )).fetchall()
+    label = TICKET_CATEGORY_LABELS.get(category, category)
+    await msg.answer(f"{confirm}\n\n📚 {label}", reply_markup=kb_kb_article_list(rows, category))
 
 
-# ── ADMINS menu ────────────────────────────────────────────────────────────────
+# ── ADMIN: admins ─────────────────────────────────────────────────────────────
 
 async def _admins_list_text(config: SupportTicketsConfig) -> str:
     ids = sorted(_load_admins(config.admins_file))
@@ -1269,6 +1005,7 @@ async def cb_adm_add(cb: CallbackQuery, state: FSMContext, config: SupportTicket
     await cb.answer()
     if not _is_admin(cb.from_user.id, config):
         return
+    await state.clear()
     await state.set_state(AdminMgmtFlow.add_admin)
     await state.update_data(started_at=time.time())
     await cb.message.edit_text("Введите Telegram ID нового администратора:", reply_markup=kb_flow_cancel())
@@ -1306,6 +1043,7 @@ async def cb_adm_remove(cb: CallbackQuery, state: FSMContext, config: SupportTic
             "Слишком много админов для списка кнопок. Обратитесь к разработчику.", reply_markup=kb_admins_menu()
         )
         return
+    await state.clear()
     await state.set_state(AdminMgmtFlow.remove_admin_pick)
     await state.update_data(started_at=time.time(), remove_admin_ids=ids)
     await cb.message.edit_text("Выберите администратора для удаления:", reply_markup=kb_remove_admins(ids))
@@ -1338,6 +1076,239 @@ async def cb_adm_remove_pick(cb: CallbackQuery, state: FSMContext, config: Suppo
     await state.clear()
     await cb.message.edit_text(f"✅ <code>{_esc(target)}</code> удалён.", parse_mode="HTML",
                                 reply_markup=kb_admins_menu())
+
+
+# ── CLIENT: self-service KB search + ticket creation ─────────────────────────
+
+@router.callback_query(F.data == "cli_support")
+async def cb_cli_support(cb: CallbackQuery, state: FSMContext):
+    await cb.answer()
+    await state.clear()
+    await cb.message.edit_text("🆘 Выберите категорию вопроса:", reply_markup=kb_client_categories())
+
+
+@router.callback_query(F.data.startswith("cli_cat:"))
+async def cb_cli_cat(cb: CallbackQuery, state: FSMContext, config: SupportTicketsConfig):
+    await cb.answer()
+    await state.clear()
+    category = cb.data.split(":", 1)[1]
+    if category not in TICKET_CATEGORY_LABELS:
+        return
+    async with aiosqlite.connect(config.db_path) as db:
+        rows = await (await db.execute(
+            "SELECT id, question FROM kb_articles WHERE category=? AND active=1 ORDER BY id DESC LIMIT ?",
+            (category, MAX_LIST_BUTTONS),
+        )).fetchall()
+    label = TICKET_CATEGORY_LABELS.get(category, category)
+    text = f"📚 {label}\n\nВозможно, ответ уже есть здесь:" if rows else f"📚 {label}\n\nПока нет статей в этой категории."
+    await cb.message.edit_text(text, reply_markup=kb_client_kb_list(rows, category))
+
+
+@router.callback_query(F.data.startswith("cli_kb_view:"))
+async def cb_cli_kb_view(cb: CallbackQuery, state: FSMContext, config: SupportTicketsConfig):
+    await cb.answer()
+    await state.clear()
+    try:
+        article_id = int(cb.data.split(":", 1)[1])
+    except ValueError:
+        return
+    async with aiosqlite.connect(config.db_path) as db:
+        row = await (await db.execute(
+            "SELECT category, question, answer FROM kb_articles WHERE id=? AND active=1", (article_id,)
+        )).fetchone()
+    if not row:
+        await cb.message.edit_text("Статья не найдена.", reply_markup=kb_client_categories())
+        return
+    category, question, answer = row
+    text = _cap_html(f"❓ <b>{_esc(question, MAX_QUESTION_LEN)}</b>\n\n{_esc(answer, MAX_ANSWER_LEN)}")
+    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=kb_client_kb_article(category))
+
+
+@router.callback_query(F.data.startswith("cli_new_ticket:"))
+async def cb_cli_new_ticket(cb: CallbackQuery, state: FSMContext):
+    await cb.answer()
+    category = cb.data.split(":", 1)[1]
+    if category not in TICKET_CATEGORY_LABELS:
+        return
+    await state.clear()
+    await state.set_state(ClientTicketFlow.problem_text)
+    await state.update_data(started_at=time.time(), category=category)
+    await cb.message.edit_text("✍️ Опишите вашу проблему одним сообщением:", reply_markup=kb_flow_cancel())
+
+
+@router.message(ClientTicketFlow.problem_text, F.text, ~F.text.startswith("/"))
+async def client_problem_text(msg: Message, state: FSMContext, bot: Bot, config: SupportTicketsConfig):
+    data = await state.get_data()
+    if _flow_expired(data):
+        await state.clear()
+        await msg.answer("Сессия истекла, начните заново.", reply_markup=kb_client_menu())
+        return
+    text = _valid_text(msg.text, MAX_PROBLEM_LEN)
+    if text is None:
+        await msg.answer(f"Описание не может быть пустым и должно быть короче {MAX_PROBLEM_LEN} символов.",
+                          reply_markup=kb_flow_cancel())
+        return
+    category = data.get("category")
+    if category not in TICKET_CATEGORY_LABELS:
+        await state.clear()
+        await msg.answer("Сессия устарела, начните заново.", reply_markup=kb_client_menu())
+        return
+    await state.clear()
+    client_name = msg.from_user.full_name or str(msg.from_user.id)
+    async with aiosqlite.connect(config.db_path) as db:
+        cur = await db.execute(
+            "INSERT INTO tickets (client_user_id, client_name, category) VALUES (?, ?, ?)",
+            (msg.from_user.id, client_name, category),
+        )
+        ticket_id = cur.lastrowid
+        await db.execute(
+            "INSERT INTO ticket_messages (ticket_id, sender, text) VALUES (?, 'client', ?)", (ticket_id, text)
+        )
+        await db.commit()
+
+    await msg.answer(
+        f"✅ Тикет №{ticket_id} создан. Мы ответим вам здесь в этом чате.", reply_markup=kb_client_menu()
+    )
+    await _notify_admins(bot, config, NEW_TICKET_ADMIN_NOTIFY.format(
+        ticket_id=ticket_id, client_name=_esc(client_name), category=TICKET_CATEGORY_LABELS[category], text=_esc(text, 1000)
+    ))
+
+
+@router.callback_query(F.data == "cli_tickets")
+async def cb_cli_tickets(cb: CallbackQuery, state: FSMContext, config: SupportTicketsConfig):
+    await cb.answer()
+    await state.clear()
+    async with aiosqlite.connect(config.db_path) as db:
+        rows = await (await db.execute(
+            "SELECT id, status, category FROM tickets WHERE client_user_id=? ORDER BY id DESC LIMIT ?",
+            (cb.from_user.id, MAX_LIST_BUTTONS),
+        )).fetchall()
+    if not rows:
+        await cb.message.edit_text("У вас пока нет тикетов.", reply_markup=kb_client_menu())
+        return
+    await cb.message.edit_text("📋 Ваши тикеты:", reply_markup=kb_client_ticket_list(rows))
+
+
+@router.callback_query(F.data.startswith("cli_ticket_view:"))
+async def cb_cli_ticket_view(cb: CallbackQuery, state: FSMContext, config: SupportTicketsConfig):
+    await cb.answer()
+    await state.clear()
+    try:
+        ticket_id = int(cb.data.split(":", 1)[1])
+    except ValueError:
+        return
+    # Ownership check: a client must never be able to view another client's
+    # ticket by guessing/incrementing the id (tickets.id is a sequential
+    # AUTOINCREMENT, so this is a real IDOR risk without the client_user_id
+    # filter here).
+    async with aiosqlite.connect(config.db_path) as db:
+        row = await (await db.execute(
+            "SELECT id FROM tickets WHERE id=? AND client_user_id=?", (ticket_id, cb.from_user.id)
+        )).fetchone()
+    if not row:
+        await cb.message.edit_text("Тикет не найден.", reply_markup=kb_client_menu())
+        return
+    text, ticket = await _ticket_detail_text(config.db_path, ticket_id)
+    needs_rating = ticket["status"] == "closed" and ticket["satisfaction_rating"] is None
+    await cb.message.edit_text(
+        text, parse_mode="HTML", reply_markup=kb_client_ticket_detail(ticket_id, ticket["status"], needs_rating)
+    )
+
+
+@router.callback_query(F.data.startswith("cli_ticket_reply:"))
+async def cb_cli_ticket_reply(cb: CallbackQuery, state: FSMContext, config: SupportTicketsConfig):
+    await cb.answer()
+    try:
+        ticket_id = int(cb.data.split(":", 1)[1])
+    except ValueError:
+        return
+    async with aiosqlite.connect(config.db_path) as db:
+        row = await (await db.execute(
+            "SELECT status FROM tickets WHERE id=? AND client_user_id=?", (ticket_id, cb.from_user.id)
+        )).fetchone()
+    if not row:
+        await cb.message.edit_text("Тикет не найден.", reply_markup=kb_client_menu())
+        return
+    if row[0] == "closed":
+        # Design requirement: a client must not be able to add messages to a
+        # closed ticket via this button — only view history and rate it.
+        text, ticket = await _ticket_detail_text(config.db_path, ticket_id)
+        needs_rating = ticket["satisfaction_rating"] is None
+        await cb.message.edit_text(
+            text, parse_mode="HTML", reply_markup=kb_client_ticket_detail(ticket_id, ticket["status"], needs_rating)
+        )
+        return
+    await state.clear()
+    await state.set_state(ClientTicketFlow.reply_text)
+    await state.update_data(started_at=time.time(), ticket_id=ticket_id)
+    await cb.message.edit_text("✍️ Введите ваше сообщение:", reply_markup=kb_flow_cancel())
+
+
+@router.message(ClientTicketFlow.reply_text, F.text, ~F.text.startswith("/"))
+async def client_reply_text(msg: Message, state: FSMContext, bot: Bot, config: SupportTicketsConfig):
+    data = await state.get_data()
+    if _flow_expired(data):
+        await state.clear()
+        await msg.answer("Сессия истекла, начните заново.", reply_markup=kb_client_menu())
+        return
+    text = _valid_text(msg.text, MAX_REPLY_LEN)
+    if text is None:
+        await msg.answer(f"Сообщение не может быть пустым и должно быть короче {MAX_REPLY_LEN} символов.",
+                          reply_markup=kb_flow_cancel())
+        return
+    ticket_id = data.get("ticket_id")
+    await state.clear()
+
+    async with aiosqlite.connect(config.db_path) as db:
+        row = await (await db.execute(
+            "SELECT status, client_name, category FROM tickets WHERE id=? AND client_user_id=?",
+            (ticket_id, msg.from_user.id),
+        )).fetchone()
+        if not row:
+            await msg.answer("Тикет не найден.", reply_markup=kb_client_menu())
+            return
+        if row[0] == "closed":
+            await msg.answer("⚠️ Тикет уже закрыт, сообщение не отправлено.", reply_markup=kb_client_menu())
+            return
+        await db.execute(
+            "INSERT INTO ticket_messages (ticket_id, sender, text) VALUES (?, 'client', ?)", (ticket_id, text)
+        )
+        await db.commit()
+        client_name, category = row[1], row[2]
+
+    await msg.answer(f"✅ Сообщение отправлено по тикету №{ticket_id}.", reply_markup=kb_client_menu())
+    await _notify_admins(bot, config, FOLLOWUP_ADMIN_NOTIFY.format(
+        ticket_id=ticket_id, client_name=_esc(client_name), text=_esc(text, 1000)
+    ))
+
+
+# ── rating (reachable from both the push prompt on close AND the client's
+# own ticket card fallback if the push failed/was never seen) ────────────────
+
+@router.callback_query(F.data.startswith("sup_rate:"))
+async def cb_sup_rate(cb: CallbackQuery, config: SupportTicketsConfig):
+    await cb.answer()
+    try:
+        _, ticket_id_s, score_s = cb.data.split(":", 2)
+        ticket_id, score = int(ticket_id_s), int(score_s)
+    except ValueError:
+        return
+    if not 1 <= score <= 5:
+        return
+    async with aiosqlite.connect(config.db_path) as db:
+        # Compare-and-swap: only the ticket's own client, only once, only on
+        # a closed ticket — prevents double-tap double-writes and prevents
+        # anyone else from rating on the client's behalf.
+        cur = await db.execute(
+            "UPDATE tickets SET satisfaction_rating=? WHERE id=? AND client_user_id=? "
+            "AND status='closed' AND satisfaction_rating IS NULL",
+            (score, ticket_id, cb.from_user.id),
+        )
+        await db.commit()
+    if cur.rowcount == 0:
+        await cb.message.edit_text("Оценка уже сохранена ранее или недоступна.")
+        return
+    await cb.message.edit_text(f"🙏 Спасибо за оценку: {score}/5!")
 
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
