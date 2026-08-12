@@ -18,7 +18,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import features
 import templates
@@ -215,6 +215,258 @@ class BrokenFeatureDoesNotTakeDownTheHostTemplateTests(unittest.IsolatedAsyncioT
             self.assertEqual(len(entry.dispatcher.sub_routers), 1)  # host template's router only
         finally:
             await entry.bot.session.close()
+
+
+_FIXTURE_BOT_ID_CAPTURE_FEATURE_SOURCE = '''
+# FEATURE: fixture_bot_id_capture_feature
+# COMPATIBLE_WITH: fixture_feature_host_template
+from aiogram import Router
+
+router = Router()
+captured_bot_ids = []
+
+
+@router.message()
+async def _capture_handler(message, bot_id):
+    captured_bot_ids.append(bot_id)
+'''
+
+_FIXTURE_COMMANDS_FEATURE_A_SOURCE = '''
+# FEATURE: fixture_commands_feature_a
+# COMPATIBLE_WITH: fixture_feature_host_template
+from aiogram import Router
+
+router = Router()
+bot_commands = [("fixturea", "Fixture command A")]
+'''
+
+_FIXTURE_COMMANDS_FEATURE_B_SOURCE = '''
+# FEATURE: fixture_commands_feature_b
+# COMPATIBLE_WITH: fixture_feature_host_template
+from aiogram import Router
+
+router = Router()
+bot_commands = [("fixtureb", "Fixture command B")]
+'''
+
+
+class FeatureHandlerReceivesBotIdTests(unittest.IsolatedAsyncioTestCase):
+    """sellable-items-inventory's generic fix: since most host templates'
+    Config dataclasses don't carry a bot_id field, a feature-level handler
+    needs data["bot_id"] injected by the registry itself — see
+    runtime/registry.py's _attach_bot_id_middleware()."""
+
+    async def asyncSetUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp_dir = Path(self._tmp.name)
+        templates.__path__.append(str(self.tmp_dir))
+        features.__path__.append(str(self.tmp_dir))
+        (self.tmp_dir / "fixture_feature_host_template.py").write_text(_FIXTURE_TEMPLATE_SOURCE, encoding="utf-8")
+        (self.tmp_dir / "fixture_bot_id_capture_feature.py").write_text(
+            _FIXTURE_BOT_ID_CAPTURE_FEATURE_SOURCE, encoding="utf-8"
+        )
+        self.data_dir_patcher = patch("config.DATA_DIR", self.tmp_dir)
+        self.data_dir_patcher.start()
+        self.bot_id = 9301
+        await enable_bot_feature(self.bot_id, "fixture_bot_id_capture_feature")
+
+    async def asyncTearDown(self):
+        await disable_bot_feature(self.bot_id, "fixture_bot_id_capture_feature")
+        self.data_dir_patcher.stop()
+        templates.__path__ = [p for p in templates.__path__ if p != str(self.tmp_dir)]
+        features.__path__ = [p for p in features.__path__ if p != str(self.tmp_dir)]
+        reg._template_module_cache.pop("fixture_feature_host_template", None)
+        reg._feature_module_cache.pop("fixture_bot_id_capture_feature", None)
+        sys.modules.pop("templates.fixture_feature_host_template", None)
+        sys.modules.pop("features.fixture_bot_id_capture_feature", None)
+        self._tmp.cleanup()
+
+    async def test_feature_handler_receives_this_bots_bot_id(self):
+        entry = await reg.build_entry(
+            self.bot_id, FAKE_TOKEN, "fixture_feature_host_template",
+            {"bot_id": self.bot_id, "name": "bot_id_capture_bot"},
+        )
+        try:
+            update = {
+                "update_id": 1,
+                "message": {
+                    "message_id": 1, "date": 1700000000,
+                    "chat": {"id": 555, "type": "private"},
+                    "from": {"id": 555, "is_bot": False, "first_name": "Test"},
+                    "text": "hello",
+                },
+            }
+            await entry.dispatcher.feed_webhook_update(entry.bot, update)
+            feature_module = sys.modules["features.fixture_bot_id_capture_feature"]
+            self.assertEqual(feature_module.captured_bot_ids, [self.bot_id])
+        finally:
+            await entry.bot.session.close()
+
+    async def test_bot_id_does_not_leak_between_two_different_bots(self):
+        other_bot_id = 9302
+        await enable_bot_feature(other_bot_id, "fixture_bot_id_capture_feature")
+        try:
+            entry_a = await reg.build_entry(
+                self.bot_id, FAKE_TOKEN, "fixture_feature_host_template",
+                {"bot_id": self.bot_id, "name": "bot_id_capture_bot_a"},
+            )
+            entry_b = await reg.build_entry(
+                other_bot_id, FAKE_TOKEN, "fixture_feature_host_template",
+                {"bot_id": other_bot_id, "name": "bot_id_capture_bot_b"},
+            )
+            try:
+                update = {
+                    "update_id": 1,
+                    "message": {
+                        "message_id": 1, "date": 1700000000,
+                        "chat": {"id": 555, "type": "private"},
+                        "from": {"id": 555, "is_bot": False, "first_name": "Test"},
+                        "text": "hello",
+                    },
+                }
+                await entry_a.dispatcher.feed_webhook_update(entry_a.bot, update)
+                await entry_b.dispatcher.feed_webhook_update(entry_b.bot, {**update, "update_id": 2})
+                feature_module = sys.modules["features.fixture_bot_id_capture_feature"]
+                self.assertEqual(feature_module.captured_bot_ids, [self.bot_id, other_bot_id])
+            finally:
+                await entry_a.bot.session.close()
+                await entry_b.bot.session.close()
+        finally:
+            await disable_bot_feature(other_bot_id, "fixture_bot_id_capture_feature")
+
+
+class SetMyCommandsCollectionTests(unittest.IsolatedAsyncioTestCase):
+    """A feature MAY export `bot_commands` (see sellable_items.py, the first
+    real user) — runtime/registry.py collects these across every enabled
+    feature and pushes ONE merged bot.set_my_commands() call, so two features
+    declaring commands can never clobber each other's list."""
+
+    async def asyncSetUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp_dir = Path(self._tmp.name)
+        templates.__path__.append(str(self.tmp_dir))
+        features.__path__.append(str(self.tmp_dir))
+        (self.tmp_dir / "fixture_feature_host_template.py").write_text(_FIXTURE_TEMPLATE_SOURCE, encoding="utf-8")
+        (self.tmp_dir / "fixture_commands_feature_a.py").write_text(_FIXTURE_COMMANDS_FEATURE_A_SOURCE, encoding="utf-8")
+        (self.tmp_dir / "fixture_commands_feature_b.py").write_text(_FIXTURE_COMMANDS_FEATURE_B_SOURCE, encoding="utf-8")
+        self.data_dir_patcher = patch("config.DATA_DIR", self.tmp_dir)
+        self.data_dir_patcher.start()
+        self.bot_id = 9303
+        await enable_bot_feature(self.bot_id, "fixture_commands_feature_a")
+        await enable_bot_feature(self.bot_id, "fixture_commands_feature_b")
+
+    async def asyncTearDown(self):
+        await disable_bot_feature(self.bot_id, "fixture_commands_feature_a")
+        await disable_bot_feature(self.bot_id, "fixture_commands_feature_b")
+        self.data_dir_patcher.stop()
+        templates.__path__ = [p for p in templates.__path__ if p != str(self.tmp_dir)]
+        features.__path__ = [p for p in features.__path__ if p != str(self.tmp_dir)]
+        reg._template_module_cache.pop("fixture_feature_host_template", None)
+        reg._feature_module_cache.pop("fixture_commands_feature_a", None)
+        reg._feature_module_cache.pop("fixture_commands_feature_b", None)
+        sys.modules.pop("templates.fixture_feature_host_template", None)
+        sys.modules.pop("features.fixture_commands_feature_a", None)
+        sys.modules.pop("features.fixture_commands_feature_b", None)
+        self._tmp.cleanup()
+
+    async def test_commands_from_two_features_are_merged_into_one_call(self):
+        calls = []
+
+        async def _fake_call(*args, **kwargs):
+            calls.append(args[0] if args else None)
+            return MagicMock()
+
+        with patch.object(reg.Bot, "__call__", new=AsyncMock(side_effect=_fake_call)):
+            entry = await reg.build_entry(
+                self.bot_id, FAKE_TOKEN, "fixture_feature_host_template",
+                {"bot_id": self.bot_id, "name": "commands_merge_bot"},
+            )
+        try:
+            set_commands_calls = [c for c in calls if type(c).__name__ == "SetMyCommands"]
+            self.assertEqual(len(set_commands_calls), 1, "expected exactly ONE set_my_commands call, not one per feature")
+            sent_commands = {(c.command, c.description) for c in set_commands_calls[0].commands}
+            self.assertEqual(
+                sent_commands,
+                {("fixturea", "Fixture command A"), ("fixtureb", "Fixture command B")},
+            )
+        finally:
+            await entry.bot.session.close()
+
+    async def test_no_commands_declared_means_no_set_my_commands_call(self):
+        # Reuses the plain fixture_dynamic_feature from the class above this
+        # one (no bot_commands attribute at all) instead of the two
+        # command-declaring fixtures — zero-cost path must stay zero-cost.
+        await disable_bot_feature(self.bot_id, "fixture_commands_feature_a")
+        await disable_bot_feature(self.bot_id, "fixture_commands_feature_b")
+        (self.tmp_dir / "fixture_no_commands_feature.py").write_text(
+            "# FEATURE: fixture_no_commands_feature\n"
+            "# COMPATIBLE_WITH: fixture_feature_host_template\n"
+            "from aiogram import Router\nrouter = Router()\n",
+            encoding="utf-8",
+        )
+        await enable_bot_feature(self.bot_id, "fixture_no_commands_feature")
+        calls = []
+
+        async def _fake_call(*args, **kwargs):
+            calls.append(args[0] if args else None)
+            return MagicMock()
+
+        try:
+            with patch.object(reg.Bot, "__call__", new=AsyncMock(side_effect=_fake_call)):
+                entry = await reg.build_entry(
+                    self.bot_id, FAKE_TOKEN, "fixture_feature_host_template",
+                    {"bot_id": self.bot_id, "name": "no_commands_bot"},
+                )
+            try:
+                set_commands_calls = [c for c in calls if type(c).__name__ == "SetMyCommands"]
+                self.assertEqual(len(set_commands_calls), 0)
+            finally:
+                await entry.bot.session.close()
+        finally:
+            await disable_bot_feature(self.bot_id, "fixture_no_commands_feature")
+            reg._feature_module_cache.pop("fixture_no_commands_feature", None)
+            sys.modules.pop("features.fixture_no_commands_feature", None)
+
+    async def test_one_features_invalid_command_does_not_drop_anothers_valid_one(self):
+        # Review finding: without per-entry validation, a single malformed
+        # bot_command from one feature (here: uppercase, which Telegram's own
+        # /setMyCommands rejects) would make the single merged
+        # bot.set_my_commands() call fail outright — silently dropping
+        # fixture_commands_feature_a's perfectly valid "fixturea" command too.
+        await disable_bot_feature(self.bot_id, "fixture_commands_feature_b")
+        (self.tmp_dir / "fixture_invalid_command_feature.py").write_text(
+            "# FEATURE: fixture_invalid_command_feature\n"
+            "# COMPATIBLE_WITH: fixture_feature_host_template\n"
+            "from aiogram import Router\n"
+            "router = Router()\n"
+            'bot_commands = [("NotValid!", "Uppercase command names are rejected by Telegram")]\n',
+            encoding="utf-8",
+        )
+        await enable_bot_feature(self.bot_id, "fixture_invalid_command_feature")
+        calls = []
+
+        async def _fake_call(*args, **kwargs):
+            calls.append(args[0] if args else None)
+            return MagicMock()
+
+        try:
+            with self.assertLogs("runtime.registry", level="WARNING"):
+                with patch.object(reg.Bot, "__call__", new=AsyncMock(side_effect=_fake_call)):
+                    entry = await reg.build_entry(
+                        self.bot_id, FAKE_TOKEN, "fixture_feature_host_template",
+                        {"bot_id": self.bot_id, "name": "invalid_command_bot"},
+                    )
+            try:
+                set_commands_calls = [c for c in calls if type(c).__name__ == "SetMyCommands"]
+                self.assertEqual(len(set_commands_calls), 1, "the valid command from the OTHER feature must still be pushed")
+                sent_commands = {(c.command, c.description) for c in set_commands_calls[0].commands}
+                self.assertEqual(sent_commands, {("fixturea", "Fixture command A")})
+            finally:
+                await entry.bot.session.close()
+        finally:
+            await disable_bot_feature(self.bot_id, "fixture_invalid_command_feature")
+            reg._feature_module_cache.pop("fixture_invalid_command_feature", None)
+            sys.modules.pop("features.fixture_invalid_command_feature", None)
 
 
 if __name__ == "__main__":

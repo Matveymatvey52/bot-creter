@@ -21,7 +21,7 @@ from typing import Any, Awaitable, Callable
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, Router
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import TelegramObject
+from aiogram.types import BotCommand, BotCommandScopeAllPrivateChats, TelegramObject
 
 from config import DATA_DIR
 from db.database import get_all_bots, get_bot, get_bot_features
@@ -59,6 +59,10 @@ _FEATURES_DIR = Path(__file__).parent.parent / "features"
 _FEATURE_HEADER_MAX_LINES = 10
 _FEATURE_LINE_RE = re.compile(r"^#\s*FEATURE:\s*(\S+)", re.MULTILINE)
 _COMPATIBLE_WITH_RE = re.compile(r"^#\s*COMPATIBLE_WITH:\s*(.+)$", re.MULTILINE)
+
+# Telegram's own /setMyCommands shape — see _load_and_include_features()'s
+# bot_commands validation.
+_BOT_COMMAND_NAME_RE = re.compile(r"^[a-z0-9_]{1,32}$")
 
 
 def discover_features() -> list[dict[str, Any]]:
@@ -297,7 +301,32 @@ async def _build_generic_middleware(bot_row: dict[str, Any], module: ModuleType)
     return module.ConfigMiddleware(config), config
 
 
-async def _load_and_include_features(dp: Dispatcher, bot_id: int, db_path: str) -> None:
+def _attach_bot_id_middleware(router: Router, bot_id: int) -> None:
+    """Injects data["bot_id"] = bot_id ahead of every event a feature router's
+    own handlers receive — see sellable-items-inventory: unlike
+    features/payments.py's create_invoice(), which takes bot_id as an
+    explicit caller-supplied parameter, a feature-level HANDLER (e.g.
+    sellable_items' own "buy" callback) has no template to thread it through.
+    Most host templates' own Config dataclasses don't carry a bot_id field at
+    all (only orders_tracker.py added one so far, for features/sheets.py calls
+    — see docs/STAGE2_DESIGN.md's per-template Config contracts) so a feature
+    can't rely on `config.bot_id` either. This is a generic registry-level
+    fix, usable by any future feature, not just this one.
+
+    Attached to the CLONED per-bot router only, via .outer_middleware() on
+    every event-type observer it has (Router has no single dp.update-style
+    entry point the way Dispatcher does) — never to the shared source Router
+    or the host template's own router, so one bot's bot_id can never leak
+    into another bot's handlers or into the host template's own data dict."""
+    async def _inject(handler, event, data):
+        data["bot_id"] = bot_id
+        return await handler(event, data)
+
+    for observer in router.observers.values():
+        observer.outer_middleware(_inject)
+
+
+async def _load_and_include_features(dp: Dispatcher, bot: Bot, bot_id: int, db_path: str) -> None:
     """Loads and wires every feature enabled for this bot (db/database.py's
     bot_features table) into its Dispatcher, the same clone-then-include_router
     pattern as the main template (see _clone_router). Each feature is isolated
@@ -308,8 +337,19 @@ async def _load_and_include_features(dp: Dispatcher, bot_id: int, db_path: str) 
 
     A bot with no enabled features (the overwhelming majority, at least until
     this system sees adoption) costs one extra DB query and nothing else —
-    get_bot_features() returns an empty list and this loop body never runs."""
+    get_bot_features() returns an empty list and this loop body never runs.
+
+    A feature module MAY also export `bot_commands: list[tuple[str, str]]`
+    (command, description) — see sellable-items-inventory: features can carry
+    their own user-facing entry points (unlike payments.py/sheets.py, which
+    are pure libraries with no UI of their own) but have no template menu to
+    add a button to without editing every compatible templates/*.py file.
+    Collected across every enabled feature and pushed once via
+    bot.set_my_commands(scope=private chats only) — a single call, not one
+    per feature, so two features declaring commands never clobber each
+    other's list the way two independent set_my_commands() calls would."""
     feature_names = await get_bot_features(bot_id)
+    collected_commands: dict[str, str] = {}
     for feature_name in feature_names:
         try:
             module = await _load_feature_module_async(feature_name)
@@ -329,12 +369,54 @@ async def _load_and_include_features(dp: Dispatcher, bot_id: int, db_path: str) 
                     "module has no 'router' attribute — skipped"
                 )
                 continue
-            dp.include_router(_clone_router(raw_router))
+            cloned_router = _clone_router(raw_router)
+            _attach_bot_id_middleware(cloned_router, bot_id)
+            dp.include_router(cloned_router)
+            try:
+                for command, description in getattr(module, "bot_commands", None) or []:
+                    # Validated per-entry (Telegram's own /setcommands shape:
+                    # lowercase ASCII/digits/underscore, 1-32 chars, non-empty
+                    # description) — review found that without this, ONE
+                    # feature declaring a single malformed command would make
+                    # the eventual bot.set_my_commands() call below reject the
+                    # WHOLE merged list, silently dropping every OTHER
+                    # feature's valid commands from this bot's "/" menu too.
+                    # Skipping just the bad entry keeps that blast radius to
+                    # itself.
+                    if not _BOT_COMMAND_NAME_RE.match(command) or not description or len(description) > 256:
+                        logger.warning(
+                            f"_load_and_include_features: bot_id={bot_id} feature={feature_name!r} "
+                            f"declared an invalid bot_command {command!r} — skipped, router still loaded"
+                        )
+                        continue
+                    collected_commands[command] = description
+            except (TypeError, ValueError):
+                # A malformed bot_commands attribute entirely (not an iterable
+                # of 2-tuples at all) must not be blamed on the router load —
+                # dp.include_router() above already succeeded, so the
+                # feature's own handlers genuinely work; only its command
+                # menu entry is missing. Keeping this in its own try/except
+                # (rather than letting the outer one below catch it) keeps
+                # that outer except's "skipped, bot continues without it" log
+                # accurate for what it actually means: the router itself
+                # never got attached.
+                logger.warning(
+                    f"_load_and_include_features: bot_id={bot_id} feature={feature_name!r} "
+                    "has a malformed bot_commands attribute — ignored, router still loaded"
+                )
         except Exception:
             logger.exception(
                 f"_load_and_include_features: bot_id={bot_id} feature={feature_name!r} "
                 "raised while loading — skipped, bot continues without it"
             )
+    if collected_commands:
+        try:
+            await bot.set_my_commands(
+                [BotCommand(command=c, description=d) for c, d in collected_commands.items()],
+                scope=BotCommandScopeAllPrivateChats(),
+            )
+        except Exception:
+            logger.exception(f"_load_and_include_features: bot_id={bot_id} failed to set bot commands")
 
 
 # Lives under DATA_DIR — the ONLY location in this project that survives a
@@ -536,7 +618,7 @@ async def build_entry(
     # to give them (and nothing meaningful to attach to) if the template itself
     # never resolved. Same condition covers the per-bot custom_features patch.
     if typed_config is not None:
-        await _load_and_include_features(dp, bot_id, typed_config.db_path)
+        await _load_and_include_features(dp, bot, bot_id, typed_config.db_path)
         await _load_and_include_custom_feature(dp, bot_id, typed_config.db_path)
 
     return BotEntry(bot=bot, dispatcher=dp, template_id=template_id, config=config)
