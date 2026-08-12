@@ -1,5 +1,5 @@
 # FEATURE: payments
-# COMPATIBLE_WITH: accountant, booking_beauty, booking_fitness, booking_medical, campaign_tracker, event_manager, inventory, loyalty_program, manager_secretary, moderator, orders_tracker, referral_program, shop_catalog, tour_operator, tourist_documents, trip_manager
+# COMPATIBLE_WITH: accountant, booking_beauty, booking_fitness, booking_medical, booking_restaurant, campaign_tracker, event_manager, inventory, loyalty_program, manager_secretary, moderator, orders_tracker, referral_program, shop_catalog, tour_operator, tourist_documents, trip_manager
 """Reusable Telegram Payments feature module — see docs/STAGE2_DESIGN.md "Фаза
 B — services/payments.py" for the original design, and feature-modules-inventory
 for how this became the library's first feature module.
