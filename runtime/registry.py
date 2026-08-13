@@ -326,6 +326,24 @@ def _attach_bot_id_middleware(router: Router, bot_id: int) -> None:
         observer.outer_middleware(_inject)
 
 
+# Telegram's own /setMyCommands description length limit — clean-code review
+# found this was a bare magic number inline below.
+_BOT_COMMAND_DESCRIPTION_MAX_LEN = 256
+
+# Last command set actually pushed to Telegram per bot_id, for the lifetime
+# of this process — devops-logs review found bot.set_my_commands() was
+# called unconditionally on EVERY build_entry()/reload_one()/reload_all(),
+# for every bot with a command-declaring feature enabled, even when nothing
+# changed since the last call. reload_all() runs on every process start
+# (Railway redeploy), so this scales linearly with the number of such bots
+# on every deploy. Comparing against this cache also fixes an adjacent gap:
+# without it, a bot whose LAST command-declaring feature gets disabled would
+# keep its stale "/items" entry in Telegram's menu forever, since the old
+# code only ever called set_my_commands when collected_commands was
+# non-empty and never explicitly cleared it.
+_last_sent_commands: dict[int, frozenset[tuple[str, str]]] = {}
+
+
 async def _load_and_include_features(dp: Dispatcher, bot: Bot, bot_id: int, db_path: str) -> None:
     """Loads and wires every feature enabled for this bot (db/database.py's
     bot_features table) into its Dispatcher, the same clone-then-include_router
@@ -383,7 +401,7 @@ async def _load_and_include_features(dp: Dispatcher, bot: Bot, bot_id: int, db_p
                     # feature's valid commands from this bot's "/" menu too.
                     # Skipping just the bad entry keeps that blast radius to
                     # itself.
-                    if not _BOT_COMMAND_NAME_RE.match(command) or not description or len(description) > 256:
+                    if not _BOT_COMMAND_NAME_RE.match(command) or not description or len(description) > _BOT_COMMAND_DESCRIPTION_MAX_LEN:
                         logger.warning(
                             f"_load_and_include_features: bot_id={bot_id} feature={feature_name!r} "
                             f"declared an invalid bot_command {command!r} — skipped, router still loaded"
@@ -409,12 +427,20 @@ async def _load_and_include_features(dp: Dispatcher, bot: Bot, bot_id: int, db_p
                 f"_load_and_include_features: bot_id={bot_id} feature={feature_name!r} "
                 "raised while loading — skipped, bot continues without it"
             )
-    if collected_commands:
+    current_commands = frozenset(collected_commands.items())
+    previous_commands = _last_sent_commands.get(bot_id)
+    if previous_commands is None and not current_commands:
+        # Never sent anything for this bot, and there's nothing to send now
+        # — skip entirely, preserving the zero-cost path for the
+        # overwhelming majority of bots with no command-declaring features.
+        pass
+    elif previous_commands != current_commands:
         try:
             await bot.set_my_commands(
                 [BotCommand(command=c, description=d) for c, d in collected_commands.items()],
                 scope=BotCommandScopeAllPrivateChats(),
             )
+            _last_sent_commands[bot_id] = current_commands
         except Exception:
             logger.exception(f"_load_and_include_features: bot_id={bot_id} failed to set bot commands")
 

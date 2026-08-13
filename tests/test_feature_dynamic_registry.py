@@ -352,6 +352,13 @@ class SetMyCommandsCollectionTests(unittest.IsolatedAsyncioTestCase):
         self.data_dir_patcher = patch("config.DATA_DIR", self.tmp_dir)
         self.data_dir_patcher.start()
         self.bot_id = 9303
+        # _last_sent_commands is a process-lifetime cache (devops-logs
+        # review — see runtime/registry.py) keyed by bot_id, not reset
+        # between test methods on its own. Every test method in this class
+        # shares bot_id=9303, so a prior method's set_my_commands() call
+        # would otherwise leak a cache entry into the next one — same reason
+        # the module/sys.modules caches below are already reset per test.
+        reg._last_sent_commands.pop(self.bot_id, None)
         await enable_bot_feature(self.bot_id, "fixture_commands_feature_a")
         await enable_bot_feature(self.bot_id, "fixture_commands_feature_b")
 
@@ -364,6 +371,7 @@ class SetMyCommandsCollectionTests(unittest.IsolatedAsyncioTestCase):
         reg._template_module_cache.pop("fixture_feature_host_template", None)
         reg._feature_module_cache.pop("fixture_commands_feature_a", None)
         reg._feature_module_cache.pop("fixture_commands_feature_b", None)
+        reg._last_sent_commands.pop(self.bot_id, None)
         sys.modules.pop("templates.fixture_feature_host_template", None)
         sys.modules.pop("features.fixture_commands_feature_a", None)
         sys.modules.pop("features.fixture_commands_feature_b", None)

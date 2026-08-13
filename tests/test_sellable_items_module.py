@@ -324,6 +324,41 @@ class BuyFlowTests(SellableItemsTestCase):
         self.assertEqual(invoice.prices[0].amount, 35000, "350 rubles must become 35000 (kopecks) in the invoice")
         self.assertTrue(invoice.payload.startswith(f"sellable_item:{item_id}:"))
 
+    async def test_buy_truncates_long_name_and_description_for_telegrams_invoice_limits(self):
+        # Security review finding: NAME_MAX_LEN=100/DESCRIPTION_MAX_LEN=1000
+        # (this file's own storage/display bounds) are far looser than
+        # Telegram's real sendInvoice/LabeledPrice limits (title/label 32
+        # chars, description 255) — without truncating specifically for the
+        # invoice call, a legitimately-entered longer name/description would
+        # make EVERY purchase attempt of that item fail with
+        # TelegramBadRequest, silently making it permanently unbuyable.
+        await set_bot_payment_provider(self.bot_id, "provider-token-for-test")
+        long_name = "А" * 60
+        long_description = "Б" * 500
+        item_id = await sellable_items._create_item(self.db_path, long_name, long_description, 350)
+
+        calls: list = []
+
+        async def _fake_call(*args, **kwargs):
+            calls.append(args[0] if args else None)
+            return MagicMock()
+
+        with patch.object(Bot, "__call__", new=AsyncMock(side_effect=_fake_call)):
+            await self.dp.feed_webhook_update(self.bot, _callback_update(1, CLIENT_ID, f"selitem_buy:{item_id}"))
+
+        invoices = [c for c in calls if type(c).__name__ == "SendInvoice"]
+        self.assertEqual(len(invoices), 1)
+        invoice = invoices[0]
+        self.assertLessEqual(len(invoice.title), sellable_items.INVOICE_TITLE_MAX_LEN)
+        self.assertLessEqual(len(invoice.description), sellable_items.INVOICE_DESCRIPTION_MAX_LEN)
+        self.assertLessEqual(len(invoice.prices[0].label), sellable_items.INVOICE_LABEL_MAX_LEN)
+
+        # The stored row itself must keep the FULL name/description — only
+        # what's sent to Telegram's own invoice API is shortened.
+        stored = await sellable_items._item_row(self.db_path, item_id)
+        self.assertEqual(stored["name"], long_name)
+        self.assertEqual(stored["description"], long_description)
+
     async def test_buy_survives_unexpected_exception_from_create_invoice(self):
         # Review finding: cb_buy originally only caught ValueError/
         # TelegramBadRequest — anything else (a bare TelegramForbiddenError,
@@ -423,6 +458,266 @@ class IsolationTests(unittest.IsolatedAsyncioTestCase):
         items_b = await sellable_items._all_items(self.db_path_b)
         self.assertEqual(len(items_a), 1)
         self.assertEqual(len(items_b), 0, "an item added on bot A must not leak into bot B's own db_path")
+
+
+def _photo_update(update_id: int, user_id: int, msg_id: int = 50) -> dict:
+    return {
+        "update_id": update_id,
+        "message": {
+            "message_id": msg_id, "date": 1700000000,
+            "chat": {"id": user_id, "type": "private"},
+            "from": {"id": user_id, "is_bot": False, "first_name": "Test"},
+            "photo": [{"file_id": "AgADfake", "file_unique_id": "fake", "width": 10, "height": 10}],
+        },
+    }
+
+
+class PanelLeakRegressionTests(SellableItemsTestCase):
+    """Second review pass (monkey-testing) found the biggest bug of the
+    whole file: every step of the multi-step "add item" flow past the very
+    first prompt sent a fresh, UNTRACKED message instead of going through
+    _replace_panel — guaranteeing 2+ permanently orphaned bot messages per
+    single normal use of "add item". Fixed by routing every prompt/re-prompt
+    through _replace_panel; these tests assert the fix by counting
+    DeleteMessage calls (one expected per panel replacement) rather than
+    trusting DB state alone."""
+
+    async def test_full_add_flow_deletes_every_intermediate_prompt(self):
+        calls: list = []
+
+        async def _fake_call(*args, **kwargs):
+            request = args[0] if args else None
+            calls.append(request)
+            return MagicMock(message_id=len(calls) + 1000)
+
+        with patch.object(Bot, "__call__", new=AsyncMock(side_effect=_fake_call)):
+            await self.dp.feed_webhook_update(self.bot, _text_update(1, ADMIN_ID, "/items"))
+            await self.dp.feed_webhook_update(self.bot, _callback_update(2, ADMIN_ID, "selitem_adm_add"))
+            await self.dp.feed_webhook_update(self.bot, _text_update(3, ADMIN_ID, "Кофе"))
+            await self.dp.feed_webhook_update(self.bot, _text_update(4, ADMIN_ID, "Арабика"))
+            await self.dp.feed_webhook_update(self.bot, _text_update(5, ADMIN_ID, "350"))
+
+        send_count = sum(1 for c in calls if type(c).__name__ == "SendMessage")
+        delete_count = sum(1 for c in calls if type(c).__name__ == "DeleteMessage")
+        # /items → panel 1 ("Управление позициями"), add → panel 2 (name
+        # prompt), name → panel 3 (description prompt), description → panel
+        # 4 (price prompt), price → panel 5 (success + list). 5 sends, and
+        # every one but the very first should have deleted its predecessor.
+        self.assertEqual(send_count, 5)
+        self.assertEqual(delete_count, 4, "every panel step after the first must delete its predecessor — no orphans")
+
+    async def test_abandoned_flow_prompt_is_deleted_on_next_items_command(self):
+        # Went silent mid "Добавить позицию", came back later, just hit
+        # /items again instead of finishing or cancelling — the abandoned
+        # "Введите название" prompt must still get cleaned up.
+        await self.dp.feed_webhook_update(self.bot, _text_update(1, ADMIN_ID, "/items"))
+        await self.dp.feed_webhook_update(self.bot, _callback_update(2, ADMIN_ID, "selitem_adm_add"))
+
+        calls: list = []
+
+        async def _fake_call(*args, **kwargs):
+            calls.append(args[0] if args else None)
+            return MagicMock(message_id=999)
+
+        with patch.object(Bot, "__call__", new=AsyncMock(side_effect=_fake_call)):
+            await self.dp.feed_webhook_update(self.bot, _text_update(3, ADMIN_ID, "/items"))
+
+        self.assertTrue(any(type(c).__name__ == "DeleteMessage" for c in calls),
+                         "the abandoned 'Введите название' prompt must be deleted, not orphaned")
+
+    async def test_invalid_input_reprompt_does_not_orphan_a_message(self):
+        await self.dp.feed_webhook_update(self.bot, _text_update(1, ADMIN_ID, "/items"))
+        await self.dp.feed_webhook_update(self.bot, _callback_update(2, ADMIN_ID, "selitem_adm_add"))
+
+        calls: list = []
+
+        async def _fake_call(*args, **kwargs):
+            calls.append(args[0] if args else None)
+            return MagicMock(message_id=1000 + len(calls))
+
+        with patch.object(Bot, "__call__", new=AsyncMock(side_effect=_fake_call)):
+            # empty name (after stripping) — must be re-prompted through the
+            # SAME tracked panel, not a bare untracked reply.
+            await self.dp.feed_webhook_update(self.bot, _text_update(3, ADMIN_ID, "   "))
+
+        self.assertTrue(any(type(c).__name__ == "DeleteMessage" for c in calls),
+                         "an invalid-input re-prompt must still replace (delete+resend) the tracked panel")
+
+
+class ConcurrencyRegressionTests(SellableItemsTestCase):
+    """Async-pooling/state-db review: two near-simultaneous updates for the
+    SAME admin could both pass validation before either committed its FSM/DB
+    write — (a) duplicate item creation on a double-submitted price, (b)
+    edit_item_id/edit_field misrouted by two quick different-field taps.
+    Fixed by _busy_admin_actions; these tests simulate the race directly via
+    asyncio.gather rather than relying on real timing."""
+
+    async def test_concurrent_price_submission_creates_only_one_item(self):
+        import asyncio
+        await self.dp.feed_webhook_update(self.bot, _text_update(1, ADMIN_ID, "/items"))
+        await self.dp.feed_webhook_update(self.bot, _callback_update(2, ADMIN_ID, "selitem_adm_add"))
+        await self.dp.feed_webhook_update(self.bot, _text_update(3, ADMIN_ID, "Кофе"))
+        await self.dp.feed_webhook_update(self.bot, _callback_update(4, ADMIN_ID, "selitem_adm_desc_skip"))
+
+        await asyncio.gather(
+            self.dp.feed_webhook_update(self.bot, _text_update(5, ADMIN_ID, "350")),
+            self.dp.feed_webhook_update(self.bot, _text_update(6, ADMIN_ID, "350")),
+        )
+
+        self.assertEqual(len(self._items_in_db()), 1, "two concurrent price submissions must create exactly one item")
+
+    async def test_concurrent_field_edit_taps_do_not_misroute_the_value(self):
+        import asyncio
+        item_id = await sellable_items._create_item(self.db_path, "Кофе", "старое описание", 350)
+
+        await asyncio.gather(
+            self.dp.feed_webhook_update(self.bot, _callback_update(1, ADMIN_ID, f"selitem_adm_field:{item_id}:name")),
+            self.dp.feed_webhook_update(self.bot, _callback_update(2, ADMIN_ID, f"selitem_adm_field:{item_id}:price")),
+        )
+        # Whichever tap "won" the race set a definite, single edit_field —
+        # submit a value consistent with EITHER outcome being internally
+        # coherent is impossible to assert generically, so instead assert
+        # the guard's actual contract: only one of the two field-select
+        # requests could have gone through to state.set_state (the other
+        # was rejected by _busy_admin_actions), so a followup submission of
+        # "500" must land in exactly one field, never split/corrupt both.
+        await self.dp.feed_webhook_update(self.bot, _text_update(3, ADMIN_ID, "500"))
+
+        row = self._items_in_db()[0]
+        changed_fields = []
+        if row["name"] == "500":
+            changed_fields.append("name")
+        if str(row["price"]) == "500":
+            changed_fields.append("price")
+        self.assertLessEqual(len(changed_fields), 1, "a single typed value must not corrupt more than one field")
+        # The untouched field must retain a sane, original-shaped value —
+        # not have been silently blanked or mismatched.
+        self.assertIn(row["name"], ("Кофе", "500"))
+
+
+class MalformedCallbackDataTests(SellableItemsTestCase):
+    """Monkey-testing review: every int(cb.data.split(...)) in the file was
+    unguarded — a forged/stale callback_data (non-numeric or truncated id)
+    raised an unhandled ValueError, for selitem_view:/selitem_buy: in
+    particular BEFORE cb.answer() had run (stuck spinner)."""
+
+    async def test_non_numeric_item_id_on_admin_edit_is_handled_gracefully(self):
+        await self.dp.feed_webhook_update(self.bot, _callback_update(1, ADMIN_ID, "selitem_adm_edit:not-a-number"))
+        # No crash (feed_webhook_update would have propagated an unhandled
+        # exception) is itself the assertion here — nothing left to check.
+
+    async def test_non_numeric_item_id_on_toggle_is_handled_gracefully(self):
+        await self.dp.feed_webhook_update(self.bot, _callback_update(1, ADMIN_ID, "selitem_adm_toggle:xyz"))
+
+    async def test_field_callback_missing_field_segment_is_handled_gracefully(self):
+        await self.dp.feed_webhook_update(self.bot, _callback_update(1, ADMIN_ID, "selitem_adm_field:5"))
+
+    async def test_non_numeric_item_id_on_client_view_answers_gracefully(self):
+        calls: list = []
+
+        async def _fake_call(*args, **kwargs):
+            calls.append(args[0] if args else None)
+            return MagicMock()
+
+        with patch.object(Bot, "__call__", new=AsyncMock(side_effect=_fake_call)):
+            await self.dp.feed_webhook_update(self.bot, _callback_update(1, CLIENT_ID, "selitem_view:garbage"))
+
+        answers = [c for c in calls if type(c).__name__ == "AnswerCallbackQuery"]
+        self.assertTrue(any(answers), "cb.answer() must still fire even for a malformed item id — no stuck spinner")
+
+    async def test_non_numeric_item_id_on_buy_answers_gracefully(self):
+        calls: list = []
+
+        async def _fake_call(*args, **kwargs):
+            calls.append(args[0] if args else None)
+            return MagicMock()
+
+        with patch.object(Bot, "__call__", new=AsyncMock(side_effect=_fake_call)):
+            await self.dp.feed_webhook_update(self.bot, _callback_update(1, CLIENT_ID, "selitem_buy:garbage"))
+
+        answers = [c for c in calls if type(c).__name__ == "AnswerCallbackQuery"]
+        self.assertTrue(any(answers), "cb.answer() must still fire even for a malformed item id — no stuck spinner")
+        method_names = [type(c).__name__ for c in calls]
+        self.assertNotIn("SendInvoice", method_names)
+
+
+class NonTextMidFlowTests(SellableItemsTestCase):
+    async def test_photo_sent_during_add_name_gets_a_please_use_text_reply(self):
+        await self.dp.feed_webhook_update(self.bot, _text_update(1, ADMIN_ID, "/items"))
+        await self.dp.feed_webhook_update(self.bot, _callback_update(2, ADMIN_ID, "selitem_adm_add"))
+
+        calls: list = []
+
+        async def _fake_call(*args, **kwargs):
+            calls.append(args[0] if args else None)
+            return MagicMock()
+
+        with patch.object(Bot, "__call__", new=AsyncMock(side_effect=_fake_call)):
+            await self.dp.feed_webhook_update(self.bot, _photo_update(3, ADMIN_ID))
+
+        texts = [getattr(c, "text", None) for c in calls]
+        self.assertTrue(any(t and "текстом" in t for t in texts))
+        self.assertEqual(len(self._items_in_db()), 0)
+
+
+class WalModeTests(SellableItemsTestCase):
+    async def test_init_db_sets_wal_mode(self):
+        # State-db/async-pooling review: this db_path never set WAL before,
+        # unlike features/payments.py's init_payments_tables — making a
+        # concurrent write (e.g. hiding an item while a payment is being
+        # recorded into the SAME db_path) more likely to surface as an
+        # unhandled "database is locked".
+        conn = sqlite3.connect(self.db_path)
+        mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+        conn.close()
+        self.assertEqual(mode.lower(), "wal")
+
+
+class TruncateUtf16Tests(unittest.TestCase):
+    """Monkey-testing review: _short()'s plain len()-based truncation counts
+    Python codepoints, not the UTF-16 code units Telegram's sendInvoice/
+    LabeledPrice limits are actually measured in — an emoji-heavy name could
+    pass a 32-codepoint slice while still exceeding Telegram's real 32-unit
+    limit, defeating the whole point of INVOICE_TITLE_MAX_LEN."""
+
+    def test_ascii_text_under_limit_is_unchanged(self):
+        self.assertEqual(sellable_items._truncate_utf16("Кофе", 32), "Кофе")
+
+    def test_astral_emoji_name_is_truncated_to_fit_utf16_limit(self):
+        # Each of these emoji is outside the Basic Multilingual Plane — 2
+        # UTF-16 code units per character, 1 Python codepoint each.
+        name = "😀" * 40
+        truncated = sellable_items._truncate_utf16(name, 32)
+        self.assertLessEqual(len(truncated.encode("utf-16-le")) // 2, 32)
+        self.assertTrue(truncated.endswith("…"))
+
+    def test_truncation_never_raises_on_surrogate_boundary(self):
+        # A length chosen so the raw UTF-16 slice lands mid-surrogate-pair —
+        # must not raise UnicodeDecodeError.
+        name = "😀" * 40
+        try:
+            sellable_items._truncate_utf16(name, 15)
+        except UnicodeDecodeError:
+            self.fail("_truncate_utf16 raised on a mid-surrogate-pair cut")
+
+
+class AdmCancelAliasTests(SellableItemsTestCase):
+    """Clean-code review: cb_adm_list/cb_adm_cancel were merged into one
+    handler registered under both callback_data values — verifies the merge
+    didn't silently drop the "❌ Отмена" behavior."""
+
+    async def test_cancel_callback_still_shows_the_admin_panel(self):
+        calls: list = []
+
+        async def _fake_call(*args, **kwargs):
+            calls.append(args[0] if args else None)
+            return MagicMock()
+
+        with patch.object(Bot, "__call__", new=AsyncMock(side_effect=_fake_call)):
+            await self.dp.feed_webhook_update(self.bot, _callback_update(1, ADMIN_ID, "selitem_adm_cancel"))
+
+        texts = [getattr(c, "text", None) for c in calls]
+        self.assertTrue(any(t and "Управление позициями" in t for t in texts))
 
 
 if __name__ == "__main__":
