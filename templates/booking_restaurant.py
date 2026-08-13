@@ -16,7 +16,7 @@ from pathlib import Path
 
 import aiosqlite
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
-from aiogram.exceptions import TelegramAPIError
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -55,6 +55,7 @@ BANQUET_THRESHOLD = 8
 # shown to the client, per the design brief ("просто честная информация").
 CANCEL_FREE_HOURS = 24
 MAX_GUESTS = 500
+MAX_TABLE_CAPACITY = 1000
 # ── END CUSTOMIZE ─────────────────────────────────────────────────────────────
 
 logging.basicConfig(level=logging.INFO)
@@ -195,24 +196,28 @@ def _valid_admin_id(text: str) -> bool:
     return int(text) > 0 and str(int(text)) == text
 
 
-def _valid_guests_count(text: str) -> int | None:
+def _valid_int_in_range(text: str, max_value: int) -> int | None:
+    """Shared bound-checked integer parser for guests_count/capacity input.
+    Review-found crash (monkey-tester): str.isdigit() returns True for
+    Unicode "digit" characters that aren't decimal digits (e.g. superscript
+    "²", circled "①") — int() then raises ValueError on them uncaught,
+    silently dropping the update with no reply. isascii() (same guard as
+    _valid_admin_id above) rules those out before int() ever sees them."""
     text = text.strip()
-    if not text.isdigit():
+    if not (text.isascii() and text.isdigit()):
         return None
     n = int(text)
-    if n <= 0 or n > MAX_GUESTS:
+    if n <= 0 or n > max_value:
         return None
     return n
+
+
+def _valid_guests_count(text: str) -> int | None:
+    return _valid_int_in_range(text, MAX_GUESTS)
 
 
 def _valid_capacity(text: str) -> int | None:
-    text = text.strip()
-    if not text.isdigit():
-        return None
-    n = int(text)
-    if n <= 0 or n > 1000:
-        return None
-    return n
+    return _valid_int_in_range(text, MAX_TABLE_CAPACITY)
 
 
 def _date_label(date_str: str) -> str:
@@ -268,14 +273,39 @@ async def _total_capacity(db_path: str) -> int:
     return row[0]
 
 
+async def _window_headroom_text(db_path: str, date: str, window_start: str, window_end: str) -> str:
+    """Review-found (state-db/async-pooling/monkey-tester, independently):
+    the comment on _available_windows below used to claim "the admin sees
+    remaining headroom on the reservation card itself when deciding" — that
+    was aspirational, not implemented: _reservation_detail_text never
+    rendered it, and cb_admres_confirm never checked it, so an admin could
+    confirm several pending reservations for the same window past total
+    capacity with zero warning. This is the actual headroom line, wired into
+    _reservation_detail_text for pending reservations (see show_headroom
+    below) so the claim is now true. Deliberately informational, not a hard
+    block — confirming past capacity remains an admin decision, per the
+    design brief (pending reservations don't reserve capacity by themselves)."""
+    total = await _total_capacity(db_path)
+    async with aiosqlite.connect(db_path) as db:
+        row = await (await db.execute(
+            "SELECT COALESCE(SUM(guests_count), 0) FROM reservations "
+            "WHERE date=? AND time_window_start=? AND time_window_end=? AND status='confirmed'",
+            (date, window_start, window_end),
+        )).fetchone()
+    confirmed = row[0]
+    remaining = total - confirmed
+    warn = " ⚠️ уже переполнено" if remaining < 0 else ""
+    return f"📊 Занято в этом окне: {confirmed}/{total} мест{warn}"
+
+
 async def _available_windows(db_path: str, date: str, guests_count: int) -> list[tuple[str, str]]:
     """Windows whose remaining capacity (total active-table capacity minus
     guests already CONFIRMED for that exact date+window) can still fit this
     party. Deliberately checked against status='confirmed' only, per the
     design brief's literal wording ("вместимость... против уже подтверждённых
     броней") — pending reservations don't reserve capacity yet, they're an
-    admin decision still in flight; the admin sees remaining headroom on the
-    reservation card itself when deciding."""
+    admin decision still in flight; see _window_headroom_text for what the
+    admin actually sees on the reservation card when deciding."""
     total = await _total_capacity(db_path)
     if total <= 0:
         return []
@@ -361,8 +391,16 @@ def kb_days(callback_prefix: str, back_callback: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def kb_windows(windows: list[tuple[str, str]], date: str) -> InlineKeyboardMarkup:
+    # Review-found blocker: callback_data used to embed "{start}:{end}" raw
+    # ("res_window:18:00:20:00") — since each half already contains a colon,
+    # cb_res_window's split(":", 2) sliced it wrong on EVERY window (parsed
+    # window_start="18", window_end="00:20:00"), corrupting every reservation's
+    # stored window and silently breaking the whole capacity check. Encoding
+    # the TIME_WINDOWS index instead is unambiguous AND doubles as revalidation
+    # against the trusted whitelist — a forged callback_data can only fail to
+    # parse or reference a real window, never inject an arbitrary time range.
     rows = [
-        [InlineKeyboardButton(text=f"⏰ {start}–{end}", callback_data=f"res_window:{start}:{end}")]
+        [InlineKeyboardButton(text=f"⏰ {start}–{end}", callback_data=f"res_window:{TIME_WINDOWS.index((start, end))}")]
         for start, end in windows
     ]
     rows.append([InlineKeyboardButton(text="◀️ Другая дата", callback_data="res_back_days")])
@@ -463,7 +501,9 @@ def kb_remove_admins(ids: list[str]) -> InlineKeyboardMarkup:
 
 # ── rendering helpers ────────────────────────────────────────────────────────
 
-async def _reservation_detail_text(db_path: str, reservation_id: int, extra_note: str | None = None) -> str | None:
+async def _reservation_detail_text(
+    db_path: str, reservation_id: int, extra_note: str | None = None, show_headroom: bool = False,
+) -> str | None:
     async with aiosqlite.connect(db_path) as db:
         db.row_factory = aiosqlite.Row
         res = await (await db.execute(
@@ -486,10 +526,33 @@ async def _reservation_detail_text(db_path: str, reservation_id: int, extra_note
     if res["deposit_required"]:
         deposit_state = "✅ подтверждён" if res["deposit_confirmed"] else "⏳ ожидает подтверждения"
         lines.append(f"💰 Депозит для банкета: {deposit_state}")
+    # Admin-only, and only while the decision is still open — a confirmed/
+    # cancelled reservation's window headroom isn't actionable information
+    # anymore, and showing restaurant-wide occupancy to the CLIENT's own
+    # "Мои брони" view would be an unrelated internal-data disclosure.
+    if show_headroom and res["status"] == "pending":
+        lines.append(await _window_headroom_text(
+            db_path, res["date"], res["time_window_start"], res["time_window_end"]
+        ))
     lines.append(f"🕐 Создана: {res['created_at']}")
     if extra_note:
         lines.append(f"\n{extra_note}")
     return _join_bounded(lines)
+
+
+async def _edit_text_safe(message: Message, text: str, **kwargs) -> None:
+    """Review-found (monkey-tester): a 3rd+ tap on admres_confirm/reject/
+    deposit (after the first two taps already made the CAS-guard a no-op and
+    left the card unchanged) calls edit_text with the exact same text/markup
+    as what's already on screen — Telegram rejects that with "message is not
+    modified", uncaught, and the update is silently dropped. Same helper/
+    rationale as templates/feedback_survey.py's _edit_text_safe: swallow only
+    that specific error, anything else re-raises."""
+    try:
+        await message.edit_text(text, **kwargs)
+    except TelegramBadRequest as e:
+        if "message is not modified" not in str(e):
+            raise
 
 
 # ── /start ────────────────────────────────────────────────────────────────────
@@ -619,7 +682,12 @@ async def cb_res_window(cb: CallbackQuery, state: FSMContext):
         await state.clear()
         await cb.message.edit_text("Сессия истекла, начните заново.", reply_markup=kb_client_menu())
         return
-    _, start, end = cb.data.split(":", 2)
+    try:
+        idx = int(cb.data.split(":", 1)[1])
+        start, end = TIME_WINDOWS[idx]
+    except (ValueError, IndexError):
+        # Malformed/forged callback_data — refuse rather than store garbage.
+        return
     await state.update_data(window_start=start, window_end=end)
     await cb.message.edit_text("🎂 Указать повод визита?", reply_markup=kb_occasion())
 
@@ -846,7 +914,7 @@ async def cb_admres_view(cb: CallbackQuery, config: BookingRestaurantConfig):
     if not row:
         await cb.message.edit_text("Бронь не найдена.", reply_markup=kb_admin_menu())
         return
-    text = await _reservation_detail_text(config.db_path, reservation_id)
+    text = await _reservation_detail_text(config.db_path, reservation_id, show_headroom=True)
     await cb.message.edit_text(text, parse_mode="HTML",
                                 reply_markup=kb_reservation_detail_admin(reservation_id, row[0], row[1], row[2]))
 
@@ -877,7 +945,7 @@ async def cb_admres_confirm(cb: CallbackQuery, bot: Bot, config: BookingRestaura
         if not row:
             await cb.message.edit_text("Бронь не найдена.", reply_markup=kb_admin_menu())
             return
-        old_status, client_user_id, deposit_required, deposit_confirmed = row
+        _, client_user_id, deposit_required, deposit_confirmed = row
         # Fixed-status guard (WHERE status='pending'), NOT "WHERE status=old_status":
         # on a double-tap old_status is already 'confirmed' by the first tap, and
         # 'confirmed'='confirmed' would match and re-notify the client — same
@@ -893,13 +961,16 @@ async def cb_admres_confirm(cb: CallbackQuery, bot: Bot, config: BookingRestaura
         note = await _admres_notify_client(
             bot, config, client_user_id, f"✅ Ваша бронь №{reservation_id} подтверждена!"
         )
+    # Review-found (clean-code): status/deposit_required/deposit_confirmed
+    # were re-fetched from the DB here even though the UPDATE above only ever
+    # touches `status`, and its outcome is already known from cur.rowcount —
+    # no second round-trip needed (matches cb_admres_deposit's own style,
+    # which never re-queries either).
+    new_status = "confirmed" if cur.rowcount else row[0]
     text = await _reservation_detail_text(config.db_path, reservation_id, extra_note=note)
-    async with aiosqlite.connect(config.db_path) as db:
-        row = await (await db.execute(
-            "SELECT status, deposit_required, deposit_confirmed FROM reservations WHERE id=?", (reservation_id,)
-        )).fetchone()
-    await cb.message.edit_text(text, parse_mode="HTML",
-                                reply_markup=kb_reservation_detail_admin(reservation_id, row[0], row[1], row[2]))
+    await _edit_text_safe(cb.message, text, parse_mode="HTML",
+                           reply_markup=kb_reservation_detail_admin(
+                               reservation_id, new_status, deposit_required, deposit_confirmed))
 
 
 @router.callback_query(F.data.startswith("admres_reject:"))
@@ -913,12 +984,13 @@ async def cb_admres_reject(cb: CallbackQuery, bot: Bot, config: BookingRestauran
         return
     async with aiosqlite.connect(config.db_path) as db:
         row = await (await db.execute(
-            "SELECT status, client_user_id FROM reservations WHERE id=?", (reservation_id,)
+            "SELECT status, client_user_id, deposit_required, deposit_confirmed FROM reservations WHERE id=?",
+            (reservation_id,),
         )).fetchone()
         if not row:
             await cb.message.edit_text("Бронь не найдена.", reply_markup=kb_admin_menu())
             return
-        old_status, client_user_id = row
+        old_status, client_user_id, deposit_required, deposit_confirmed = row
         # Same fixed-status guard as cb_admres_confirm above — only a
         # 'pending' reservation can be rejected, so a double-tap (where
         # old_status is already 'cancelled' from the first tap) can't
@@ -933,13 +1005,13 @@ async def cb_admres_reject(cb: CallbackQuery, bot: Bot, config: BookingRestauran
         note = await _admres_notify_client(
             bot, config, client_user_id, f"❌ Ваша бронь №{reservation_id} отклонена администратором."
         )
+    # Same fix as cb_admres_confirm — no second round-trip needed, the UPDATE
+    # only ever touches `status` and its outcome is already known.
+    new_status = "cancelled" if cur.rowcount else old_status
     text = await _reservation_detail_text(config.db_path, reservation_id, extra_note=note)
-    async with aiosqlite.connect(config.db_path) as db:
-        row = await (await db.execute(
-            "SELECT status, deposit_required, deposit_confirmed FROM reservations WHERE id=?", (reservation_id,)
-        )).fetchone()
-    await cb.message.edit_text(text, parse_mode="HTML",
-                                reply_markup=kb_reservation_detail_admin(reservation_id, row[0], row[1], row[2]))
+    await _edit_text_safe(cb.message, text, parse_mode="HTML",
+                           reply_markup=kb_reservation_detail_admin(
+                               reservation_id, new_status, deposit_required, deposit_confirmed))
 
 
 @router.callback_query(F.data.startswith("admres_deposit:"))
@@ -962,8 +1034,8 @@ async def cb_admres_deposit(cb: CallbackQuery, bot: Bot, config: BookingRestaura
         status, client_user_id, deposit_required, deposit_confirmed = row
         if not deposit_required or deposit_confirmed:
             text = await _reservation_detail_text(config.db_path, reservation_id)
-            await cb.message.edit_text(text, parse_mode="HTML",
-                                        reply_markup=kb_reservation_detail_admin(reservation_id, status, deposit_required, deposit_confirmed))
+            await _edit_text_safe(cb.message, text, parse_mode="HTML",
+                                   reply_markup=kb_reservation_detail_admin(reservation_id, status, deposit_required, deposit_confirmed))
             return
         cur = await db.execute(
             "UPDATE reservations SET deposit_confirmed=1 WHERE id=? AND deposit_confirmed=0",
@@ -976,8 +1048,8 @@ async def cb_admres_deposit(cb: CallbackQuery, bot: Bot, config: BookingRestaura
             bot, config, client_user_id, f"💰 Депозит для вашей брони №{reservation_id} отмечен как оплаченный."
         )
     text = await _reservation_detail_text(config.db_path, reservation_id, extra_note=note)
-    await cb.message.edit_text(text, parse_mode="HTML",
-                                reply_markup=kb_reservation_detail_admin(reservation_id, status, deposit_required, 1))
+    await _edit_text_safe(cb.message, text, parse_mode="HTML",
+                           reply_markup=kb_reservation_detail_admin(reservation_id, status, deposit_required, 1))
 
 
 # ── ADMIN: "Столы" ───────────────────────────────────────────────────────────
@@ -1086,19 +1158,28 @@ async def cb_tbl_toggle(cb: CallbackQuery, config: BookingRestaurantConfig):
     except ValueError:
         return
     async with aiosqlite.connect(config.db_path) as db:
-        row = await (await db.execute("SELECT active FROM tables WHERE id=?", (table_id,))).fetchone()
+        row = await (await db.execute("SELECT name, capacity, active FROM tables WHERE id=?", (table_id,))).fetchone()
         if not row:
             await cb.message.edit_text("Стол не найден.", reply_markup=kb_tables_menu())
             return
-        new_active = 0 if row[0] else 1
-        await db.execute("UPDATE tables SET active=? WHERE id=?", (new_active, table_id))
+        name, capacity, old_active = row
+        new_active = 0 if old_active else 1
+        # Review-found (monkey-tester): plain read-then-write with no CAS
+        # guard — two near-simultaneous taps could double-flip the flag back
+        # to its original value with no error, silently no-op'ing from the
+        # admin's perspective. WHERE active=old_active makes the loser of a
+        # race a safe no-op (still re-renders the current, correct state)
+        # instead of both taps applying.
+        cur = await db.execute(
+            "UPDATE tables SET active=? WHERE id=? AND active=?", (new_active, table_id, old_active)
+        )
         await db.commit()
-        name, capacity = (await (await db.execute(
-            "SELECT name, capacity FROM tables WHERE id=?", (table_id,)
-        )).fetchone())
+        if cur.rowcount == 0:
+            row = await (await db.execute("SELECT name, capacity, active FROM tables WHERE id=?", (table_id,))).fetchone()
+            name, capacity, new_active = row
     status = "🟢 активен" if new_active else "⚪️ скрыт"
-    await cb.message.edit_text(
-        f"🍽 <b>{_esc(name)}</b>\n👥 Вместимость: {capacity}\n{status}",
+    await _edit_text_safe(
+        cb.message, f"🍽 <b>{_esc(name)}</b>\n👥 Вместимость: {capacity}\n{status}",
         parse_mode="HTML", reply_markup=kb_table_detail(table_id, new_active),
     )
 

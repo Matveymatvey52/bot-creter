@@ -87,11 +87,15 @@ async def _create_reservation_via_flow(
     """Drives the full client FSM: book_new -> guests -> pick date -> pick
     window -> occasion (add or skip) -> phone -> reservation is created.
     Returns the next free update_id."""
+    # callback_data encodes the TIME_WINDOWS index, not raw "start:end" text
+    # (see kb_windows/cb_res_window in the template — fixed after review found
+    # the raw encoding unparseable, since start/end themselves contain ":").
+    window_index = booking_restaurant.TIME_WINDOWS.index((window_start, window_end))
     uid = start_update_id
     await dp.feed_webhook_update(bot, _callback_update(uid, client_id, "book_new")); uid += 1
     await dp.feed_webhook_update(bot, _text_update(uid, client_id, guests)); uid += 1
     await dp.feed_webhook_update(bot, _callback_update(uid, client_id, f"res_day:{date}")); uid += 1
-    await dp.feed_webhook_update(bot, _callback_update(uid, client_id, f"res_window:{window_start}:{window_end}")); uid += 1
+    await dp.feed_webhook_update(bot, _callback_update(uid, client_id, f"res_window:{window_index}")); uid += 1
     if occasion is None:
         await dp.feed_webhook_update(bot, _callback_update(uid, client_id, "res_occ_skip")); uid += 1
     else:
@@ -201,6 +205,24 @@ class BookingRestaurantCapacityTests(unittest.IsolatedAsyncioTestCase):
         windows = await booking_restaurant._available_windows(self.config.db_path, TOMORROW, 3)
         self.assertNotIn(("18:00", "20:00"), windows, "confirmed booking didn't reduce remaining capacity")
         self.assertIn(("14:00", "16:00"), windows, "an unrelated window was wrongly filtered out")
+
+    async def test_reservation_stores_the_exact_window_picked_via_the_flow(self):
+        """Review-found blocker regression: cb_res_window used to parse
+        callback_data with split(":", 2), which mis-sliced "res_window:18:00:
+        20:00" (each half already contains a colon) into window_start="18",
+        window_end="00:20:00" for EVERY window — corrupting every reservation
+        ever created via the real flow and silently breaking the capacity
+        check downstream. Drives the actual FSM (not a raw INSERT) and checks
+        the stored columns match exactly what was picked."""
+        await _create_reservation_via_flow(
+            self.dp, self.bot, CLIENT_ID, "3", TOMORROW, "14:00", "16:00", "89991234567", 10,
+        )
+        conn = sqlite3.connect(self.config.db_path)
+        row = conn.execute(
+            "SELECT time_window_start, time_window_end FROM reservations"
+        ).fetchone()
+        conn.close()
+        self.assertEqual(row, ("14:00", "16:00"))
 
     async def test_pending_reservation_does_not_reduce_capacity(self):
         # Literal design-brief wording: capacity is checked against ALREADY
@@ -449,6 +471,19 @@ class BookingRestaurantTableManagementTests(unittest.IsolatedAsyncioTestCase):
         row = conn.execute("SELECT name, capacity, active FROM tables").fetchone()
         conn.close()
         self.assertEqual(row, ("Стол у окна", 6, 1))
+
+    async def test_unicode_digit_capacity_input_is_rejected_not_a_crash(self):
+        """Review-found (monkey-tester): str.isdigit() is True for Unicode
+        "digit" characters (superscript "²", circled "①") that int() can't
+        parse — an unhandled ValueError would silently drop the update with
+        no reply. "²" must be cleanly rejected, not crash the handler."""
+        await self.dp.feed_webhook_update(self.bot, _callback_update(10, ADMIN_ID, "tbl_new"))
+        await self.dp.feed_webhook_update(self.bot, _text_update(11, ADMIN_ID, "Стол у окна"))
+        await self.dp.feed_webhook_update(self.bot, _text_update(12, ADMIN_ID, "②"))
+        conn = sqlite3.connect(self.config.db_path)
+        count = conn.execute("SELECT COUNT(*) FROM tables").fetchone()[0]
+        conn.close()
+        self.assertEqual(count, 0, "malformed capacity input should not create a table")
 
     async def test_toggle_hides_and_shows_table(self):
         async with aiosqlite.connect(self.config.db_path) as db:
