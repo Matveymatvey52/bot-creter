@@ -30,6 +30,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from aiogram import Bot
 
+import db.database as db_module
 from db.database import create_bot_record_with_admins, delete_bot
 from runtime.registry import Registry
 from templates import booking_beauty
@@ -79,8 +80,25 @@ class RegistryInitDbTests(unittest.IsolatedAsyncioTestCase):
         self.data_dir = Path(self._tmp.name)
         self._data_dir_patcher = patch("config.DATA_DIR", self.data_dir)
         self._data_dir_patcher.start()
+        # db.database.DB_PATH is computed from DATA_DIR at import time, so
+        # patching config.DATA_DIR above does NOT redirect it — patch it
+        # directly too, otherwise create_bot_record_with_admins()/delete_bot()
+        # hit the real data/bots.db (see MEMORY.md "Backlog: test DB isolation").
+        self._db_path_patcher = patch.object(db_module, "DB_PATH", self.data_dir / "bots.db")
+        self._db_path_patcher.start()
+        # In production, main.py calls db.database.init_db() once at startup
+        # before any registry work — so the central bots.db schema (e.g.
+        # bot_features, read by _load_and_include_features) always exists by
+        # the time add_or_replace() runs. Mirror that bootstrap here now that
+        # this test has its own isolated tmp DB instead of piggybacking on
+        # the real data/bots.db's already-existing tables. This is NOT the
+        # per-bot init_db() this test class is about — that one still only
+        # ever runs via the registry path under test, never called directly
+        # here (see module docstring / test names above).
+        await db_module.init_db()
 
     async def asyncTearDown(self):
+        self._db_path_patcher.stop()
         self._data_dir_patcher.stop()
         self._tmp.cleanup()
         self._bot_call_patcher.stop()
