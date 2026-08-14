@@ -13,11 +13,12 @@ standalone smoke test below only confirms it still imports/builds fine for
 the unchanged subprocess model.
 
 Real external APIs (AssemblyAI transcription, raw Anthropic REST call) are
-mocked by patching transcribe_voice()/parse_with_claude() directly — this
-template calls them as plain module-level functions (not via an SDK client
-object), so patching the functions themselves is the natural mock point, same
-spirit as patching Bot.__call__/anthropic.AsyncAnthropic in the other four
-templates' isolation tests. No real network calls, no real tokens.
+mocked by patching features.voice_intake._transcribe_voice()/_parse_with_claude()
+directly — the voice-intake mechanism now lives in that feature module (see
+features/voice_intake.py), not in this template, so patching those functions
+is the natural mock point, same spirit as patching Bot.__call__/
+anthropic.AsyncAnthropic in the other four templates' isolation tests. No
+real network calls, no real tokens.
 
 Run with: python -m unittest tests.test_tour_operator_isolation
 """
@@ -36,8 +37,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
 
-from runtime.registry import get_template_router
+from runtime.registry import _clone_router, get_template_router
 from templates import tour_operator
+import features.voice_intake as voice_intake
 
 FAKE_TOKEN = "123456:test-token-not-real"
 SAME_USER_ID = 111
@@ -91,14 +93,33 @@ def _callback_update(update_id: int, user_id: int, data: str) -> dict:
     }
 
 
-def _build_bot_dispatcher(config: tour_operator.TourOperatorConfig) -> tuple[Bot, Dispatcher]:
+class _BotIdMiddleware:
+    """Stands in for runtime/registry.py's _attach_bot_id_middleware — the
+    voice_intake feature router needs data["bot_id"] to resolve which bot's
+    VoiceSchema applies."""
+
+    def __init__(self, bot_id: int) -> None:
+        self.bot_id = bot_id
+
+    async def __call__(self, handler, event, data):
+        data["bot_id"] = self.bot_id
+        return await handler(event, data)
+
+
+def _build_bot_dispatcher(config: tour_operator.TourOperatorConfig, bot_id: int) -> tuple[Bot, Dispatcher]:
     """Mirrors runtime/registry.py's build_entry() for this template: fresh
     Dispatcher, cloned Router (Phase 1 fix), the template's own typed
-    ConfigMiddleware (Phase 7)."""
+    ConfigMiddleware (Phase 7), PLUS the voice_intake feature router (voice
+    handling moved there — see features/voice_intake.py) with bot_id
+    injection, same as _load_and_include_features() does in production."""
     bot = Bot(token=FAKE_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
     dp.update.outer_middleware(tour_operator.ConfigMiddleware(config))
     dp.include_router(get_template_router("tour_operator"))
+    voice_router = _clone_router(voice_intake.router)
+    for observer in voice_router.observers.values():
+        observer.outer_middleware(_BotIdMiddleware(bot_id))
+    dp.include_router(voice_router)
     return bot, dp
 
 
@@ -137,8 +158,8 @@ class TourOperatorIsolationTests(unittest.IsolatedAsyncioTestCase):
         await tour_operator.init_db(self.config_a.db_path)
         await tour_operator.init_db(self.config_b.db_path)
 
-        self.bot_a, self.dp_a = _build_bot_dispatcher(self.config_a)
-        self.bot_b, self.dp_b = _build_bot_dispatcher(self.config_b)
+        self.bot_a, self.dp_a = _build_bot_dispatcher(self.config_a, 101)
+        self.bot_b, self.dp_b = _build_bot_dispatcher(self.config_b, 102)
 
     async def asyncTearDown(self):
         self._tmp.cleanup()
@@ -191,8 +212,8 @@ class TourOperatorIsolationTests(unittest.IsolatedAsyncioTestCase):
 
         await tour_operator.init_db(config_c.db_path)
         await tour_operator.init_db(config_d.db_path)
-        bot_c, dp_c = _build_bot_dispatcher(config_c)
-        bot_d, dp_d = _build_bot_dispatcher(config_d)
+        bot_c, dp_c = _build_bot_dispatcher(config_c, 201)
+        bot_d, dp_d = _build_bot_dispatcher(config_d, 202)
 
         await _create_and_activate_tour(dp_c, bot_c, SAME_USER_ID, "Gamma Tour", 1)
         await _create_and_activate_tour(dp_d, bot_d, SAME_USER_ID, "Delta Tour", 1)
@@ -208,18 +229,18 @@ class TourOperatorIsolationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(names_d, ["Delta Tour"])
 
     async def test_voice_driven_entry_saved_isolated_per_bot(self):
-        """Owner-requested: mock AssemblyAI/Anthropic (transcribe_voice/
-        parse_with_claude), drive the voice -> confirm -> save flow on two
-        bots with the SAME user_id, prove each entry lands only in its own
-        bot's db file."""
+        """Owner-requested: mock AssemblyAI/Anthropic (voice_intake's
+        _transcribe_voice/_parse_with_claude), drive the voice -> confirm ->
+        save flow on two bots with the SAME user_id, prove each entry lands
+        only in its own bot's db file."""
         await _create_and_activate_tour(self.dp_a, self.bot_a, SAME_USER_ID, "Alpha Tour", 1)
         await _create_and_activate_tour(self.dp_b, self.bot_b, SAME_USER_ID, "Beta Tour", 1)
 
         parsed_a = {"type": "location", "data": {"name": "Alpha Waterfall", "region": "North"}, "confidence": 0.9}
         parsed_b = {"type": "location", "data": {"name": "Beta Cave", "region": "South"}, "confidence": 0.9}
 
-        with patch.object(tour_operator, "transcribe_voice", new=AsyncMock(return_value="some speech")), \
-             patch.object(tour_operator, "parse_with_claude", new=AsyncMock(side_effect=[parsed_a, parsed_b])):
+        with patch.object(voice_intake, "_transcribe_voice", new=AsyncMock(return_value="some speech")), \
+             patch.object(voice_intake, "_parse_with_claude", new=AsyncMock(side_effect=[parsed_a, parsed_b])):
             await self.dp_a.feed_webhook_update(self.bot_a, _voice_update(10, SAME_USER_ID))
             await self.dp_a.feed_webhook_update(self.bot_a, _callback_update(11, SAME_USER_ID, "vs_save"))
 

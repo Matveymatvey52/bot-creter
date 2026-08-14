@@ -12,7 +12,6 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-import aiohttp
 import aiosqlite
 from aiohttp import web
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
@@ -31,15 +30,18 @@ from features.cashflow_ledger import (
     list_entries as cashflow_list_entries,
     record_entry as cashflow_record_entry,
 )
+from features import voice_intake
+from features.voice_intake import VoiceFieldSpec, VoiceRecordType, VoiceSchema
 
 # ── Config ────────────────────────────────────────────────────────────────────
-# BOT_TOKEN/ANTHROPIC_KEY/ASSEMBLYAI_KEY/PORT/BASE_URL are process-wide, NOT
-# per-bot — same treatment as ANTHROPIC_API_KEY in manager_secretary/trip_manager
-# (Stage 2 Phases 4/6): they stay module-level env reads, not TourOperatorConfig
-# fields, since every bot in the shared webhook process reads the same values.
+# BOT_TOKEN/PORT/BASE_URL are process-wide, NOT per-bot — same treatment as
+# other such constants in manager_secretary/trip_manager (Stage 2 Phases
+# 4/6): they stay module-level env reads, not TourOperatorConfig fields,
+# since every bot in the shared webhook process reads the same values.
+# ANTHROPIC_API_KEY/ASSEMBLYAI_API_KEY are no longer read here — the voice
+# transcription/parsing mechanism moved to features/voice_intake.py, which
+# imports them from config.py directly (see that module's docstring).
 BOT_TOKEN      = os.getenv("BOT_TOKEN", "")
-ANTHROPIC_KEY  = os.getenv("ANTHROPIC_API_KEY", "")
-ASSEMBLYAI_KEY = os.getenv("ASSEMBLYAI_API_KEY", "")
 PORT           = int(os.getenv("PORT", "8080"))
 
 RAILWAY_DOMAIN = os.getenv("RAILWAY_PUBLIC_DOMAIN", "")
@@ -130,6 +132,13 @@ def config_from_bot_row(bot_row: dict, data_dir: Path) -> TourOperatorConfig:
     )
     config.display_name = bot_row.get("display_name")
     config.group_chat_id = bot_row.get("group_chat_id")
+    # Registers this bot's voice-intake schema NOW, since bot_id is only
+    # known from this point on (init_db(db_path) below has no bot_id at
+    # all — see runtime/registry.py's _build_generic_middleware, which calls
+    # config_from_bot_row BEFORE init_db). Idempotent — see
+    # voice_intake.register_schema's own docstring for why re-registering on
+    # every reload_one/reload_all is safe.
+    voice_intake.register_schema(bot_id, _build_voice_schema())
     return config
 
 
@@ -269,98 +278,11 @@ async def set_active_tour(db_path: str, uid, tid):
         )
         await db.commit()
 
-# ── Voice → text (AssemblyAI REST) ───────────────────────────────────────────
-async def transcribe_voice(bot, voice):
-    tg_file = await bot.get_file(voice.file_id)
-    # Uses THIS bot's own token (bot.token), not the standalone-mode BOT_TOKEN
-    # module constant — in the webhook runtime, many bots share one process and
-    # each has its own token; the module constant would be wrong for all but
-    # (at most) one of them. Harmless in standalone mode: Bot(token=BOT_TOKEN)
-    # there means bot.token == BOT_TOKEN anyway.
-    audio_url = f"https://api.telegram.org/file/bot{bot.token}/{tg_file.file_path}"
-    async with aiohttp.ClientSession() as s:
-        async with s.get(audio_url) as r:
-            audio_bytes = await r.read()
-        async with s.post(
-            "https://api.assemblyai.com/v2/upload",
-            headers={"authorization": ASSEMBLYAI_KEY, "content-type": "audio/ogg"},
-            data=audio_bytes,
-        ) as r:
-            up = await r.json()
-        upload_url = up.get("upload_url", "")
-        if not upload_url:
-            return ""
-        async with s.post(
-            "https://api.assemblyai.com/v2/transcript",
-            headers={"authorization": ASSEMBLYAI_KEY, "content-type": "application/json"},
-            json={"audio_url": upload_url, "language_code": "ru"},
-        ) as r:
-            tx = await r.json()
-        tx_id = tx.get("id", "")
-        if not tx_id:
-            return ""
-        for _ in range(60):
-            await asyncio.sleep(3)
-            async with s.get(
-                f"https://api.assemblyai.com/v2/transcript/{tx_id}",
-                headers={"authorization": ASSEMBLYAI_KEY},
-            ) as r:
-                res = await r.json()
-            if res.get("status") == "completed":
-                return res.get("text", "")
-            if res.get("status") == "error":
-                return ""
-    return ""
-
-# ── Text → structured data (Claude) ──────────────────────────────────────────
-_PARSE_PROMPT = """Ты помощник менеджера туров. Разбери текст и верни JSON.
-
-Тип записи:
-- new_tour: name, destination, date_start(YYYY-MM-DD), date_end(YYYY-MM-DD), guests_count(int)
-- location (ЛиП): name, region, category, status(✅/2️⃣/❗/❌/—), hours, cost, notes, maps_link, contacts, website, youtube, instagram
-- program: day_num(int), date(YYYY-MM-DD), time(HH:MM), title, emoji, cost_fixed, cost_variable, cost_team, cost_extra, tasks, contractor_req
-- hotel: name, region, rating(float 1-5), rooms_info, booking_cost, our_cost, notes, contacts, maps_link, booking_link, status
-- guest: name, total_cost, prepaid, our_price, status(not_paid/partial/paid/refund), notes
-- dds: date(YYYY-MM-DD), amount_rub, amount_usd, description, entity, type(in/out)
-- unknown
-
-Ответ ТОЛЬКО JSON без пояснений:
-{"type":"...","data":{...},"confidence":0.0}
-
-Текст: {text}"""
-
-async def parse_with_claude(text):
-    async with aiohttp.ClientSession() as s:
-        async with s.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": ANTHROPIC_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json={
-                "model": "claude-haiku-4-5-20251001",
-                "max_tokens": 512,
-                "messages": [{"role": "user", "content": _PARSE_PROMPT.format(text=text)}],
-            },
-        ) as r:
-            res = await r.json()
-    try:
-        raw = res["content"][0]["text"]
-        raw = re.sub(r"^```(?:json)?\n?", "", raw.strip())
-        raw = re.sub(r"\n?```$", "", raw.strip())
-        return json.loads(raw)
-    except Exception:
-        return {"type": "unknown", "data": {}, "confidence": 0}
-
 # ── FSM States ────────────────────────────────────────────────────────────────
 class NewTour(StatesGroup):
     name        = State()
     destination = State()
     dates       = State()
-
-class VoicePend(StatesGroup):
-    confirm = State()
 
 # ── Keyboards ─────────────────────────────────────────────────────────────────
 def mk(rows):
@@ -378,78 +300,23 @@ def main_kb():
         [btn("💰 ДДС", "sec_dds")],
     ])
 
-# ── Voice helpers ─────────────────────────────────────────────────────────────
-_TYPE_ICON = {"new_tour": "🌍", "location": "📍", "program": "📅", "hotel": "🏨", "guest": "👥", "dds": "💰"}
-_TYPE_NAME = {"new_tour": "Новый тур", "location": "ЛиП", "program": "Программа",
-              "hotel": "Отель", "guest": "Гость", "dds": "ДДС", "unknown": "Неизвестно"}
-_FIELD_LBL = {
-    "name": "Название", "region": "Регион", "category": "Категория", "status": "Статус",
-    "hours": "Часы", "cost": "Стоимость", "notes": "Заметки", "maps_link": "Карта",
-    "contacts": "Контакты", "website": "Сайт", "youtube": "YouTube", "instagram": "Instagram",
-    "day_num": "День", "date": "Дата", "time": "Время", "title": "Название", "emoji": "Эмодзи",
-    "cost_fixed": "Фикс. расходы", "cost_variable": "Пер. расходы",
-    "cost_team": "Ком. расходы", "cost_extra": "Доп. расходы",
-    "tasks": "Задачи", "contractor_req": "Подрядчик",
-    "rating": "Рейтинг", "rooms_info": "Номера", "booking_cost": "Букинг цена",
-    "our_cost": "Наша цена", "booking_link": "Букинг ссылка",
-    "total_cost": "Полная ст-ть", "prepaid": "Предоплата", "our_price": "Наша цена",
-    "amount_rub": "₽ Рубли", "amount_usd": "$ Доллары",
-    "description": "Описание", "entity": "Контрагент", "type": "Тип",
-}
+# ── Voice intake schema (features/voice_intake.py) ───────────────────────────
+# Reproduces the original transcribe_voice/parse_with_claude/save_entry/
+# on_voice/vs_save mechanism 1:1, but declared as data (a VoiceSchema) instead
+# of hardcoded handlers — see features/voice_intake.py's module docstring.
+async def _voice_get_context_id(db_path: str, user_id) -> int | None:
+    tour = await get_active_tour(db_path, user_id)
+    return tour["id"] if tour else None
 
-def format_parsed(parsed, text):
-    t = parsed.get("type", "unknown")
-    d = parsed.get("data", {})
-    c = parsed.get("confidence", 0)
-    snippet = text[:200] + ("..." if len(text) > 200 else "")
-    lines = [
-        f"🎤 <i>{snippet}</i>",
-        f"\n<b>{_TYPE_ICON.get(t, '❓')} {_TYPE_NAME.get(t, '?')}</b>  <i>{int(c * 100)}% уверенность</i>",
-    ]
-    for k, v in d.items():
-        if v is not None and v != "" and v != 0:
-            lines.append(f"  • {_FIELD_LBL.get(k, k)}: <b>{v}</b>")
-    return "\n".join(lines)
 
-async def save_entry(db_path: str, tour_id, kind, d):
+async def _save_location(db_path: str, tour_id, d: dict):
     async with aiosqlite.connect(db_path) as db:
-        if kind == "location":
-            await db.execute(
-                "INSERT INTO locations(tour_id,region,category,status,name,hours,cost,notes,maps_link,contacts,website,youtube,instagram) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (tour_id, d.get("region"), d.get("category"), d.get("status", "2️⃣"),
-                 d.get("name", "Без названия"), d.get("hours"), d.get("cost"), d.get("notes"),
-                 d.get("maps_link"), d.get("contacts"), d.get("website"), d.get("youtube"), d.get("instagram")),
-            )
-        elif kind == "program":
-            await db.execute(
-                "INSERT INTO program(tour_id,day_num,date,time,title,emoji,cost_fixed,cost_variable,cost_team,cost_extra,tasks,contractor_req) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                (tour_id, d.get("day_num"), d.get("date"), d.get("time"),
-                 d.get("title", "Мероприятие"), d.get("emoji", "🔥"),
-                 d.get("cost_fixed", 0), d.get("cost_variable", 0),
-                 d.get("cost_team", 0), d.get("cost_extra", 0),
-                 d.get("tasks"), d.get("contractor_req")),
-            )
-        elif kind == "hotel":
-            await db.execute(
-                "INSERT INTO hotels(tour_id,region,name,rating,rooms_info,booking_cost,our_cost,notes,contacts,maps_link,booking_link,status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                (tour_id, d.get("region"), d.get("name", "Отель"), d.get("rating"),
-                 d.get("rooms_info"), d.get("booking_cost"), d.get("our_cost"),
-                 d.get("notes"), d.get("contacts"), d.get("maps_link"),
-                 d.get("booking_link"), d.get("status", "2️⃣")),
-            )
-        elif kind == "guest":
-            await db.execute(
-                "INSERT INTO guests(tour_id,name,total_cost,prepaid,our_price,status,notes) VALUES(?,?,?,?,?,?,?)",
-                (tour_id, d.get("name", "Гость"), d.get("total_cost", 0),
-                 d.get("prepaid", 0), d.get("our_price", 0), d.get("status", "not_paid"), d.get("notes")),
-            )
-        elif kind == "new_tour":
-            cur = await db.execute(
-                "INSERT INTO tours(name,destination,date_start,date_end,guests_count) VALUES(?,?,?,?,?)",
-                (d.get("name", "Новый тур"), d.get("destination"), d.get("date_start"),
-                 d.get("date_end"), d.get("guests_count", 0)),
-            )
-            return cur.lastrowid
+        await db.execute(
+            "INSERT INTO locations(tour_id,region,category,status,name,hours,cost,notes,maps_link,contacts,website,youtube,instagram) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (tour_id, d.get("region"), d.get("category"), d.get("status", "2️⃣"),
+             d.get("name", "Без названия"), d.get("hours"), d.get("cost"), d.get("notes"),
+             d.get("maps_link"), d.get("contacts"), d.get("website"), d.get("youtube"), d.get("instagram")),
+        )
         await db.commit()
     if kind == "dds":
         rub = d.get("amount_rub", 0) or 0
@@ -460,6 +327,152 @@ async def save_entry(db_path: str, tour_id, kind, d):
             db_path, parent_id=tour_id, date=d.get("date"), amount_rub=rub, amount_usd=usd,
             description=d.get("description"), entity=d.get("entity"), type=d.get("type", "out"),
         )
+
+
+async def _save_program(db_path: str, tour_id, d: dict):
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            "INSERT INTO program(tour_id,day_num,date,time,title,emoji,cost_fixed,cost_variable,cost_team,cost_extra,tasks,contractor_req) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (tour_id, d.get("day_num"), d.get("date"), d.get("time"),
+             d.get("title", "Мероприятие"), d.get("emoji", "🔥"),
+             d.get("cost_fixed", 0), d.get("cost_variable", 0),
+             d.get("cost_team", 0), d.get("cost_extra", 0),
+             d.get("tasks"), d.get("contractor_req")),
+        )
+        await db.commit()
+
+
+async def _save_hotel(db_path: str, tour_id, d: dict):
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            "INSERT INTO hotels(tour_id,region,name,rating,rooms_info,booking_cost,our_cost,notes,contacts,maps_link,booking_link,status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (tour_id, d.get("region"), d.get("name", "Отель"), d.get("rating"),
+             d.get("rooms_info"), d.get("booking_cost"), d.get("our_cost"),
+             d.get("notes"), d.get("contacts"), d.get("maps_link"),
+             d.get("booking_link"), d.get("status", "2️⃣")),
+        )
+        await db.commit()
+
+
+async def _save_guest(db_path: str, tour_id, d: dict):
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            "INSERT INTO guests(tour_id,name,total_cost,prepaid,our_price,status,notes) VALUES(?,?,?,?,?,?,?)",
+            (tour_id, d.get("name", "Гость"), d.get("total_cost", 0),
+             d.get("prepaid", 0), d.get("our_price", 0), d.get("status", "not_paid"), d.get("notes")),
+        )
+        await db.commit()
+
+
+async def _save_new_tour(db_path: str, _context_id, d: dict) -> int:
+    # _context_id is unused: a new_tour record has no PARENT tour — it CREATES
+    # one, exactly like the original save_entry()'s "new_tour" branch, which
+    # ignored the tour_id argument the same way.
+    async with aiosqlite.connect(db_path) as db:
+        cur = await db.execute(
+            "INSERT INTO tours(name,destination,date_start,date_end,guests_count) VALUES(?,?,?,?,?)",
+            (d.get("name", "Новый тур"), d.get("destination"), d.get("date_start"),
+             d.get("date_end"), d.get("guests_count", 0)),
+        )
+        await db.commit()
+        return cur.lastrowid
+
+
+async def _save_dds(db_path: str, tour_id, d: dict):
+    rub = d.get("amount_rub", 0) or 0
+    usd = d.get("amount_usd", 0) or 0
+    if rub and not usd:
+        usd = round(rub / 87.0, 2)
+    await cashflow_record_entry(
+        db_path, parent_id=tour_id, date=d.get("date"), amount_rub=rub, amount_usd=usd,
+        description=d.get("description"), entity=d.get("entity"), type=d.get("type", "out"),
+    )
+
+
+async def _on_new_tour_saved(db_path: str, user_id: int, new_tour_id) -> None:
+    await set_active_tour(db_path, user_id, new_tour_id)
+
+
+def _build_voice_schema() -> VoiceSchema:
+    return VoiceSchema(
+        get_context_id=_voice_get_context_id,
+        no_context_message="⚠️ Нет активного тура. Создайте: /newtrip",
+        language_code="ru",
+        record_types=[
+            VoiceRecordType(
+                key="new_tour", label="Новый тур", icon="🌍",
+                prompt_desc="name, destination, date_start(YYYY-MM-DD), date_end(YYYY-MM-DD), guests_count(int)",
+                fields=[
+                    VoiceFieldSpec("name", "Название"),
+                    VoiceFieldSpec("destination", "Направление"),
+                    VoiceFieldSpec("date_start", "Дата начала"),
+                    VoiceFieldSpec("date_end", "Дата окончания"),
+                    VoiceFieldSpec("guests_count", "Гостей"),
+                ],
+                save=_save_new_tour,
+                on_saved=_on_new_tour_saved,
+            ),
+            VoiceRecordType(
+                key="location", label="ЛиП", icon="📍",
+                prompt_desc="name, region, category, status(✅/2️⃣/❗/❌/—), hours, cost, notes, maps_link, contacts, website, youtube, instagram",
+                fields=[
+                    VoiceFieldSpec("name", "Название"), VoiceFieldSpec("region", "Регион"),
+                    VoiceFieldSpec("category", "Категория"), VoiceFieldSpec("status", "Статус"),
+                    VoiceFieldSpec("hours", "Часы"), VoiceFieldSpec("cost", "Стоимость"),
+                    VoiceFieldSpec("notes", "Заметки"), VoiceFieldSpec("maps_link", "Карта"),
+                    VoiceFieldSpec("contacts", "Контакты"), VoiceFieldSpec("website", "Сайт"),
+                    VoiceFieldSpec("youtube", "YouTube"), VoiceFieldSpec("instagram", "Instagram"),
+                ],
+                save=_save_location,
+            ),
+            VoiceRecordType(
+                key="program", label="Программа", icon="📅",
+                prompt_desc="day_num(int), date(YYYY-MM-DD), time(HH:MM), title, emoji, cost_fixed, cost_variable, cost_team, cost_extra, tasks, contractor_req",
+                fields=[
+                    VoiceFieldSpec("day_num", "День"), VoiceFieldSpec("date", "Дата"),
+                    VoiceFieldSpec("time", "Время"), VoiceFieldSpec("title", "Название"),
+                    VoiceFieldSpec("emoji", "Эмодзи"), VoiceFieldSpec("cost_fixed", "Фикс. расходы"),
+                    VoiceFieldSpec("cost_variable", "Пер. расходы"), VoiceFieldSpec("cost_team", "Ком. расходы"),
+                    VoiceFieldSpec("cost_extra", "Доп. расходы"), VoiceFieldSpec("tasks", "Задачи"),
+                    VoiceFieldSpec("contractor_req", "Подрядчик"),
+                ],
+                save=_save_program,
+            ),
+            VoiceRecordType(
+                key="hotel", label="Отель", icon="🏨",
+                prompt_desc="name, region, rating(float 1-5), rooms_info, booking_cost, our_cost, notes, contacts, maps_link, booking_link, status",
+                fields=[
+                    VoiceFieldSpec("name", "Название"), VoiceFieldSpec("region", "Регион"),
+                    VoiceFieldSpec("rating", "Рейтинг"), VoiceFieldSpec("rooms_info", "Номера"),
+                    VoiceFieldSpec("booking_cost", "Букинг цена"), VoiceFieldSpec("our_cost", "Наша цена"),
+                    VoiceFieldSpec("notes", "Заметки"), VoiceFieldSpec("contacts", "Контакты"),
+                    VoiceFieldSpec("maps_link", "Карта"), VoiceFieldSpec("booking_link", "Букинг ссылка"),
+                    VoiceFieldSpec("status", "Статус"),
+                ],
+                save=_save_hotel,
+            ),
+            VoiceRecordType(
+                key="guest", label="Гость", icon="👥",
+                prompt_desc="name, total_cost, prepaid, our_price, status(not_paid/partial/paid/refund), notes",
+                fields=[
+                    VoiceFieldSpec("name", "Название"), VoiceFieldSpec("total_cost", "Полная ст-ть"),
+                    VoiceFieldSpec("prepaid", "Предоплата"), VoiceFieldSpec("our_price", "Наша цена"),
+                    VoiceFieldSpec("status", "Статус"), VoiceFieldSpec("notes", "Заметки"),
+                ],
+                save=_save_guest,
+            ),
+            VoiceRecordType(
+                key="dds", label="ДДС", icon="💰",
+                prompt_desc="date(YYYY-MM-DD), amount_rub, amount_usd, description, entity, type(in/out)",
+                fields=[
+                    VoiceFieldSpec("date", "Дата"), VoiceFieldSpec("amount_rub", "₽ Рубли"),
+                    VoiceFieldSpec("amount_usd", "$ Доллары"), VoiceFieldSpec("description", "Описание"),
+                    VoiceFieldSpec("entity", "Контрагент"), VoiceFieldSpec("type", "Тип"),
+                ],
+                save=_save_dds,
+            ),
+        ],
+    )
 
 # ── Bot handlers ──────────────────────────────────────────────────────────────
 @router.message(Command("start"))
@@ -606,74 +619,6 @@ async def cmd_lip(m: Message, config: TourOperatorConfig):
             cat = f"[{loc['category']}] " if loc.get("category") else ""
             lines.append(f"  {loc.get('status', '—')} {cat}{loc['name']}")
     await m.answer("\n".join(lines), parse_mode="HTML")
-
-# ── Voice handler ─────────────────────────────────────────────────────────────
-@router.message(F.voice)
-async def on_voice(m: Message, state: FSMContext, config: TourOperatorConfig):
-    if not _is_admin(m.from_user.id, config.admins_file):
-        return
-    tour = await get_active_tour(config.db_path, m.from_user.id)
-    if not tour:
-        await m.answer("⚠️ Нет активного тура. Создайте: /newtrip")
-        return
-    sm = await m.answer("🎤 Транскрибирую…")
-    text = await transcribe_voice(m.bot, m.voice)
-    if not text:
-        await sm.edit_text("❌ Не удалось распознать речь. Попробуйте ещё раз.")
-        return
-    await sm.edit_text(f"🤖 Анализирую данные…\n\n<i>«{text[:200]}»</i>", parse_mode="HTML")
-    parsed = await parse_with_claude(text)
-    if parsed.get("type") == "unknown":
-        await sm.edit_text(
-            f"❓ Не удалось определить тип записи.\n\n<i>«{text}»</i>",
-            parse_mode="HTML",
-        )
-        return
-    await state.set_state(VoicePend.confirm)
-    await state.update_data(parsed=parsed, tour_id=tour["id"])
-    await sm.edit_text(
-        format_parsed(parsed, text),
-        parse_mode="HTML",
-        reply_markup=mk([[
-            btn("✅ Сохранить", "vs_save"),
-            btn("✏️ Исправить", "vs_edit"),
-            btn("❌ Отменить", "vs_cancel"),
-        ]]),
-    )
-
-@router.callback_query(VoicePend.confirm, F.data == "vs_save")
-async def vs_save(cb: CallbackQuery, state: FSMContext, config: TourOperatorConfig):
-    d = await state.get_data()
-    kind = d["parsed"]["type"]
-    data = d["parsed"].get("data", {})
-    icon = _TYPE_ICON.get(kind, "✅")
-    name = _TYPE_NAME.get(kind, "Запись")
-    if kind == "new_tour":
-        async with aiosqlite.connect(config.db_path) as db:
-            cur = await db.execute(
-                "INSERT INTO tours(name,destination,date_start,date_end,guests_count) VALUES(?,?,?,?,?)",
-                (data.get("name", "Новый тур"), data.get("destination"),
-                 data.get("date_start"), data.get("date_end"), data.get("guests_count", 0)),
-            )
-            tid = cur.lastrowid
-            await db.commit()
-        await set_active_tour(config.db_path, cb.from_user.id, tid)
-        await state.clear()
-        await cb.message.edit_text(
-            f"✅ 🌍 Тур <b>{data.get('name','Новый тур')}</b> создан и выбран!\n\nДобавляйте данные голосом.",
-            parse_mode="HTML",
-        )
-    else:
-        await save_entry(config.db_path, d["tour_id"], kind, data)
-        await state.clear()
-        await cb.message.edit_text(f"✅ {icon} {name} сохранена!")
-    await cb.answer("Сохранено!")
-
-@router.callback_query(VoicePend.confirm, F.data.in_({"vs_edit", "vs_cancel"}))
-async def vs_cancel(cb: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await cb.message.edit_text("✏️ Отменено. Отправьте новое голосовое с уточнёнными данными.")
-    await cb.answer()
 
 # ── Inline callbacks ──────────────────────────────────────────────────────────
 @router.callback_query(F.data == "new_tour")
