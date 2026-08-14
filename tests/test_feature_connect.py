@@ -305,13 +305,14 @@ class UnknownBotNameRefusalTests(unittest.IsolatedAsyncioTestCase):
 
 class IncompatibleFeatureRefusalTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        # vehicle_service is a real template not listed in sheets/payments'
-        # # COMPATIBLE_WITH: header (features/sheets.py, features/payments.py).
+        # channel_monitor is a real template not listed in sheets/payments'
+        # # COMPATIBLE_WITH: header (features/sheets.py, features/payments.py) —
+        # it's monitoring-only and has no money/record flow either feature fits.
         self.bot_id = await create_bot_record_with_admins(
             name="fconn_vehicle_bot", description="t", token=FAKE_TOKEN,
-            file_path="templates/vehicle_service.py", admin_ids=["1"],
+            file_path="templates/channel_monitor.py", admin_ids=["1"],
         )
-        self.bot_row = {"id": self.bot_id, "name": "fconn_vehicle_bot", "username": None, "display_name": None, "file_path": "templates/vehicle_service.py"}
+        self.bot_row = {"id": self.bot_id, "name": "fconn_vehicle_bot", "username": None, "display_name": None, "file_path": "templates/channel_monitor.py"}
 
     async def asyncTearDown(self):
         await delete_bot(self.bot_id)
