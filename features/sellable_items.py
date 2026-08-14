@@ -1,5 +1,5 @@
 # FEATURE: sellable_items
-# COMPATIBLE_WITH: accountant, booking_beauty, booking_fitness, booking_medical, campaign_tracker, event_manager, inventory, manager_secretary, moderator, orders_tracker, referral_program, shop_catalog, tour_operator, tourist_documents, trip_manager
+# COMPATIBLE_WITH: accountant, booking_beauty, booking_fitness, booking_medical, campaign_tracker, event_manager, inventory, manager_secretary, moderator, orders_tracker, referral_program, shop_catalog, tourist_documents, trip_manager
 """Reusable "sellable items" catalog feature — a bot owner's own configurable
 list of named/priced/described things to sell, layered ENTIRELY on top of
 features/payments.py (see sellable-items-inventory for the design). Unlike

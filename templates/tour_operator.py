@@ -24,6 +24,14 @@ from aiogram.types import (
     CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message,
 )
 
+from features.cashflow_ledger import (
+    delete_entry as cashflow_delete_entry,
+    get_totals as cashflow_get_totals,
+    init_cashflow_tables,
+    list_entries as cashflow_list_entries,
+    record_entry as cashflow_record_entry,
+)
+
 # ── Config ────────────────────────────────────────────────────────────────────
 # BOT_TOKEN/ANTHROPIC_KEY/ASSEMBLYAI_KEY/PORT/BASE_URL are process-wide, NOT
 # per-bot — same treatment as ANTHROPIC_API_KEY in manager_secretary/trip_manager
@@ -234,24 +242,13 @@ async def init_db(db_path: str):
                 notes      TEXT,
                 created_at TEXT DEFAULT (datetime('now','localtime'))
             );
-            CREATE TABLE IF NOT EXISTS dds (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                tour_id     INTEGER,
-                date        TEXT,
-                amount_rub  REAL DEFAULT 0,
-                amount_usd  REAL DEFAULT 0,
-                amount_idr  REAL DEFAULT 0,
-                description TEXT,
-                entity      TEXT,
-                type        TEXT DEFAULT 'out',
-                created_at  TEXT DEFAULT (datetime('now','localtime'))
-            );
             CREATE TABLE IF NOT EXISTS user_prefs (
                 user_id        TEXT PRIMARY KEY,
                 active_tour_id INTEGER
             );
         """)
         await db.commit()
+    await init_cashflow_tables(db_path)
 
 async def get_active_tour(db_path: str, uid):
     async with aiosqlite.connect(db_path) as db:
@@ -453,17 +450,16 @@ async def save_entry(db_path: str, tour_id, kind, d):
                  d.get("date_end"), d.get("guests_count", 0)),
             )
             return cur.lastrowid
-        elif kind == "dds":
-            rub = d.get("amount_rub", 0) or 0
-            usd = d.get("amount_usd", 0) or 0
-            if rub and not usd:
-                usd = round(rub / 87.0, 2)
-            await db.execute(
-                "INSERT INTO dds(tour_id,date,amount_rub,amount_usd,amount_idr,description,entity,type) VALUES(?,?,?,?,?,?,?,?)",
-                (tour_id, d.get("date"), rub, usd, 0,
-                 d.get("description"), d.get("entity"), d.get("type", "out")),
-            )
         await db.commit()
+    if kind == "dds":
+        rub = d.get("amount_rub", 0) or 0
+        usd = d.get("amount_usd", 0) or 0
+        if rub and not usd:
+            usd = round(rub / 87.0, 2)
+        await cashflow_record_entry(
+            db_path, parent_id=tour_id, date=d.get("date"), amount_rub=rub, amount_usd=usd,
+            description=d.get("description"), entity=d.get("entity"), type=d.get("type", "out"),
+        )
 
 # ── Bot handlers ──────────────────────────────────────────────────────────────
 @router.message(Command("start"))
@@ -754,15 +750,13 @@ async def _section_summary(sec: str, tour: dict, db_path: str) -> str:
                     f"Выручка: <b>{int(r['rev']):,} ₽</b>\n"
                     f"Предоплата: <b>{int(r['pre']):,} ₽</b>\n"
                     f"Прибыль: <b>{int(r['pro']):,} ₽</b>").replace(",", " ")
-        elif sec == "sec_dds":
-            async with db.execute("SELECT type, COALESCE(SUM(amount_rub),0) r, COALESCE(SUM(amount_usd),0) u FROM dds WHERE tour_id=? GROUP BY type", (tid,)) as c:
-                rows = {r["type"]: r for r in await c.fetchall()}
-            ir = rows.get("in", {})
-            ow = rows.get("out", {})
-            return (f"💰 <b>ДДС — {name}</b>\n\n"
-                    f"⬆️ Приход: <b>{int(ir.get('r',0)):,} ₽</b> / <b>{ir.get('u',0):.2f} $</b>\n"
-                    f"⬇️ Расход: <b>{int(ow.get('r',0)):,} ₽</b> / <b>{ow.get('u',0):.2f} $</b>\n"
-                    f"📊 Баланс: <b>{int(ir.get('r',0)-ow.get('r',0)):,} ₽</b>").replace(",", " ")
+    if sec == "sec_dds":
+        totals = await cashflow_get_totals(db_path, parent_id=tid)
+        ir, ow = totals["in"], totals["out"]
+        return (f"💰 <b>ДДС — {name}</b>\n\n"
+                f"⬆️ Приход: <b>{int(ir['rub']):,} ₽</b> / <b>{ir['usd']:.2f} $</b>\n"
+                f"⬇️ Расход: <b>{int(ow['rub']):,} ₽</b> / <b>{ow['usd']:.2f} $</b>\n"
+                f"📊 Баланс: <b>{int(totals['balance_rub']):,} ₽</b>").replace(",", " ")
     return ""
 
 @router.callback_query(F.data.startswith("sec_"))
@@ -865,8 +859,9 @@ async def api_tour_delete(req):
     tid = int(req.match_info["id"])
     async with aiosqlite.connect(db_path) as db:
         await db.execute("DELETE FROM tours WHERE id=?", (tid,))
-        for t in ("program", "locations", "hotels", "guests", "dds"):
+        for t in ("program", "locations", "hotels", "guests"):
             await db.execute(f"DELETE FROM {t} WHERE tour_id=?", (tid,))
+        await db.execute("DELETE FROM cashflow_entries WHERE parent_id=?", (str(tid),))
         await db.commit()
     return jresp({"ok": True})
 
@@ -971,15 +966,57 @@ gst_get, gst_post, gst_put, gst_del = _make_crud(
     ["name", "total_cost", "prepaid", "our_price", "status", "notes"],
     order_by="name",
 )
-dds_get, dds_post, dds_put, dds_del = _make_crud(
-    "dds",
-    "tour_id,date,amount_rub,amount_usd,amount_idr,description,entity,type",
-    lambda b, tid: (tid, b.get("date"), b.get("amount_rub", 0), b.get("amount_usd", 0),
-                    b.get("amount_idr", 0), b.get("description"), b.get("entity"),
-                    b.get("type", "out")),
-    ["date", "amount_rub", "amount_usd", "amount_idr", "description", "entity", "type"],
-    order_by="date DESC,created_at DESC",
-)
+# dds_* handlers use features/cashflow_ledger.py directly (not _make_crud):
+# cashflow_entries is keyed by parent_id (TEXT, opaque scope key), not the
+# tour_id INTEGER column every other _make_crud table has.
+async def dds_get(req):
+    if not await check_auth(req):
+        return jresp({"e": "Unauthorized"}, 401)
+    db_path = req.app["config"].db_path
+    tid = int(req.match_info["tour_id"])
+    return jresp(await cashflow_list_entries(db_path, parent_id=tid))
+
+async def dds_post(req):
+    if not await check_auth(req):
+        return jresp({"e": "Unauthorized"}, 401)
+    db_path = req.app["config"].db_path
+    tid = int(req.match_info["tour_id"])
+    b = await req.json()
+    rid = await cashflow_record_entry(
+        db_path, parent_id=tid, date=b.get("date"),
+        amount_rub=b.get("amount_rub", 0), amount_usd=b.get("amount_usd", 0),
+        amount_idr=b.get("amount_idr", 0), description=b.get("description"),
+        entity=b.get("entity"), type=b.get("type", "out"),
+    )
+    async with aiosqlite.connect(db_path) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM cashflow_entries WHERE id=?", (rid,)) as c:
+            return jresp(dict(await c.fetchone()), 201)
+
+async def dds_put(req):
+    if not await check_auth(req):
+        return jresp({"e": "Unauthorized"}, 401)
+    db_path = req.app["config"].db_path
+    rid = int(req.match_info["id"])
+    b = await req.json()
+    flds = ["date", "amount_rub", "amount_usd", "amount_idr", "description", "entity", "type"]
+    sets = ", ".join(f"{f}=?" for f in flds if f in b)
+    vals = [b[f] for f in flds if f in b] + [rid]
+    async with aiosqlite.connect(db_path) as db:
+        if sets:
+            await db.execute(f"UPDATE cashflow_entries SET {sets} WHERE id=?", vals)
+            await db.commit()
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM cashflow_entries WHERE id=?", (rid,)) as c:
+            return jresp(dict(await c.fetchone()))
+
+async def dds_del(req):
+    if not await check_auth(req):
+        return jresp({"e": "Unauthorized"}, 401)
+    db_path = req.app["config"].db_path
+    rid = int(req.match_info["id"])
+    await cashflow_delete_entry(db_path, rid)
+    return jresp({"ok": True})
 
 # ── HTML SPA ──────────────────────────────────────────────────────────────────
 HTML_APP = r"""<!DOCTYPE html>
