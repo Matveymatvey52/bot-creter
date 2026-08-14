@@ -31,6 +31,7 @@ from db.database import (
 )
 from features.sheets import get_service_account_email, verify_access
 from handlers.admin_manager import _is_owner
+from handlers.create_bot import cancel_keyboard
 from runtime.registry import _CUSTOM_FEATURES_DIR, discover_features, infer_template_id, invalidate_custom_feature_cache
 from runtime.registry_holder import RegistryHandle
 from services.bot_runner import _make_extra_env, get_bot_logs, is_running, start_bot, stop_bot
@@ -481,18 +482,11 @@ def _parse_spreadsheet_id(text: str) -> str | None:
 
 _SHEETS_CONNECT_TEXT_TEMPLATE = (
     "📊 <b>Подключение Google Таблицы</b>\n\n"
-    "⚠️ Доступ к таблице получит <b>общий сервисный аккаунт фабрики</b> — "
-    "один и тот же для ВСЕХ ботов на этой платформе, а не отдельный робот "
-    "лично под твоего бота. Он уже имеет доступ ко всем таблицам, которые "
-    "расшарили другие владельцы ботов через эту же фабрику. Если это "
-    "неприемлемо (например, в таблице чувствительные данные) — не "
-    "подключай её сюда.\n\n"
-    "Как подключить:\n"
+    "Чтобы бот мог читать и писать в таблицу, дай ему доступ:\n\n"
     "1. Открой свою Google Таблицу → «Настройки доступа» → «Добавить пользователей».\n"
     "2. Вставь этот email, выдай роль «Редактор»:\n"
     "<code>{sa_email}</code>\n"
-    "3. Пришли сюда ссылку на таблицу.\n\n"
-    "Для отмены — кнопка ниже."
+    "3. Пришли сюда ссылку на таблицу."
 )
 
 
@@ -953,9 +947,9 @@ async def cb_fix_bug(callback: CallbackQuery, state: FSMContext):
     await state.update_data(fix_bot_id=bot_id)
     await callback.message.edit_text(
         f"🐛 Исправляем <b>{b['name']}</b>\n\n"
-        "Опиши баг или что нужно улучшить — голосовым или текстом.\n\n"
-        "/cancel — отменить",
+        "Опиши баг или что нужно улучшить — голосовым или текстом.",
         parse_mode="HTML",
+        reply_markup=cancel_keyboard(),
     )
 
 
@@ -1079,4 +1073,7 @@ async def msg_fix_unsupported(message: Message):
     if not _is_owner(message.from_user.id):
         await _deny_message(message)
         return
-    await message.answer("Не понял — отправь текст или голосовое с описанием бага. /cancel — отменить.")
+    await message.answer(
+        "Не понял — отправь текст или голосовое с описанием бага.",
+        reply_markup=cancel_keyboard(),
+    )

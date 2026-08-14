@@ -1,12 +1,17 @@
 from pathlib import Path
 
-from aiogram import Router
+from aiogram import F, Router
 from aiogram.filters import Command
-from aiogram.types import FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 router = Router()
 
 WELCOME_IMAGE = Path(__file__).resolve().parent.parent / "assets" / "welcome.png"
+
+_WELCOME_CAPTION = (
+    "👋 Привет! Я Bot-Creator — создаю Telegram-ботов по твоему описанию.\n\n"
+    "Опиши, какого бота хочешь — текстом или голосовым 🎤 или перейди к своим уже созданным ботам."
+)
 
 
 def _start_keyboard() -> InlineKeyboardMarkup:
@@ -21,14 +26,18 @@ def _start_keyboard() -> InlineKeyboardMarkup:
 
 @router.message(Command("start"))
 async def cmd_start(message: Message):
-    caption = (
-        "👋 Привет! Я Bot-Creator — создаю Telegram-ботов по твоему описанию.\n\n"
-        "Команды:\n"
-        "/create — создать нового бота\n"
-        "/list — мои боты и управление ими\n\n"
-        "Начни с /create! Можно текстом или голосовым 🎤"
-    )
     if WELCOME_IMAGE.exists():
-        await message.answer_photo(FSInputFile(WELCOME_IMAGE), caption=caption, reply_markup=_start_keyboard())
+        await message.answer_photo(FSInputFile(WELCOME_IMAGE), caption=_WELCOME_CAPTION, reply_markup=_start_keyboard())
     else:
-        await message.answer(caption, reply_markup=_start_keyboard())
+        await message.answer(_WELCOME_CAPTION, reply_markup=_start_keyboard())
+
+
+@router.callback_query(F.data == "start_menu")
+async def cb_start_menu(callback: CallbackQuery):
+    # Same content as /start — this is Баг 3's "◀ В главное меню" target,
+    # reuses _WELCOME_CAPTION/_start_keyboard rather than duplicating the text.
+    await callback.answer()
+    if WELCOME_IMAGE.exists():
+        await callback.message.answer_photo(FSInputFile(WELCOME_IMAGE), caption=_WELCOME_CAPTION, reply_markup=_start_keyboard())
+    else:
+        await callback.message.answer(_WELCOME_CAPTION, reply_markup=_start_keyboard())

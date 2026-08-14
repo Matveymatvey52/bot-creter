@@ -272,14 +272,41 @@ class CreateBotStates(StatesGroup):
 
 # ── /cancel ───────────────────────────────────────────────────────────────────
 
+def cancel_keyboard() -> InlineKeyboardMarkup:
+    """Inline-button equivalent of typing /cancel — routes into the same
+    cb_cancel handler as cmd_cancel below, so every FSM state factory-wide
+    (create-bot, fixbug, custom-feature, ...) gets a tappable cancel instead
+    of a raw command."""
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_fsm")
+    ]])
+
+
+def _cancelled_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀ В главное меню", callback_data="start_menu")],
+        [InlineKeyboardButton(text="📋 Мои боты", callback_data="list")],
+    ])
+
+
+async def _do_cancel(user_id: int, state: FSMContext, answer) -> None:
+    if await state.get_state() is None:
+        await answer("Нечего отменять.")
+        return
+    _pending.pop(user_id, None)
+    await state.clear()
+    await answer("Отменено.", reply_markup=_cancelled_keyboard())
+
+
 @router.message(Command("cancel"), StateFilter("*"))
 async def cmd_cancel(message: Message, state: FSMContext):
-    if await state.get_state() is None:
-        await message.answer("Нечего отменять.")
-        return
-    _pending.pop(message.from_user.id, None)
-    await state.clear()
-    await message.answer("Отменено. Начни заново с /create")
+    await _do_cancel(message.from_user.id, state, message.answer)
+
+
+@router.callback_query(F.data == "cancel_fsm", StateFilter("*"))
+async def cb_cancel(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await _do_cancel(callback.from_user.id, state, callback.message.answer)
 
 
 # ── /create ───────────────────────────────────────────────────────────────────

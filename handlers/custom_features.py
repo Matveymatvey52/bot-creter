@@ -35,6 +35,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 
 from db.database import add_custom_feature_record, get_bot, get_custom_feature_history
 from handlers.admin_manager import _is_owner
+from handlers.create_bot import cancel_keyboard
 from handlers.manage_bots import _bot_keyboard, _busy_bots, _recognize_voice_fix
 from runtime.registry import _CUSTOM_FEATURES_DIR, invalidate_custom_feature_cache
 from runtime.registry_holder import RegistryHandle
@@ -131,9 +132,9 @@ async def cb_start_custom_feature(callback: CallbackQuery, state: FSMContext) ->
     await callback.message.edit_text(
         f"🧩➕ Доработка для <b>{html.escape(b['name'])}</b>\n\n"
         "Опиши, что добавить — голосовым или текстом. Это добавит новую возможность, "
-        "не трогая то, что уже работает.\n\n"
-        "/cancel — отменить",
+        "не трогая то, что уже работает.",
         parse_mode="HTML",
+        reply_markup=cancel_keyboard(),
     )
 
 
@@ -272,7 +273,10 @@ async def msg_custom_feature_fallback(message: Message, state: FSMContext) -> No
     data = await state.get_data()
     if "cf_pending_code" in data:
         return  # preview pending — only the buttons or /cancel act on it
-    await message.answer("Не понял — отправь текст или голосовое с описанием доработки. /cancel — отменить.")
+    await message.answer(
+        "Не понял — отправь текст или голосовое с описанием доработки.",
+        reply_markup=cancel_keyboard(),
+    )
 
 
 @router.callback_query(F.data.startswith("applycustom:"))
