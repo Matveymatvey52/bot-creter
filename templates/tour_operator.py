@@ -61,6 +61,51 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 router = Router()
 
+# ── mini-app config (pilot, see docs/MINIAPP_DESIGN.md) ────────────────────────
+# Declarative schema read by runtime/miniapp_api.py's generic CRUD handlers —
+# NOT executable code, by design (see that module's docstring: the mini-app
+# is one shared SPA + REST engine, this dict is the only per-template
+# knowledge it needs). `table` and each field's `name` must match init_db()'s
+# CREATE TABLE columns above exactly — miniapp_api.py builds SQL directly
+# from these names (values are always bound as parameters, never
+# interpolated; only the column/table identifiers come from this trusted,
+# hand-authored dict, never from a request).
+miniapp_config = {
+    "resources": [
+        {
+            "name": "tours",
+            "table": "tours",
+            "order_by": "created_at DESC",
+            "creatable": True,
+            "fields": [
+                {"name": "name", "required": True},
+                {"name": "destination"},
+                {"name": "date_start"},
+                {"name": "date_end"},
+                {"name": "guests_count"},
+                {"name": "status"},
+                {"name": "created_at", "creatable": False},
+            ],
+        },
+        {
+            "name": "guests",
+            "table": "guests",
+            "order_by": "created_at DESC",
+            "creatable": True,
+            "fields": [
+                {"name": "tour_id", "required": True},
+                {"name": "name", "required": True},
+                {"name": "total_cost"},
+                {"name": "prepaid"},
+                {"name": "our_price"},
+                {"name": "status"},
+                {"name": "notes"},
+                {"name": "created_at", "creatable": False},
+            ],
+        },
+    ],
+}
+
 
 # ── config (Stage 2 Phase 7) ─────────────────────────────────────────────────
 # Same pattern as templates/accountant.py (Phase 2), manager_secretary.py
@@ -85,6 +130,12 @@ class TourOperatorConfig:
     welcome_image: Path
     display_name: str | None = None   # not used by this template (verified: no matches)
     group_chat_id: str | None = None  # not used by this template (verified: no matches)
+    # Only set in webhook mode (config_from_bot_row) — standalone mode has no
+    # bots-table row to source it from, same as display_name/group_chat_id
+    # above. Used by _miniapp_url() to scope a magic-link token to this bot;
+    # None in standalone mode simply means no mini-app link can be minted
+    # there (WEB_CRM_ENABLED's own standalone web server doesn't need one).
+    bot_id: int | None = None
 
 
 def _paths_for(name: str, data_dir: Path) -> TourOperatorConfig:
@@ -132,6 +183,7 @@ def config_from_bot_row(bot_row: dict, data_dir: Path) -> TourOperatorConfig:
     )
     config.display_name = bot_row.get("display_name")
     config.group_chat_id = bot_row.get("group_chat_id")
+    config.bot_id = bot_id
     # Registers this bot's voice-intake schema NOW, since bot_id is only
     # known from this point on (init_db(db_path) below has no bot_id at
     # all — see runtime/registry.py's _build_generic_middleware, which calls
@@ -566,6 +618,24 @@ async def cmd_tours(m: Message, config: TourOperatorConfig):
     rows.append([btn("➕ Новый тур", "new_tour")])
     await m.answer("🌍 <b>Туры</b> (нажми для переключения):", parse_mode="HTML", reply_markup=mk(rows))
 
+def _miniapp_url(bot_id: int, telegram_user_id: int) -> str | None:
+    """Builds the mini-app link with a signed, expiring token (see
+    runtime/miniapp_api.py's mint_magic_link_token) — NOT the bare
+    telegram_user_id this used to embed (see docs/MINIAPP_DESIGN.md §2.1:
+    that was an unsigned, non-expiring bypass and had to be fixed, not
+    copied, once a real mini-app backend exists). Returns None if
+    MINIAPP_SECRET isn't configured (e.g. standalone/dev mode without the
+    webhook runtime's mini-app layer) — callers fall back to the
+    Telegram-only message in that case."""
+    from runtime.miniapp_api import mint_magic_link_token
+
+    try:
+        token = mint_magic_link_token(bot_id, telegram_user_id)
+    except RuntimeError:
+        return None
+    return f"{BASE_URL}/app/{bot_id}?token={token}"
+
+
 @router.message(Command("app"))
 async def cmd_app(m: Message, config: TourOperatorConfig):
     if not _is_admin(m.from_user.id, config.admins_file):
@@ -576,7 +646,13 @@ async def cmd_app(m: Message, config: TourOperatorConfig):
             "Пользуйтесь Telegram-командами: /tours /lip /newtrip"
         )
         return
-    url = f"{BASE_URL}/app?token={m.from_user.id}"
+    url = _miniapp_url(config.bot_id, m.from_user.id) if config.bot_id is not None else None
+    if not url:
+        await m.answer(
+            "🌐 Веб-приложение временно недоступно (не настроен MINIAPP_SECRET). "
+            "Пользуйтесь Telegram-командами: /tours /lip /newtrip"
+        )
+        return
     await m.answer(
         f"🌐 <b>Веб-приложение</b>\n\n"
         f'<a href="{url}">Открыть CRM →</a>\n\n<code>{url}</code>',
@@ -619,7 +695,7 @@ async def cb_new_tour(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
 
 @router.callback_query(F.data == "open_app")
-async def cb_open_app(cb: CallbackQuery):
+async def cb_open_app(cb: CallbackQuery, config: TourOperatorConfig):
     if not WEB_CRM_ENABLED:
         await cb.message.answer(
             "🌐 Веб-приложение недоступно в этом режиме бота. "
@@ -627,7 +703,14 @@ async def cb_open_app(cb: CallbackQuery):
         )
         await cb.answer()
         return
-    url = f"{BASE_URL}/app?token={cb.from_user.id}"
+    url = _miniapp_url(config.bot_id, cb.from_user.id) if config.bot_id is not None else None
+    if not url:
+        await cb.message.answer(
+            "🌐 Веб-приложение временно недоступно (не настроен MINIAPP_SECRET). "
+            "Пользуйтесь Telegram-командами: /tours /lip /newtrip"
+        )
+        await cb.answer()
+        return
     await cb.message.answer(
         f'🌐 <a href="{url}">Открыть CRM →</a>\n<code>{url}</code>',
         parse_mode="HTML", disable_web_page_preview=True,
@@ -710,9 +793,10 @@ async def cb_section(cb: CallbackQuery, state: FSMContext, config: TourOperatorC
         except Exception:
             pass
     summary = await _section_summary(cb.data, tour, config.db_path)
-    if WEB_CRM_ENABLED:
-        url = f"{BASE_URL}/app?token={cb.from_user.id}"
-        summary += f'\n\n<a href="{url}">Открыть в веб-приложении →</a>'
+    if WEB_CRM_ENABLED and config.bot_id is not None:
+        url = _miniapp_url(config.bot_id, cb.from_user.id)
+        if url:
+            summary += f'\n\n<a href="{url}">Открыть в веб-приложении →</a>'
     msg = await cb.message.answer(
         summary,
         parse_mode="HTML", disable_web_page_preview=True,

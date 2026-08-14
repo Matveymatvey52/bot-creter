@@ -1,0 +1,73 @@
+import { useEffect, useState } from 'react'
+import { listResource, ApiError, type ResourceItem } from '../lib/api'
+import { RESOURCES, statusTone } from '../lib/resources'
+import { Card, CardHeader, CardTitle, ChipRow, Chip, Badge } from '../components/Card'
+
+export function ListScreen({
+  resourceName,
+  onOpenItem,
+  onCreateNew,
+}: {
+  resourceName: string
+  onOpenItem: (id: number) => void
+  onCreateNew: () => void
+}) {
+  const [items, setItems] = useState<ResourceItem[] | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const resource = RESOURCES[resourceName]
+
+  useEffect(() => {
+    let cancelled = false
+    setItems(null)
+    setError(null)
+    listResource(resourceName)
+      .then((data) => {
+        if (!cancelled) setItems(data.items)
+      })
+      .catch((err) => {
+        if (cancelled) return
+        setError(err instanceof ApiError ? err.message : 'Не удалось загрузить данные')
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [resourceName])
+
+  if (!resource) {
+    return <div className="state-message">Неизвестный ресурс: {resourceName}</div>
+  }
+
+  return (
+    <div className="screen">
+      <div className="screen-header">
+        <h1>{resource.title}</h1>
+      </div>
+
+      {error && <div className="state-message">{error}</div>}
+      {!error && items === null && <div className="state-message">Загрузка…</div>}
+      {!error && items !== null && items.length === 0 && (
+        <div className="state-message">Пока пусто</div>
+      )}
+
+      {items?.map((item) => (
+        <Card key={item.id} onClick={() => onOpenItem(item.id)}>
+          <CardHeader>
+            <CardTitle>{String(item[resource.titleField] ?? `#${item.id}`)}</CardTitle>
+            {'status' in item && <Badge tone={statusTone(item.status)}>{String(item.status ?? '—')}</Badge>}
+          </CardHeader>
+          <ChipRow>
+            {resource.listFields
+              .filter((f) => f.name !== 'status' && item[f.name] != null && item[f.name] !== '')
+              .map((f) => (
+                <Chip key={f.name}>{String(item[f.name])}</Chip>
+              ))}
+          </ChipRow>
+        </Card>
+      ))}
+
+      <button className="btn-primary" onClick={onCreateNew}>
+        + Добавить
+      </button>
+    </div>
+  )
+}

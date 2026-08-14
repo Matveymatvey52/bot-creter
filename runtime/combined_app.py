@@ -53,6 +53,7 @@ from handlers.manage_bots import router as manage_router, set_registry as set_ma
 from handlers.start import router as start_router
 from main import ManagedBotMiddleware, build_group_router, restore_bots
 from runtime.registry import FACTORY_BOT_ID, build_factory_entry, build_registry
+from runtime.miniapp_api import register_routes as register_miniapp_routes
 from runtime.webhook_app import create_app
 
 logging.basicConfig(
@@ -137,7 +138,15 @@ async def _bootstrap_app() -> web.Application:
     set_custom_features_registry(registry)
 
     logger.info(f"Combined registry built: {len(registry)} bot(s), including the factory bot")
-    return create_app(registry)
+    app = create_app(registry)
+    # Same Application/process/port as the webhook routes above — a template's
+    # own web.TCPSite (e.g. tour_operator.py's build_web_app()) is explicitly
+    # NOT started here for exactly this reason (see that template's "Стоп:
+    # веб-часть не ложится на паттерн" docstring); the mini-app REST layer
+    # avoids that trap by registering onto the existing app instead of binding
+    # its own port. See docs/MINIAPP_DESIGN.md §2.2.
+    register_miniapp_routes(app)
+    return app
 
 
 def main() -> None:

@@ -9,3 +9,5 @@ generated_bots/*.py
 .DS_Store
 **/.DS_Store
 .claude/scheduled_tasks.lock
+miniapp/node_modules/
+miniapp/dist/
