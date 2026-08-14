@@ -318,15 +318,6 @@ async def _save_location(db_path: str, tour_id, d: dict):
              d.get("maps_link"), d.get("contacts"), d.get("website"), d.get("youtube"), d.get("instagram")),
         )
         await db.commit()
-    if kind == "dds":
-        rub = d.get("amount_rub", 0) or 0
-        usd = d.get("amount_usd", 0) or 0
-        if rub and not usd:
-            usd = round(rub / 87.0, 2)
-        await cashflow_record_entry(
-            db_path, parent_id=tour_id, date=d.get("date"), amount_rub=rub, amount_usd=usd,
-            description=d.get("description"), entity=d.get("entity"), type=d.get("type", "out"),
-        )
 
 
 async def _save_program(db_path: str, tour_id, d: dict):
