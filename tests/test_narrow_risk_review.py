@@ -46,6 +46,40 @@ class NarrowRiskReviewPromptCoversAllThreeCategories(unittest.TestCase):
         )
 
 
+class PaymentSafetyExtraCoversMoneyRiskCategory(unittest.TestCase):
+    """PAYMENT_SAFETY_REVIEW_EXTRA is the 4th, conditional risk category —
+    it must actually name the specific money-safety concerns it exists for."""
+
+    def test_covers_payment_money_safety_heading(self):
+        self.assertIn("PAYMENT/MONEY SAFETY", claude_service.PAYMENT_SAFETY_REVIEW_EXTRA)
+
+    def test_covers_amount_currency_trust(self):
+        self.assertIn("never trusted unvalidated user input", claude_service.PAYMENT_SAFETY_REVIEW_EXTRA)
+
+    def test_covers_idempotency(self):
+        self.assertIn("idempotent", claude_service.PAYMENT_SAFETY_REVIEW_EXTRA)
+
+    def test_covers_fulfillment_without_verified_payment(self):
+        self.assertIn(
+            "WITHOUT a corresponding verified successful-payment event",
+            claude_service.PAYMENT_SAFETY_REVIEW_EXTRA,
+        )
+
+
+class MentionsPayments(unittest.TestCase):
+    def test_true_when_code_mentions_payments(self):
+        self.assertTrue(claude_service._mentions_payments("import payments\n", "", ""))
+
+    def test_true_when_context_mentions_invoice(self):
+        self.assertTrue(claude_service._mentions_payments("", "add invoice support", ""))
+
+    def test_true_when_reference_code_mentions_payments_case_insensitive(self):
+        self.assertTrue(claude_service._mentions_payments("", "", "PAYMENTS_TABLE = 'x'"))
+
+    def test_false_when_none_mention_payments(self):
+        self.assertFalse(claude_service._mentions_payments("import aiosqlite\n", "add a /stats command", ""))
+
+
 class ReviewNarrowRiskCode(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self._patcher = patch.object(claude_service, "client")
@@ -87,6 +121,45 @@ class ReviewNarrowRiskCode(unittest.IsolatedAsyncioTestCase):
         self.assertIn("READ-ONLY", content)
         self.assertIn("MAIN_BOT_CODE", content)
         self.assertIn("PATCH_CODE", content)
+
+    async def test_payment_mention_in_code_appends_payment_safety_extra(self):
+        create = AsyncMock(return_value=_fake_response("REVIEWED\nasyncio.run(main())"))
+        self.mock_client.messages.create = create
+        await claude_service._review_narrow_risk_code("import payments\n", "requirements text")
+        _, kwargs = create.call_args
+        self.assertEqual(
+            kwargs["system"],
+            claude_service.NARROW_RISK_REVIEW_SYSTEM_PROMPT + claude_service.PAYMENT_SAFETY_REVIEW_EXTRA,
+        )
+
+    async def test_payment_mention_in_context_appends_payment_safety_extra(self):
+        create = AsyncMock(return_value=_fake_response("REVIEWED\nasyncio.run(main())"))
+        self.mock_client.messages.create = create
+        await claude_service._review_narrow_risk_code("SOME_CODE", "owner wants to add invoice support")
+        _, kwargs = create.call_args
+        self.assertEqual(
+            kwargs["system"],
+            claude_service.NARROW_RISK_REVIEW_SYSTEM_PROMPT + claude_service.PAYMENT_SAFETY_REVIEW_EXTRA,
+        )
+
+    async def test_payment_mention_in_reference_code_appends_payment_safety_extra(self):
+        create = AsyncMock(return_value=_fake_response("REVIEWED"))
+        self.mock_client.messages.create = create
+        await claude_service._review_narrow_risk_code(
+            "PATCH_CODE", "add a /stats command", reference_code="from features import payments"
+        )
+        _, kwargs = create.call_args
+        self.assertEqual(
+            kwargs["system"],
+            claude_service.NARROW_RISK_REVIEW_SYSTEM_PROMPT + claude_service.PAYMENT_SAFETY_REVIEW_EXTRA,
+        )
+
+    async def test_no_payment_mention_uses_base_prompt_unchanged(self):
+        create = AsyncMock(return_value=_fake_response("REVIEWED\nasyncio.run(main())"))
+        self.mock_client.messages.create = create
+        await claude_service._review_narrow_risk_code("import aiosqlite\n", "add a /stats command")
+        _, kwargs = create.call_args
+        self.assertEqual(kwargs["system"], claude_service.NARROW_RISK_REVIEW_SYSTEM_PROMPT)
 
 
 class GenerateCustomFeatureCallsNarrowRiskReview(unittest.IsolatedAsyncioTestCase):

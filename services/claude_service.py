@@ -1433,15 +1433,19 @@ async def _review_merged_bot_code(code: str, requirements: str) -> str:
 
 
 # Narrow, risk-targeted review pass — reserved for the two riskiest generation
-# paths (synthesis and custom_features, see their call sites below). Checks
-# three things neither _review_bot_code nor _review_merged_bot_code cover as
-# a dedicated concern: FSM state-transition correctness, SQL parameterization
-# / cross-bot data isolation (not checked ANYWHERE else in the pipeline
-# today), and duplication/dead code. Deliberately not run for plain
-# single-template customization or from-scratch generation — those paths
-# reuse a previously-reviewed template or already get the full generic pass;
-# this is extra spend only where the generated code is least proven.
-NARROW_RISK_REVIEW_SYSTEM_PROMPT = """You are a senior Python code reviewer specializing in aiogram 3.13 Telegram bots. You are reviewing code from one of the two highest-risk generation paths in an automated bot-factory: either synthesized from two templates, or a from-scratch patch written for one specific bot's unique request. Focus ONLY on these three risk categories — do not comment on anything else, do not restyle, do not "improve" unrelated code:
+# paths (synthesis and custom_features, see their call sites below), plus
+# (unconditionally, see generate_bot_code's from-scratch branch) the
+# from-scratch fallback. Checks three things neither _review_bot_code nor
+# _review_merged_bot_code cover as a dedicated concern: FSM state-transition
+# correctness, SQL parameterization / cross-bot data isolation (not checked
+# ANYWHERE else in the pipeline today), and duplication/dead code — plus a
+# 4th, conditional PAYMENT/MONEY SAFETY category appended only when the code
+# or context mentions payments, so the prompt (and token cost) stays at its
+# original size for the common non-payment case. Deliberately not run for
+# plain single-template customization — that path only changes a
+# `# CUSTOMIZE` block inside an already-reviewed template, so the narrow-risk
+# categories don't apply.
+NARROW_RISK_REVIEW_SYSTEM_PROMPT = """You are a senior Python code reviewer specializing in aiogram 3.13 Telegram bots. You are reviewing code from one of the highest-risk generation paths in an automated bot-factory: synthesized from two templates, generated from scratch, or a from-scratch patch written for one specific bot's unique request. Focus ONLY on these risk categories — do not comment on anything else, do not restyle, do not "improve" unrelated code:
 
 1. FSM STATE-TRANSITION CORRECTNESS
    - Every state a handler/keyboard can put the FSM into must have a handler that consumes it and either advances to the next state or clears state — no dead ends.
@@ -1458,24 +1462,49 @@ NARROW_RISK_REVIEW_SYSTEM_PROMPT = """You are a senior Python code reviewer spec
    - Copy-pasted blocks that should be one shared helper.
    - Any defined function, constant, import, or handler that is never referenced anywhere in the file.
 
-For each real issue found in these three categories: fix it directly in the code, minimally, without touching anything else. If nothing in these three categories is wrong, return the code unchanged — do not invent problems to justify a change.
+For each real issue found in these categories: fix it directly in the code, minimally, without touching anything else. If nothing in these categories is wrong, return the code unchanged — do not invent problems to justify a change.
 
 Return ONLY valid Python code. No markdown, no explanations."""
 
+# Appended to NARROW_RISK_REVIEW_SYSTEM_PROMPT only when the code/context
+# mentions payments — see _mentions_payments below. Kept as a separate
+# constant (rather than always in the base prompt) so the common
+# non-payment review call stays at its original prompt size.
+PAYMENT_SAFETY_REVIEW_EXTRA = """
+
+4. PAYMENT/MONEY SAFETY
+   - Every payment/invoice handler must verify the amount and currency come from server-side/bot-defined values, never trusted unvalidated user input.
+   - Successful-payment handlers (e.g. F.successful_payment) must be idempotent — a duplicate webhook/update for the same payment must not double-credit, double-fulfill, or double-charge.
+   - Every payment record write must be tied to the paying user's own id and this bot's own instance — flag anything that could credit/fulfill the wrong user or bot.
+   - Flag any path where a purchase/fulfillment action can be reached WITHOUT a corresponding verified successful-payment event (e.g. granting the item on button click instead of on payment confirmation)."""
+
+
+def _mentions_payments(*texts: str) -> bool:
+    """True if any of the given strings mention payments/invoices — gates
+    whether PAYMENT_SAFETY_REVIEW_EXTRA is appended to the narrow-risk
+    prompt. Deliberately cheap (substring check, no LLM call) since this
+    runs on every narrow-risk review regardless of outcome."""
+    haystack = "\n".join(texts).lower()
+    return "payment" in haystack or "invoice" in haystack
+
 
 async def _review_narrow_risk_code(code: str, context: str, reference_code: str = "") -> str:
-    """FSM-transition / SQL-safety-and-data-isolation / duplication pass. See
-    NARROW_RISK_REVIEW_SYSTEM_PROMPT's comment above for scope and why it's
-    reserved for synthesis and custom_features. `context` is free-form —
-    the requirements summary for synthesis, or the owner's feature-request
-    text for custom_features. `reference_code`, when given, is the existing
+    """FSM-transition / SQL-safety-and-data-isolation / duplication (+ payment
+    safety when relevant) pass. See NARROW_RISK_REVIEW_SYSTEM_PROMPT's
+    comment above for scope and why it's reserved for synthesis,
+    from-scratch generation, and custom_features. `context` is free-form —
+    the requirements summary for synthesis/from-scratch, or the owner's
+    feature-request text for custom_features. `reference_code`, when given, is the existing
     bot's main file shown READ-ONLY so the reviewer can also flag new
     table/callback names that collide with it — used for custom_features
     only; synthesis already gets collision checking from
     _review_merged_bot_code so it calls this with reference_code empty.
-    Same auto-apply contract as _review_bot_code/_review_merged_bot_code:
-    returns the full corrected file, or the pre-review code unchanged if the
-    reviewed output doesn't parse."""
+    If code/context/reference_code mentions payments or invoices,
+    PAYMENT_SAFETY_REVIEW_EXTRA is appended to the prompt for this call only
+    — see _mentions_payments. Same auto-apply contract as
+    _review_bot_code/_review_merged_bot_code: returns the full corrected
+    file, or the pre-review code unchanged if the reviewed output doesn't
+    parse."""
     user_content = f"Context (for reference, not to be reproduced):\n{context}\n\n"
     if reference_code:
         user_content += (
@@ -1484,10 +1513,14 @@ async def _review_narrow_risk_code(code: str, context: str, reference_code: str 
         )
     user_content += f"Code to review:\n{code}"
 
+    system = NARROW_RISK_REVIEW_SYSTEM_PROMPT
+    if _mentions_payments(code, context, reference_code):
+        system += PAYMENT_SAFETY_REVIEW_EXTRA
+
     response = await client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=25000 if not reference_code else 8000,  # custom_features patches are small modules
-        system=NARROW_RISK_REVIEW_SYSTEM_PROMPT,
+        system=system,
         messages=[{"role": "user", "content": user_content}],
     )
     reviewed = _strip_code_fences(response.content[0].text)
@@ -1562,6 +1595,12 @@ async def generate_bot_code(requirements_summary: str) -> str:
         )
         code = _strip_code_fences(fix_response.content[0].text)
         _ast.parse(code)
+
+    # Narrow-risk pass first (FSM transitions / SQL isolation / duplication,
+    # plus payment safety if requirements_summary mentions payments) — same
+    # ordering as the synthesis branch above, so the generic pass below
+    # reviews the already-narrow-fixed code rather than a pre-fix draft.
+    code = await _review_narrow_risk_code(code, requirements_summary)
 
     # Static review pass — find and fix potential runtime issues before deployment
     code = await _review_bot_code(code, requirements_summary, bot_type=bot_type)

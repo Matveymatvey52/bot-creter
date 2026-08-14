@@ -322,7 +322,12 @@ class SynthesisModeIsolatedFromSingleTemplateRequests(unittest.IsolatedAsyncioTe
         # general review pass at all.
         self.assertEqual(result, "REVIEWED\nasyncio.run(main())")
 
-    async def test_no_template_match_never_calls_synthesis_merge_or_narrow_review(self):
+    async def test_no_template_match_never_calls_synthesis_or_merge_review(self):
+        """The from-scratch fallback still never touches synthesis-specific
+        code (there's nothing to merge) — this class patches
+        _review_narrow_risk_code itself out, so its real wiring/output-flow
+        on this path is covered separately by GenerateBotCodeFromScratchBranch
+        below, which does NOT patch it."""
         select_prompt = claude_service._build_template_select_prompt()
 
         async def fake_create(*, model, max_tokens, system, messages):
@@ -342,8 +347,54 @@ class SynthesisModeIsolatedFromSingleTemplateRequests(unittest.IsolatedAsyncioTe
 
         self.mock_synth.assert_not_called()
         self.mock_merge_review.assert_not_called()
-        self.mock_narrow_review.assert_not_called()
+        self.mock_narrow_review.assert_called_once()
         self.assertEqual(result, "SCRATCH_REVIEWED\nasyncio.run(main())")
+
+
+class GenerateBotCodeFromScratchBranch(unittest.IsolatedAsyncioTestCase):
+    """The from-scratch fallback used to be the only generation path with
+    zero narrow-risk review (see NARROW_RISK_REVIEW_SYSTEM_PROMPT's own
+    comment) — this covers its new wiring: narrow-risk runs after the
+    generic scratch generation/fix-up steps and BEFORE the generic
+    _review_bot_code pass, same ordering as the two-template branch."""
+
+    async def asyncSetUp(self):
+        self._patcher = patch.object(claude_service, "client")
+        self.mock_client = self._patcher.start()
+
+    async def asyncTearDown(self):
+        self._patcher.stop()
+
+    async def test_narrow_risk_runs_before_general_review(self):
+        select_prompt = claude_service._build_template_select_prompt()
+        call_order: list[str] = []
+
+        async def fake_create(*, model, max_tokens, system, messages):
+            if system == select_prompt:
+                return _fake_response("none")
+            if system == claude_service.BOT_TYPE_CLASSIFY_PROMPT:
+                call_order.append("classify")
+                return _fake_response("general")
+            if system == claude_service.GENERATE_SYSTEM_PROMPT:
+                call_order.append("generate")
+                return _fake_response("SCRATCH_CODE\nasyncio.run(main())")
+            if system == claude_service.NARROW_RISK_REVIEW_SYSTEM_PROMPT:
+                call_order.append("narrow_risk_review")
+                return _fake_response("NARROW_REVIEWED\nasyncio.run(main())")
+            if system == claude_service.REVIEW_SYSTEM_PROMPT:
+                call_order.append("general_review")
+                return _fake_response("FINAL_REVIEWED\nasyncio.run(main())")
+            raise AssertionError(f"unexpected system prompt: {system[:120]!r}")
+
+        self.mock_client.messages.create = AsyncMock(side_effect=fake_create)
+
+        result = await claude_service.generate_bot_code("a completely novel kind of bot")
+
+        self.assertEqual(
+            call_order,
+            ["classify", "generate", "narrow_risk_review", "general_review"],
+        )
+        self.assertEqual(result, "FINAL_REVIEWED\nasyncio.run(main())")
 
 
 if __name__ == "__main__":
