@@ -327,7 +327,7 @@ class TourOperatorWebCrmFlagTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("недоступно" in t for t in sent_texts))
         self.assertTrue(all("http://" not in t and "https://" not in t for t in sent_texts))
 
-    async def test_app_command_shows_url_by_default(self):
+    async def test_app_command_shows_url_when_miniapp_secret_configured(self):
         # Other tests in this file's process (TourOperatorIsolationTests'
         # asyncSetUp calls get_template_router("tour_operator"), which runs
         # the registry's own loader — the same one that permanently sets
@@ -336,12 +336,32 @@ class TourOperatorWebCrmFlagTests(unittest.IsolatedAsyncioTestCase):
         # patch.dict(os.environ) here guarantees a clean "nobody set it" slate
         # for this specific assertion and fully restores whatever was there
         # afterward — the real environment is never left touched.
-        with patch.dict(os.environ):
+        #
+        # MINIAPP_SECRET must also be set here (unlike the old bare-user_id
+        # link this template used to send): cmd_app now mints a signed
+        # magic-link token via runtime/miniapp_api.mint_magic_link_token,
+        # which fails closed without a secret — see docs/MINIAPP_DESIGN.md
+        # §2.1 and _miniapp_url()'s docstring in templates/tour_operator.py.
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "test-secret"}):
             os.environ.pop("TOUR_OPERATOR_WEB_ENABLED", None)
             importlib.reload(tour_operator)
             self.assertTrue(tour_operator.WEB_CRM_ENABLED)
             sent_texts = await self._send_app_command()
         self.assertTrue(any("http://" in t or "https://" in t for t in sent_texts))
+
+    async def test_app_command_shows_unavailable_message_when_miniapp_secret_missing(self):
+        """WEB_CRM_ENABLED alone is no longer sufficient — without
+        MINIAPP_SECRET, cmd_app can't mint a signed token and must degrade to
+        the Telegram-only message rather than send an unsigned/forgeable
+        link (see _miniapp_url()'s docstring)."""
+        with patch.dict(os.environ):
+            os.environ.pop("TOUR_OPERATOR_WEB_ENABLED", None)
+            os.environ.pop("MINIAPP_SECRET", None)
+            importlib.reload(tour_operator)
+            self.assertTrue(tour_operator.WEB_CRM_ENABLED)
+            sent_texts = await self._send_app_command()
+        self.assertTrue(any("не настроен MINIAPP_SECRET" in t for t in sent_texts))
+        self.assertTrue(all("http://" not in t and "https://" not in t for t in sent_texts))
 
 
 if __name__ == "__main__":
