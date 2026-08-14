@@ -26,6 +26,7 @@ from unittest.mock import patch
 
 import templates
 import runtime.registry as reg
+import db.database as db_module
 
 FAKE_TOKEN = "123456789:AAHfakeTokenButShapedRight1234567890"
 
@@ -131,8 +132,19 @@ class RealTemplatesStillRegisterCorrectly(unittest.IsolatedAsyncioTestCase):
         self.data_dir = Path(self._tmp.name)
         self._patcher = patch("config.DATA_DIR", self.data_dir)
         self._patcher.start()
+        # db.database.DB_PATH is computed from DATA_DIR at import time, so
+        # patching config.DATA_DIR above does NOT redirect it — patch it
+        # directly too, otherwise build_entry()'s DB reads/writes hit the
+        # real data/bots.db (see MEMORY.md "Backlog: test DB isolation").
+        self._db_path_patcher = patch.object(db_module, "DB_PATH", self.data_dir / "bots.db")
+        self._db_path_patcher.start()
+        # Fresh tmp DB has no schema yet — build_entry()'s
+        # _load_and_include_features() reads the bot_features table, which
+        # must exist even for bots with none enabled.
+        await db_module.init_db()
 
     async def asyncTearDown(self):
+        self._db_path_patcher.stop()
         self._patcher.stop()
         self._tmp.cleanup()
 

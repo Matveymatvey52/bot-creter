@@ -36,6 +36,7 @@ from aiogram.fsm.context import FSMContext
 from aiohttp.test_utils import TestClient, TestServer
 
 import handlers.create_bot as create_bot_module
+import db.database as db_module
 from db.database import delete_bot, get_bot_by_name
 from runtime.registry import BotEntry, FACTORY_BOT_ID, Registry, build_factory_entry, get_template_router
 from runtime.webhook_app import WEBHOOK_SECRET_HEADER, create_app
@@ -117,6 +118,19 @@ class BotCreatedThroughFactoryRespondsImmediately(unittest.IsolatedAsyncioTestCa
         self.data_dir = Path(self._tmp.name)
         self._data_dir_patcher = patch("config.DATA_DIR", self.data_dir)
         self._data_dir_patcher.start()
+        # db.database.DB_PATH is computed from DATA_DIR at import time, so
+        # patching config.DATA_DIR above does NOT redirect it — patch it
+        # directly too, otherwise the factory flow writes the new bot row
+        # into the real data/bots.db instead of this test's tmp dir (see
+        # MEMORY.md "Backlog: test DB isolation" — this is the test that
+        # flaked from exactly that pollution).
+        self._db_path_patcher = patch.object(db_module, "DB_PATH", self.data_dir / "bots.db")
+        self._db_path_patcher.start()
+        # Fresh tmp DB has no schema yet — the factory flow's
+        # create_bot_record_with_admins()/get_bot_by_name()/
+        # _load_and_include_features() all need bots/bot_admins/bot_features
+        # to exist (in production, main.py calls this once at startup).
+        await db_module.init_db()
 
         self._gen_dir_patcher = patch.object(create_bot_module, "GENERATED_BOTS_DIR", self.data_dir / "generated_bots")
         self._img_dir_patcher = patch.object(create_bot_module, "BOT_IMAGES_DIR", self.data_dir / "bot_images")
@@ -144,7 +158,7 @@ class BotCreatedThroughFactoryRespondsImmediately(unittest.IsolatedAsyncioTestCa
         for p in (
             self._start_bot_patcher, self._guide_patcher, self._github_patcher,
             self._avatar_dir_patcher, self._img_dir_patcher, self._gen_dir_patcher,
-            self._data_dir_patcher,
+            self._db_path_patcher, self._data_dir_patcher,
         ):
             p.stop()
         self._tmp.cleanup()

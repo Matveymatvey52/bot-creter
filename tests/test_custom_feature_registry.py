@@ -24,6 +24,7 @@ from unittest.mock import patch
 
 import templates
 import runtime.registry as reg
+import db.database as db_module
 from db.database import init_db
 
 FAKE_TOKEN = "123456789:AAHfakeTokenButShapedRight1234567890"
@@ -84,17 +85,24 @@ _FIXTURE_BROKEN_CUSTOM_FEATURE = "raise RuntimeError('deliberately broken import
 
 class _CustomFeatureRegistryTestBase(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        # build_entry() also calls _load_and_include_features(), which reads
-        # the real bot_features table — idempotent init_db() makes this file
-        # self-sufficient regardless of run order (see
-        # tests/test_custom_feature_db.py's identical comment).
-        await init_db()
         self._tmp = tempfile.TemporaryDirectory()
         self.tmp_dir = Path(self._tmp.name)
         templates.__path__.append(str(self.tmp_dir))
         (self.tmp_dir / "fixture_cf_host_template.py").write_text(_FIXTURE_TEMPLATE_SOURCE, encoding="utf-8")
         self.data_dir_patcher = patch("config.DATA_DIR", self.tmp_dir)
         self.data_dir_patcher.start()
+        # db.database.DB_PATH is computed from DATA_DIR at import time, so
+        # patching config.DATA_DIR above does NOT redirect it — patch it
+        # directly too, otherwise init_db()/build_entry() hit the real
+        # data/bots.db (see MEMORY.md "Backlog: test DB isolation").
+        self.db_path_patcher = patch.object(db_module, "DB_PATH", self.tmp_dir / "bots.db")
+        self.db_path_patcher.start()
+
+        # build_entry() also calls _load_and_include_features(), which reads
+        # the real bot_features table — idempotent init_db() makes this file
+        # self-sufficient regardless of run order (see
+        # tests/test_custom_feature_db.py's identical comment).
+        await init_db()
 
         self._cf_tmp = tempfile.TemporaryDirectory()
         self.cf_dir = Path(self._cf_tmp.name)
@@ -103,6 +111,7 @@ class _CustomFeatureRegistryTestBase(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self):
         self._cf_dir_patcher.stop()
+        self.db_path_patcher.stop()
         self.data_dir_patcher.stop()
         templates.__path__ = [p for p in templates.__path__ if p != str(self.tmp_dir)]
         reg._template_module_cache.pop("fixture_cf_host_template", None)

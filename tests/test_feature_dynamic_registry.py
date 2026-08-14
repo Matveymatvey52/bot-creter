@@ -23,6 +23,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import features
 import templates
 import runtime.registry as reg
+import db.database as db_module
 from db.database import disable_bot_feature, enable_bot_feature
 
 FAKE_TOKEN = "123456789:AAHfakeTokenButShapedRight1234567890"
@@ -96,12 +97,22 @@ class FeatureIsAutoLoadedOntoHostTemplateWithNoCodeChange(unittest.IsolatedAsync
 
         self.data_dir_patcher = patch("config.DATA_DIR", self.tmp_dir)
         self.data_dir_patcher.start()
+        # db.database.DB_PATH is computed from DATA_DIR at import time, so
+        # patching config.DATA_DIR above does NOT redirect it — patch it
+        # directly too, otherwise DB calls hit the real data/bots.db (see
+        # MEMORY.md "Backlog: test DB isolation").
+        self.db_path_patcher = patch.object(db_module, "DB_PATH", self.tmp_dir / "bots.db")
+        self.db_path_patcher.start()
+        # Fresh tmp DB has no schema yet — enable_bot_feature()/
+        # get_bot_features() need the bot_features table to exist.
+        await db_module.init_db()
 
         self.bot_id = 9201
         await enable_bot_feature(self.bot_id, "fixture_dynamic_feature")
 
     async def asyncTearDown(self):
         await disable_bot_feature(self.bot_id, "fixture_dynamic_feature")
+        self.db_path_patcher.stop()
         self.data_dir_patcher.stop()
         templates.__path__ = [p for p in templates.__path__ if p != str(self.tmp_dir)]
         features.__path__ = [p for p in features.__path__ if p != str(self.tmp_dir)]
@@ -151,9 +162,19 @@ class BotWithNoEnabledFeaturesIsUnaffectedTests(unittest.IsolatedAsyncioTestCase
         (self.tmp_dir / "fixture_feature_host_template.py").write_text(_FIXTURE_TEMPLATE_SOURCE, encoding="utf-8")
         self.data_dir_patcher = patch("config.DATA_DIR", self.tmp_dir)
         self.data_dir_patcher.start()
+        # db.database.DB_PATH is computed from DATA_DIR at import time, so
+        # patching config.DATA_DIR above does NOT redirect it — patch it
+        # directly too, otherwise DB calls hit the real data/bots.db (see
+        # MEMORY.md "Backlog: test DB isolation").
+        self.db_path_patcher = patch.object(db_module, "DB_PATH", self.tmp_dir / "bots.db")
+        self.db_path_patcher.start()
+        # Fresh tmp DB has no schema yet — enable_bot_feature()/
+        # get_bot_features() need the bot_features table to exist.
+        await db_module.init_db()
         self.bot_id = 9202
 
     async def asyncTearDown(self):
+        self.db_path_patcher.stop()
         self.data_dir_patcher.stop()
         templates.__path__ = [p for p in templates.__path__ if p != str(self.tmp_dir)]
         reg._template_module_cache.pop("fixture_feature_host_template", None)
@@ -190,12 +211,22 @@ class BrokenFeatureDoesNotTakeDownTheHostTemplateTests(unittest.IsolatedAsyncioT
         )
         self.data_dir_patcher = patch("config.DATA_DIR", self.tmp_dir)
         self.data_dir_patcher.start()
+        # db.database.DB_PATH is computed from DATA_DIR at import time, so
+        # patching config.DATA_DIR above does NOT redirect it — patch it
+        # directly too, otherwise DB calls hit the real data/bots.db (see
+        # MEMORY.md "Backlog: test DB isolation").
+        self.db_path_patcher = patch.object(db_module, "DB_PATH", self.tmp_dir / "bots.db")
+        self.db_path_patcher.start()
+        # Fresh tmp DB has no schema yet — enable_bot_feature()/
+        # get_bot_features() need the bot_features table to exist.
+        await db_module.init_db()
 
         self.bot_id = 9203
         await enable_bot_feature(self.bot_id, "broken_feature")
 
     async def asyncTearDown(self):
         await disable_bot_feature(self.bot_id, "broken_feature")
+        self.db_path_patcher.stop()
         self.data_dir_patcher.stop()
         templates.__path__ = [p for p in templates.__path__ if p != str(self.tmp_dir)]
         features.__path__ = [p for p in features.__path__ if p != str(self.tmp_dir)]
@@ -267,11 +298,21 @@ class FeatureHandlerReceivesBotIdTests(unittest.IsolatedAsyncioTestCase):
         )
         self.data_dir_patcher = patch("config.DATA_DIR", self.tmp_dir)
         self.data_dir_patcher.start()
+        # db.database.DB_PATH is computed from DATA_DIR at import time, so
+        # patching config.DATA_DIR above does NOT redirect it — patch it
+        # directly too, otherwise DB calls hit the real data/bots.db (see
+        # MEMORY.md "Backlog: test DB isolation").
+        self.db_path_patcher = patch.object(db_module, "DB_PATH", self.tmp_dir / "bots.db")
+        self.db_path_patcher.start()
+        # Fresh tmp DB has no schema yet — enable_bot_feature()/
+        # get_bot_features() need the bot_features table to exist.
+        await db_module.init_db()
         self.bot_id = 9301
         await enable_bot_feature(self.bot_id, "fixture_bot_id_capture_feature")
 
     async def asyncTearDown(self):
         await disable_bot_feature(self.bot_id, "fixture_bot_id_capture_feature")
+        self.db_path_patcher.stop()
         self.data_dir_patcher.stop()
         templates.__path__ = [p for p in templates.__path__ if p != str(self.tmp_dir)]
         features.__path__ = [p for p in features.__path__ if p != str(self.tmp_dir)]
@@ -351,6 +392,15 @@ class SetMyCommandsCollectionTests(unittest.IsolatedAsyncioTestCase):
         (self.tmp_dir / "fixture_commands_feature_b.py").write_text(_FIXTURE_COMMANDS_FEATURE_B_SOURCE, encoding="utf-8")
         self.data_dir_patcher = patch("config.DATA_DIR", self.tmp_dir)
         self.data_dir_patcher.start()
+        # db.database.DB_PATH is computed from DATA_DIR at import time, so
+        # patching config.DATA_DIR above does NOT redirect it — patch it
+        # directly too, otherwise DB calls hit the real data/bots.db (see
+        # MEMORY.md "Backlog: test DB isolation").
+        self.db_path_patcher = patch.object(db_module, "DB_PATH", self.tmp_dir / "bots.db")
+        self.db_path_patcher.start()
+        # Fresh tmp DB has no schema yet — enable_bot_feature()/
+        # get_bot_features() need the bot_features table to exist.
+        await db_module.init_db()
         self.bot_id = 9303
         # _last_sent_commands is a process-lifetime cache (devops-logs
         # review — see runtime/registry.py) keyed by bot_id, not reset
@@ -365,6 +415,7 @@ class SetMyCommandsCollectionTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         await disable_bot_feature(self.bot_id, "fixture_commands_feature_a")
         await disable_bot_feature(self.bot_id, "fixture_commands_feature_b")
+        self.db_path_patcher.stop()
         self.data_dir_patcher.stop()
         templates.__path__ = [p for p in templates.__path__ if p != str(self.tmp_dir)]
         features.__path__ = [p for p in features.__path__ if p != str(self.tmp_dir)]
