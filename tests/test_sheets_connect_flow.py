@@ -92,7 +92,7 @@ class SheetsConnectStartTests(unittest.IsolatedAsyncioTestCase):
         self._owner_patcher.stop()
         await delete_bot(self.bot_id)
 
-    async def test_warns_about_shared_service_account_and_shows_its_email(self):
+    async def test_shows_connect_steps_with_sa_email(self):
         callback = _make_callback(self.owner_id, f"sheetsconnect:{self.bot_id}")
         state = _make_fsm_context(self.owner_id)
 
@@ -101,10 +101,13 @@ class SheetsConnectStartTests(unittest.IsolatedAsyncioTestCase):
         callback.message.edit_text.assert_awaited_once()
         text = callback.message.edit_text.call_args[0][0]
         self.assertIn(FAKE_SA_EMAIL, text)
-        # Owner's explicit requirement: must not hide behind neutral wording —
-        # the text must actually say the account is SHARED across bots.
-        self.assertIn("общий сервисный аккаунт", text.lower())
-        self.assertIn("всех", text.lower())
+        # Owner's revised requirement (UX review, 2026-08-15): the shared-SA
+        # risk explanation was confirmed as a non-issue — sheets.py's
+        # read_data/write_row/verify_access always key strictly off
+        # bot_sheets_config's per-bot_id spreadsheet_id via gc.open_by_key,
+        # never enumerating/listing the SA's other shared spreadsheets — so
+        # the warning was removed entirely in favor of a plain connect guide.
+        self.assertNotIn("общий сервисный аккаунт", text.lower())
         self.assertEqual(await state.get_state(), manage_bots.SheetsConnectFlow.waiting_for_link.state)
 
     async def test_non_owner_is_denied_and_state_is_not_set(self):
