@@ -122,17 +122,17 @@ class DiscoverTemplatesRegressionOnRealTemplates(unittest.TestCase):
     that must not affect TEMPLATE:/USE FOR: parsing). booking_medical,
     event_manager, debtors, vehicle_service, rental_equipment,
     loyalty_program, feedback_survey, staff_scheduler, support_tickets,
-    booking_restaurant, and repair_tracker were each added after this test was
-    first written — every new template added purely by dropping a file into
-    templates/, with zero changes to claude_service.py, needs this set
-    updated to match."""
+    booking_restaurant, repair_tracker, habit_tracker, and coworking_space
+    were each added after this test was first written — every new template added purely by
+    dropping a file into templates/, with zero changes to claude_service.py,
+    needs this set updated to match."""
 
     def test_all_real_templates_are_discovered(self):
         found = claude_service.discover_templates()
         names = {t["name"] for t in found}
         self.assertEqual(
             names,
-            {"accountant", "booking_beauty", "booking_fitness", "booking_medical", "booking_restaurant", "campaign_tracker", "debtors", "event_manager", "event_rsvp", "expense_tracker", "feedback_survey", "inventory", "loyalty_program", "manager_secretary", "moderator", "orders_tracker", "referral_program", "rental_equipment", "repair_tracker", "shop_catalog", "staff_scheduler", "support_tickets", "tour_operator", "tourist_documents", "trip_manager", "vehicle_service"},
+            {"accountant", "booking_beauty", "booking_fitness", "booking_medical", "booking_restaurant", "campaign_tracker", "car_rental", "coworking_space", "debtors", "event_manager", "event_rsvp", "expense_tracker", "feedback_survey", "habit_tracker", "inventory", "loyalty_program", "manager_secretary", "moderator", "orders_tracker", "referral_program", "rental_equipment", "repair_tracker", "shop_catalog", "staff_scheduler", "support_tickets", "tour_operator", "tourist_documents", "trip_manager", "vehicle_service"},
         )
 
     def test_tour_operator_use_for_is_parsed_despite_missing_customize_line(self):
