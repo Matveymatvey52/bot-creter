@@ -19,6 +19,16 @@ GOOGLE_SHEETS_SA_KEY_B64 = os.getenv("GOOGLE_SHEETS_SA_KEY_B64")
 DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR / "data")))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
+# userbot (Telethon Client API) — channel_monitor product. Deliberately
+# separate secrets from the rest of the factory: a client-account session
+# string is equivalent to a password to that Telegram account, and API_ID/
+# API_HASH identify the application making the connection. See
+# docs/USERBOT_CHANNEL_MONITOR_DESIGN.md §1.
+USERBOT_ENCRYPTION_KEY = os.getenv("USERBOT_ENCRYPTION_KEY")
+TELEGRAM_API_ID = os.getenv("TELEGRAM_API_ID")
+TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN is not set in .env")
 if not ANTHROPIC_API_KEY:
