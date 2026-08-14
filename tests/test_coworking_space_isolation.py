@@ -50,6 +50,13 @@ ADMIN_ID = 999
 CLIENT_A_ID = 555
 CLIENT_B_ID = 556
 TODAY = coworking_space._upcoming_dates()[0]
+# A date whose slots are guaranteed still in the future regardless of what time
+# of day the suite happens to run — TODAY's own slots can already be in the
+# past by wall-clock time (e.g. SLOT_A is 09:00-11:00; a run after 11:00 would
+# make a "today" booking already-started, not a genuinely future one), which
+# would make cancel-related assertions flaky depending on run time. Used only
+# by tests that specifically assert "an upcoming booking is cancellable".
+FUTURE_DATE = coworking_space._upcoming_dates()[1]
 SLOT_A = coworking_space.TIME_WINDOWS[0]   # ("09:00", "11:00")
 SLOT_B = coworking_space.TIME_WINDOWS[1]   # ("11:00", "13:00")
 
@@ -423,7 +430,7 @@ class CoworkingSpaceMyBookingsTests(unittest.IsolatedAsyncioTestCase):
         self._bot_call_patcher.stop()
 
     async def test_client_can_cancel_own_future_booking(self):
-        uid = await _book_via_flow(self.dp, self.bot, CLIENT_A_ID, "desk", TODAY, SLOT_A, self.resource_id, "day_pass", 10)
+        uid = await _book_via_flow(self.dp, self.bot, CLIENT_A_ID, "desk", FUTURE_DATE, SLOT_A, self.resource_id, "day_pass", 10)
         conn = sqlite3.connect(self.config.db_path)
         booking_id = conn.execute("SELECT id FROM bookings WHERE client_user_id=?", (CLIENT_A_ID,)).fetchone()[0]
         conn.close()
@@ -445,7 +452,7 @@ class CoworkingSpaceMyBookingsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, "confirmed", "a client was able to cancel another client's booking")
 
     async def test_double_cancel_is_a_no_op_not_an_error(self):
-        uid = await _book_via_flow(self.dp, self.bot, CLIENT_A_ID, "desk", TODAY, SLOT_A, self.resource_id, "day_pass", 10)
+        uid = await _book_via_flow(self.dp, self.bot, CLIENT_A_ID, "desk", FUTURE_DATE, SLOT_A, self.resource_id, "day_pass", 10)
         conn = sqlite3.connect(self.config.db_path)
         booking_id = conn.execute("SELECT id FROM bookings WHERE client_user_id=?", (CLIENT_A_ID,)).fetchone()[0]
         conn.close()
