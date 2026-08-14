@@ -39,6 +39,7 @@ import json
 import logging
 import os
 import time
+from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl
 
@@ -48,6 +49,13 @@ from aiohttp import web
 from runtime.registry import Registry, _load_template_module_async
 
 logger = logging.getLogger(__name__)
+
+# The SPA build (miniapp/dist/, produced by `npm run build` — see
+# miniapp/vite.config.ts's base:'./' setting, which is what makes this ONE
+# build servable from any /app/{bot_id} path). Same static index.html/JS/CSS
+# for every bot; bot_id only affects which API calls the loaded page makes,
+# not which files get served — see docs/MINIAPP_DESIGN.md §2.3.
+_MINIAPP_DIST_DIR = Path(__file__).parent.parent / "miniapp" / "dist"
 
 # Magic-link tokens expire quickly — this is a "click the link now" flow off
 # a freshly-sent Telegram message, not a durable session; a stale bookmarked
@@ -327,6 +335,45 @@ async def create_resource_handler(request: web.Request) -> web.Response:
     return web.json_response({"resource": resource_name, "id": new_id}, status=201)
 
 
+async def serve_app_shell(request: web.Request) -> web.Response:
+    """Serves the SPA's index.html for /app/{bot_id} (and any client-side
+    sub-route under it — the SPA does its own in-memory routing per
+    App.tsx, so any path here just needs the same shell). bot_id is
+    validated (existence + miniapp_config presence) the same way the /api/*
+    handlers are, so an unknown/unconfigured bot 404s before ever serving
+    the SPA shell, rather than serving a page that would just fail its own
+    API calls once loaded."""
+    resolved = await _resolve_entry_and_config(request)
+    if isinstance(resolved, web.Response):
+        return resolved
+
+    index_path = _MINIAPP_DIST_DIR / "index.html"
+    if not index_path.exists():
+        return web.json_response(
+            {"error": "mini-app build not found — run `npm run build` in miniapp/"}, status=503
+        )
+    return web.FileResponse(index_path)
+
+
+def _register_static_routes(app: web.Application) -> None:
+    """Registers the built SPA's JS/CSS/favicon files under the FIXED prefix
+    /app-assets/, kept OUT of the /app/{bot_id}/* namespace on purpose:
+    /app/{bot_id} is matched per-request against the live Registry (see
+    serve_app_shell), so mixing a static-file prefix into that same path
+    space would require careful route-ordering and still risks a bot_id
+    that happens to collide with an asset filename. A dedicated prefix
+    sidesteps that. miniapp/vite.config.ts's base:'/app-assets/' is what
+    makes the built index.html's own <link>/<script> tags point here,
+    identically regardless of which bot_id the shell page was loaded under.
+
+    Serves the WHOLE dist/ directory (not just dist/assets/) under this one
+    prefix — Vite's build also emits publicDir copies (favicon.svg) at
+    dist/'s top level, not under dist/assets/, and both need to resolve
+    under the same /app-assets/ prefix the base config already points at."""
+    if _MINIAPP_DIST_DIR.exists():
+        app.router.add_static("/app-assets/", _MINIAPP_DIST_DIR, name="miniapp-assets")
+
+
 # Imported lazily inside register_routes (not at module top) to avoid a
 # circular import: webhook_app.py doesn't import this module, so there is no
 # cycle today, but keeping REGISTRY_KEY sourced from webhook_app's own
@@ -344,3 +391,5 @@ def register_routes(app: web.Application) -> None:
     app.router.add_get("/api/{bot_id}/{resource}", list_resource_handler)
     app.router.add_get("/api/{bot_id}/{resource}/{item_id}", get_resource_handler)
     app.router.add_post("/api/{bot_id}/{resource}", create_resource_handler)
+    app.router.add_get("/app/{bot_id}", serve_app_shell)
+    _register_static_routes(app)

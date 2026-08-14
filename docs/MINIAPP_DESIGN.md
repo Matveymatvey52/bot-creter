@@ -183,11 +183,53 @@ tour_operator.py (`_section_summary`, REST-хендлеры) как источн
 3. **Форма создания** — минимум полей, одна primary-кнопка "Создать" снизу (Telegram `MainButton`
    в Mini App-контексте, обычная fixed-кнопка в браузере).
 
-## 4. Стоп
+## 4. Статус реализации (pilot, tour_operator)
 
-Работа остановлена здесь — нужно решение владельца по:
-- pilot-шаблону (`tour_operator` vs проще),
-- принятию схемы "1 SPA-движок + декларативный `miniapp_config` per-bot" вместо генерации кода на бота,
-- расположению роутов в `combined_app.py` (новый `runtime/miniapp_api.py`, тот же процесс/порт).
+Владелец подтвердил pilot (`tour_operator`) и архитектуру "1 SPA-движок + декларативный
+`miniapp_config`" — работа продолжена без дальнейших стопов, см. историю коммитов на ветке
+`miniapp-design`.
 
-Код не писался. Ветка/worktree сохранены для продолжения после решения.
+Реализовано:
+- **Бэкенд**: `runtime/miniapp_api.py` — CRUD REST-слой (`/api/{bot_id}/me`,
+  `/api/{bot_id}/{resource}[/{item_id}]`) поверх того же aiohttp-процесса, что и вебхук; двойная
+  авторизация (Telegram `initData` HMAC + подписанный истекающий magic-link токен); зарегистрирован
+  в `runtime/combined_app.py`.
+- **`templates/tour_operator.py`**: `miniapp_config` с ресурсами `tours`/`guests`; `/app`-команда и
+  связанные callback-хендлеры теперь шлют подписанный `mint_magic_link_token`-токен вместо старого
+  голого `user_id`.
+- **Фронтенд**: `miniapp/` — Vite + React + TypeScript SPA. Дизайн-токены из §3.1 в
+  `src/index.css`; переиспользуемые компоненты (`Card`, `Chip`, `Badge`) в `src/components/`;
+  опциональный слой `window.Telegram.WebApp` в `src/lib/telegram.ts` (везде `?.`, ничего не
+  предполагает наличие Telegram-контекста); API-клиент `src/lib/api.ts`, зеркалящий контракт
+  `miniapp_api.py`; три типа экрана (`ListScreen`/`DetailScreen`/`CreateFormScreen`) для pilot-
+  ресурсов `tours`/`guests`.
+- **Раздача статики**: `GET /app/{bot_id}` отдаёт собранный `miniapp/dist/index.html` (после
+  проверки, что бот существует и имеет `miniapp_config` — то же самое разграничение, что и у
+  `/api/*`); JS/CSS/favicon раздаются под фиксированным префиксом `/app-assets/` (см.
+  `miniapp/vite.config.ts`'s `base: '/app-assets/'` — абсолютный, не относительный путь, чтобы
+  ссылки на ассеты не зависели от того, под каким `bot_id` была загружена страница).
+
+### 4.1 Важно для деплоя (не забыть)
+
+**TODO (не решено, требует отдельного согласования перед продом): прописать сборку SPA в
+Railway build command.**
+
+`GET /app/{bot_id}` отдаёт 503, если `miniapp/dist/` не существует — сборка SPA (`npm run build` в
+`miniapp/`) должна стать частью деплой-пайплайна (Railway build step), ИНАЧЕ мини-апп молчит в
+проде при полностью рабочем бэкенде. `miniapp/node_modules/` и `miniapp/dist/` добавлены в
+`.gitignore` (стандартная гигиена — не коммитить регенерируемые артефакты), но это означает `dist/`
+не существует на свежем чекауте без явного шага сборки — сейчас Railway's build command знает
+только про Python-зависимости (см. существующий деплой-конфиг), про `npm install && npm run build`
+в `miniapp/` там ничего нет.
+
+Не решается в рамках этой сессии — открытый пункт, ждёт отдельного решения владельца (какая именно
+команда/шаг добавляется в Railway build command, до или вместе с остальным pilot-планом).
+
+## 5. Дальнейшие открытые вопросы
+
+- Автогенерация `miniapp_config` при `/create` (Phase 2 из §2.3) — не начата, ждёт, пока pilot
+  докажет, что сама схема "движок + конфиг" достаточна.
+- `DetailScreen`'а pilot ограничена одной primary-кнопкой "Назад к списку" — реальное per-domain
+  действие (например "отметить оплаченным" для `guests`) не реализовано, нужно решение, что именно
+  показывать.
+- **Railway build step для `npm run build`** — см. TODO в §4.1, открытый пункт, не решён.

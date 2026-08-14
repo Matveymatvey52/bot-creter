@@ -13,6 +13,7 @@ import os
 import tempfile
 import time
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import aiosqlite
@@ -25,6 +26,7 @@ from runtime.miniapp_api import (
     mint_magic_link_token,
     register_routes,
 )
+import runtime.miniapp_api as miniapp_api_module
 
 FAKE_TOKEN = "123456:test-token-not-real"
 KNOWN_BOT_ID = 42
@@ -237,6 +239,74 @@ class MiniAppApiTests(unittest.IsolatedAsyncioTestCase):
     async def test_unknown_bot_id_returns_404(self):
         resp = await self.client.get("/api/999999/tours")
         self.assertEqual(resp.status, 404)
+
+
+class MiniAppShellTests(unittest.IsolatedAsyncioTestCase):
+    """Covers serve_app_shell + the /app-assets/ static route — the pieces
+    that make GET /app/{bot_id} actually serve the built SPA (see
+    runtime/miniapp_api.py's _MINIAPP_DIST_DIR and register_routes)."""
+
+    async def asyncSetUp(self):
+        self._dist_tmpdir = tempfile.TemporaryDirectory()
+        dist_dir = Path(self._dist_tmpdir.name)
+        (dist_dir / "index.html").write_text("<html><body>fake shell</body></html>")
+        (dist_dir / "assets").mkdir()
+        (dist_dir / "assets" / "index-test.js").write_text("console.log('fake bundle')")
+
+        self._dist_patcher = patch.object(miniapp_api_module, "_MINIAPP_DIST_DIR", dist_dir)
+        self._dist_patcher.start()
+
+        entry = BotEntry(
+            bot=_FakeBot(FAKE_TOKEN),
+            dispatcher=None,
+            template_id="tour_operator",
+            config={"bot_id": KNOWN_BOT_ID, "db_path": ":memory:"},
+        )
+        self.app = create_app({KNOWN_BOT_ID: entry})
+        register_routes(self.app)
+
+        self._config_patcher = patch(
+            "runtime.miniapp_api._load_template_module_async", return_value=_FakeModule()
+        )
+        self._config_patcher.start()
+
+        self.server = TestServer(self.app)
+        self.client = TestClient(self.server)
+        await self.client.start_server()
+
+    async def asyncTearDown(self):
+        await self.client.close()
+        self._config_patcher.stop()
+        self._dist_patcher.stop()
+        self._dist_tmpdir.cleanup()
+
+    async def test_serves_shell_for_known_bot_with_miniapp_config(self):
+        resp = await self.client.get(f"/app/{KNOWN_BOT_ID}")
+        self.assertEqual(resp.status, 200)
+        body = await resp.text()
+        self.assertIn("fake shell", body)
+
+    async def test_unknown_bot_id_404s_before_serving_shell(self):
+        resp = await self.client.get("/app/999999")
+        self.assertEqual(resp.status, 404)
+
+    async def test_serves_static_asset_under_app_assets_prefix(self):
+        resp = await self.client.get("/app-assets/assets/index-test.js")
+        self.assertEqual(resp.status, 200)
+        body = await resp.text()
+        self.assertIn("fake bundle", body)
+
+    async def test_missing_dist_dir_returns_503(self):
+        self._dist_patcher.stop()
+        missing_dir = Path(self._dist_tmpdir.name) / "does_not_exist"
+        patcher = patch.object(miniapp_api_module, "_MINIAPP_DIST_DIR", missing_dir)
+        patcher.start()
+        try:
+            resp = await self.client.get(f"/app/{KNOWN_BOT_ID}")
+            self.assertEqual(resp.status, 503)
+        finally:
+            patcher.stop()
+            self._dist_patcher.start()  # so asyncTearDown's stop() call is balanced
 
 
 if __name__ == "__main__":
