@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import aiosqlite
 from cryptography.fernet import Fernet, InvalidToken
@@ -23,6 +24,61 @@ except (ValueError, TypeError) as e:
         "ENCRYPTION_KEY is invalid. Generate one with: "
         "python -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\""
     ) from e
+
+# Userbot (Telethon StringSession) encryption uses a SEPARATE key from
+# ENCRYPTION_KEY (bot tokens / payment provider tokens) — see
+# docs/USERBOT_CHANNEL_MONITOR_DESIGN.md §1: rotating one secret type must
+# not force rotating access to the other. Read lazily (not at import time)
+# so importing db.database doesn't hard-require USERBOT_ENCRYPTION_KEY for
+# code paths that never touch userbot_sessions (existing bots-table users,
+# tests unrelated to channel_monitor). The Fernet instance itself is built
+# once on first use and cached, mirroring _fernet above.
+_userbot_fernet: Fernet | None = None
+_userbot_fernet_key_used: str | None = None
+
+
+def _get_userbot_fernet() -> Fernet:
+    global _userbot_fernet, _userbot_fernet_key_used
+    key = os.getenv("USERBOT_ENCRYPTION_KEY")
+    if not key:
+        raise ValueError(
+            "USERBOT_ENCRYPTION_KEY is not set in .env — required to store/read Telegram "
+            "userbot sessions (channel_monitor). Generate one with: python -c "
+            "\"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\""
+        )
+    # Rebuild if the env var changed since last call (e.g. tests monkeypatching
+    # os.environ between cases) — cheap, and avoids a stale Fernet instance
+    # silently keeping an old key alive for the rest of the process.
+    if _userbot_fernet is None or _userbot_fernet_key_used != key:
+        try:
+            _userbot_fernet = Fernet(key.encode())
+        except (ValueError, TypeError) as e:
+            raise ValueError(
+                "USERBOT_ENCRYPTION_KEY is invalid. Generate one with: python -c "
+                "\"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\""
+            ) from e
+        _userbot_fernet_key_used = key
+    return _userbot_fernet
+
+
+def _encrypt_session(session_string: str | None) -> str | None:
+    if not session_string:
+        return session_string
+    return _get_userbot_fernet().encrypt(session_string.encode()).decode()
+
+
+def _decrypt_session(session_string: str | None) -> str | None:
+    if not session_string:
+        return session_string
+    try:
+        return _get_userbot_fernet().decrypt(session_string.encode()).decode()
+    except (InvalidToken, AttributeError, TypeError, ValueError):
+        # USERBOT_ENCRYPTION_KEY was rotated/changed since this session was
+        # encrypted (or the ciphertext is corrupt) — unrecoverable. Never log
+        # the undecryptable blob itself (could resemble session material);
+        # return None so callers treat this exactly like "no session".
+        logger.warning("Could not decrypt a userbot session — USERBOT_ENCRYPTION_KEY changed or ciphertext corrupt")
+        return None
 
 
 def _encrypt_token(token: str | None) -> str | None:
@@ -139,6 +195,42 @@ async def init_db():
                 spreadsheet_id TEXT NOT NULL,
                 sheet_title    TEXT,
                 connected_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        # channel_monitor (userbot/Telethon product) — see
+        # docs/USERBOT_CHANNEL_MONITOR_DESIGN.md §1, §4. Lives in the central
+        # factory DB (not a per-tenant-bot DB): a userbot session belongs to
+        # the factory client (owner_user_id), not to any single rented bot.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS userbot_sessions (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_user_id   INTEGER NOT NULL,
+                phone           TEXT NOT NULL,
+                session_string  TEXT,
+                status          TEXT DEFAULT 'pending',
+                created_at      TEXT DEFAULT (datetime('now','localtime')),
+                updated_at      TEXT DEFAULT (datetime('now','localtime'))
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS monitored_channels (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_user_id     INTEGER NOT NULL,
+                channel_username  TEXT,
+                channel_id        INTEGER,
+                channel_title     TEXT,
+                active            INTEGER DEFAULT 1,
+                added_at          TEXT DEFAULT (datetime('now','localtime'))
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS channel_posts (
+                id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+                monitored_channel_id INTEGER NOT NULL REFERENCES monitored_channels(id),
+                message_id           INTEGER,
+                text                 TEXT,
+                posted_at            TEXT DEFAULT (datetime('now','localtime')),
+                summary              TEXT
             )
         """)
         await db.commit()
@@ -405,3 +497,277 @@ async def update_bot_status(bot_id: int, status: str, pid: int | None = None):
                 (status, bot_id),
             )
         await db.commit()
+
+
+
+# ── userbot_sessions (channel_monitor) ──────────────────────────────────────
+# See docs/USERBOT_CHANNEL_MONITOR_DESIGN.md §1. session_string is Fernet-
+# encrypted with USERBOT_ENCRYPTION_KEY (_encrypt_session/_decrypt_session
+# above) — a SEPARATE key from ENCRYPTION_KEY (bot tokens).
+
+def _decrypt_userbot_row(row: dict) -> dict:
+    if "session_string" in row:
+        row["session_string"] = _decrypt_session(row["session_string"])
+    return row
+
+
+async def create_userbot_session(owner_user_id: int, phone: str) -> int:
+    """Inserts the 'pending' row an auth FSM attaches to as it progresses —
+    same idea as create_bot_record_with_admins: one row per authorization
+    attempt, status starts 'pending', session_string is NULL until sign-in
+    succeeds (activate_userbot_session below)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "INSERT INTO userbot_sessions (owner_user_id, phone, status) VALUES (?, ?, 'pending')",
+            (owner_user_id, phone),
+        )
+        await db.commit()
+        return cursor.lastrowid
+
+
+async def activate_userbot_session(session_id: int, session_string: str) -> None:
+    """Encrypts and stores the completed Telethon StringSession, marking the
+    row 'active'. The plaintext session_string exists only in the caller's
+    memory up to this call — never logged, never persisted unencrypted."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE userbot_sessions SET session_string = ?, status = 'active', "
+            "updated_at = datetime('now','localtime') WHERE id = ?",
+            (_encrypt_session(session_string), session_id),
+        )
+        await db.commit()
+    logger.info(f"activate_userbot_session: session_id={session_id} is now active")
+
+
+async def mark_userbot_session_failed(session_id: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE userbot_sessions SET status = 'auth_failed', updated_at = datetime('now','localtime') "
+            "WHERE id = ?",
+            (session_id,),
+        )
+        await db.commit()
+
+
+async def set_userbot_session_active(session_id: int, session_string: str) -> None:
+    """Alias for activate_userbot_session — matches
+    templates/channel_monitor.py's call-site naming for the FSM success path."""
+    await activate_userbot_session(session_id, session_string)
+
+
+async def set_userbot_session_status(session_id: int, status: str) -> None:
+    """Generic status setter (status in {'pending','active','revoked','auth_failed'})
+    used by templates/channel_monitor.py's FSM failure paths (e.g. marking
+    'auth_failed' after too many bad codes) — unlike revoke_userbot_session,
+    does NOT touch session_string, since these failure paths never had one."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE userbot_sessions SET status = ?, updated_at = datetime('now','localtime') WHERE id = ?",
+            (status, session_id),
+        )
+        await db.commit()
+
+
+async def revoke_userbot_session(session_id: int) -> None:
+    """Per design §1: the row is kept for audit ('revoked', not deleted), but
+    session_string is wiped — reconnecting after revoke requires a full new
+    authorization, not a resume."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE userbot_sessions SET session_string = NULL, status = 'revoked', "
+            "updated_at = datetime('now','localtime') WHERE id = ?",
+            (session_id,),
+        )
+        await db.commit()
+    logger.info(f"revoke_userbot_session: session_id={session_id} revoked")
+
+
+async def get_userbot_session(session_id: int) -> dict | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM userbot_sessions WHERE id = ?", (session_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            return _decrypt_userbot_row(dict(row)) if row else None
+
+
+async def get_userbot_session_by_owner(owner_user_id: int) -> dict | None:
+    """A factory client is expected to have at most one userbot session at a
+    time — most recent row wins if somehow more than one exists (e.g. after a
+    revoke + re-authorization)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM userbot_sessions WHERE owner_user_id = ? ORDER BY id DESC LIMIT 1",
+            (owner_user_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return _decrypt_userbot_row(dict(row)) if row else None
+
+
+async def get_userbot_sessions_by_owner(owner_user_id: int) -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM userbot_sessions WHERE owner_user_id = ? ORDER BY created_at DESC",
+            (owner_user_id,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [_decrypt_userbot_row(dict(row)) for row in rows]
+
+
+async def get_active_userbot_sessions() -> list[dict]:
+    """Used by runtime/userbot_worker.py on startup to restore every active
+    client — same role restore_bots() plays for tenant bots in main.py."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM userbot_sessions WHERE status = 'active'"
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [_decrypt_userbot_row(dict(row)) for row in rows]
+
+
+# ── monitored_channels (channel_monitor) ────────────────────────────────────
+
+async def add_monitored_channel(
+    owner_user_id: int,
+    channel_username: str | None,
+    channel_id: int | None,
+    channel_title: str | None,
+) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "INSERT INTO monitored_channels (owner_user_id, channel_username, channel_id, channel_title) "
+            "VALUES (?, ?, ?, ?)",
+            (owner_user_id, channel_username, channel_id, channel_title),
+        )
+        await db.commit()
+        return cursor.lastrowid
+
+
+async def get_monitored_channels(owner_user_id: int, active_only: bool = False) -> list[dict]:
+    query = "SELECT * FROM monitored_channels WHERE owner_user_id = ?"
+    params: list = [owner_user_id]
+    if active_only:
+        query += " AND active = 1"
+    query += " ORDER BY added_at DESC"
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(query, params) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
+
+async def get_monitored_channels_by_owner(owner_user_id: int) -> list[dict]:
+    """Alias for get_monitored_channels(owner_user_id) — kept as a separate
+    name matching templates/channel_monitor.py's call sites (mirrors
+    get_userbot_sessions_by_owner's naming), same query underneath."""
+    return await get_monitored_channels(owner_user_id)
+
+
+async def get_monitored_channel(channel_row_id: int) -> dict | None:
+    """channel_row_id is monitored_channels.id (the PK), not the Telegram
+    channel id — same naming ambiguity as bot_id elsewhere in this file."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM monitored_channels WHERE id = ?", (channel_row_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+
+async def get_all_active_monitored_channels() -> list[dict]:
+    """Used by runtime/userbot_worker.py to know which channels each restored
+    client should subscribe events.NewMessage on."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM monitored_channels WHERE active = 1"
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
+
+async def get_active_monitored_channels() -> list[dict]:
+    """Alias for get_all_active_monitored_channels — matches
+    runtime/userbot_worker.py's call-site naming."""
+    return await get_all_active_monitored_channels()
+
+
+async def set_monitored_channel_active(channel_row_id: int, active: bool) -> None:
+    """Toggle used by the "📋 Мои каналы" list — channel_row_id is monitored_channels.id."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE monitored_channels SET active = ? WHERE id = ?",
+            (1 if active else 0, channel_row_id),
+        )
+        await db.commit()
+
+
+async def set_monitored_channel_resolved(channel_row_id: int, channel_id: int, channel_title: str | None) -> None:
+    """Fills in channel_id/channel_title once client.get_entity() resolves the
+    @username the client typed — see design §4."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE monitored_channels SET channel_id = ?, channel_title = ? WHERE id = ?",
+            (channel_id, channel_title, channel_row_id),
+        )
+        await db.commit()
+
+
+# ── channel_posts (channel_monitor) ─────────────────────────────────────────
+
+async def add_channel_post(monitored_channel_id: int, message_id: int | None, text: str | None) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "INSERT INTO channel_posts (monitored_channel_id, message_id, text) VALUES (?, ?, ?)",
+            (monitored_channel_id, message_id, text),
+        )
+        await db.commit()
+        return cursor.lastrowid
+
+
+async def set_channel_post_summary(post_id: int, summary: str) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE channel_posts SET summary = ? WHERE id = ?", (summary, post_id)
+        )
+        await db.commit()
+
+
+async def get_posts_missing_summary(limit: int = 20) -> list[dict]:
+    """Used by the background Gemini-summarization loop in
+    runtime/userbot_worker.py to pick up posts batched since the last run,
+    oldest first so a backlog drains in order."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM channel_posts WHERE summary IS NULL ORDER BY id ASC LIMIT ?",
+            (limit,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
+
+async def get_recent_posts_for_owner(owner_user_id: int, limit: int = 10) -> list[dict]:
+    """Powers the «📰 Лента» screen — most recent posts across all of this
+    owner's ACTIVE monitored channels, newest first. Joins in channel_title/
+    channel_username so the feed can label which channel each post came from."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """
+            SELECT cp.*, mc.channel_title, mc.channel_username
+            FROM channel_posts cp
+            JOIN monitored_channels mc ON mc.id = cp.monitored_channel_id
+            WHERE mc.owner_user_id = ? AND mc.active = 1
+            ORDER BY cp.id DESC
+            LIMIT ?
+            """,
+            (owner_user_id, limit),
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]

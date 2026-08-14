@@ -7,3 +7,5 @@ openpyxl==3.1.5
 aiohttp==3.10.11
 cryptography==49.0.0
 gspread==6.2.1
+telethon==1.36.0
+google-genai==0.3.0
