@@ -647,6 +647,27 @@ async def build_entry(
         await _load_and_include_features(dp, bot, bot_id, typed_config.db_path)
         await _load_and_include_custom_feature(dp, bot_id, typed_config.db_path)
 
+    # "Офисы" (docs/OFFICES_DESIGN.md) — by-convention opt-in, same pattern as
+    # `router`/`init_db`/`config_from_bot_row`: a template that wants to
+    # RECEIVE office events exposes a module-level on_office_event(event,
+    # config) coroutine; features/office_events.py's publish_event() looks it
+    # up via BotEntry.config["on_office_event"] set here. Deliberately checked
+    # even when typed_config is None (module resolved but has no
+    # config_from_bot_row-driven db_path) — this hook doesn't need db_path,
+    # unlike the feature-loading block above. Imported locally (not at module
+    # top) to avoid a circular import: features/office_events.py imports
+    # runtime.registry_holder, not runtime.registry itself, so this is a
+    # one-way dependency edge (registry -> office_events), never the reverse.
+    if module is not None:
+        on_office_event = getattr(module, "on_office_event", None)
+        if on_office_event is not None:
+            from features.office_events import register_office_event_hook
+
+            async def _office_event_hook(event, _handler=on_office_event, _config=typed_config or config):
+                await _handler(event, _config)
+
+            register_office_event_hook(config, _office_event_hook)
+
     return BotEntry(bot=bot, dispatcher=dp, template_id=template_id, config=config)
 
 

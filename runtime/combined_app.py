@@ -52,6 +52,7 @@ from handlers.general import router as general_router
 from handlers.manage_bots import router as manage_router, set_registry as set_manage_bots_registry
 from handlers.start import router as start_router
 from main import ManagedBotMiddleware, build_group_router, restore_bots
+from features.office_events import set_registry as set_office_events_registry
 from runtime.registry import FACTORY_BOT_ID, build_factory_entry, build_registry
 from runtime.factory_analytics_api import register_routes as register_factory_analytics_routes
 from runtime.miniapp_api import register_routes as register_miniapp_routes
@@ -137,6 +138,7 @@ async def _bootstrap_app() -> web.Application:
     set_registry(registry)
     set_manage_bots_registry(registry)
     set_custom_features_registry(registry)
+    set_office_events_registry(registry)
 
     logger.info(f"Combined registry built: {len(registry)} bot(s), including the factory bot")
     app = create_app(registry)
