@@ -161,7 +161,7 @@ async def init_db():
                 PRIMARY KEY (bot_id, telegram_id)
             )
         """)
-        for col in ("display_name TEXT", "group_chat_id TEXT"):
+        for col in ("display_name TEXT", "group_chat_id TEXT", "archived_at TIMESTAMP"):
             try:
                 await db.execute(f"ALTER TABLE bots ADD COLUMN {col}")
             except aiosqlite.OperationalError:
@@ -187,6 +187,15 @@ async def init_db():
                 bot_id      INTEGER NOT NULL REFERENCES bots(id),
                 description TEXT NOT NULL,
                 applied_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS bot_feedback (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                bot_id     INTEGER NOT NULL REFERENCES bots(id),
+                rating     INTEGER NOT NULL,
+                comment    TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
         await db.execute("""
@@ -533,6 +542,69 @@ async def get_custom_feature_history(bot_id: int) -> list[dict]:
             "WHERE bot_id = ? ORDER BY id DESC",
             (bot_id,),
         ) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
+
+async def add_bot_feedback(bot_id: int, rating: int, comment: str | None = None) -> None:
+    """Append-only, like add_custom_feature_record — the owner can leave
+    feedback more than once per bot as things change, so this is a history
+    trail, not a 1:1 upsert (unlike bot_sheets_config/bot_miniapp_config)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO bot_feedback (bot_id, rating, comment) VALUES (?, ?, ?)",
+            (bot_id, rating, comment),
+        )
+        await db.commit()
+    logger.info(f"add_bot_feedback: bot_id={bot_id} rating={rating}")
+
+
+async def get_bot_feedback(bot_id: int) -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT id, rating, comment, created_at FROM bot_feedback "
+            "WHERE bot_id = ? ORDER BY id DESC",
+            (bot_id,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
+
+async def list_bots_with_stats() -> list[dict]:
+    """One row per bot for the factory analytics dashboard (see
+    docs/FACTORY_ANALYTICS_DESIGN.md): created_at/status/archived_at straight
+    off `bots`, plus aggregate counts joined in. Deliberately excludes
+    `token` (encrypted at rest — see _decrypt_row/_encrypt_token — this
+    dashboard has no business decrypting it) and file_path (template is
+    derived from it separately via runtime.registry.infer_template_id, kept
+    out of the DB layer to avoid a db/database.py -> runtime/registry.py
+    import). Feature list comes back as a comma-joined string (SQLite has no
+    array type); callers split on ',' and filter empties."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("""
+            SELECT
+                b.id, b.name, b.username, b.display_name, b.status,
+                b.created_at, b.archived_at, b.file_path,
+                COALESCE(f.features, '') AS features,
+                COALESCE(c.edits_count, 0) AS edits_count,
+                r.avg_rating, r.feedback_count
+            FROM bots b
+            LEFT JOIN (
+                SELECT bot_id, GROUP_CONCAT(feature_name, ',') AS features
+                FROM bot_features GROUP BY bot_id
+            ) f ON f.bot_id = b.id
+            LEFT JOIN (
+                SELECT bot_id, COUNT(*) AS edits_count
+                FROM bot_custom_features GROUP BY bot_id
+            ) c ON c.bot_id = b.id
+            LEFT JOIN (
+                SELECT bot_id, AVG(rating) AS avg_rating, COUNT(*) AS feedback_count
+                FROM bot_feedback GROUP BY bot_id
+            ) r ON r.bot_id = b.id
+            ORDER BY b.created_at DESC
+        """) as cursor:
             rows = await cursor.fetchall()
             return [dict(row) for row in rows]
 

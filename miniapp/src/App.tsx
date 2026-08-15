@@ -5,6 +5,16 @@ import { getTelegramWebApp } from './lib/telegram'
 import { ListScreen } from './screens/ListScreen'
 import { DetailScreen } from './screens/DetailScreen'
 import { CreateFormScreen } from './screens/CreateFormScreen'
+import { FactoryDashboardScreen } from './screens/FactoryDashboardScreen'
+
+// bot_id=0 is the reserved FACTORY_BOT_ID (runtime/registry.py) — the
+// factory's own /app command opens /app/0, which has no per-bot
+// miniapp_config/resources of its own and instead gets the owner-only
+// analytics dashboard (runtime/factory_analytics_api.py) rather than the
+// generic per-bot resource list/detail/create routes below.
+function isFactoryBotPath(): boolean {
+  return /\/app\/0(\/|$)/.test(window.location.pathname)
+}
 
 type Route =
   | { kind: 'list'; resource: string }
@@ -23,6 +33,10 @@ export default function App() {
     webApp?.ready()
     webApp?.expand()
   }, [])
+
+  if (isFactoryBotPath()) {
+    return <FactoryDashboardScreen />
+  }
 
   return (
     <div>

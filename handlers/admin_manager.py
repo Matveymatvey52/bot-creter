@@ -50,6 +50,42 @@ def _bots_keyboard(bots: list[dict], action: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+# ── /analytics ─────────────────────────────────────────────────────────────────
+# Opens the owner-only factory dashboard (runtime/factory_analytics_api.py) —
+# same magic-link pattern as templates/tour_operator.py's cmd_app/_miniapp_url,
+# just targeting FACTORY_BOT_ID (the mini-app SPA's /app/0 route, see
+# runtime/miniapp_api.py's serve_app_shell special case for that bot_id and
+# miniapp/src/App.tsx's isFactoryBotPath()) instead of a tenant bot.
+
+def _analytics_url(telegram_user_id: int) -> str | None:
+    from runtime.miniapp_api import mint_magic_link_token
+    from runtime.registry import FACTORY_BOT_ID
+
+    railway_domain = os.getenv("RAILWAY_PUBLIC_DOMAIN", "")
+    port = os.getenv("PORT", "8080")
+    base_url = f"https://{railway_domain}" if railway_domain else f"http://localhost:{port}"
+    try:
+        token = mint_magic_link_token(FACTORY_BOT_ID, telegram_user_id)
+    except RuntimeError:
+        return None
+    return f"{base_url}/app/{FACTORY_BOT_ID}?token={token}"
+
+
+@router.message(Command("analytics"))
+async def cmd_analytics(message: Message):
+    if not _is_owner(message.from_user.id):
+        return
+    url = _analytics_url(message.from_user.id)
+    if url is None:
+        await message.answer("Дашборд недоступен: не настроен MINIAPP_SECRET.")
+        return
+    await message.answer(
+        f'<a href="{url}">📊 Открыть аналитику фабрики</a>',
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+
+
 # ── /addadmin ──────────────────────────────────────────────────────────────────
 
 @router.message(Command("addadmin"))
