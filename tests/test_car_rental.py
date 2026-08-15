@@ -17,6 +17,7 @@ Run with: python -m unittest tests.test_car_rental
 from __future__ import annotations
 
 import asyncio
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -460,6 +461,90 @@ class CarRentalStandaloneSmokeTest(unittest.TestCase):
         self.assertIsNone(car_rental._parse_date("not-a-date"))
         self.assertIsNone(car_rental._parse_date("2020-01-01"))
         self.assertIsNone(car_rental._parse_date("2026-13-40"))
+
+
+class CarRentalMiniAppConfigTests(unittest.IsolatedAsyncioTestCase):
+    """miniapp_config's declared table/field names must match init_db()'s
+    real schema — miniapp_api.py builds SQL directly off these names, so a
+    drift here would 500 at request time instead of failing a test."""
+
+    def test_miniapp_config_resource_names(self):
+        names = {r["name"] for r in car_rental.miniapp_config["resources"]}
+        self.assertEqual(names, {"cars", "bookings"})
+
+    def test_cars_resource_targets_rental_items_table(self):
+        cars = next(r for r in car_rental.miniapp_config["resources"] if r["name"] == "cars")
+        self.assertEqual(cars["table"], "rental_items")
+        self.assertTrue(cars["creatable"])
+        self.assertIn("name", {f["name"] for f in cars["fields"]})
+
+    def test_bookings_resource_targets_rental_bookings_table(self):
+        bookings = next(r for r in car_rental.miniapp_config["resources"] if r["name"] == "bookings")
+        self.assertEqual(bookings["table"], "rental_bookings")
+        field_names = {f["name"] for f in bookings["fields"]}
+        self.assertEqual(
+            field_names,
+            {"item_id", "client_user_id", "client_name", "client_phone",
+             "start_date", "end_date", "status", "created_at"},
+        )
+
+    async def test_miniapp_config_fields_match_real_schema(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "schema_check.db")
+            await car_rental.init_db(db_path)
+            async with aiosqlite.connect(db_path) as db:
+                for resource in car_rental.miniapp_config["resources"]:
+                    cur = await db.execute(f"PRAGMA table_info({resource['table']})")
+                    real_columns = {row[1] for row in await cur.fetchall()}
+                    declared = {f["name"] for f in resource["fields"]} | {"id"}
+                    self.assertTrue(
+                        declared.issubset(real_columns),
+                        f"{resource['name']}: declared fields {declared} not all in "
+                        f"real columns {real_columns}",
+                    )
+
+
+class CarRentalAppCommandTests(unittest.IsolatedAsyncioTestCase):
+    """/app command + the "🌐 Веб-приложение" menu button — same magic-link
+    pattern as templates/tour_operator.py's cmd_app (see
+    tests/test_tour_operator_isolation.py's equivalent tests)."""
+
+    async def _send(self, text_or_callback: str, is_callback: bool = False) -> list[str]:
+        bot_call_mock = AsyncMock(return_value=MagicMock())
+        with patch.object(Bot, "__call__", new=bot_call_mock):
+            with tempfile.TemporaryDirectory() as tmp:
+                config = car_rental.config_from_bot_row(
+                    {"bot_id": 901, "name": "car_rental_app_bot", "display_name": None, "group_chat_id": None},
+                    Path(tmp),
+                )
+                await car_rental.init_db(config.db_path)
+                bot, dp = _build_bot_dispatcher(config)
+                await dp.feed_webhook_update(bot, _text_update(1, ADMIN_ID, "/start"))
+                if is_callback:
+                    await dp.feed_webhook_update(bot, _callback_update(2, ADMIN_ID, text_or_callback))
+                else:
+                    await dp.feed_webhook_update(bot, _text_update(2, ADMIN_ID, text_or_callback))
+        return [
+            call.args[0].text for call in bot_call_mock.call_args_list
+            if getattr(call.args[0], "text", None)
+        ]
+
+    async def test_app_command_shows_url_when_miniapp_secret_configured(self):
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "test-secret"}):
+            sent_texts = await self._send("/app")
+        self.assertTrue(any("http://" in t or "https://" in t for t in sent_texts))
+
+    async def test_app_command_shows_unavailable_message_when_miniapp_secret_missing(self):
+        with patch.dict(os.environ):
+            os.environ.pop("MINIAPP_SECRET", None)
+            sent_texts = await self._send("/app")
+        self.assertTrue(any("не настроен MINIAPP_SECRET" in t for t in sent_texts))
+        self.assertTrue(all("http://" not in t and "https://" not in t for t in sent_texts))
+
+    async def test_miniapp_link_button_shows_url_when_configured(self):
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "test-secret"}):
+            sent_texts = await self._send("miniapp_link", is_callback=True)
+        self.assertTrue(any("http://" in t or "https://" in t for t in sent_texts))
 
 
 if __name__ == "__main__":
