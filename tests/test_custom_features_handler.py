@@ -22,7 +22,14 @@ from aiogram.fsm.storage.memory import MemoryStorage
 
 import handlers.custom_features as cf_module
 import runtime.registry as reg
-from db.database import add_custom_feature_record, create_bot_record_with_admins, delete_bot, get_custom_feature_history, init_db
+from db.database import (
+    add_custom_feature_record,
+    create_bot_record_with_admins,
+    delete_bot,
+    get_bot_miniapp_config,
+    get_custom_feature_history,
+    init_db,
+)
 from services.claude_service import CustomFeatureGenerationError
 
 FAKE_TOKEN = "123456789:AAHfakeTokenButShapedRight1234567890"
@@ -166,6 +173,78 @@ class HappyPathAppliesPatchTests(_CustomFeatureHandlerTestBase):
         self.assertEqual(len(history), 1)
         self.assertEqual(history[0]["description"], "добавь команду /ping")
         self.assertIsNone(await state.get_state())
+
+
+class ApplyRegeneratesMiniappConfigTests(_CustomFeatureHandlerTestBase):
+    """See docs/MINIAPP_DESIGN.md §6: a successful apply must trigger a
+    miniapp_config regeneration, since a custom_features patch can add its
+    own tables and leave a previously-stored config stale. Fired via
+    asyncio.create_task (fire-and-forget, must not block/delay the apply
+    response) — patched here to run synchronously so it's observable."""
+
+    owner_id = 600010
+
+    async def _apply_patch_and_wait_for_regeneration(self, state):
+        """asyncio.create_task is fire-and-forget in the handler; capture the
+        coroutine it schedules and await it directly instead of sleeping/
+        polling for it to finish on its own."""
+        scheduled = []
+        real_create_task = __import__("asyncio").create_task
+
+        def _capturing_create_task(coro, *a, **kw):
+            scheduled.append(coro)
+            return MagicMock()  # stand-in Task, never actually scheduled
+
+        with patch.object(cf_module.asyncio, "create_task", side_effect=_capturing_create_task):
+            apply_callback = _make_callback(self.owner_id, f"applycustom:{self.bot_id}")
+            await cf_module.cb_apply_custom_feature(apply_callback, state)
+
+        # The github-push task is also scheduled via create_task — run every
+        # captured coroutine; only the miniapp-config one has an observable
+        # DB effect, the others are no-ops against the fakes in this test.
+        for coro in scheduled:
+            await coro
+
+    async def test_apply_triggers_regeneration_that_persists_a_valid_config(self):
+        state = _make_fsm_context(self.owner_id)
+        start_callback = _make_callback(self.owner_id, f"customfeature:{self.bot_id}")
+        await cf_module.cb_start_custom_feature(start_callback, state)
+
+        message = _make_message(self.owner_id, "добавь таблицу заказов")
+        with patch.object(cf_module, "generate_custom_feature", AsyncMock(return_value=_CLEAN_PATCH_SOURCE)), \
+             patch.object(cf_module, "explain_custom_feature", AsyncMock(return_value="ok")):
+            await cf_module.msg_custom_feature_text(message, state)
+
+        fake_config = {
+            "resources": [{"name": "orders", "table": "orders", "fields": [{"name": "x"}]}]
+        }
+        with patch.object(cf_module, "_generate_miniapp_config", AsyncMock(return_value=fake_config)):
+            await self._apply_patch_and_wait_for_regeneration(state)
+
+        self.assertEqual(await get_bot_miniapp_config(self.bot_id), fake_config)
+
+    async def test_regeneration_failure_does_not_break_the_apply(self):
+        """_generate_miniapp_config already never raises on its own (see
+        tests/test_miniapp_config_claude_service.py), but the hook wrapping
+        it must also survive an unexpected exception without propagating —
+        the apply itself (file write, history record, reload) must have
+        already fully succeeded by the time this runs."""
+        state = _make_fsm_context(self.owner_id)
+        start_callback = _make_callback(self.owner_id, f"customfeature:{self.bot_id}")
+        await cf_module.cb_start_custom_feature(start_callback, state)
+
+        message = _make_message(self.owner_id, "добавь команду /ping")
+        with patch.object(cf_module, "generate_custom_feature", AsyncMock(return_value=_CLEAN_PATCH_SOURCE)), \
+             patch.object(cf_module, "explain_custom_feature", AsyncMock(return_value="ok")):
+            await cf_module.msg_custom_feature_text(message, state)
+
+        with patch.object(cf_module, "_generate_miniapp_config", AsyncMock(side_effect=RuntimeError("boom"))):
+            await self._apply_patch_and_wait_for_regeneration(state)
+
+        module_path = self.cf_dir / f"bot_{self.bot_id}.py"
+        self.assertTrue(module_path.exists())
+        self._fake_registry.reload_one.assert_awaited_once_with(self.bot_id)
+        self.assertIsNone(await get_bot_miniapp_config(self.bot_id))
 
 
 class GenerationErrorOffersRetryTests(_CustomFeatureHandlerTestBase):

@@ -25,6 +25,7 @@ from db.database import (
     get_bot_by_name,
     get_bot_features,
     get_bot_sheets_config,
+    set_bot_miniapp_config,
     set_bot_sheets_config,
     update_bot_status,
     update_bot_username,
@@ -804,6 +805,7 @@ async def cb_recreate(callback: CallbackQuery):
             except Exception:
                 pass
 
+        regenerating_from_scratch = not current_code
         if current_code:
             await callback.message.edit_text(f"✨ Улучшаю код <b>{b['name']}</b>...", parse_mode="HTML")
             task = improve_bot_code(current_code, b.get("description", ""))
@@ -811,8 +813,10 @@ async def cb_recreate(callback: CallbackQuery):
             await callback.message.edit_text(f"🔧 Генерирую код для <b>{b['name']}</b>...", parse_mode="HTML")
             task = generate_bot_code(b.get("description", ""))
 
+        miniapp_config: dict | None = None
         try:
-            code = await asyncio.wait_for(task, timeout=240.0)
+            result = await asyncio.wait_for(task, timeout=240.0)
+            code, miniapp_config = result if regenerating_from_scratch else (result, None)
         except Exception as e:
             logger.error(f"Failed to regenerate bot {bot_id}: {e}")
             await callback.message.edit_text(
@@ -829,6 +833,9 @@ async def cb_recreate(callback: CallbackQuery):
         bot_file = Path(b["file_path"])
         bot_file.write_text(code, encoding="utf-8")
         asyncio.create_task(push_bot_to_github(b["name"], code))
+
+        if miniapp_config:
+            await set_bot_miniapp_config(bot_id, miniapp_config)
 
         try:
             pid = await start_bot(bot_id, str(bot_file), b["token"], extra_env=_make_extra_env(b))

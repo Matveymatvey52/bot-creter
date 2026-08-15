@@ -33,7 +33,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-from db.database import add_custom_feature_record, get_bot, get_custom_feature_history
+from db.database import add_custom_feature_record, get_bot, get_custom_feature_history, set_bot_miniapp_config
 from handlers.admin_manager import _is_owner
 from handlers.create_bot import cancel_keyboard
 from handlers.manage_bots import _bot_keyboard, _busy_bots, _recognize_voice_fix
@@ -41,6 +41,7 @@ from runtime.registry import _CUSTOM_FEATURES_DIR, invalidate_custom_feature_cac
 from runtime.registry_holder import RegistryHandle
 from services.claude_service import (
     CustomFeatureGenerationError,
+    _generate_miniapp_config,
     check_forbidden_imports,
     explain_custom_feature,
     generate_custom_feature,
@@ -279,6 +280,22 @@ async def msg_custom_feature_fallback(message: Message, state: FSMContext) -> No
     )
 
 
+async def _regenerate_miniapp_config_after_custom_feature(
+    bot_id: int, main_code: str, patch_code: str, description: str
+) -> None:
+    """Runs after a custom_features patch is applied — see the call site's
+    comment. Never raises: _generate_miniapp_config already never raises, and
+    a failure to persist here must not surface anywhere the owner would see
+    it (this task is created fire-and-forget, nothing awaits it)."""
+    try:
+        combined_code = f"{main_code}\n\n# ── custom_features/bot_{bot_id}.py ──\n{patch_code}"
+        miniapp_config = await _generate_miniapp_config(combined_code, description)
+        if miniapp_config:
+            await set_bot_miniapp_config(bot_id, miniapp_config)
+    except Exception as e:
+        logger.warning(f"_regenerate_miniapp_config_after_custom_feature: bot_id={bot_id} failed: {type(e).__name__}: {e}")
+
+
 @router.callback_query(F.data.startswith("applycustom:"))
 async def cb_apply_custom_feature(callback: CallbackQuery, state: FSMContext) -> None:
     if not _is_owner(callback.from_user.id):
@@ -406,6 +423,18 @@ async def cb_apply_custom_feature(callback: CallbackQuery, state: FSMContext) ->
         else:
             logger.debug(f"cb_apply_custom_feature: no live registry available — bot_id={bot_id} written to disk only")
         asyncio.create_task(push_bot_to_github(f"bot_{bot_id}", patch_code, subdir="custom_features"))
+
+        # Regenerate miniapp_config (see docs/MINIAPP_DESIGN.md §6) — a
+        # custom_features module can add its own tables (same DB_PATH as the
+        # main bot, see CUSTOM_FEATURE_SYSTEM_PROMPT's aiosqlite guidance), so
+        # the previously stored config can go stale relative to the real
+        # schema. Fire-and-forget: never blocks or fails the apply itself —
+        # same never-raises contract as generate_bot_code's own call to this
+        # function. Combined source (main file + patch) so the schema scan
+        # sees every real table, not just the main file's.
+        asyncio.create_task(
+            _regenerate_miniapp_config_after_custom_feature(bot_id, current_main_code, patch_code, b.get("description", ""))
+        )
 
         await callback.message.edit_text(
             f"✅ Доработка для <b>{html.escape(b['name'])}</b> применена и подключена.",
