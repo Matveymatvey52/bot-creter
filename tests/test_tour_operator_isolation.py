@@ -190,8 +190,8 @@ class TourOperatorIsolationTests(unittest.IsolatedAsyncioTestCase):
         admins_a = json.loads(Path(self.config_a.admins_file).read_text())
         admins_b = json.loads(Path(self.config_b.admins_file).read_text())
 
-        self.assertEqual(admins_a, [SAME_USER_ID])
-        self.assertEqual(admins_b, [999])
+        self.assertEqual(admins_a, {"ids": [str(SAME_USER_ID)]})
+        self.assertEqual(admins_b, {"ids": ["999"]})
 
     async def test_same_name_different_bot_id_still_isolated(self):
         """The actual case this phase closes: bots.name has no UNIQUE

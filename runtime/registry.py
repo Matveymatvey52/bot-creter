@@ -646,6 +646,12 @@ async def build_entry(
     if typed_config is not None:
         await _load_and_include_features(dp, bot, bot_id, typed_config.db_path)
         await _load_and_include_custom_feature(dp, bot_id, typed_config.db_path)
+        # runtime/miniapp_api.py's handlers read entry.config.get("db_path")
+        # (the BotEntry.config dict below, not typed_config) — without this,
+        # every mini-app write/read call 500s with "bot has no database
+        # configured" even though the bot itself works fine, since
+        # typed_config was otherwise only used internally above.
+        config["db_path"] = typed_config.db_path
 
     # "Офисы" (docs/OFFICES_DESIGN.md) — by-convention opt-in, same pattern as
     # `router`/`init_db`/`config_from_bot_row`: a template that wants to

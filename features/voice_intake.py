@@ -68,27 +68,28 @@ class VoiceIntakeConfig(Protocol):
 
 
 def _is_admin(user_id: int, admins_file: str | None) -> bool:
-    """Reproduces templates/tour_operator.py's own _is_admin() read-path
-    (plain JSON list of ids, via json.load — NOT features/sellable_items.py's
-    different `{"ids": [...]}` shape, a different admins_file format
-    entirely). The original on_voice handler gated on this before doing
-    anything else; that gate moved here so it isn't lost in the extraction.
+    """Reproduces templates/tour_operator.py's own _is_admin() read-path —
+    the `{"ids": [...]}` shape with string ids (db.database.sync_bot_admins_json's
+    format, same as features/sellable_items.py's admins_file convention).
+    The original on_voice handler gated on this before doing anything else;
+    that gate moved here so it isn't lost in the extraction.
 
-    Deliberately does NOT reproduce the original _is_admin's
-    self-registration side effect (auto-writing [uid] as the sole admin the
-    first time an empty admins list is seen) — that bootstrap belongs to
-    /start, the user's first-ever interaction with the bot, not to a voice
-    message that could arrive from anyone. An empty/missing/unreadable
-    admins_file here fails CLOSED (no one is admin yet), leaving the actual
-    bootstrap to happen the normal way via /start first."""
+    Deliberately does NOT reproduce _is_admin's self-registration side effect
+    (auto-writing the caller as the sole admin the first time an empty admins
+    list is seen) — that bootstrap belongs to /start, the user's first-ever
+    interaction with the bot, not to a voice message that could arrive from
+    anyone. An empty/missing/unreadable admins_file here fails CLOSED (no one
+    is admin yet), leaving the actual bootstrap to happen the normal way via
+    /start first."""
     if not admins_file:
         return True
     try:
         with open(admins_file) as f:
-            admins = json.load(f)
+            data = json.load(f)
+        admins = data.get("ids", []) if isinstance(data, dict) else data
     except Exception:
         return False
-    return user_id in admins
+    return str(user_id) in admins
 
 
 # ── Schema registration API ──────────────────────────────────────────────────
