@@ -146,6 +146,61 @@ class ParseMiniappConfig(unittest.TestCase):
     def test_not_a_dict_returns_none(self):
         self.assertIsNone(claude_service._parse_miniapp_config("[1, 2, 3]", SAMPLE_BOT_CODE))
 
+    def test_display_metadata_passes_through_when_present(self):
+        with_display = """{
+            "resources": [
+                {
+                    "name": "orders", "table": "orders", "creatable": true,
+                    "title": "Заказы", "titleField": "customer_name",
+                    "fields": [
+                        {"name": "customer_name", "required": true, "label": "Клиент", "kind": "text", "list": true, "detail": true, "create": true},
+                        {"name": "status", "label": "Статус", "kind": "status", "list": true, "detail": true, "create": false}
+                    ]
+                }
+            ]
+        }"""
+        result = claude_service._parse_miniapp_config(with_display, SAMPLE_BOT_CODE)
+        self.assertIsNotNone(result)
+        resource = result["resources"][0]
+        self.assertEqual(resource["title"], "Заказы")
+        self.assertEqual(resource["titleField"], "customer_name")
+        self.assertEqual(resource["fields"][0]["label"], "Клиент")
+        self.assertEqual(resource["fields"][0]["kind"], "text")
+        self.assertTrue(resource["fields"][1]["list"])
+
+    def test_missing_display_metadata_still_parses(self):
+        # Older-shape configs (no title/label/kind/list/detail/create) must
+        # keep working — display metadata is optional, not required.
+        result = claude_service._parse_miniapp_config(VALID_CONFIG_JSON, SAMPLE_BOT_CODE)
+        self.assertIsNotNone(result)
+        self.assertNotIn("title", result["resources"][0])
+
+    def test_title_field_referencing_unknown_field_returns_none(self):
+        bad = """{
+            "resources": [
+                {
+                    "name": "orders", "table": "orders",
+                    "titleField": "nonexistent_field",
+                    "fields": [{"name": "customer_name"}]
+                }
+            ]
+        }"""
+        self.assertIsNone(claude_service._parse_miniapp_config(bad, SAMPLE_BOT_CODE))
+
+    def test_title_field_referencing_real_field_passes(self):
+        ok = """{
+            "resources": [
+                {
+                    "name": "orders", "table": "orders",
+                    "titleField": "customer_name",
+                    "fields": [{"name": "customer_name"}]
+                }
+            ]
+        }"""
+        result = claude_service._parse_miniapp_config(ok, SAMPLE_BOT_CODE)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["resources"][0]["titleField"], "customer_name")
+
 
 class GenerateMiniappConfig(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -170,6 +225,14 @@ class GenerateMiniappConfig(unittest.IsolatedAsyncioTestCase):
         # describe it — this is what makes it "few-shot".
         self.assertIn('"tours"', claude_service.MINIAPP_CONFIG_SYSTEM_PROMPT)
         self.assertIn('"guests"', claude_service.MINIAPP_CONFIG_SYSTEM_PROMPT)
+
+    async def test_prompt_requests_display_metadata(self):
+        # Phase 2: the generator must ask for label/kind/list/detail/create
+        # display metadata, not just the bare resource/field data contract.
+        prompt = claude_service.MINIAPP_CONFIG_SYSTEM_PROMPT
+        for keyword in ("titleField", "\"label\"", "\"kind\"", "\"list\"", "\"detail\"", "\"create\""):
+            self.assertIn(keyword, prompt)
+        self.assertIn('"titleField": "name"', claude_service._TOUR_OPERATOR_MINIAPP_CONFIG_EXAMPLE)
 
     async def test_api_exception_never_raises_returns_none(self):
         self.mock_client.messages.create = AsyncMock(side_effect=RuntimeError("network broke"))

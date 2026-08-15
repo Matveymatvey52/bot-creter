@@ -38,9 +38,11 @@ FAKE_MINIAPP_CONFIG = {
             "table": "tours",
             "order_by": "id DESC",
             "creatable": True,
+            "title": "Туры",
+            "titleField": "name",
             "fields": [
-                {"name": "name", "required": True},
-                {"name": "status"},
+                {"name": "name", "required": True, "label": "Название", "kind": "text", "list": False, "detail": False, "create": True},
+                {"name": "status", "label": "Статус", "kind": "status", "list": True, "detail": True, "create": False},
             ],
         },
         {
@@ -194,6 +196,59 @@ class MiniAppApiTests(unittest.IsolatedAsyncioTestCase):
         qs = await self._auth_query()
         with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
             resp = await self.client.get(f"/api/{KNOWN_BOT_ID}/not_a_resource?{qs}")
+        self.assertEqual(resp.status, 404)
+
+    # ── GET /schema (display metadata for the dynamic SPA, see
+    # miniapp/src/lib/displaySchema.ts) ─────────────────────────────────
+    async def test_schema_returns_display_metadata(self):
+        qs = await self._auth_query()
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            resp = await self.client.get(f"/api/{KNOWN_BOT_ID}/schema?{qs}")
+        self.assertEqual(resp.status, 200)
+        body = await resp.json()
+        names = {r["name"] for r in body["resources"]}
+        self.assertEqual(names, {"tours", "readonly_res"})
+        tours = next(r for r in body["resources"] if r["name"] == "tours")
+        self.assertEqual(tours["title"], "Туры")
+        self.assertEqual(tours["titleField"], "name")
+        status_field = next(f for f in tours["fields"] if f["name"] == "status")
+        self.assertEqual(status_field["label"], "Статус")
+        self.assertEqual(status_field["kind"], "status")
+        self.assertTrue(status_field["list"])
+
+    async def test_schema_omits_backend_only_keys(self):
+        # "table" and "order_by" are SQL plumbing with no UI meaning — the
+        # SPA has no business knowing the bot's raw table names.
+        qs = await self._auth_query()
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            resp = await self.client.get(f"/api/{KNOWN_BOT_ID}/schema?{qs}")
+        body = await resp.json()
+        tours = next(r for r in body["resources"] if r["name"] == "tours")
+        self.assertNotIn("table", tours)
+        self.assertNotIn("order_by", tours)
+
+    async def test_schema_field_missing_display_metadata_is_omitted_not_null(self):
+        # readonly_res's one field has no label/kind/list/detail/create in
+        # the fixture — the response should simply lack those keys (frontend
+        # applies its own defaults) rather than emit null placeholders.
+        qs = await self._auth_query()
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            resp = await self.client.get(f"/api/{KNOWN_BOT_ID}/schema?{qs}")
+        body = await resp.json()
+        readonly = next(r for r in body["resources"] if r["name"] == "readonly_res")
+        field = readonly["fields"][0]
+        self.assertEqual(field["name"], "name")
+        self.assertNotIn("label", field)
+        self.assertNotIn("kind", field)
+
+    async def test_schema_requires_auth(self):
+        resp = await self.client.get(f"/api/{KNOWN_BOT_ID}/schema")
+        self.assertEqual(resp.status, 403)
+
+    async def test_schema_unknown_bot_id_404s(self):
+        qs = await self._auth_query()
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            resp = await self.client.get(f"/api/999999/schema?{qs}")
         self.assertEqual(resp.status, 404)
 
     async def test_get_resource_detail(self):

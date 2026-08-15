@@ -78,3 +78,26 @@ export function createResource(
 export function getMe(): Promise<{ bot_id: number; telegram_user_id: number }> {
   return request('/me')
 }
+
+export interface SchemaField {
+  name: string
+  required?: boolean
+  creatable?: boolean
+  label?: string
+  kind?: 'text' | 'number' | 'date' | 'status'
+  list?: boolean
+  detail?: boolean
+  create?: boolean
+}
+
+export interface SchemaResource {
+  name: string
+  creatable?: boolean
+  title?: string
+  titleField?: string
+  fields: SchemaField[]
+}
+
+export function getSchema(): Promise<{ resources: SchemaResource[] }> {
+  return request('/schema')
+}

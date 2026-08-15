@@ -1,27 +1,26 @@
 import { useCallback, useState } from 'react'
 import { createResource, ApiError } from '../lib/api'
-import { RESOURCES } from '../lib/resources'
+import type { ResourceDisplay } from '../lib/displaySchema'
 import { useTelegramMainButton } from '../lib/useMainButton'
 import { isInTelegram } from '../lib/telegram'
 
 export function CreateFormScreen({
-  resourceName,
+  resource,
   onCreated,
   onCancel,
 }: {
-  resourceName: string
+  resource: ResourceDisplay
   onCreated: (id: number) => void
   onCancel: () => void
 }) {
-  const resource = RESOURCES[resourceName]
   const [values, setValues] = useState<Record<string, string>>({})
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
-  const requiredFilled = resource ? resource.createFields.every((f) => f.name !== 'name' || values.name?.trim()) : false
+  const requiredFilled = resource.createFields.every((f) => f.name !== 'name' || values.name?.trim())
 
   const handleSubmit = useCallback(async () => {
-    if (!resource || submitting) return
+    if (submitting) return
     setSubmitting(true)
     setError(null)
     try {
@@ -31,20 +30,16 @@ export function CreateFormScreen({
         if (raw === undefined || raw === '') continue
         payload[f.name] = f.kind === 'number' ? Number(raw) : raw
       }
-      const result = await createResource(resourceName, payload)
+      const result = await createResource(resource.name, payload)
       onCreated(result.id)
     } catch (err) {
       setError(err instanceof ApiError ? err.message : 'Не удалось создать запись')
     } finally {
       setSubmitting(false)
     }
-  }, [resource, resourceName, submitting, values, onCreated])
+  }, [resource, submitting, values, onCreated])
 
   useTelegramMainButton('Создать', handleSubmit, requiredFilled && !submitting)
-
-  if (!resource) {
-    return <div className="state-message">Неизвестный ресурс: {resourceName}</div>
-  }
 
   return (
     <div className="screen">

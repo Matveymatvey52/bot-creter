@@ -1638,14 +1638,16 @@ _TOUR_OPERATOR_MINIAPP_CONFIG_EXAMPLE = """{
             "table": "tours",
             "order_by": "created_at DESC",
             "creatable": true,
+            "title": "Туры",
+            "titleField": "name",
             "fields": [
-                {"name": "name", "required": true},
-                {"name": "destination"},
-                {"name": "date_start"},
-                {"name": "date_end"},
-                {"name": "guests_count"},
-                {"name": "status"},
-                {"name": "created_at", "creatable": false}
+                {"name": "name", "required": true, "label": "Название", "kind": "text", "list": false, "detail": false, "create": true},
+                {"name": "destination", "label": "Направление", "kind": "text", "list": true, "detail": true, "create": true},
+                {"name": "date_start", "label": "Начало", "kind": "date", "list": false, "detail": true, "create": true},
+                {"name": "date_end", "label": "Окончание", "kind": "date", "list": false, "detail": true, "create": true},
+                {"name": "guests_count", "label": "Гостей", "kind": "number", "list": false, "detail": true, "create": true},
+                {"name": "status", "label": "Статус", "kind": "status", "list": true, "detail": true, "create": false},
+                {"name": "created_at", "creatable": false, "label": "Создано", "kind": "date", "list": false, "detail": false, "create": false}
             ]
         },
         {
@@ -1653,15 +1655,17 @@ _TOUR_OPERATOR_MINIAPP_CONFIG_EXAMPLE = """{
             "table": "guests",
             "order_by": "created_at DESC",
             "creatable": true,
+            "title": "Гости",
+            "titleField": "name",
             "fields": [
-                {"name": "tour_id", "required": true},
-                {"name": "name", "required": true},
-                {"name": "total_cost"},
-                {"name": "prepaid"},
-                {"name": "our_price"},
-                {"name": "status"},
-                {"name": "notes"},
-                {"name": "created_at", "creatable": false}
+                {"name": "tour_id", "required": true, "label": "ID тура", "kind": "number", "list": false, "detail": false, "create": true},
+                {"name": "name", "required": true, "label": "Имя гостя", "kind": "text", "list": false, "detail": false, "create": true},
+                {"name": "total_cost", "label": "Стоимость", "kind": "number", "list": true, "detail": true, "create": true},
+                {"name": "prepaid", "label": "Предоплата", "kind": "number", "list": false, "detail": true, "create": true},
+                {"name": "our_price", "label": "Наша цена", "kind": "number", "list": false, "detail": true, "create": false},
+                {"name": "status", "label": "Статус", "kind": "status", "list": true, "detail": true, "create": false},
+                {"name": "notes", "label": "Заметки", "kind": "text", "list": false, "detail": true, "create": false},
+                {"name": "created_at", "creatable": false, "label": "Создано", "kind": "date", "list": false, "detail": false, "create": false}
             ]
         }
     ]
@@ -1671,7 +1675,7 @@ MINIAPP_CONFIG_SYSTEM_PROMPT = f"""You extract a mini-app schema from a Telegram
 
 You will be given the bot's full source code (its init_db() function contains the real CREATE TABLE statements — this is your only source of truth for table and column names) and a short description of what the bot does.
 
-Produce a JSON object describing which of the bot's SQLite tables deserve a screen in a generic mini-app (a shared list/detail/create-form UI that reads this schema by convention — you are NOT writing any UI code, only describing the data).
+Produce a JSON object describing which of the bot's SQLite tables deserve a screen in a generic mini-app (a shared list/detail/create-form UI that reads this schema by convention AND renders it for a human — you are NOT writing any UI code, only describing the data and how to label/format it).
 
 Here is one correct real example, from a tour-operator bot (tours + guests are real tables in that bot's init_db()):
 
@@ -1679,7 +1683,8 @@ Here is one correct real example, from a tour-operator bot (tours + guests are r
 
 Rules:
 - Respond with ONLY the JSON object, no markdown fences, no explanation.
-- Top-level shape: {{"resources": [...]}}. Each resource: "name" (short identifier), "table" (MUST be a real table name from the given code's CREATE TABLE statements, verbatim), "order_by" (a real column, e.g. "created_at DESC" or "id DESC"), "creatable" (true/false), "fields" (list of {{"name": ..., "required": true/false (optional, default false), "creatable": true/false (optional, default true)}}).
+- Top-level shape: {{"resources": [...]}}. Each resource: "name" (short identifier), "table" (MUST be a real table name from the given code's CREATE TABLE statements, verbatim), "order_by" (a real column, e.g. "created_at DESC" or "id DESC"), "creatable" (true/false), "title" (short human-readable plural name for this resource, in the SAME language as the bot description — e.g. "Туры" for a Russian tour bot, "Tours" for an English one), "titleField" (the field name whose value best identifies a single record to a human, e.g. a name/title column — pick one that exists in "fields"), "fields" (ordered list; order is the display order).
+- Each field: {{"name": ..., "required": true/false (optional, default false), "creatable": true/false (optional, default true — false means the column is server-set, like a timestamp or computed value, and must never appear in the create form), "label": a short human-readable label for this field in the bot's language (e.g. "Направление" not "destination"), "kind": one of "text" | "number" | "date" | "status" (pick "status" only for a column whose value is a small fixed set of state-like strings, e.g. pending/paid/confirmed; "number" for anything numeric; "date" for a date or datetime column; "text" otherwise), "list": true/false (show this field as a chip in the compact list-row view — pick 1-3 of the most important non-identifying fields per resource, not everything), "detail": true/false (show this field in the full single-record detail view — most fields should be true here, except the record's own title/name field which is already shown as the heading), "create": true/false (show this field as an input in the create form — matches "creatable" for most fields, but a field can be creatable at the DB layer yet still deliberately left off the create form if a human would never fill it in by hand, e.g. a foreign-key id better left for a future version)}}.
 - Every "table" and every field "name" MUST match a real table/column that appears in the given code's CREATE TABLE statements. Never invent a table or column that isn't there.
 - Only include tables that hold user-facing records worth browsing (bookings, orders, items, clients, etc). Skip purely internal/administrative tables (admins, state, sessions, migration/version tables, FSM storage).
 - If the bot has no table worth showing as a mini-app screen (e.g. a purely conversational bot with no data table, or only internal tables), respond with exactly {{"resources": []}}. This is a valid, expected answer — not an error.
@@ -1751,9 +1756,19 @@ def _parse_miniapp_config(raw: str, bot_code: str) -> dict | None:
             return None
         if not isinstance(resource.get("fields"), list) or not resource["fields"]:
             return None
+        field_names = set()
         for field in resource["fields"]:
             if not isinstance(field, dict) or not isinstance(field.get("name"), str):
                 return None
+            field_names.add(field["name"])
+        # titleField is optional display metadata (older/pre-Phase-2 configs
+        # omit it — the frontend falls back to "#{id}" when absent, see
+        # miniapp/src/lib/displaySchema.ts), but if the model DID include it,
+        # it must reference a field that's actually declared on this
+        # resource — same "never invent" posture as table/column names above.
+        title_field = resource.get("titleField")
+        if title_field is not None and title_field not in field_names:
+            return None
     if not _validate_miniapp_config_against_code(data, bot_code):
         return None
     return data
