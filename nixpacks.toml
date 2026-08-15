@@ -1,11 +1,11 @@
 providers = ["python"]
 
 [phases.setup]
-nixPkgs = ["nodejs_20"]
+nixPkgs = ["nodejs_22"]
 
 [phases.miniapp_build]
 dependsOn = ["setup"]
-cmds = ["cd miniapp && npm ci && npm run build"]
+cmds = ["npm install -g npm@latest && cd miniapp && npm ci && npm run build"]
 
 [phases.install]
 dependsOn = ["miniapp_build"]
