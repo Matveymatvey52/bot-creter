@@ -218,20 +218,28 @@ def _load_admins(admins_file: str):
         return []
     try:
         with open(admins_file) as f:
-            return json.load(f)
+            data = json.load(f)
+        # db.database.sync_bot_admins_json (webhook mode — used by both the
+        # normal /create flow and any DB-side bot provisioning) writes
+        # {"ids": [...]} with string ids, not a bare list of ints. Standalone
+        # mode's _save_admins below writes the same {"ids": [...]} shape now
+        # too, so both modes agree on one format.
+        if isinstance(data, dict):
+            return data.get("ids", [])
+        return data
     except Exception:
         return []
 
 def _save_admins(admins_file: str, lst):
     with open(admins_file, "w") as f:
-        json.dump(lst, f)
+        json.dump({"ids": [str(x) for x in lst]}, f)
 
 def _is_admin(uid, admins_file: str):
     admins = _load_admins(admins_file)
     if not admins:
         _save_admins(admins_file, [uid])
         return True
-    return uid in admins
+    return str(uid) in admins
 
 # ── Database ──────────────────────────────────────────────────────────────────
 async def init_db(db_path: str):
