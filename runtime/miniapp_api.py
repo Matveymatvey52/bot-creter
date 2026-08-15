@@ -47,7 +47,7 @@ import aiosqlite
 from aiohttp import web
 
 from db.database import get_bot_miniapp_config
-from runtime.registry import Registry, _load_template_module_async
+from runtime.registry import FACTORY_BOT_ID, Registry, _load_template_module_async
 
 logger = logging.getLogger(__name__)
 
@@ -351,7 +351,24 @@ async def serve_app_shell(request: web.Request) -> web.Response:
     validated (existence + miniapp_config presence) the same way the /api/*
     handlers are, so an unknown/unconfigured bot 404s before ever serving
     the SPA shell, rather than serving a page that would just fail its own
-    API calls once loaded."""
+    API calls once loaded.
+
+    bot_id=FACTORY_BOT_ID is a special case: it has no bots-table row and no
+    miniapp_config (template_id="__factory__", see runtime/registry.py), so
+    _resolve_entry_and_config() would always 404 it. It gets the owner-only
+    analytics dashboard instead (App.tsx's isFactoryBotPath() branches to
+    FactoryDashboardScreen client-side, authed separately by
+    runtime/factory_analytics_api.py's own /api/factory/* routes) — the SPA
+    shell itself is served unconditionally for this one bot_id."""
+    bot_id_raw = request.match_info.get("bot_id", "")
+    if bot_id_raw == str(FACTORY_BOT_ID):
+        index_path = _MINIAPP_DIST_DIR / "index.html"
+        if not index_path.exists():
+            return web.json_response(
+                {"error": "mini-app build not found — run `npm run build` in miniapp/"}, status=503
+            )
+        return web.FileResponse(index_path)
+
     resolved = await _resolve_entry_and_config(request)
     if isinstance(resolved, web.Response):
         return resolved

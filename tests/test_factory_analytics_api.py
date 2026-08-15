@@ -1,0 +1,146 @@
+"""Tests for runtime/factory_analytics_api.py — the owner-only factory-wide
+analytics dashboard. Same style as tests/test_miniapp_api.py: a fake
+BotEntry + registry, no real Telegram network calls, no real bot tokens.
+
+Covers: owner-only auth (wrong user / missing OWNER_ID / no credentials),
+list_bots_handler's shape (features/edits_count/avg_rating aggregation via
+db.database.list_bots_with_stats), and add_feedback_handler's validation.
+"""
+
+from __future__ import annotations
+
+import os
+import unittest
+from unittest.mock import patch
+
+from aiohttp.test_utils import TestClient, TestServer
+
+import db.database as db_module
+from db.database import (
+    create_bot_record_with_admins,
+    delete_bot,
+    init_db,
+)
+from runtime.factory_analytics_api import register_routes
+from runtime.miniapp_api import mint_magic_link_token
+from runtime.registry import FACTORY_BOT_ID, BotEntry
+from runtime.webhook_app import create_app
+
+FAKE_TOKEN = "123456789:AAHfakeTokenButShapedRight1234567890"
+FACTORY_TOKEN = "987654321:AAHfactoryOwnTokenAlsoShapedRight123456"
+OWNER_TELEGRAM_ID = 555
+OTHER_TELEGRAM_ID = 999
+
+
+class _FakeBot:
+    def __init__(self, token: str) -> None:
+        self.token = token
+
+
+class FactoryAnalyticsApiTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        await init_db()
+        self.bot_id = await create_bot_record_with_admins(
+            name="factory_analytics_test_bot", description="test", token=FAKE_TOKEN,
+            file_path="templates/tour_operator.py", admin_ids=["1"],
+        )
+        await db_module.enable_bot_feature(self.bot_id, "sheets")
+        await db_module.enable_bot_feature(self.bot_id, "payments")
+        await db_module.add_custom_feature_record(self.bot_id, "make button blue")
+        await db_module.add_bot_feedback(self.bot_id, 4, "works well")
+        await db_module.add_bot_feedback(self.bot_id, 5, None)
+
+        entry = BotEntry(
+            bot=_FakeBot(FACTORY_TOKEN),
+            dispatcher=None,
+            template_id="__factory__",
+            config={"bot_id": FACTORY_BOT_ID},
+        )
+        registry = {FACTORY_BOT_ID: entry}
+        self.app = create_app(registry)
+        register_routes(self.app)
+
+        self._owner_patcher = patch("runtime.factory_analytics_api.OWNER_ID", OWNER_TELEGRAM_ID)
+        self._owner_patcher.start()
+
+        self.server = TestServer(self.app)
+        self.client = TestClient(self.server)
+        await self.client.start_server()
+
+    async def asyncTearDown(self):
+        await self.client.close()
+        self._owner_patcher.stop()
+        await delete_bot(self.bot_id)
+
+    async def _owner_qs(self) -> str:
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            token = mint_magic_link_token(FACTORY_BOT_ID, OWNER_TELEGRAM_ID)
+        return f"token={token}"
+
+    # ── auth ──────────────────────────────────────────────────────────
+    async def test_non_owner_token_returns_403(self):
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            token = mint_magic_link_token(FACTORY_BOT_ID, OTHER_TELEGRAM_ID)
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            resp = await self.client.get(f"/api/factory/bots?token={token}")
+        self.assertEqual(resp.status, 403)
+
+    async def test_no_credentials_returns_403(self):
+        resp = await self.client.get("/api/factory/bots")
+        self.assertEqual(resp.status, 403)
+
+    async def test_owner_id_unset_fails_closed(self):
+        with patch("runtime.factory_analytics_api.OWNER_ID", 0):
+            qs = await self._owner_qs()
+            with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+                resp = await self.client.get(f"/api/factory/bots?{qs}")
+        self.assertEqual(resp.status, 403)
+
+    # ── list_bots_handler ─────────────────────────────────────────────
+    async def test_owner_sees_bot_list_with_aggregated_stats(self):
+        qs = await self._owner_qs()
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            resp = await self.client.get(f"/api/factory/bots?{qs}")
+        self.assertEqual(resp.status, 200)
+        body = await resp.json()
+        item = next(i for i in body["items"] if i["id"] == self.bot_id)
+        self.assertEqual(item["template"], "tour_operator")
+        self.assertEqual(sorted(item["features"]), ["payments", "sheets"])
+        self.assertEqual(item["edits_count"], 1)
+        self.assertEqual(item["feedback_count"], 2)
+        self.assertAlmostEqual(item["avg_rating"], 4.5)
+        self.assertNotIn("token", item)
+
+    # ── add_feedback_handler ─────────────────────────────────────────
+    async def test_add_feedback_valid_rating_persists(self):
+        qs = await self._owner_qs()
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            resp = await self.client.post(
+                f"/api/factory/bots/{self.bot_id}/feedback?{qs}", json={"rating": 3, "comment": "meh"}
+            )
+        self.assertEqual(resp.status, 201)
+        history = await db_module.get_bot_feedback(self.bot_id)
+        self.assertEqual(len(history), 3)
+
+    async def test_add_feedback_invalid_rating_returns_400(self):
+        qs = await self._owner_qs()
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            resp = await self.client.post(
+                f"/api/factory/bots/{self.bot_id}/feedback?{qs}", json={"rating": 7}
+            )
+        self.assertEqual(resp.status, 400)
+
+    async def test_add_feedback_non_owner_returns_403(self):
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            token = mint_magic_link_token(FACTORY_BOT_ID, OTHER_TELEGRAM_ID)
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            resp = await self.client.post(
+                f"/api/factory/bots/{self.bot_id}/feedback?token={token}", json={"rating": 5}
+            )
+        self.assertEqual(resp.status, 403)
+
+    async def test_add_feedback_bad_bot_id_returns_404(self):
+        qs = await self._owner_qs()
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            resp = await self.client.post(f"/api/factory/bots/not-a-number/feedback?{qs}", json={"rating": 5})
+        self.assertEqual(resp.status, 404)

@@ -53,6 +53,7 @@ from handlers.manage_bots import router as manage_router, set_registry as set_ma
 from handlers.start import router as start_router
 from main import ManagedBotMiddleware, build_group_router, restore_bots
 from runtime.registry import FACTORY_BOT_ID, build_factory_entry, build_registry
+from runtime.factory_analytics_api import register_routes as register_factory_analytics_routes
 from runtime.miniapp_api import register_routes as register_miniapp_routes
 from runtime.webhook_app import create_app
 
@@ -146,6 +147,7 @@ async def _bootstrap_app() -> web.Application:
     # avoids that trap by registering onto the existing app instead of binding
     # its own port. See docs/MINIAPP_DESIGN.md §2.2.
     register_miniapp_routes(app)
+    register_factory_analytics_routes(app)
     return app
 
 
