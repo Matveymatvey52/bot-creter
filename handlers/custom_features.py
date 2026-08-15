@@ -24,6 +24,7 @@ import asyncio
 import hashlib
 import html
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -39,6 +40,7 @@ from handlers.create_bot import cancel_keyboard
 from handlers.manage_bots import _bot_keyboard, _busy_bots, _recognize_voice_fix
 from runtime.registry import _CUSTOM_FEATURES_DIR, invalidate_custom_feature_cache
 from runtime.registry_holder import RegistryHandle
+from runtime.webhook_setup import set_miniapp_menu_button
 from services.claude_service import (
     CustomFeatureGenerationError,
     _generate_miniapp_config,
@@ -292,6 +294,11 @@ async def _regenerate_miniapp_config_after_custom_feature(
         miniapp_config = await _generate_miniapp_config(combined_code, description)
         if miniapp_config:
             await set_bot_miniapp_config(bot_id, miniapp_config)
+            base_url = os.getenv("PUBLIC_BASE_URL", "").strip()
+            if base_url:
+                bot_row = await get_bot(bot_id)
+                if bot_row and bot_row.get("token"):
+                    await set_miniapp_menu_button(bot_row["token"], base_url, bot_id)
     except Exception as e:
         logger.warning(f"_regenerate_miniapp_config_after_custom_feature: bot_id={bot_id} failed: {type(e).__name__}: {e}")
 

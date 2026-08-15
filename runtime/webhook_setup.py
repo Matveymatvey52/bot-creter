@@ -12,10 +12,15 @@ import asyncio
 import os
 
 from aiogram import Bot
+from aiogram.types import MenuButtonDefault, MenuButtonWebApp, WebAppInfo
 
 
 def build_webhook_url(base_url: str, bot_id: int) -> str:
     return f"{base_url.rstrip('/')}/webhook/{bot_id}"
+
+
+def build_miniapp_url(base_url: str, bot_id: int) -> str:
+    return f"{base_url.rstrip('/')}/app/{bot_id}"
 
 
 async def set_webhook_for_bot(token: str, base_url: str, bot_id: int, secret: str) -> None:
@@ -24,6 +29,29 @@ async def set_webhook_for_bot(token: str, base_url: str, bot_id: int, secret: st
     bot = Bot(token=token)
     try:
         await bot.set_webhook(url=url, secret_token=secret)
+    finally:
+        await bot.session.close()
+
+
+async def set_miniapp_menu_button(token: str, base_url: str, bot_id: int) -> None:
+    """Registers the bot's own mini-app as its Telegram Menu Button via Bot API
+    (setChatMenuButton), replacing the manual @BotFather /setmenubutton step.
+    Safe to call repeatedly — Telegram just overwrites the previous menu button."""
+    url = build_miniapp_url(base_url, bot_id)
+    bot = Bot(token=token)
+    try:
+        await bot.set_chat_menu_button(
+            menu_button=MenuButtonWebApp(text="Открыть", web_app=WebAppInfo(url=url))
+        )
+    finally:
+        await bot.session.close()
+
+
+async def reset_menu_button(token: str) -> None:
+    """Reverts a bot's Menu Button to Telegram's default (no mini-app configured)."""
+    bot = Bot(token=token)
+    try:
+        await bot.set_chat_menu_button(menu_button=MenuButtonDefault())
     finally:
         await bot.session.close()
 

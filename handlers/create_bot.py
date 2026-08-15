@@ -18,7 +18,7 @@ from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, Inli
 from config import ASSEMBLYAI_API_KEY, BOT_TOKEN, DATA_DIR
 from db.database import create_bot_record_with_admins, get_bot, set_bot_display_name, set_bot_miniapp_config, update_bot_status
 from runtime.registry_holder import RegistryHandle
-from runtime.webhook_setup import build_webhook_url, set_webhook_for_bot
+from runtime.webhook_setup import build_webhook_url, set_miniapp_menu_button, set_webhook_for_bot
 from services.bot_runner import start_bot
 from services.claude_service import chat_gather_requirements, extract_bot_name, generate_bot_code, generate_bot_guide
 from services.github_sync import push_bot_to_github
@@ -110,7 +110,7 @@ class _Activation(NamedTuple):
 
 
 async def _activate_new_bot(
-    bot_id: int, bot_name: str, bot_file: Path, token: str, extra_env: dict | None
+    bot_id: int, bot_name: str, bot_file: Path, token: str, extra_env: dict | None, has_miniapp: bool = False
 ) -> _Activation:
     """Brings a freshly-created bot online, choosing the mechanism by runtime mode.
     Never raises — an activation failure must not undo an already-created bot (it is
@@ -129,6 +129,11 @@ async def _activate_new_bot(
     Polling / standalone mode (PUBLIC_BASE_URL empty — main.py): start_bot() as before.
     """
     base_url = os.getenv("PUBLIC_BASE_URL", "").strip()
+    if base_url and has_miniapp:
+        try:
+            await set_miniapp_menu_button(token, base_url, bot_id)
+        except Exception as e:
+            logger.error(f"Bot id={bot_id} ({bot_name}) created but Menu Button setup failed: {e}")
     if base_url:
         secret = os.getenv("WEBHOOK_SECRET", "").strip()
         if not secret:
@@ -729,7 +734,7 @@ async def auto_launch_managed_bot(managed_data: dict, bot: Bot, storage=None) ->
     extra_env = {}
     if display_name:
         extra_env["BOT_DISPLAY_NAME"] = display_name
-    activation = await _activate_new_bot(bot_record_id, bot_name, bot_file, token, extra_env)
+    activation = await _activate_new_bot(bot_record_id, bot_name, bot_file, token, extra_env, has_miniapp=bool(miniapp_config))
     await _notify_bot_created(bot, chat_id, bot_record_id, bot_name, bot_summary, username_display, activation)
 
 
@@ -805,7 +810,7 @@ async def handle_token(message: Message, state: FSMContext, bot: Bot):
     extra_env = {}
     if display_name:
         extra_env["BOT_DISPLAY_NAME"] = display_name
-    activation = await _activate_new_bot(bot_id, bot_name, bot_file, token, extra_env)
+    activation = await _activate_new_bot(bot_id, bot_name, bot_file, token, extra_env, has_miniapp=bool(miniapp_config))
     await _notify_bot_created(bot, message.chat.id, bot_id, bot_name, bot_summary, username_display, activation)
 
     await state.clear()
