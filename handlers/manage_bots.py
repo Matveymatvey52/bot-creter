@@ -18,6 +18,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 
 from config import ASSEMBLYAI_API_KEY
 from db.database import (
+    add_office_link,
     delete_bot,
     disable_bot_feature,
     enable_bot_feature,
@@ -27,6 +28,8 @@ from db.database import (
     get_bot_features,
     get_bot_payment_provider,
     get_bot_sheets_config,
+    get_office_links_for_bot,
+    remove_office_link,
     set_bot_miniapp_config,
     set_bot_payment_provider,
     set_bot_sheets_config,
@@ -166,6 +169,9 @@ def _bot_keyboard(bot_id: int) -> InlineKeyboardMarkup:
     ])
     rows.append([
         InlineKeyboardButton(text="🕘 История доработок", callback_data=f"customfeaturehistory:{bot_id}"),
+    ])
+    rows.append([
+        InlineKeyboardButton(text="🏢 Офисы", callback_data=f"office:{bot_id}"),
     ])
     rows.append([
         InlineKeyboardButton(text="◀ К списку", callback_data="list"),
@@ -480,6 +486,151 @@ async def cb_toggle_feature(callback: CallbackQuery):
 
 _SPREADSHEET_ID_RE = re.compile(r"/d/([a-zA-Z0-9_-]{20,})")
 _BARE_SPREADSHEET_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{20,}$")
+
+
+# ── "Офисы" (docs/OFFICES_DESIGN.md §9) ─────────────────────────────────────
+# Only event_type in _EVENT_TYPES right now is "order.created" — office:{bot_id}
+# always subscribes the OTHER bot to notifications FROM this bot (X → Y, this
+# bot X is always source), no event-type picker shown yet. When a second
+# event_type is added to features/office_events.py, insert a picker step
+# between officeconnect and the add_office_link() call below rather than
+# reworking this flow — see §9's "Ограничение первой итерации" note.
+_OFFICE_EVENT_TYPE = "order.created"
+
+
+async def _office_panel_text_and_keyboard(bot_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    links = await get_office_links_for_bot(bot_id)
+    rows: list[list[InlineKeyboardButton]] = []
+    if not links:
+        text = "🏢 <b>Офисы</b>\n\nПока нет связей с другими ботами."
+    else:
+        lines = ["🏢 <b>Офисы</b>\n\nТекущие связи:"]
+        for link in links:
+            source_id, target_id, event_type = link["source_bot_id"], link["target_bot_id"], link["event_type"]
+            if source_id == bot_id:
+                source_bot = await get_bot(bot_id)
+                target_bot = await get_bot(target_id)
+                arrow_label = f"📤 {source_bot['name'] if source_bot else bot_id} → {target_bot['name'] if target_bot else target_id}"
+            else:
+                source_bot = await get_bot(source_id)
+                target_bot = await get_bot(bot_id)
+                arrow_label = f"📥 {source_bot['name'] if source_bot else source_id} → {target_bot['name'] if target_bot else bot_id}"
+            lines.append(f"{arrow_label} ({event_type})")
+            rows.append([
+                InlineKeyboardButton(
+                    text=f"❌ {arrow_label}",
+                    callback_data=f"officeunlink:{source_id}:{target_id}:{event_type}:{bot_id}",
+                )
+            ])
+        text = "\n".join(lines)
+    rows.append([InlineKeyboardButton(text="➕ Подключить к другому боту", callback_data=f"officeconnect:{bot_id}")])
+    rows.append([InlineKeyboardButton(text="◀ Назад", callback_data=f"info:{bot_id}")])
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data.startswith("office:"))
+async def cb_office_panel(callback: CallbackQuery):
+    if not _is_owner(callback.from_user.id):
+        await _deny_callback(callback)
+        return
+    await callback.answer()
+    bot_id = int(callback.data.split(":")[1])
+    b = await get_bot(bot_id)
+    if not b:
+        await callback.message.answer("Бот не найден.")
+        return
+    text, keyboard = await _office_panel_text_and_keyboard(bot_id)
+    await _edit_or_resend(callback, text, parse_mode="HTML", reply_markup=keyboard)
+
+
+@router.callback_query(F.data.startswith("officeconnect:"))
+async def cb_office_connect_start(callback: CallbackQuery):
+    if not _is_owner(callback.from_user.id):
+        await _deny_callback(callback)
+        return
+    await callback.answer()
+    bot_id = int(callback.data.split(":")[1])
+    b = await get_bot(bot_id)
+    if not b:
+        await callback.message.answer("Бот не найден.")
+        return
+    other_bots = [ob for ob in await get_all_bots() if ob["id"] != bot_id]
+    if not other_bots:
+        await _edit_or_resend(
+            callback,
+            "🏢 Других ботов пока нет — сначала создай ещё одного, чтобы объединить их в офис.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="◀ Назад", callback_data=f"office:{bot_id}")]
+            ]),
+        )
+        return
+    rows = [
+        [InlineKeyboardButton(text=ob["name"], callback_data=f"officelink:{bot_id}:{ob['id']}")]
+        for ob in other_bots
+    ]
+    rows.append([InlineKeyboardButton(text="◀ Назад", callback_data=f"office:{bot_id}")])
+    await _edit_or_resend(
+        callback,
+        f"🏢 Выбери бота, которого «{b['name']}» будет уведомлять о новых заказах:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+@router.callback_query(F.data.startswith("officelink:"))
+async def cb_office_link(callback: CallbackQuery):
+    if not _is_owner(callback.from_user.id):
+        await _deny_callback(callback)
+        return
+    _, source_id_str, target_id_str = callback.data.split(":")
+    source_id, target_id = int(source_id_str), int(target_id_str)
+    await callback.answer()
+    # Review finding: officeconnect:'s own keyboard already excludes bot_id
+    # from the target list, but that's a UI-layer filter, not a guarantee —
+    # this handler must not rely on it. A self-link would make publish_event()
+    # hand a bot's own order.created straight back to itself as though it
+    # came from another bot, which office_events' whole contract assumes
+    # never happens (source_bot_id always means an OTHER bot).
+    if source_id == target_id:
+        await callback.message.answer("⚠️ Нельзя объединить бота с самим собой.")
+        return
+    source_bot = await get_bot(source_id)
+    target_bot = await get_bot(target_id)
+    if not source_bot or not target_bot:
+        await callback.message.answer("Бот не найден.")
+        return
+    await add_office_link(source_id, target_id, _OFFICE_EVENT_TYPE)
+    text, keyboard = await _office_panel_text_and_keyboard(source_id)
+    await _edit_or_resend(
+        callback,
+        f"✅ «{source_bot['name']}» теперь уведомляет «{target_bot['name']}» о новых заказах.\n\n{text}",
+        parse_mode="HTML",
+        reply_markup=keyboard,
+    )
+
+
+@router.callback_query(F.data.startswith("officeunlink:"))
+async def cb_office_unlink(callback: CallbackQuery):
+    if not _is_owner(callback.from_user.id):
+        await _deny_callback(callback)
+        return
+    # maxsplit=4: event_type is the only free-form-looking segment here, but
+    # _EVENT_TYPES (features/office_events.py) is a closed, developer-owned
+    # set with no ':' in any current key — still, an unbounded split() would
+    # raise ValueError (unhandled — no answer to the user) the day a future
+    # event_type contains ':'. Bounding it here keeps parsing correct
+    # regardless of what event_type itself contains.
+    _, source_id_str, target_id_str, event_type, panel_bot_id_str = callback.data.split(":", 4)
+    source_id, target_id, panel_bot_id = int(source_id_str), int(target_id_str), int(panel_bot_id_str)
+    await callback.answer()
+    panel_bot = await get_bot(panel_bot_id)
+    if not panel_bot:
+        await callback.message.answer("Бот не найден.")
+        return
+    await remove_office_link(source_id, target_id, event_type)
+    text, keyboard = await _office_panel_text_and_keyboard(panel_bot_id)
+    await _edit_or_resend(callback, text, parse_mode="HTML", reply_markup=keyboard)
 
 
 def _parse_spreadsheet_id(text: str) -> str | None:

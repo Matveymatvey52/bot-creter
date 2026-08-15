@@ -29,6 +29,7 @@ from aiogram import Bot, F, Router
 from aiogram.types import LabeledPrice, Message, PreCheckoutQuery
 
 from db.database import get_bot_payment_provider
+from features.office_events import OrderCreatedEvent, publish_event
 
 logger = logging.getLogger(__name__)
 
@@ -36,9 +37,16 @@ router = Router()
 
 
 class PaymentsConfig(Protocol):
-    """Any template Config dataclass with a db_path works — duck-typed so this
-    module doesn't need to know about any specific template's Config shape."""
+    """Any template Config dataclass with a db_path AND bot_id works —
+    duck-typed so this module doesn't need to know about any specific
+    template's Config shape. bot_id is required (not just db_path) since
+    on_successful_payment now publishes office_events' order.created with
+    source_bot_id=config.bot_id — see docs/OFFICES_DESIGN.md §10 q4. Every
+    template wired to payments already carries bot_id in webhook mode
+    (config_from_bot_row sets it — same convention as templates/
+    tour_operator.py's/templates/event_rsvp.py's own Config.bot_id)."""
     db_path: str
+    bot_id: int | None
 
 
 async def init_payments_tables(db_path: str) -> None:
@@ -136,7 +144,7 @@ async def on_successful_payment(message: Message, config: PaymentsConfig) -> Non
     async with aiosqlite.connect(config.db_path) as db:
         await db.execute("PRAGMA busy_timeout=5000")
         try:
-            await db.execute(
+            cursor = await db.execute(
                 """
                 INSERT INTO payments
                     (telegram_payment_charge_id, provider_payment_charge_id,
@@ -153,6 +161,7 @@ async def on_successful_payment(message: Message, config: PaymentsConfig) -> Non
                 ),
             )
             await db.commit()
+            payments_row_id = cursor.lastrowid
         except sqlite3.IntegrityError:
             logger.info(
                 f"on_successful_payment: duplicate delivery of "
@@ -177,6 +186,39 @@ async def on_successful_payment(message: Message, config: PaymentsConfig) -> Non
         f"on_successful_payment: recorded telegram_payment_charge_id={payment.telegram_payment_charge_id} "
         f"user_id={message.from_user.id} amount={payment.total_amount} {payment.currency}"
     )
+
+    # "Офисы" (docs/OFFICES_DESIGN.md §10 q4) — publish order.created from this
+    # ONE central place rather than each of the 27 payments-compatible
+    # templates calling publish_event() itself: order_id/amount/currency/
+    # customer_chat_id are already on hand here, right after the credit is
+    # durably committed. config.bot_id is None only in standalone/subprocess
+    # mode (no bots-table row to source it from — see PaymentsConfig's
+    # docstring); office_events has no meaning there (no live Registry either,
+    # per features/office_events.py's own no-op-without-registry behavior),
+    # so this is skipped rather than publishing with a fabricated source_bot_id.
+    # Deliberately best-effort: publish_event() never raises for a subscriber
+    # failure, but a broken office_events call here must ALSO never turn a
+    # successfully credited payment into an error response to Telegram —
+    # same isolation reasoning as runtime/registry.py's
+    # _load_and_include_features().
+    if config.bot_id is not None:
+        try:
+            await publish_event(
+                config.bot_id,
+                "order.created",
+                OrderCreatedEvent(
+                    order_id=payments_row_id,
+                    amount=payment.total_amount,
+                    currency=payment.currency,
+                    customer_chat_id=message.from_user.id,
+                ),
+            )
+        except Exception:
+            logger.exception(
+                "on_successful_payment: publish_event(order.created) raised — "
+                f"telegram_payment_charge_id={payment.telegram_payment_charge_id} bot_id={config.bot_id}, "
+                "payment credit is unaffected"
+            )
 
 
 async def record_refund(db_path: str, telegram_payment_charge_id: str, admin_id: str) -> bool:

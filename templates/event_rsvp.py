@@ -234,7 +234,79 @@ async def init_db(db_path: str):
         """)
         await db.execute("CREATE INDEX IF NOT EXISTS idx_rsvps_status ON rsvps(status)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_rsvps_client ON rsvps(client_user_id)")
+        # "Офисы" (docs/OFFICES_DESIGN.md §8 вариант 1) — one row per matched
+        # office_event, so an admin can see cross-bot overlaps without this
+        # template needing a live Bot instance to push a Telegram message
+        # (on_office_event() below only receives event+config, no Bot — see
+        # runtime/registry.py's _office_event_hook). Kept minimal on purpose:
+        # this is the FIRST real office_events consumer, proving the
+        # publish→deliver→react path end-to-end on the existing order.created
+        # contract, not a general notifications feature.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS office_notes (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_bot_id   INTEGER NOT NULL,
+                event_type      TEXT NOT NULL,
+                note            TEXT NOT NULL,
+                created_at      TEXT DEFAULT (datetime('now','localtime'))
+            )
+        """)
         await db.commit()
+
+
+# "Офисы" (docs/OFFICES_DESIGN.md §8 вариант 1) — by-convention hook: exposing
+# a module-level on_office_event(event, config) is what makes registry.py's
+# build_entry() register this template as a subscriber for ANY bot linked to
+# it via bot_office_links, regardless of event_type (the type check happens
+# inside, since _EVENT_TYPES may grow beyond order.created later and this
+# function only knows how to react to that one type today).
+async def on_office_event(event, config: EventRsvpConfig) -> None:
+    """Reacts to order.created from a linked source bot (e.g. tour_operator):
+    if the paying customer (event.payload.customer_chat_id) already has an
+    active RSVP for this bot's own event, records a note for the admin to see
+    — same "tour guest is also an event attendee" cross-sell/logistics signal
+    docs/OFFICES_DESIGN.md §8's Вариант 1 describes. Deliberately does NOT
+    push a live Telegram message: on_office_event() is called with only
+    (event, config), no Bot instance (see runtime/registry.py's
+    _office_event_hook) — a DB note keeps this subscriber simple and
+    consistent with every other office_events subscriber that will ever be
+    added without needing its own Bot plumbing threaded through the hook.
+
+    Never raises: features/office_events.py's publish_event() already
+    isolates each subscriber in its own try/except, but this stays defensive
+    on the same "must not have any dispatcher-side effect" principle CUSTOMIZE
+    hooks across this codebase follow."""
+    if event.event_type != "order.created":
+        return
+    customer_chat_id = getattr(event.payload, "customer_chat_id", None)
+    if customer_chat_id is None:
+        return
+    try:
+        async with aiosqlite.connect(config.db_path) as db:
+            has_rsvp = await (await db.execute(
+                "SELECT 1 FROM rsvps WHERE client_user_id=? AND status IN ('confirmed','waitlist') LIMIT 1",
+                (customer_chat_id,),
+            )).fetchone()
+            if not has_rsvp:
+                return
+            await db.execute(
+                """
+                INSERT INTO office_notes (source_bot_id, event_type, note)
+                VALUES (?, ?, ?)
+                """,
+                (
+                    event.source_bot_id,
+                    event.event_type,
+                    f"Клиент {customer_chat_id} оформил заказ у связанного бота "
+                    f"(bot_id={event.source_bot_id}) и уже зарегистрирован на это мероприятие.",
+                ),
+            )
+            await db.commit()
+    except Exception:
+        logger.exception(
+            f"on_office_event: failed to record office note for customer_chat_id={customer_chat_id} "
+            f"source_bot_id={event.source_bot_id}"
+        )
 
 
 async def _get_event(db_path: str) -> aiosqlite.Row | None:

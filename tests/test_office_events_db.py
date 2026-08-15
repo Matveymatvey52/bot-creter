@@ -14,6 +14,7 @@ from db.database import (
     add_office_link,
     create_bot_record_with_admins,
     delete_bot,
+    get_office_links_for_bot,
     get_office_subscribers,
     init_db,
     remove_office_link,
@@ -105,3 +106,32 @@ async def test_delete_bot_cleans_up_links_where_bot_is_target(isolated_db):
     await add_office_link(a, b, "order.created")
     await delete_bot(b)
     assert await get_office_subscribers(a, "order.created") == []
+
+
+@pytest.mark.asyncio
+async def test_get_office_links_for_bot_empty_by_default(isolated_db):
+    a, b = await _make_bots(2)
+    assert await get_office_links_for_bot(a) == []
+
+
+@pytest.mark.asyncio
+async def test_get_office_links_for_bot_as_source(isolated_db):
+    a, b = await _make_bots(2)
+    await add_office_link(a, b, "order.created")
+    links = await get_office_links_for_bot(a)
+    assert links == [{"source_bot_id": a, "target_bot_id": b, "event_type": "order.created"}]
+
+
+@pytest.mark.asyncio
+async def test_get_office_links_for_bot_as_target(isolated_db):
+    a, b = await _make_bots(2)
+    await add_office_link(a, b, "order.created")
+    links = await get_office_links_for_bot(b)
+    assert links == [{"source_bot_id": a, "target_bot_id": b, "event_type": "order.created"}]
+
+
+@pytest.mark.asyncio
+async def test_get_office_links_for_bot_excludes_unrelated_links(isolated_db):
+    a, b, c = await _make_bots(3)
+    await add_office_link(a, b, "order.created")
+    assert await get_office_links_for_bot(c) == []

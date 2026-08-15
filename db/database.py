@@ -556,6 +556,28 @@ async def remove_office_link(source_bot_id: int, target_bot_id: int, event_type:
         await db.commit()
 
 
+async def get_office_links_for_bot(bot_id: int) -> list[dict]:
+    """Every bot_office_links row where bot_id is EITHER source or target —
+    the shape handlers/manage_bots.py's "🏢 Офисы" panel needs to show both
+    directions (bot X notifies Y / bot Z notifies X) on one screen. Unlike
+    get_office_subscribers (scoped to one source+event_type pair for
+    publish_event()'s single lookup), this is a UI-listing query, so it
+    returns full rows rather than just target_bot_id."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """
+            SELECT source_bot_id, target_bot_id, event_type
+            FROM bot_office_links
+            WHERE source_bot_id = ? OR target_bot_id = ?
+            ORDER BY created_at
+            """,
+            (bot_id, bot_id),
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
+
 async def get_office_subscribers(source_bot_id: int, event_type: str) -> list[int]:
     """Every bot_id currently subscribed to event_type published by
     source_bot_id — see features/office_events.py's publish_event(), the only

@@ -22,12 +22,14 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiosqlite
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
 
+import features.office_events as office_events
 from db.database import (
     DB_PATH,
     create_bot_record_with_admins,
@@ -35,6 +37,7 @@ from db.database import (
     get_bot_payment_provider,
     set_bot_payment_provider,
 )
+from features.office_events import OrderCreatedEvent, register_office_event_hook
 from runtime.registry import _clone_router
 from tests.fixtures import payment_fixture_template as fixture
 
@@ -155,6 +158,100 @@ class SuccessfulPaymentIdempotencyTests(unittest.IsolatedAsyncioTestCase):
             any("charge-logged" in msg for msg in log_ctx.output),
             "successful payment credit produced no INFO log line naming the charge_id",
         )
+
+
+class FakeRegistry:
+    """Same minimal .get(bot_id) stand-in as tests/test_office_events_module.py
+    — publish_event() (called from on_successful_payment now) only ever calls
+    .get() on the live registry."""
+    def __init__(self, entries: dict[int, object]):
+        self._entries = entries
+
+    def get(self, bot_id: int):
+        return self._entries.get(bot_id)
+
+
+class SuccessfulPaymentOfficeEventsTests(unittest.IsolatedAsyncioTestCase):
+    """docs/OFFICES_DESIGN.md §10 q4 — on_successful_payment must publish
+    order.created from this ONE central place, and a broken/absent
+    office_events wiring must never turn a successfully credited payment into
+    an error response to Telegram (same isolation reasoning as
+    features/office_events.py's own subscriber try/except)."""
+
+    async def asyncSetUp(self):
+        self._bot_call_patcher = patch.object(Bot, "__call__", new=AsyncMock(return_value=MagicMock()))
+        self._bot_call_patcher.start()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.db_path = str(Path(self._tmp.name) / "fixture.db")
+        await fixture.init_db(self.db_path)
+        self.config = fixture.FixtureConfig(bot_id=9201, db_path=self.db_path)
+        self.bot, self.dp = _build_bot_dispatcher(self.config)
+        office_events.set_registry(None)
+
+    async def asyncTearDown(self):
+        self._tmp.cleanup()
+        self._bot_call_patcher.stop()
+        office_events.set_registry(None)
+
+    async def test_publishes_order_created_to_subscribed_bot(self):
+        hook = AsyncMock()
+        config = {}
+        register_office_event_hook(config, hook)
+        office_events.set_registry(FakeRegistry({7001: SimpleNamespace(config=config)}))
+
+        with patch.object(office_events, "get_office_subscribers", AsyncMock(return_value=[7001])):
+            await self.dp.feed_webhook_update(
+                self.bot, _successful_payment_update(1, USER_ID, charge_id="office-charge-1")
+            )
+
+        hook.assert_awaited_once()
+        (event,), _ = hook.call_args
+        self.assertEqual(event.event_type, "order.created")
+        self.assertEqual(event.source_bot_id, self.config.bot_id)
+        self.assertIsInstance(event.payload, OrderCreatedEvent)
+        self.assertEqual(event.payload.currency, "RUB")
+        self.assertEqual(event.payload.amount, 10000)
+        self.assertEqual(event.payload.customer_chat_id, USER_ID)
+
+    async def test_no_office_link_means_no_delivery_but_payment_still_credited(self):
+        with patch.object(office_events, "get_office_subscribers", AsyncMock(return_value=[])):
+            await self.dp.feed_webhook_update(
+                self.bot, _successful_payment_update(1, USER_ID, charge_id="office-charge-2")
+            )
+        conn = sqlite3.connect(self.db_path)
+        count = conn.execute(
+            "SELECT COUNT(*) FROM payments WHERE telegram_payment_charge_id='office-charge-2'"
+        ).fetchone()[0]
+        conn.close()
+        self.assertEqual(count, 1)
+
+    async def test_publish_event_failure_does_not_break_payment_credit(self):
+        with patch.object(
+            office_events, "get_office_subscribers", AsyncMock(side_effect=RuntimeError("boom"))
+        ):
+            # Must not raise — the credited payment above is the thing that matters.
+            await self.dp.feed_webhook_update(
+                self.bot, _successful_payment_update(1, USER_ID, charge_id="office-charge-3")
+            )
+        conn = sqlite3.connect(self.db_path)
+        count = conn.execute(
+            "SELECT COUNT(*) FROM payments WHERE telegram_payment_charge_id='office-charge-3'"
+        ).fetchone()[0]
+        conn.close()
+        self.assertEqual(count, 1, "publish_event() failure must not roll back or block the payment credit")
+
+    async def test_no_registry_means_no_crash(self):
+        # office_events.set_registry(None) in asyncSetUp — publish_event()'s
+        # own no-live-registry branch returns 0, must not raise here either.
+        await self.dp.feed_webhook_update(
+            self.bot, _successful_payment_update(1, USER_ID, charge_id="office-charge-4")
+        )
+        conn = sqlite3.connect(self.db_path)
+        count = conn.execute(
+            "SELECT COUNT(*) FROM payments WHERE telegram_payment_charge_id='office-charge-4'"
+        ).fetchone()[0]
+        conn.close()
+        self.assertEqual(count, 1)
 
 
 class PreCheckoutTimeoutSafetyTests(unittest.IsolatedAsyncioTestCase):
