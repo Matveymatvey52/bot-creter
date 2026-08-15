@@ -1,32 +1,77 @@
-# React + TypeScript + Vite
+# Bot mini-app SPA
 
-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
+Generic Telegram Mini App front-end for bots created by this project. It talks to
+`runtime/miniapp_api.py`'s REST layer (`GET/POST /api/{bot_id}/{resource}`) and renders
+list / detail / create screens for whatever resources a bot's template declares.
 
-Currently, two official plugins are available:
+The SPA itself has no per-bot logic in it. All bot-specific content — which resources
+exist, what their fields are called, how they're labeled and formatted — lives in one
+file: [`src/lib/resources.ts`](src/lib/resources.ts).
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+## Adding a new bot
 
-## React Compiler
+1. Make sure the bot's template module (e.g. `templates/car_rental.py`) exports a
+   `miniapp_config` dict describing its resources, matching the shape already used by
+   `templates/tour_operator.py`:
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+   ```python
+   miniapp_config = {
+       "resources": [
+           {
+               "name": "cars",
+               "table": "cars",
+               "order_by": "created_at DESC",
+               "creatable": True,
+               "fields": [
+                   {"name": "make", "required": True},
+                   {"name": "status"},
+                   {"name": "created_at", "creatable": False},
+               ],
+           },
+           ...
+       ],
+   }
+   ```
 
-## Expanding the Oxlint configuration
+   This is the server-side contract: it controls which columns exist, which are
+   writable, and which are required. The generic REST layer in `miniapp_api.py` reads
+   this at request time — no backend code changes needed per bot.
 
-If you are developing a production application, we recommend enabling type-aware lint rules by installing `oxlint-tsgolint` and editing `.oxlintrc.json`:
+2. Edit `src/lib/resources.ts` and add one entry to the `RESOURCES` map per resource
+   in `miniapp_config`, keyed by the same resource `name`:
 
-```json
-{
-  "$schema": "./node_modules/oxlint/configuration_schema.json",
-  "plugins": ["react", "typescript", "oxc"],
-  "options": {
-    "typeAware": true
-  },
-  "rules": {
-    "react/rules-of-hooks": "error",
-    "react/only-export-components": ["warn", { "allowConstantExport": true }]
-  }
-}
+   ```ts
+   cars: {
+     name: 'cars',
+     title: 'Машины',        // tab label
+     titleField: 'make',     // which field is shown as the item's heading
+     listFields: [ { name: 'status', label: 'Статус', kind: 'status' } ],
+     detailFields: [ /* fields shown on the detail screen, in order */ ],
+     createFields: [ /* fields shown on the create form, in order */ ],
+   },
+   ```
+
+   `kind` is one of `'text' | 'number' | 'date' | 'status'` — it picks the form input
+   type on the create screen and the display formatting elsewhere. `status` values in
+   `statusTone()` (same file) control which statuses render as "success" (green chip)
+   vs neutral; adjust that set if a new bot uses different status vocabulary.
+
+3. That's it. `App.tsx`, `api.ts`, and all three screens (`ListScreen`, `DetailScreen`,
+   `CreateFormScreen`) read resource names and field lists entirely from `RESOURCES` —
+   nothing else in the SPA needs to change. The whole `miniapp/` directory can be
+   copied as-is between bots; only `resources.ts` differs.
+
+## What NOT to hardcode elsewhere
+
+If you find yourself adding a resource or field name to any file other than
+`resources.ts` (or a bot-specific `miniapp_config` in the template), that's a sign the
+change belongs in one of those two places instead — it keeps the SPA reusable across
+templates without code changes.
+
+## Development
+
+```sh
+npm install
+npm run dev       # dev server; see vite.config.ts for the API proxy
+npm run build      # outputs to dist/, served by combined_app.py at /app/{bot_id}
 ```
-
-See the [Oxlint rules documentation](https://oxc.rs/docs/guide/usage/linter/rules) for the full list of rules and categories.

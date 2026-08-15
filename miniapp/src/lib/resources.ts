@@ -1,15 +1,15 @@
-/* Client-side display schema for the tour_operator pilot's two resources
-   (tours, guests) — see templates/tour_operator.py's miniapp_config for the
+/* Client-side display schema, one entry per bot resource, keyed by resource
+   name — see templates/tour_operator.py's miniapp_config for the
    server-side counterpart this mirrors. The backend's miniapp_config
    controls what columns EXIST and are writable; this controls how they're
    LABELED and formatted for a human, which the generic REST layer has no
    opinion on (see docs/MINIAPP_DESIGN.md §2.3: the backend stays
    template-agnostic, but a human-readable label is inherently per-domain).
 
-   Scoped to this one pilot template for now — not yet a general "any
-   template can supply its own display schema" mechanism, since the pilot
-   hasn't proven what that mechanism should look like (see design doc §2.4:
-   auto-generation is explicitly Phase 2, after the pilot). */
+   This is the only file that needs to change to point the SPA at a new
+   bot's resources — see miniapp/README.md. Auto-generating this from
+   miniapp_config server-side is tracked as Phase 2 (design doc §2.4) and
+   hasn't landed yet, so it's maintained by hand today. */
 
 export interface FieldDisplay {
   name: string
