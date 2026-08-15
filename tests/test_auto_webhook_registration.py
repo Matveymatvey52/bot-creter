@@ -36,19 +36,26 @@ SECRET = "s3cret-token"
 
 class ActivateNewBotChoosesMechanismByMode(unittest.IsolatedAsyncioTestCase):
     def _patch_side_effects(self):
-        """Mocks the three side-effecting calls _activate_new_bot can make, so
+        """Mocks the side-effecting calls _activate_new_bot can make, so
         no real Telegram / subprocess / DB work happens."""
         self._set_webhook = patch.object(create_bot_module, "set_webhook_for_bot", new=AsyncMock())
         self._start_bot = patch.object(create_bot_module, "start_bot", new=AsyncMock(return_value=54321))
         self._update_status = patch.object(create_bot_module, "update_bot_status", new=AsyncMock())
-        mocks = (self._set_webhook.start(), self._start_bot.start(), self._update_status.start())
+        self._set_menu_button = patch.object(create_bot_module, "set_miniapp_menu_button", new=AsyncMock())
+        mocks = (
+            self._set_webhook.start(),
+            self._start_bot.start(),
+            self._update_status.start(),
+            self._set_menu_button.start(),
+        )
         self.addCleanup(self._set_webhook.stop)
         self.addCleanup(self._start_bot.stop)
         self.addCleanup(self._update_status.stop)
+        self.addCleanup(self._set_menu_button.stop)
         return mocks
 
     async def test_webhook_mode_registers_webhook_and_does_not_start_polling(self):
-        set_webhook, start_bot, update_status = self._patch_side_effects()
+        set_webhook, start_bot, update_status, set_menu_button = self._patch_side_effects()
         with patch.dict(os.environ, {"PUBLIC_BASE_URL": BASE_URL, "WEBHOOK_SECRET": SECRET}):
             activation = await create_bot_module._activate_new_bot(
                 BOT_ID, BOT_NAME, BOT_FILE, FAKE_TOKEN, {"BOT_DISPLAY_NAME": "X"}
@@ -59,13 +66,16 @@ class ActivateNewBotChoosesMechanismByMode(unittest.IsolatedAsyncioTestCase):
         # The URL that secret-token would be attached to — /webhook/<bot_id>.
         self.assertEqual(build_webhook_url(BASE_URL, BOT_ID), f"{BASE_URL}/webhook/{BOT_ID}")
         start_bot.assert_not_called()
+        # has_miniapp defaults to False — no miniapp_config was passed, so no
+        # Menu Button call should be made even though PUBLIC_BASE_URL is set.
+        set_menu_button.assert_not_called()
         # The exact persisted state restore_bots() keys off of: status "running"
         # with NO pid argument → pid column stays NULL → webhook-served, not polling.
         # (This is what RestoreBotsRespectsWebhookMode below then guards against.)
         update_status.assert_awaited_once_with(BOT_ID, "running")
 
     async def test_polling_mode_starts_bot_and_registers_no_webhook(self):
-        set_webhook, start_bot, _ = self._patch_side_effects()
+        set_webhook, start_bot, _, set_menu_button = self._patch_side_effects()
         # PUBLIC_BASE_URL absent → polling / standalone mode.
         env_without_base = {k: v for k, v in os.environ.items() if k != "PUBLIC_BASE_URL"}
         with patch.dict(os.environ, env_without_base, clear=True):
@@ -79,9 +89,10 @@ class ActivateNewBotChoosesMechanismByMode(unittest.IsolatedAsyncioTestCase):
             BOT_ID, str(BOT_FILE), FAKE_TOKEN, extra_env={"BOT_DISPLAY_NAME": "X"}
         )
         set_webhook.assert_not_called()
+        set_menu_button.assert_not_called()
 
     async def test_webhook_mode_without_secret_registers_nothing_and_warns(self):
-        set_webhook, start_bot, _ = self._patch_side_effects()
+        set_webhook, start_bot, _, _set_menu_button = self._patch_side_effects()
         env = {k: v for k, v in os.environ.items() if k != "WEBHOOK_SECRET"}
         env["PUBLIC_BASE_URL"] = BASE_URL  # webhook mode, but no secret
         with patch.dict(os.environ, env, clear=True):
@@ -99,7 +110,7 @@ class ActivateNewBotChoosesMechanismByMode(unittest.IsolatedAsyncioTestCase):
         """Task 3 error handling: if set_webhook raises, the bot is already created
         and in the registry — we do NOT fall back to polling (that would 409 against
         the webhook once it's fixed), we surface webhook_failed for the user message."""
-        set_webhook, start_bot, _ = self._patch_side_effects()
+        set_webhook, start_bot, _, _set_menu_button = self._patch_side_effects()
         set_webhook.side_effect = RuntimeError("Telegram unreachable")
         with patch.dict(os.environ, {"PUBLIC_BASE_URL": BASE_URL, "WEBHOOK_SECRET": SECRET}):
             with self.assertLogs("handlers.create_bot", level="ERROR"):
@@ -110,6 +121,54 @@ class ActivateNewBotChoosesMechanismByMode(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(activation.outcome, "webhook_failed")
         set_webhook.assert_awaited_once()
         start_bot.assert_not_called()
+
+    async def test_has_miniapp_registers_menu_button_in_webhook_mode(self):
+        set_webhook, _, _, set_menu_button = self._patch_side_effects()
+        with patch.dict(os.environ, {"PUBLIC_BASE_URL": BASE_URL, "WEBHOOK_SECRET": SECRET}):
+            activation = await create_bot_module._activate_new_bot(
+                BOT_ID, BOT_NAME, BOT_FILE, FAKE_TOKEN, None, has_miniapp=True
+            )
+
+        self.assertEqual(activation.outcome, "webhook_ok")
+        set_menu_button.assert_awaited_once_with(FAKE_TOKEN, BASE_URL, BOT_ID)
+
+    async def test_has_miniapp_registers_menu_button_in_polling_mode(self):
+        _, start_bot, _, set_menu_button = self._patch_side_effects()
+        env_without_base = {k: v for k, v in os.environ.items() if k != "PUBLIC_BASE_URL"}
+        with patch.dict(os.environ, {**env_without_base, "PUBLIC_BASE_URL": BASE_URL}):
+            activation = await create_bot_module._activate_new_bot(
+                BOT_ID, BOT_NAME, BOT_FILE, FAKE_TOKEN, None, has_miniapp=True
+            )
+
+        # PUBLIC_BASE_URL is set here (needed for the mini-app to be servable
+        # at all), so this actually exercises webhook mode; the Menu Button
+        # call itself doesn't care which delivery mode follows it.
+        set_menu_button.assert_awaited_once_with(FAKE_TOKEN, BASE_URL, BOT_ID)
+
+    async def test_has_miniapp_but_no_base_url_skips_menu_button(self):
+        """Without PUBLIC_BASE_URL there is no servable mini-app URL to point at."""
+        _, _, _, set_menu_button = self._patch_side_effects()
+        env_without_base = {k: v for k, v in os.environ.items() if k != "PUBLIC_BASE_URL"}
+        with patch.dict(os.environ, env_without_base, clear=True):
+            await create_bot_module._activate_new_bot(
+                BOT_ID, BOT_NAME, BOT_FILE, FAKE_TOKEN, None, has_miniapp=True
+            )
+        set_menu_button.assert_not_called()
+
+    async def test_menu_button_failure_does_not_block_webhook_registration(self):
+        """Menu Button setup is best-effort — a failure must not stop the bot
+        from otherwise going live via webhook registration."""
+        set_webhook, _, update_status, set_menu_button = self._patch_side_effects()
+        set_menu_button.side_effect = RuntimeError("Telegram unreachable")
+        with patch.dict(os.environ, {"PUBLIC_BASE_URL": BASE_URL, "WEBHOOK_SECRET": SECRET}):
+            with self.assertLogs("handlers.create_bot", level="ERROR"):
+                activation = await create_bot_module._activate_new_bot(
+                    BOT_ID, BOT_NAME, BOT_FILE, FAKE_TOKEN, None, has_miniapp=True
+                )
+
+        self.assertEqual(activation.outcome, "webhook_ok")
+        set_webhook.assert_awaited_once()
+        update_status.assert_awaited_once_with(BOT_ID, "running")
 
 
 class RestoreBotsRespectsWebhookMode(unittest.IsolatedAsyncioTestCase):

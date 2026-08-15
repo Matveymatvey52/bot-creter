@@ -4,6 +4,7 @@ import asyncio
 import functools
 import html
 import logging
+import os
 import re
 import tempfile
 from pathlib import Path
@@ -35,6 +36,7 @@ from handlers.admin_manager import _is_owner
 from handlers.create_bot import cancel_keyboard
 from runtime.registry import _CUSTOM_FEATURES_DIR, discover_features, infer_template_id, invalidate_custom_feature_cache
 from runtime.registry_holder import RegistryHandle
+from runtime.webhook_setup import set_miniapp_menu_button
 from services.bot_runner import _make_extra_env, get_bot_logs, is_running, start_bot, stop_bot
 from services.claude_service import fix_bot_code, generate_bot_code, improve_bot_code
 from services.github_sync import push_bot_to_github
@@ -836,6 +838,12 @@ async def cb_recreate(callback: CallbackQuery):
 
         if miniapp_config:
             await set_bot_miniapp_config(bot_id, miniapp_config)
+            base_url = os.getenv("PUBLIC_BASE_URL", "").strip()
+            if base_url and b.get("token"):
+                try:
+                    await set_miniapp_menu_button(b["token"], base_url, bot_id)
+                except Exception as e:
+                    logger.error(f"Bot id={bot_id} regenerated but Menu Button setup failed: {e}")
 
         try:
             pid = await start_bot(bot_id, str(bot_file), b["token"], extra_env=_make_extra_env(b))
