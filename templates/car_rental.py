@@ -26,6 +26,14 @@ from aiogram.types import (
     KeyboardButton, Message, ReplyKeyboardMarkup, ReplyKeyboardRemove,
 )
 
+# BASE_URL/PORT are process-wide, same treatment as templates/tour_operator.py
+# (see that template's own comment) — every bot in the shared webhook process
+# reads the same values, so these stay module-level env reads rather than
+# CarRentalConfig fields.
+PORT           = int(os.getenv("PORT", "8080"))
+RAILWAY_DOMAIN = os.getenv("RAILWAY_PUBLIC_DOMAIN", "")
+BASE_URL       = f"https://{RAILWAY_DOMAIN}" if RAILWAY_DOMAIN else f"http://localhost:{PORT}"
+
 # ── CUSTOMIZE ────────────────────────────────────────────────────────────────
 # Same status as every other template's CUSTOMIZE block: per-file source-text
 # customization Claude edits when generating a specific bot, not per-bot
@@ -67,6 +75,48 @@ STATUS_TRANSITIONS = {
 BLOCKING_STATUSES = ("pending", "confirmed")
 
 
+# ── mini-app config (see docs/MINIAPP_DESIGN.md, templates/tour_operator.py's
+# own miniapp_config for the pilot) ─────────────────────────────────────────
+# Declarative schema read by runtime/miniapp_api.py's generic CRUD handlers —
+# NOT executable code (see that module's docstring). `table` and each field's
+# `name` must match init_db()'s CREATE TABLE columns above exactly —
+# miniapp_api.py builds SQL directly from these names (values are always
+# bound as parameters, never interpolated; only the column/table identifiers
+# come from this trusted, hand-authored dict, never from a request).
+miniapp_config = {
+    "resources": [
+        {
+            "name": "cars",
+            "table": "rental_items",
+            "order_by": "id DESC",
+            "creatable": True,
+            "fields": [
+                {"name": "name", "required": True},
+                {"name": "description"},
+                {"name": "price_per_day"},
+                {"name": "active"},
+            ],
+        },
+        {
+            "name": "bookings",
+            "table": "rental_bookings",
+            "order_by": "created_at DESC",
+            "creatable": True,
+            "fields": [
+                {"name": "item_id", "required": True},
+                {"name": "client_user_id", "required": True},
+                {"name": "client_name"},
+                {"name": "client_phone"},
+                {"name": "start_date", "required": True},
+                {"name": "end_date", "required": True},
+                {"name": "status"},
+                {"name": "created_at", "creatable": False},
+            ],
+        },
+    ],
+}
+
+
 # ── config ───────────────────────────────────────────────────────────────────
 # Same pattern as every other template — see docs/STAGE2_DESIGN.md.
 
@@ -78,6 +128,11 @@ class CarRentalConfig:
     welcome_image: Path
     display_name: str | None = None
     group_chat_id: str | None = None
+    # Only set in webhook mode (config_from_bot_row) — standalone mode has no
+    # bots-table row to source it from. Used by _miniapp_url() to scope a
+    # magic-link token to this bot; None means no mini-app link can be
+    # minted (same as templates/tour_operator.py's CarRentalConfig.bot_id).
+    bot_id: int | None = None
 
 
 def _paths_for(name: str, data_dir: Path) -> CarRentalConfig:
@@ -111,6 +166,7 @@ def config_from_bot_row(bot_row: dict, data_dir: Path) -> CarRentalConfig:
     )
     config.display_name = bot_row.get("display_name")
     config.group_chat_id = bot_row.get("group_chat_id")
+    config.bot_id = bot_id
     return config
 
 
@@ -332,6 +388,7 @@ def kb_main_menu() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📅 Брони", callback_data="bk_menu")],
         [InlineKeyboardButton(text="🚗 Техника", callback_data="it_menu")],
         [InlineKeyboardButton(text="👥 Админы", callback_data="adm_menu")],
+        [InlineKeyboardButton(text="🌐 Веб-приложение", callback_data="miniapp_link")],
     ])
 
 def kb_client_menu() -> InlineKeyboardMarkup:
@@ -513,6 +570,59 @@ async def cmd_start(message: Message, state: FSMContext, config: CarRentalConfig
             )
     else:
         await message.answer(CUSTOMER_WELCOME_TEXT, parse_mode="HTML", reply_markup=kb_client_menu())
+
+
+def _miniapp_url(bot_id: int, telegram_user_id: int) -> str | None:
+    """Builds the mini-app link with a signed, expiring token (see
+    runtime/miniapp_api.py's mint_magic_link_token) — same pattern as
+    templates/tour_operator.py's _miniapp_url(). Returns None if
+    MINIAPP_SECRET isn't configured (e.g. standalone/dev mode without the
+    webhook runtime's mini-app layer) — callers fall back to a
+    Telegram-only message in that case."""
+    from runtime.miniapp_api import mint_magic_link_token
+
+    try:
+        token = mint_magic_link_token(bot_id, telegram_user_id)
+    except RuntimeError:
+        return None
+    return f"{BASE_URL}/app/{bot_id}?token={token}"
+
+
+@router.message(Command("app"))
+async def cmd_app(m: Message, config: CarRentalConfig):
+    if not _is_admin(m.from_user.id, config):
+        return
+    url = _miniapp_url(config.bot_id, m.from_user.id) if config.bot_id is not None else None
+    if not url:
+        await m.answer(
+            "🌐 Веб-приложение временно недоступно (не настроен MINIAPP_SECRET). "
+            "Пользуйтесь кнопками ниже."
+        )
+        return
+    await m.answer(
+        f"🌐 <b>Веб-приложение</b>\n\n"
+        f'<a href="{url}">Открыть →</a>\n\n<code>{url}</code>',
+        parse_mode="HTML", disable_web_page_preview=True,
+    )
+
+
+@router.callback_query(F.data == "miniapp_link")
+async def cb_miniapp_link(cb: CallbackQuery, config: CarRentalConfig):
+    await cb.answer()
+    if not _is_admin(cb.from_user.id, config):
+        return
+    url = _miniapp_url(config.bot_id, cb.from_user.id) if config.bot_id is not None else None
+    if not url:
+        await cb.message.answer(
+            "🌐 Веб-приложение временно недоступно (не настроен MINIAPP_SECRET). "
+            "Пользуйтесь кнопками ниже."
+        )
+        return
+    await cb.message.answer(
+        f"🌐 <b>Веб-приложение</b>\n\n"
+        f'<a href="{url}">Открыть →</a>\n\n<code>{url}</code>',
+        parse_mode="HTML", disable_web_page_preview=True,
+    )
 
 
 @router.callback_query(F.data == "main_menu")
