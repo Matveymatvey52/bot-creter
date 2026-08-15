@@ -25,8 +25,10 @@ from db.database import (
     get_bot,
     get_bot_by_name,
     get_bot_features,
+    get_bot_payment_provider,
     get_bot_sheets_config,
     set_bot_miniapp_config,
+    set_bot_payment_provider,
     set_bot_sheets_config,
     update_bot_status,
     update_bot_username,
@@ -69,6 +71,11 @@ class FixBotStates(StatesGroup):
 
 class SheetsConnectFlow(StatesGroup):
     waiting_for_link = State()
+
+
+class PaymentConnectFlow(StatesGroup):
+    browsing_step = State()
+    waiting_for_token = State()
 
 router = Router()
 
@@ -348,10 +355,12 @@ def _features_keyboard(
         rows.append([
             InlineKeyboardButton(text=f"{icon} {name}", callback_data=f"togglefeature:{bot_id}:{name}"),
         ])
-        # "sheets" needs a spreadsheet_id per bot beyond a plain on/off toggle
-        # (unlike payments, which is wired factory-side against the DB with
-        # no button UI at all — see sheets-feature-inventory) — this second
-        # row only appears once the feature itself is enabled.
+        # "sheets" needs a spreadsheet_id per bot beyond a plain on/off toggle —
+        # this second row only appears once the feature itself is enabled.
+        if name == "payments" and name in enabled:
+            rows.append([
+                InlineKeyboardButton(text="💳 Как подключить оплату", callback_data=f"paystart:{bot_id}")
+            ])
         if name == "sheets" and name in enabled:
             label = "📊 Подключить Google Таблицу"
             if sheets_config:
@@ -625,6 +634,175 @@ async def msg_sheets_connect_invalid(message: Message) -> None:
     if not _is_owner(message.from_user.id):
         return
     await message.answer("Пришли ссылку на Google Таблицу текстом, либо нажми ❌ Отмена.")
+
+
+# ── payment provider onboarding wizard ──────────────────────────────────────
+# Telegram's Bot API has no method to programmatically attach a payment
+# provider to a bot — the provider_token can only be issued by BotFather after
+# the owner manually picks a provider there, which forwards them into that
+# provider's own bot (e.g. @YooKassaBot) to confirm. Nothing here bypasses
+# that; this wizard only removes the confusion around *which* buttons to
+# press, and replaces the factory-side-only DB write set_bot_payment_provider
+# used to require with a validated owner-facing flow.
+
+_PROVIDER_TOKEN_RE = re.compile(r"^\d+:(TEST|LIVE):.{1,256}$")
+
+_PAYMENT_STEP_1_TEXT = (
+    "💳 <b>Подключение оплаты (Telegram Payments)</b>\n\n"
+    "Шаг 1 из 4 — Регистрация у платёжного провайдера\n\n"
+    "Если у тебя ещё нет магазина в ЮKassa — зарегистрируй его по кнопке ниже. "
+    "Понадобятся данные ИП/самозанятости/юрлица — это требование платёжного "
+    "законодательства, тут это не обойти."
+)
+_PAYMENT_STEP_2_TEXT = (
+    "💳 Шаг 2 из 4 — Открой BotFather\n\n"
+    "В открывшемся чате отправь:\n"
+    "<code>/mybots</code> → выбери своего бота → <b>Bot Settings</b> → <b>Payments</b>."
+)
+_PAYMENT_STEP_3_TEXT = (
+    "💳 Шаг 3 из 4 — Выбери провайдера в списке\n\n"
+    "В списке провайдеров выбери <b>YooKassa</b> — BotFather откроет чат с "
+    "@YooKassaBot. Войди там в свой аккаунт ЮKassa и подтверди — он пришлёт "
+    "тебе токен вида <code>381764678:TEST:...</code> или <code>381764678:LIVE:...</code>."
+)
+_PAYMENT_STEP_4_TEXT = (
+    "💳 Шаг 4 из 4 — Вставь токен сюда\n\n"
+    "Скопируй токен, который прислал @YooKassaBot, и пришли его сюда сообщением."
+)
+
+
+def _payment_step_keyboard(bot_id: int, step: int) -> InlineKeyboardMarkup:
+    rows = []
+    if step == 1:
+        rows.append([InlineKeyboardButton(text="🔗 Зарегистрироваться в ЮKassa", url="https://yookassa.ru/joinups")])
+    if step == 2:
+        rows.append([InlineKeyboardButton(text="🔗 Открыть BotFather", url="https://t.me/BotFather")])
+    nav = []
+    if step > 1:
+        nav.append(InlineKeyboardButton(text="◀ Назад", callback_data=f"paystep:{bot_id}:{step - 1}"))
+    if step < 4:
+        nav.append(InlineKeyboardButton(text="Далее ▶️", callback_data=f"paystep:{bot_id}:{step + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data=f"paycancel:{bot_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+_PAYMENT_STEP_TEXTS = {
+    1: _PAYMENT_STEP_1_TEXT,
+    2: _PAYMENT_STEP_2_TEXT,
+    3: _PAYMENT_STEP_3_TEXT,
+    4: _PAYMENT_STEP_4_TEXT,
+}
+
+
+@router.callback_query(F.data.startswith("paystart:"))
+async def cb_payment_connect_start(callback: CallbackQuery, state: FSMContext):
+    if not _is_owner(callback.from_user.id):
+        await _deny_callback(callback)
+        return
+    await callback.answer()
+    bot_id = int(callback.data.split(":")[1])
+    if not await get_bot(bot_id):
+        await callback.message.answer("Бот не найден.")
+        return
+    # Set from the very first screen (not just at the final text-collecting
+    # step) so bot_id in FSM data is state-guarded throughout steps 1-3 too —
+    # matches SheetsConnectFlow's single-state-from-the-start design instead
+    # of leaving an unguarded window where another flow could silently
+    # clobber this wizard's stashed bot_id.
+    await state.set_state(PaymentConnectFlow.browsing_step)
+    await state.update_data(bot_id=bot_id)
+    await _edit_or_resend(
+        callback,
+        _PAYMENT_STEP_1_TEXT,
+        parse_mode="HTML",
+        reply_markup=_payment_step_keyboard(bot_id, 1),
+    )
+
+
+@router.callback_query(F.data.startswith("paystep:"))
+async def cb_payment_connect_step(callback: CallbackQuery, state: FSMContext):
+    if not _is_owner(callback.from_user.id):
+        await _deny_callback(callback)
+        return
+    await callback.answer()
+    _, bot_id_str, step_str = callback.data.split(":", 2)
+    bot_id, step = int(bot_id_str), int(step_str)
+    if step not in _PAYMENT_STEP_TEXTS:
+        # Malformed/tampered/stale callback_data (e.g. an old inline keyboard
+        # surviving a future step-range change) — ignore rather than crash on
+        # a dict lookup or route through invalid FSM data.
+        return
+    if not await get_bot(bot_id):
+        await state.clear()
+        await callback.message.answer("Бот не найден.")
+        return
+    if step == 4:
+        # Only the final step actually collects free text.
+        await state.set_state(PaymentConnectFlow.waiting_for_token)
+    else:
+        await state.set_state(PaymentConnectFlow.browsing_step)
+    await state.update_data(bot_id=bot_id)
+    await _edit_or_resend(
+        callback,
+        _PAYMENT_STEP_TEXTS[step],
+        parse_mode="HTML",
+        reply_markup=_payment_step_keyboard(bot_id, step),
+    )
+
+
+@router.callback_query(F.data.startswith("paycancel:"))
+async def cb_payment_connect_cancel(callback: CallbackQuery, state: FSMContext):
+    if not _is_owner(callback.from_user.id):
+        await _deny_callback(callback)
+        return
+    await callback.answer()
+    bot_id = int(callback.data.split(":")[1])
+    await state.clear()
+    await _back_to_features_panel(bot_id, callback.message)
+
+
+@router.message(PaymentConnectFlow.waiting_for_token, F.text, ~F.text.startswith("/"))
+async def msg_payment_connect_token(message: Message, state: FSMContext):
+    if not _is_owner(message.from_user.id):
+        return
+    data = await state.get_data()
+    bot_id = data.get("bot_id")
+    if bot_id is None:
+        await state.clear()
+        return
+    token = message.text.strip()
+    if not _PROVIDER_TOKEN_RE.match(token):
+        await message.answer(
+            "⚠️ Не похоже на токен от @YooKassaBot. Ожидается формат вида "
+            "<code>381764678:TEST:...</code> или <code>381764678:LIVE:...</code>. "
+            "Проверь и пришли ещё раз, либо нажми ❌ Отмена.",
+            parse_mode="HTML",
+        )
+        return
+    if bot_id in _busy_bots:
+        await message.answer(_BUSY_TEXT)
+        return
+    _busy_bots.add(bot_id)
+    try:
+        if not await get_bot(bot_id):
+            await state.clear()
+            await message.answer("Бот не найден.")
+            return
+        await set_bot_payment_provider(bot_id, token)
+        await state.clear()
+        await message.answer("✅ Платёжный провайдер подключён. Бот теперь может принимать оплату.")
+        await _back_to_features_panel(bot_id, message)
+    finally:
+        _busy_bots.discard(bot_id)
+
+
+@router.message(PaymentConnectFlow.waiting_for_token)
+async def msg_payment_connect_invalid(message: Message) -> None:
+    if not _is_owner(message.from_user.id):
+        return
+    await message.answer("Пришли токен от @YooKassaBot текстом, либо нажми ❌ Отмена.")
 
 
 @router.callback_query(F.data.startswith("start:"))

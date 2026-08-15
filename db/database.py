@@ -410,8 +410,8 @@ async def update_bot_username(bot_id: int, username: str) -> None:
 
 async def set_bot_payment_provider(bot_id: int, provider_token: str) -> None:
     """Upserts this bot's Telegram payment provider token — 1:1 with bots.id,
-    same Fernet encryption as bots.token. No admin-facing command sets this in
-    Phase B; it's written directly against the DB (factory-side), per owner."""
+    same Fernet encryption as bots.token. Set via the owner-facing payment
+    onboarding wizard in handlers/manage_bots.py (PaymentConnectFlow)."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             """
