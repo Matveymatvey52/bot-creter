@@ -1,7 +1,7 @@
 providers = ["python"]
 
 [phases.setup]
-nixPkgs = ["nodejs_20"]
+nixPkgs = ["nodejs_20", "python311", "gcc"]
 
 [phases.miniapp_build]
 dependsOn = ["setup"]
