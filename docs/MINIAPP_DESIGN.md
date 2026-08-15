@@ -211,19 +211,22 @@ tour_operator.py (`_section_summary`, REST-хендлеры) как источн
 
 ### 4.1 Важно для деплоя (не забыть)
 
-**TODO (не решено, требует отдельного согласования перед продом): прописать сборку SPA в
-Railway build command.**
+**ЗАКРЫТО: сборка SPA прописана в Railway build pipeline через `nixpacks.toml`.**
 
-`GET /app/{bot_id}` отдаёт 503, если `miniapp/dist/` не существует — сборка SPA (`npm run build` в
-`miniapp/`) должна стать частью деплой-пайплайна (Railway build step), ИНАЧЕ мини-апп молчит в
-проде при полностью рабочем бэкенде. `miniapp/node_modules/` и `miniapp/dist/` добавлены в
-`.gitignore` (стандартная гигиена — не коммитить регенерируемые артефакты), но это означает `dist/`
-не существует на свежем чекауте без явного шага сборки — сейчас Railway's build command знает
-только про Python-зависимости (см. существующий деплой-конфиг), про `npm install && npm run build`
-в `miniapp/` там ничего нет.
+`GET /app/{bot_id}` отдаёт 503, если `miniapp/dist/` не существует. Добавлен `nixpacks.toml` в
+корне репо с отдельной фазой `miniapp_build` (`cd miniapp && npm install && npm run build`),
+которая выполняется до фазы `install` (Python-зависимости) и до `start` (`bash start.sh`) —
+Nixpacks строит граф фаз по `dependsOn`, так что `dist/` гарантированно существует к моменту
+старта Python-приложения. `miniapp/node_modules/` и `miniapp/dist/` остаются в `.gitignore`
+(регенерируемые артефакты, не коммитятся) — на свежем чекауте их нет, но build step их создаёт
+до запуска сервера.
 
-Не решается в рамках этой сессии — открытый пункт, ждёт отдельного решения владельца (какая именно
-команда/шаг добавляется в Railway build command, до или вместе с остальным pilot-планом).
+Протестировано локально: чистый `miniapp/dist/` + `node_modules/` удалены, прогнан build step
+(`npm install && npm run build` — тот же, что в `nixpacks.toml`), `dist/` появился
+(`index.html`, `assets/*.js`, `assets/*.css`), `GET /app/{bot_id}` (напрямую через
+`serve_app_shell`, dist не замокан) вернул 200 с реальным `index.html` вместо 503. Полный
+regression-прогон `tests/test_miniapp_api.py` (22 теста, включая `test_missing_dist_dir_returns_503`
+и app-shell тесты) зелёный.
 
 ## 5. Дальнейшие открытые вопросы
 
@@ -232,7 +235,7 @@ Railway build command.**
 - `DetailScreen`'а pilot ограничена одной primary-кнопкой "Назад к списку" — реальное per-domain
   действие (например "отметить оплаченным" для `guests`) не реализовано, нужно решение, что именно
   показывать.
-- **Railway build step для `npm run build`** — см. TODO в §4.1, открытый пункт, не решён.
+- ~~Railway build step для `npm run build`~~ — закрыто, см. §4.1 (`nixpacks.toml` в корне репо).
 
 ## 6. Phase 2 — автогенерация `miniapp_config` для произвольного бота (предложение, кода нет)
 
