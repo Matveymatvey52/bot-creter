@@ -5,7 +5,7 @@ nixPkgs = ["nodejs_20"]
 
 [phases.miniapp_build]
 dependsOn = ["setup"]
-cmds = ["cd miniapp && npm install && npm run build"]
+cmds = ["cd miniapp && npm ci && npm run build"]
 
 [phases.install]
 dependsOn = ["miniapp_build"]
