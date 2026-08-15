@@ -1,26 +1,25 @@
 import { useEffect, useState } from 'react'
 import { listResource, ApiError, type ResourceItem } from '../lib/api'
-import { RESOURCES, statusTone } from '../lib/resources'
+import { statusTone, type ResourceDisplay } from '../lib/displaySchema'
 import { Card, CardHeader, CardTitle, ChipRow, Chip, Badge } from '../components/Card'
 
 export function ListScreen({
-  resourceName,
+  resource,
   onOpenItem,
   onCreateNew,
 }: {
-  resourceName: string
+  resource: ResourceDisplay
   onOpenItem: (id: number) => void
   onCreateNew: () => void
 }) {
   const [items, setItems] = useState<ResourceItem[] | null>(null)
   const [error, setError] = useState<string | null>(null)
-  const resource = RESOURCES[resourceName]
 
   useEffect(() => {
     let cancelled = false
     setItems(null)
     setError(null)
-    listResource(resourceName)
+    listResource(resource.name)
       .then((data) => {
         if (!cancelled) setItems(data.items)
       })
@@ -31,11 +30,7 @@ export function ListScreen({
     return () => {
       cancelled = true
     }
-  }, [resourceName])
-
-  if (!resource) {
-    return <div className="state-message">Неизвестный ресурс: {resourceName}</div>
-  }
+  }, [resource.name])
 
   return (
     <div className="screen">

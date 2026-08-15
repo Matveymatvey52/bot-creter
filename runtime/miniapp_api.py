@@ -214,6 +214,51 @@ async def me_handler(request: web.Request) -> web.Response:
     return web.json_response({"bot_id": bot_id, "telegram_user_id": telegram_user_id})
 
 
+# Resource keys the SPA needs to render generic list/detail/create screens —
+# everything except backend-only plumbing ("table", "order_by") that has no
+# UI meaning and would otherwise leak the bot's raw SQL table names to the
+# client for no reason. The frontend used to hardcode this exact shape by
+# hand in miniapp/src/lib/resources.ts (Phase 2 design doc §2.4); this
+# endpoint is what replaces that file.
+_SCHEMA_RESOURCE_KEYS = ("name", "creatable", "title", "titleField")
+_SCHEMA_FIELD_KEYS = ("name", "required", "creatable", "label", "kind", "list", "detail", "create")
+
+
+def _resource_display_schema(resource: dict) -> dict:
+    """Strips a miniapp_config resource down to what the SPA needs to render
+    it — same shape whether the config came from a template's hand-authored
+    dict or the Haiku generator, since both now emit the same display keys
+    (see services/claude_service.py's MINIAPP_CONFIG_SYSTEM_PROMPT). Fields
+    the config is missing (older, pre-Phase-2 configs) are simply absent from
+    the response — the SPA fills sane defaults itself rather than the
+    backend inventing labels it has no business guessing."""
+    out = {k: resource[k] for k in _SCHEMA_RESOURCE_KEYS if k in resource}
+    out["fields"] = [
+        {k: field[k] for k in _SCHEMA_FIELD_KEYS if k in field}
+        for field in resource.get("fields", [])
+    ]
+    return out
+
+
+async def schema_handler(request: web.Request) -> web.Response:
+    """GET /api/{bot_id}/schema — the display-schema counterpart to
+    list/get/create's data endpoints below. Same auth and resolution as
+    every other per-bot route; returns the resources this bot's mini-app
+    should render, with display metadata only (no table/order_by/SQL
+    plumbing) — see _resource_display_schema()."""
+    resolved = await _resolve_entry_and_config(request)
+    if isinstance(resolved, web.Response):
+        return resolved
+    bot_id, entry, miniapp_config = resolved
+
+    telegram_user_id = await _authenticate(request, bot_id, entry.bot.token)
+    if telegram_user_id is None:
+        return web.json_response({"error": "forbidden"}, status=403)
+
+    resources = [_resource_display_schema(r) for r in miniapp_config.get("resources", [])]
+    return web.json_response({"resources": resources})
+
+
 def _resource_spec(miniapp_config: dict, resource_name: str) -> dict | None:
     for resource in miniapp_config.get("resources", []):
         if resource.get("name") == resource_name:
@@ -414,6 +459,12 @@ def register_routes(app: web.Application) -> None:
     by combined_app.py right after webhook_app.create_app() so both live on
     the same Application/process/port (see module docstring)."""
     app.router.add_get("/api/{bot_id}/me", me_handler)
+    # Registered before the generic {resource} route below — aiohttp matches
+    # routes in registration order, and "schema" would otherwise be swallowed
+    # as if it were a resource name (see docs on _resource_spec: a bot could
+    # in principle even declare a resource literally named "schema", which
+    # this ordering also protects against by reserving the word).
+    app.router.add_get("/api/{bot_id}/schema", schema_handler)
     app.router.add_get("/api/{bot_id}/{resource}", list_resource_handler)
     app.router.add_get("/api/{bot_id}/{resource}/{item_id}", get_resource_handler)
     app.router.add_post("/api/{bot_id}/{resource}", create_resource_handler)

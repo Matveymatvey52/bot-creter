@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import './components/ui.css'
-import { RESOURCES } from './lib/resources'
+import { getSchema, ApiError } from './lib/api'
+import { normalizeResources, type ResourceDisplay } from './lib/displaySchema'
 import { getTelegramWebApp } from './lib/telegram'
 import { ListScreen } from './screens/ListScreen'
 import { DetailScreen } from './screens/DetailScreen'
@@ -21,11 +22,7 @@ type Route =
   | { kind: 'detail'; resource: string; itemId: number }
   | { kind: 'create'; resource: string }
 
-const RESOURCE_NAMES = Object.keys(RESOURCES)
-
 export default function App() {
-  const [route, setRoute] = useState<Route>({ kind: 'list', resource: RESOURCE_NAMES[0] })
-
   // Telegram's own bootstrap sequence — no-op outside the WebView (see
   // lib/telegram.ts: getTelegramWebApp() returns null in a plain browser).
   useEffect(() => {
@@ -38,11 +35,51 @@ export default function App() {
     return <FactoryDashboardScreen />
   }
 
+  return <TenantApp />
+}
+
+// Split out from App() so the factory-dashboard branch above never mounts
+// the schema fetch below — bot_id=0 has no miniapp_config/GET /schema route
+// (see runtime/miniapp_api.py's serve_app_shell docstring on the same
+// special-case), so nothing here should even try.
+function TenantApp() {
+  const [resources, setResources] = useState<Record<string, ResourceDisplay> | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [route, setRoute] = useState<Route | null>(null)
+
+  useEffect(() => {
+    let cancelled = false
+    getSchema()
+      .then((data) => {
+        if (cancelled) return
+        const normalized = normalizeResources(data.resources)
+        setResources(normalized)
+        const firstName = Object.keys(normalized)[0]
+        setRoute(firstName ? { kind: 'list', resource: firstName } : null)
+      })
+      .catch((err) => {
+        if (cancelled) return
+        setError(err instanceof ApiError ? err.message : 'Не удалось загрузить схему мини-приложения')
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  if (error) {
+    return <div className="state-message">{error}</div>
+  }
+  if (!resources || !route) {
+    return <div className="state-message">Загрузка…</div>
+  }
+
+  const resourceNames = Object.keys(resources)
+
   return (
     <div>
       {route.kind !== 'list' ? null : (
         <div className="chip-row" style={{ padding: '16px 16px 0' }}>
-          {RESOURCE_NAMES.map((name) => (
+          {resourceNames.map((name) => (
             <button
               key={name}
               className="chip"
@@ -53,7 +90,7 @@ export default function App() {
               }
               onClick={() => setRoute({ kind: 'list', resource: name })}
             >
-              {RESOURCES[name].title}
+              {resources[name].title}
             </button>
           ))}
         </div>
@@ -61,7 +98,7 @@ export default function App() {
 
       {route.kind === 'list' && (
         <ListScreen
-          resourceName={route.resource}
+          resource={resources[route.resource]}
           onOpenItem={(itemId) => setRoute({ kind: 'detail', resource: route.resource, itemId })}
           onCreateNew={() => setRoute({ kind: 'create', resource: route.resource })}
         />
@@ -69,7 +106,7 @@ export default function App() {
 
       {route.kind === 'detail' && (
         <DetailScreen
-          resourceName={route.resource}
+          resource={resources[route.resource]}
           itemId={route.itemId}
           onBack={() => setRoute({ kind: 'list', resource: route.resource })}
         />
@@ -77,7 +114,7 @@ export default function App() {
 
       {route.kind === 'create' && (
         <CreateFormScreen
-          resourceName={route.resource}
+          resource={resources[route.resource]}
           onCreated={(itemId) => setRoute({ kind: 'detail', resource: route.resource, itemId })}
           onCancel={() => setRoute({ kind: 'list', resource: route.resource })}
         />

@@ -1,28 +1,27 @@
 import { useCallback, useEffect, useState } from 'react'
 import { getResource, ApiError, type ResourceItem } from '../lib/api'
-import { RESOURCES, statusTone } from '../lib/resources'
+import { statusTone, type ResourceDisplay } from '../lib/displaySchema'
 import { Badge } from '../components/Card'
 import { useTelegramMainButton } from '../lib/useMainButton'
 import { isInTelegram } from '../lib/telegram'
 
 export function DetailScreen({
-  resourceName,
+  resource,
   itemId,
   onBack,
 }: {
-  resourceName: string
+  resource: ResourceDisplay
   itemId: number
   onBack: () => void
 }) {
   const [item, setItem] = useState<ResourceItem | null>(null)
   const [error, setError] = useState<string | null>(null)
-  const resource = RESOURCES[resourceName]
 
   useEffect(() => {
     let cancelled = false
     setItem(null)
     setError(null)
-    getResource(resourceName, itemId)
+    getResource(resource.name, itemId)
       .then((data) => {
         if (!cancelled) setItem(data.item)
       })
@@ -33,17 +32,13 @@ export function DetailScreen({
     return () => {
       cancelled = true
     }
-  }, [resourceName, itemId])
+  }, [resource.name, itemId])
 
   // Pilot's one primary action is "back to list" — a real per-template
   // action (e.g. "отметить оплаченным") is out of scope until a second
   // pilot resource needs one; see docs/MINIAPP_DESIGN.md §3 screen types.
   const handlePrimaryAction = useCallback(() => onBack(), [onBack])
   useTelegramMainButton('Назад к списку', handlePrimaryAction, Boolean(item))
-
-  if (!resource) {
-    return <div className="state-message">Неизвестный ресурс: {resourceName}</div>
-  }
 
   return (
     <div className="screen">
