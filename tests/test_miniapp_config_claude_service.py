@@ -253,28 +253,47 @@ class GenerateMiniappConfig(unittest.IsolatedAsyncioTestCase):
 
 
 class GenerateBotCodeReturnsCodeAndMiniappConfig(unittest.IsolatedAsyncioTestCase):
-    """generate_bot_code's public contract: always a (code, miniapp_config)
-    tuple, and a miniapp_config failure never prevents code from coming back."""
+    """generate_bot_code's public contract: always a (code, miniapp_config,
+    office_hook_config) tuple, and a miniapp_config/office_hook_config
+    failure never prevents code from coming back."""
 
     async def test_wraps_inner_generation_and_appends_miniapp_config(self):
         with patch.object(
             claude_service, "_generate_bot_code_inner", AsyncMock(return_value=SAMPLE_BOT_CODE)
         ), patch.object(
             claude_service, "_generate_miniapp_config", AsyncMock(return_value={"resources": [{"name": "orders"}]})
+        ), patch.object(
+            claude_service, "_generate_office_hook_config", AsyncMock(return_value=None)
         ):
-            code, miniapp_config = await claude_service.generate_bot_code("an order bot")
+            code, miniapp_config, office_hook_config = await claude_service.generate_bot_code("an order bot")
         self.assertEqual(code, SAMPLE_BOT_CODE)
         self.assertEqual(miniapp_config, {"resources": [{"name": "orders"}]})
+        self.assertIsNone(office_hook_config)
 
     async def test_miniapp_config_none_still_returns_the_code(self):
         with patch.object(
             claude_service, "_generate_bot_code_inner", AsyncMock(return_value=SAMPLE_BOT_CODE)
         ), patch.object(
             claude_service, "_generate_miniapp_config", AsyncMock(return_value=None)
+        ), patch.object(
+            claude_service, "_generate_office_hook_config", AsyncMock(return_value=None)
         ):
-            code, miniapp_config = await claude_service.generate_bot_code("an order bot")
+            code, miniapp_config, office_hook_config = await claude_service.generate_bot_code("an order bot")
         self.assertEqual(code, SAMPLE_BOT_CODE)
         self.assertIsNone(miniapp_config)
+        self.assertIsNone(office_hook_config)
+
+    async def test_office_hook_config_is_appended_when_generated(self):
+        with patch.object(
+            claude_service, "_generate_bot_code_inner", AsyncMock(return_value=SAMPLE_BOT_CODE)
+        ), patch.object(
+            claude_service, "_generate_miniapp_config", AsyncMock(return_value=None)
+        ), patch.object(
+            claude_service, "_generate_office_hook_config",
+            AsyncMock(return_value={"table": "orders", "match_field": "user_id"}),
+        ):
+            code, miniapp_config, office_hook_config = await claude_service.generate_bot_code("an order bot")
+        self.assertEqual(office_hook_config, {"table": "orders", "match_field": "user_id"})
 
 
 if __name__ == "__main__":

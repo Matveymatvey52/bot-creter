@@ -154,7 +154,13 @@ class BuildEntryRegistersOfficeEventHook(unittest.IsolatedAsyncioTestCase):
         finally:
             await entry.bot.session.close()
 
-    async def test_template_without_hook_gets_no_office_event_key(self):
+    async def test_template_without_hand_written_hook_gets_the_generic_fallback(self):
+        # docs/OFFICES_DESIGN.md §11 — a template-resolved bot (has typed_config
+        # via config_from_bot_row) with no hand-written on_office_event still
+        # gets SOME hook wired now (the generic one), not none at all — this
+        # is the whole point of the auto-generated fallback. See
+        # tests/test_office_events_generic_hook.py for the generic hook's own
+        # behavior in isolation.
         entry = await reg.build_entry(
             9102,
             FAKE_TOKEN,
@@ -162,6 +168,40 @@ class BuildEntryRegistersOfficeEventHook(unittest.IsolatedAsyncioTestCase):
             {"bot_id": 9102, "name": "fixture_bot_no_hook"},
         )
         try:
-            self.assertNotIn("on_office_event", entry.config)
+            self.assertIn("on_office_event", entry.config)
+        finally:
+            await entry.bot.session.close()
+
+    async def test_generic_fallback_records_a_note_with_no_office_hook_config_row(self):
+        # No bot_office_hook_config row was ever written for bot_id=9103 —
+        # the generic hook must still record its plain fallback note (never
+        # crash, never no-op silently) via features/office_events.py's own
+        # office_notes CREATE TABLE IF NOT EXISTS.
+        import sqlite3
+
+        from features.office_events import OfficeEvent, OrderCreatedEvent
+
+        entry = await reg.build_entry(
+            9103,
+            FAKE_TOKEN,
+            "fixture_office_events_no_hook_template",
+            {"bot_id": 9103, "name": "fixture_bot_no_hook_2"},
+        )
+        try:
+            hook = entry.config["on_office_event"]
+            event = OfficeEvent(
+                event_type="order.created",
+                source_bot_id=1,
+                payload=OrderCreatedEvent(order_id=1, amount=100, currency="RUB", customer_chat_id=555),
+            )
+            await hook(event)
+
+            db_path = self._data_dir / "bot_9103_fixture.db"
+            conn = sqlite3.connect(str(db_path))
+            rows = conn.execute("SELECT source_bot_id, event_type, note FROM office_notes").fetchall()
+            conn.close()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0][0], 1)
+            self.assertEqual(rows[0][1], "order.created")
         finally:
             await entry.bot.session.close()

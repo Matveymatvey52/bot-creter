@@ -667,6 +667,27 @@ async def build_entry(
                 await _handler(event, _config)
 
             register_office_event_hook(config, _office_event_hook)
+        elif typed_config is not None:
+            # docs/OFFICES_DESIGN.md §11 — the universal fallback: a
+            # TEMPLATE-resolved bot (module is not None, so it has a real
+            # db_path via typed_config) with NO hand-written on_office_event
+            # still gets wired to features/office_events.py's
+            # generic_on_office_event(), driven by this bot's own
+            # bot_office_hook_config row (may be None — generic_on_office_event
+            # degrades to a plain fallback note in that case, never raises).
+            # Scoped to template-based bots only (typed_config requires a
+            # resolved module with config_from_bot_row) — fully from-scratch
+            # generated bots (no `# TEMPLATE:` marker, module is None) are out
+            # of scope for this iteration, see docs/OFFICES_DESIGN.md §11's
+            # "Custom-бот scope" decision.
+            from db.database import get_bot_office_hook_config
+            from features.office_events import generic_on_office_event, register_office_event_hook
+
+            async def _generic_office_event_hook(event, _bot_id=bot_id, _db_path=typed_config.db_path):
+                hook_config = await get_bot_office_hook_config(_bot_id)
+                await generic_on_office_event(event, _db_path, hook_config, bot_id=_bot_id)
+
+            register_office_event_hook(config, _generic_office_event_hook)
 
     return BotEntry(bot=bot, dispatcher=dp, template_id=template_id, config=config)
 

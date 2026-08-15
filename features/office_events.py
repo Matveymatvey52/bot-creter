@@ -30,6 +30,7 @@ features/sheets.py's write_row()/read_data().
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -162,3 +163,131 @@ def register_office_event_hook(config: dict[str, Any], hook) -> None:
     adding a dedicated dataclass field there would require every OTHER
     template with no interest in office_events to still carry a None for it."""
     config["on_office_event"] = hook
+
+
+# ── generic office-hook (docs/OFFICES_DESIGN.md §11) ────────────────────────
+#
+# The universal fallback wired by runtime/registry.py's build_entry() for any
+# TEMPLATE-based bot that has NO hand-written on_office_event of its own —
+# lets a customer's own generated bot react to office_events without the
+# owner (or Claude) ever writing per-bot Python for it. Driven by
+# bot_office_hook_config (db/database.py), itself produced by a cheap Haiku
+# call at bot-creation/regeneration time (services/claude_service.py's
+# _generate_office_hook_config) — see that module for the {"table":...,
+# "match_field":...} shape.
+#
+# Deliberately data-driven, not code-generation: no per-bot Python is ever
+# written or eval'd for this — table/column names are read back from the
+# bot's OWN sqlite schema (via PRAGMA table_info) at call time and checked
+# against a strict identifier allowlist before ever being interpolated into
+# SQL, so a hallucinated or stale hook_config can only ever degrade to "no
+# match attempted", never to malformed/unsafe SQL.
+
+_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+async def _table_columns(db, table: str) -> set[str] | None:
+    """Real column names for `table` in this connection's own database, or
+    None if the table doesn't exist. PRAGMA table_info doesn't accept bound
+    parameters for the table name — table is validated against
+    _IDENTIFIER_RE by the only caller (generic_on_office_event) before this
+    is ever called, so the f-string below can't carry attacker-controlled
+    SQL even though it isn't a bind parameter. Quoted for the same reserved-word
+    reason as the SELECT in generic_on_office_event (e.g. table="order")."""
+    async with db.execute(f'PRAGMA table_info("{table}")') as cursor:
+        rows = await cursor.fetchall()
+    if not rows:
+        return None
+    return {row[1] for row in rows}
+
+
+async def generic_on_office_event(
+    event: OfficeEvent, db_path: str, hook_config: dict[str, Any] | None, bot_id: int | None = None
+) -> None:
+    """The universal, auto-wired on_office_event() body for template-based
+    bots with no hand-written hook of their own. Two-tier reaction, per
+    docs/OFFICES_DESIGN.md §11:
+
+    1. ALWAYS records a plain fallback note in this bot's own office_notes
+       table (created here, IF NOT EXISTS, on first use — no template's
+       init_db() needs to know about this table).
+    2. IF hook_config names a real table+match_field (both re-validated
+       against this bot's actual schema at call time, not just trusted from
+       generation time), additionally checks whether event.payload's
+       customer identifier already has a matching row there, and notes that
+       too — the "this office event is about someone I already have a
+       record for" signal docs/OFFICES_DESIGN.md §8's hand-written
+       tour_operator/event_rsvp pair demonstrates, generalized.
+
+    The tier-2 match attempt is isolated in its OWN try/except — review
+    found that table/match_field could be a real column whose name happens
+    to be a SQLite reserved word (e.g. "order", "group", "check" — all valid
+    CREATE TABLE column names, all requiring quoting when used bare in a
+    SELECT). Without isolation, that SyntaxError would abort BEFORE the
+    tier-1 fallback INSERT, breaking the "ALWAYS records a note" guarantee
+    above for exactly the templates (orders_tracker, shop_catalog,
+    delivery_tracker, ...) most likely to hit it. Quoting both identifiers
+    in double-quotes (safe here specifically because _IDENTIFIER_RE already
+    rejects any input containing a quote character) avoids the failure mode
+    entirely; the isolated try/except is defense in depth on top of that.
+
+    Never raises — same isolation guarantee every other office_events
+    subscriber in this codebase provides (features/office_events.py's own
+    publish_event() isolates each subscriber, but this stays defensive on
+    principle, same as templates/event_rsvp.py's hand-written
+    on_office_event)."""
+    import aiosqlite
+
+    customer_chat_id = getattr(event.payload, "customer_chat_id", None)
+    note = (
+        f"Получено событие '{event.event_type}' от связанного бота (bot_id={event.source_bot_id})"
+        + (f", клиент {customer_chat_id}." if customer_chat_id is not None else ".")
+    )
+    try:
+        async with aiosqlite.connect(db_path) as db:
+            await db.execute("PRAGMA busy_timeout=5000")
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS office_notes (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_bot_id   INTEGER NOT NULL,
+                    event_type      TEXT NOT NULL,
+                    note            TEXT NOT NULL,
+                    created_at      TEXT DEFAULT (datetime('now','localtime'))
+                )
+            """)
+
+            table = hook_config.get("table") if hook_config else None
+            match_field = hook_config.get("match_field") if hook_config else None
+            if (
+                customer_chat_id is not None
+                and isinstance(table, str) and _IDENTIFIER_RE.match(table)
+                and isinstance(match_field, str) and _IDENTIFIER_RE.match(match_field)
+            ):
+                try:
+                    columns = await _table_columns(db, table)
+                    if columns and match_field in columns:
+                        async with db.execute(
+                            f'SELECT 1 FROM "{table}" WHERE "{match_field}" = ? LIMIT 1',
+                            (customer_chat_id,),
+                        ) as cursor:
+                            matched = (await cursor.fetchone()) is not None
+                        if matched:
+                            note += f" Найдено совпадение в таблице '{table}' по полю '{match_field}'."
+                except Exception:
+                    logger.warning(
+                        f"generic_on_office_event: match attempt against table={table!r} "
+                        f"match_field={match_field!r} failed (stale/hallucinated hook_config?) — "
+                        f"bot_id={bot_id} event_type={event.event_type}, falling back to plain note",
+                        exc_info=True,
+                    )
+
+            await db.execute(
+                "INSERT INTO office_notes (source_bot_id, event_type, note) VALUES (?, ?, ?)",
+                (event.source_bot_id, event.event_type, note),
+            )
+            await db.commit()
+    except Exception:
+        logger.exception(
+            f"generic_on_office_event: failed to record office note — "
+            f"bot_id={bot_id} event_type={event.event_type} source_bot_id={event.source_bot_id} db_path={db_path}"
+        )

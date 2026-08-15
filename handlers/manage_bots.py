@@ -31,6 +31,7 @@ from db.database import (
     get_office_links_for_bot,
     remove_office_link,
     set_bot_miniapp_config,
+    set_bot_office_hook_config,
     set_bot_payment_provider,
     set_bot_sheets_config,
     update_bot_status,
@@ -1145,9 +1146,13 @@ async def cb_recreate(callback: CallbackQuery):
             task = generate_bot_code(b.get("description", ""))
 
         miniapp_config: dict | None = None
+        office_hook_config: dict | None = None
         try:
             result = await asyncio.wait_for(task, timeout=240.0)
-            code, miniapp_config = result if regenerating_from_scratch else (result, None)
+            if regenerating_from_scratch:
+                code, miniapp_config, office_hook_config = result
+            else:
+                code = result
         except Exception as e:
             logger.error(f"Failed to regenerate bot {bot_id}: {e}")
             await callback.message.edit_text(
@@ -1165,6 +1170,8 @@ async def cb_recreate(callback: CallbackQuery):
         bot_file.write_text(code, encoding="utf-8")
         asyncio.create_task(push_bot_to_github(b["name"], code))
 
+        if office_hook_config:
+            await set_bot_office_hook_config(bot_id, office_hook_config)
         if miniapp_config:
             await set_bot_miniapp_config(bot_id, miniapp_config)
             base_url = os.getenv("PUBLIC_BASE_URL", "").strip()

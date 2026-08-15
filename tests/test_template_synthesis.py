@@ -256,8 +256,12 @@ class GenerateBotCodeTwoTemplateBranch(unittest.IsolatedAsyncioTestCase):
 
         self.mock_client.messages.create = AsyncMock(side_effect=fake_create)
 
-        with patch.object(claude_service, "_generate_miniapp_config", AsyncMock(return_value=None)):
-            code, _miniapp_config = await claude_service.generate_bot_code("sells products and rewards loyalty points")
+        with patch.object(
+            claude_service, "_generate_miniapp_config", AsyncMock(return_value=None)
+        ), patch.object(claude_service, "_generate_office_hook_config", AsyncMock(return_value=None)):
+            code, _miniapp_config, _office_hook_config = await claude_service.generate_bot_code(
+                "sells products and rewards loyalty points"
+            )
 
         self.assertEqual(
             call_order,
@@ -310,8 +314,10 @@ class SynthesisModeIsolatedFromSingleTemplateRequests(unittest.IsolatedAsyncioTe
 
         self.mock_client.messages.create = AsyncMock(side_effect=fake_create)
 
-        with patch.object(claude_service, "_generate_miniapp_config", AsyncMock(return_value=None)):
-            code, _miniapp_config = await claude_service.generate_bot_code("sells products online")
+        with patch.object(
+            claude_service, "_generate_miniapp_config", AsyncMock(return_value=None)
+        ), patch.object(claude_service, "_generate_office_hook_config", AsyncMock(return_value=None)):
+            code, _miniapp_config, _office_hook_config = await claude_service.generate_bot_code("sells products online")
 
         self.mock_synth.assert_not_called()
         self.mock_merge_review.assert_not_called()
@@ -345,8 +351,12 @@ class SynthesisModeIsolatedFromSingleTemplateRequests(unittest.IsolatedAsyncioTe
 
         self.mock_client.messages.create = AsyncMock(side_effect=fake_create)
 
-        with patch.object(claude_service, "_generate_miniapp_config", AsyncMock(return_value=None)):
-            code, _miniapp_config = await claude_service.generate_bot_code("a completely novel kind of bot")
+        with patch.object(
+            claude_service, "_generate_miniapp_config", AsyncMock(return_value=None)
+        ), patch.object(claude_service, "_generate_office_hook_config", AsyncMock(return_value=None)):
+            code, _miniapp_config, _office_hook_config = await claude_service.generate_bot_code(
+                "a completely novel kind of bot"
+            )
 
         self.mock_synth.assert_not_called()
         self.mock_merge_review.assert_not_called()
@@ -391,8 +401,12 @@ class GenerateBotCodeFromScratchBranch(unittest.IsolatedAsyncioTestCase):
 
         self.mock_client.messages.create = AsyncMock(side_effect=fake_create)
 
-        with patch.object(claude_service, "_generate_miniapp_config", AsyncMock(return_value=None)):
-            code, _miniapp_config = await claude_service.generate_bot_code("a completely novel kind of bot")
+        with patch.object(
+            claude_service, "_generate_miniapp_config", AsyncMock(return_value=None)
+        ), patch.object(claude_service, "_generate_office_hook_config", AsyncMock(return_value=None)):
+            code, _miniapp_config, _office_hook_config = await claude_service.generate_bot_code(
+                "a completely novel kind of bot"
+            )
 
         self.assertEqual(
             call_order,
