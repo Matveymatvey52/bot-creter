@@ -211,6 +211,20 @@ async def init_db():
         # dict: {"resources": [...]}). Stored in the factory DB, not inline in
         # the bot's .py file, so it can be regenerated (custom_features edits,
         # /recreate) without touching the bot's source.
+        # "Офисы" (docs/OFFICES_DESIGN.md) — explicit, factory-side subscription
+        # links between two bots owned by the same factory instance. Not
+        # per-bot data (like bot_sheets_config): this is metadata ABOUT the
+        # relationship between two bots.id rows, so it lives here alongside
+        # bot_features rather than in either bot's own per-bot db_path.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS bot_office_links (
+                source_bot_id INTEGER NOT NULL REFERENCES bots(id),
+                target_bot_id INTEGER NOT NULL REFERENCES bots(id),
+                event_type    TEXT NOT NULL,
+                created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (source_bot_id, target_bot_id, event_type)
+            )
+        """)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS bot_miniapp_config (
                 bot_id       INTEGER PRIMARY KEY REFERENCES bots(id),
@@ -382,6 +396,9 @@ async def delete_bot(bot_id: int) -> None:
         await db.execute("DELETE FROM bot_sheets_config WHERE bot_id = ?", (bot_id,))
         await db.execute("DELETE FROM bot_custom_features WHERE bot_id = ?", (bot_id,))
         await db.execute("DELETE FROM bot_miniapp_config WHERE bot_id = ?", (bot_id,))
+        await db.execute(
+            "DELETE FROM bot_office_links WHERE source_bot_id = ? OR target_bot_id = ?", (bot_id, bot_id)
+        )
         await db.commit()
 
 
@@ -509,6 +526,46 @@ async def get_bot_features(bot_id: int) -> list[str]:
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
             "SELECT feature_name FROM bot_features WHERE bot_id = ?", (bot_id,)
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [row[0] for row in rows]
+
+
+async def add_office_link(source_bot_id: int, target_bot_id: int, event_type: str) -> None:
+    """Subscribes target_bot_id to event_type published by source_bot_id — see
+    docs/OFFICES_DESIGN.md §3. INSERT OR IGNORE: re-subscribing to an already
+    existing (source, target, event_type) triple is a no-op, not an error —
+    same idempotency the PRIMARY KEY already gives bot_features."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT OR IGNORE INTO bot_office_links (source_bot_id, target_bot_id, event_type)
+            VALUES (?, ?, ?)
+            """,
+            (source_bot_id, target_bot_id, event_type),
+        )
+        await db.commit()
+
+
+async def remove_office_link(source_bot_id: int, target_bot_id: int, event_type: str) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "DELETE FROM bot_office_links WHERE source_bot_id = ? AND target_bot_id = ? AND event_type = ?",
+            (source_bot_id, target_bot_id, event_type),
+        )
+        await db.commit()
+
+
+async def get_office_subscribers(source_bot_id: int, event_type: str) -> list[int]:
+    """Every bot_id currently subscribed to event_type published by
+    source_bot_id — see features/office_events.py's publish_event(), the only
+    caller. Deliberately scoped to ONE source+event_type pair per call rather
+    than returning the whole links table, since that's the only shape a
+    publisher ever needs."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT target_bot_id FROM bot_office_links WHERE source_bot_id = ? AND event_type = ?",
+            (source_bot_id, event_type),
         ) as cursor:
             rows = await cursor.fetchall()
             return [row[0] for row in rows]
