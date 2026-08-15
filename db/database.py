@@ -197,6 +197,18 @@ async def init_db():
                 connected_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        # mini-app config (see docs/MINIAPP_DESIGN.md §6) — one row per bot,
+        # JSON blob (same shape as templates/tour_operator.py's miniapp_config
+        # dict: {"resources": [...]}). Stored in the factory DB, not inline in
+        # the bot's .py file, so it can be regenerated (custom_features edits,
+        # /recreate) without touching the bot's source.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS bot_miniapp_config (
+                bot_id       INTEGER PRIMARY KEY REFERENCES bots(id),
+                config_json  TEXT NOT NULL,
+                generated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         # channel_monitor (userbot/Telethon product) — see
         # docs/USERBOT_CHANNEL_MONITOR_DESIGN.md §1, §4. Lives in the central
         # factory DB (not a per-tenant-bot DB): a userbot session belongs to
@@ -360,6 +372,7 @@ async def delete_bot(bot_id: int) -> None:
         await db.execute("DELETE FROM bot_features WHERE bot_id = ?", (bot_id,))
         await db.execute("DELETE FROM bot_sheets_config WHERE bot_id = ?", (bot_id,))
         await db.execute("DELETE FROM bot_custom_features WHERE bot_id = ?", (bot_id,))
+        await db.execute("DELETE FROM bot_miniapp_config WHERE bot_id = ?", (bot_id,))
         await db.commit()
 
 
@@ -441,6 +454,46 @@ async def get_bot_sheets_config(bot_id: int) -> dict | None:
         ) as cursor:
             row = await cursor.fetchone()
             return dict(row) if row else None
+
+
+async def set_bot_miniapp_config(bot_id: int, config: dict) -> None:
+    """Upserts this bot's mini-app schema (see docs/MINIAPP_DESIGN.md §6) —
+    1:1 with bots.id, same ON CONFLICT pattern as set_bot_sheets_config.
+    config is the {"resources": [...]} dict (same shape as
+    templates/tour_operator.py's miniapp_config), stored as JSON since the
+    resource/field list is per-bot and has no fixed column set."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO bot_miniapp_config (bot_id, config_json) VALUES (?, ?)
+            ON CONFLICT(bot_id) DO UPDATE SET config_json = excluded.config_json,
+                generated_at = CURRENT_TIMESTAMP
+            """,
+            (bot_id, json.dumps(config, ensure_ascii=False)),
+        )
+        await db.commit()
+    logger.info(f"set_bot_miniapp_config: bot_id={bot_id}")
+
+
+async def get_bot_miniapp_config(bot_id: int) -> dict | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT config_json FROM bot_miniapp_config WHERE bot_id = ?", (bot_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            if not row:
+                return None
+            try:
+                return json.loads(row[0])
+            except (json.JSONDecodeError, ValueError):
+                logger.warning(f"get_bot_miniapp_config: corrupt config_json for bot_id={bot_id}")
+                return None
+
+
+async def delete_bot_miniapp_config(bot_id: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM bot_miniapp_config WHERE bot_id = ?", (bot_id,))
+        await db.commit()
 
 
 async def get_bot_features(bot_id: int) -> list[str]:

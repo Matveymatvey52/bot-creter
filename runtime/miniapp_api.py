@@ -46,6 +46,7 @@ from urllib.parse import parse_qsl
 import aiosqlite
 from aiohttp import web
 
+from db.database import get_bot_miniapp_config
 from runtime.registry import Registry, _load_template_module_async
 
 logger = logging.getLogger(__name__)
@@ -172,7 +173,15 @@ async def _resolve_entry_and_config(request: web.Request) -> tuple[int, Any, Any
     """Shared prologue for every /api/{bot_id}/... handler: validates bot_id,
     looks the bot up in the live Registry, and loads its miniapp_config (if
     any). Returns (bot_id, entry, miniapp_config) on success, or an
-    already-built error web.Response the caller should return as-is."""
+    already-built error web.Response the caller should return as-is.
+
+    miniapp_config lookup order (see docs/MINIAPP_DESIGN.md §6): the factory
+    DB (db.database.bot_miniapp_config) is authoritative for anything
+    generated via generate_bot_code()/custom_features — DB is checked first.
+    Falls back to the template module's own `miniapp_config` attribute (the
+    pre-DB pilot mechanism, still how templates/tour_operator.py's
+    hand-authored config is served) only when the DB has no row for this
+    bot, so existing bots created before this table existed keep working."""
     bot_id_raw = request.match_info.get("bot_id", "")
     if err := _bad_bot_id(bot_id_raw):
         return err
@@ -183,10 +192,10 @@ async def _resolve_entry_and_config(request: web.Request) -> tuple[int, Any, Any
     if entry is None:
         return web.json_response({"error": "unknown bot"}, status=404)
 
-    if not entry.template_id:
-        return web.json_response({"error": "mini-app not available for this bot"}, status=404)
-    module = await _load_template_module_async(entry.template_id)
-    miniapp_config = getattr(module, "miniapp_config", None) if module is not None else None
+    miniapp_config = await get_bot_miniapp_config(bot_id)
+    if miniapp_config is None and entry.template_id:
+        module = await _load_template_module_async(entry.template_id)
+        miniapp_config = getattr(module, "miniapp_config", None) if module is not None else None
     if miniapp_config is None:
         return web.json_response({"error": "mini-app not available for this bot"}, status=404)
 

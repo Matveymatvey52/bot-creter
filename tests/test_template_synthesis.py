@@ -256,13 +256,14 @@ class GenerateBotCodeTwoTemplateBranch(unittest.IsolatedAsyncioTestCase):
 
         self.mock_client.messages.create = AsyncMock(side_effect=fake_create)
 
-        result = await claude_service.generate_bot_code("sells products and rewards loyalty points")
+        with patch.object(claude_service, "_generate_miniapp_config", AsyncMock(return_value=None)):
+            code, _miniapp_config = await claude_service.generate_bot_code("sells products and rewards loyalty points")
 
         self.assertEqual(
             call_order,
             ["select", "synthesize", "merge_review", "narrow_risk_review", "classify", "general_review"],
         )
-        self.assertEqual(result, "FINAL_REVIEWED\nasyncio.run(main())")
+        self.assertEqual(code, "FINAL_REVIEWED\nasyncio.run(main())")
 
 
 class SynthesisModeIsolatedFromSingleTemplateRequests(unittest.IsolatedAsyncioTestCase):
@@ -309,7 +310,8 @@ class SynthesisModeIsolatedFromSingleTemplateRequests(unittest.IsolatedAsyncioTe
 
         self.mock_client.messages.create = AsyncMock(side_effect=fake_create)
 
-        result = await claude_service.generate_bot_code("sells products online")
+        with patch.object(claude_service, "_generate_miniapp_config", AsyncMock(return_value=None)):
+            code, _miniapp_config = await claude_service.generate_bot_code("sells products online")
 
         self.mock_synth.assert_not_called()
         self.mock_merge_review.assert_not_called()
@@ -320,7 +322,7 @@ class SynthesisModeIsolatedFromSingleTemplateRequests(unittest.IsolatedAsyncioTe
         # Regression check for the gap found during design: the single-template
         # customize path used to return right after customization, with no
         # general review pass at all.
-        self.assertEqual(result, "REVIEWED\nasyncio.run(main())")
+        self.assertEqual(code, "REVIEWED\nasyncio.run(main())")
 
     async def test_no_template_match_never_calls_synthesis_or_merge_review(self):
         """The from-scratch fallback still never touches synthesis-specific
@@ -343,12 +345,13 @@ class SynthesisModeIsolatedFromSingleTemplateRequests(unittest.IsolatedAsyncioTe
 
         self.mock_client.messages.create = AsyncMock(side_effect=fake_create)
 
-        result = await claude_service.generate_bot_code("a completely novel kind of bot")
+        with patch.object(claude_service, "_generate_miniapp_config", AsyncMock(return_value=None)):
+            code, _miniapp_config = await claude_service.generate_bot_code("a completely novel kind of bot")
 
         self.mock_synth.assert_not_called()
         self.mock_merge_review.assert_not_called()
         self.mock_narrow_review.assert_called_once()
-        self.assertEqual(result, "SCRATCH_REVIEWED\nasyncio.run(main())")
+        self.assertEqual(code, "SCRATCH_REVIEWED\nasyncio.run(main())")
 
 
 class GenerateBotCodeFromScratchBranch(unittest.IsolatedAsyncioTestCase):
@@ -388,13 +391,14 @@ class GenerateBotCodeFromScratchBranch(unittest.IsolatedAsyncioTestCase):
 
         self.mock_client.messages.create = AsyncMock(side_effect=fake_create)
 
-        result = await claude_service.generate_bot_code("a completely novel kind of bot")
+        with patch.object(claude_service, "_generate_miniapp_config", AsyncMock(return_value=None)):
+            code, _miniapp_config = await claude_service.generate_bot_code("a completely novel kind of bot")
 
         self.assertEqual(
             call_order,
             ["classify", "generate", "narrow_risk_review", "general_review"],
         )
-        self.assertEqual(result, "FINAL_REVIEWED\nasyncio.run(main())")
+        self.assertEqual(code, "FINAL_REVIEWED\nasyncio.run(main())")
 
 
 if __name__ == "__main__":

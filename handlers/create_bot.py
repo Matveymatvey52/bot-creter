@@ -16,7 +16,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from config import ASSEMBLYAI_API_KEY, BOT_TOKEN, DATA_DIR
-from db.database import create_bot_record_with_admins, get_bot, set_bot_display_name, update_bot_status
+from db.database import create_bot_record_with_admins, get_bot, set_bot_display_name, set_bot_miniapp_config, update_bot_status
 from runtime.registry_holder import RegistryHandle
 from runtime.webhook_setup import build_webhook_url, set_webhook_for_bot
 from services.bot_runner import start_bot
@@ -530,7 +530,7 @@ async def _run_generation(chat_id: int, user_id: int, bot: Bot, state: FSMContex
 
     gen_msg = await bot.send_message(chat_id, "Генерирую код... 🔧")
     try:
-        code = await asyncio.wait_for(generate_bot_code(summary), timeout=360.0)
+        code, miniapp_config = await asyncio.wait_for(generate_bot_code(summary), timeout=360.0)
     except asyncio.TimeoutError:
         logger.error("Code generation timed out after 240s")
         try:
@@ -566,7 +566,7 @@ async def _run_generation(chat_id: int, user_id: int, bot: Bot, state: FSMContex
     except Exception:
         pass
 
-    await state.update_data(bot_code=code)
+    await state.update_data(bot_code=code, miniapp_config=miniapp_config)
     await state.set_state(CreateBotStates.waiting_for_token)
 
     _pending[user_id] = {
@@ -575,6 +575,7 @@ async def _run_generation(chat_id: int, user_id: int, bot: Bot, state: FSMContex
         "name": bot_name,
         "summary": summary,
         "display_name": data.get("display_name", ""),
+        "miniapp_config": miniapp_config,
     }
 
     suggested_username = f"{bot_name}Bot"
@@ -683,6 +684,7 @@ async def auto_launch_managed_bot(managed_data: dict, bot: Bot, storage=None) ->
     bot_code: str = pending["code"]
     bot_summary: str = pending["summary"]
     display_name: str = pending.get("display_name", "")
+    miniapp_config: dict | None = pending.get("miniapp_config")
 
     avatar_path = AVATAR_DIR / f"{bot_name}.jpg"
     if avatar_path.exists():
@@ -706,6 +708,9 @@ async def auto_launch_managed_bot(managed_data: dict, bot: Bot, storage=None) ->
         admin_ids=admin_ids,
         username=real_username,
     )
+
+    if miniapp_config:
+        await set_bot_miniapp_config(bot_record_id, miniapp_config)
 
     # The welcome photo was saved during onboarding under the bot's NAME
     # (handle_welcome_photo, before this bot's row/id existed). All five
@@ -749,6 +754,7 @@ async def handle_token(message: Message, state: FSMContext, bot: Bot):
     bot_name: str = data["bot_name"]
     bot_summary: str = data.get("bot_summary", "")
     display_name: str = data.get("display_name", "")
+    miniapp_config: dict | None = data.get("miniapp_config")
 
     real_username: str | None = None
     try:
@@ -779,6 +785,9 @@ async def handle_token(message: Message, state: FSMContext, bot: Bot):
         admin_ids=admin_ids,
         username=real_username,
     )
+
+    if miniapp_config:
+        await set_bot_miniapp_config(bot_id, miniapp_config)
 
     # See the equivalent comment in _run_generation() above — the welcome
     # photo was saved under the bot's name before its row/id existed; all

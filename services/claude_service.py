@@ -1531,7 +1531,18 @@ async def _review_narrow_risk_code(code: str, context: str, reference_code: str 
         return code  # review broke the code — keep pre-review version
 
 
-async def generate_bot_code(requirements_summary: str) -> str:
+async def generate_bot_code(requirements_summary: str) -> tuple[str, dict | None]:
+    """Generates the bot's code, then a mini-app config for it (see
+    docs/MINIAPP_DESIGN.md §6) — a single cheap Haiku call, never blocking:
+    if it fails or produces something that doesn't match the generated
+    code's actual tables, the bot is still returned with miniapp_config=None
+    (plain Telegram bot, no mini-app, same as any template without one)."""
+    code = await _generate_bot_code_inner(requirements_summary)
+    miniapp_config = await _generate_miniapp_config(code, requirements_summary)
+    return code, miniapp_config
+
+
+async def _generate_bot_code_inner(requirements_summary: str) -> str:
     # Try template(s) first — saves 5-10x tokens vs generating from scratch
     templates = await _select_template(requirements_summary)
 
@@ -1606,6 +1617,167 @@ async def generate_bot_code(requirements_summary: str) -> str:
     code = await _review_bot_code(code, requirements_summary, bot_type=bot_type)
 
     return code
+
+
+# ── mini-app config generation (see docs/MINIAPP_DESIGN.md §6) ─────────────────
+#
+# One cheap Haiku call per bot, same cost tier as classify_bot_type()/
+# extract_bot_name() — NOT a second code-generation pass. Reads the bot's own
+# already-generated code (its init_db()'s CREATE TABLE statements are the
+# ground truth) and produces a declarative {"resources": [...]} schema in the
+# same shape as templates/tour_operator.py's hand-written miniapp_config,
+# which is given as the only few-shot example. Never blocks bot creation:
+# any failure (network, malformed JSON, hallucinated table/column names)
+# degrades to miniapp_config=None — the bot is just a plain Telegram bot,
+# exactly like any template without a miniapp_config today.
+
+_TOUR_OPERATOR_MINIAPP_CONFIG_EXAMPLE = """{
+    "resources": [
+        {
+            "name": "tours",
+            "table": "tours",
+            "order_by": "created_at DESC",
+            "creatable": true,
+            "fields": [
+                {"name": "name", "required": true},
+                {"name": "destination"},
+                {"name": "date_start"},
+                {"name": "date_end"},
+                {"name": "guests_count"},
+                {"name": "status"},
+                {"name": "created_at", "creatable": false}
+            ]
+        },
+        {
+            "name": "guests",
+            "table": "guests",
+            "order_by": "created_at DESC",
+            "creatable": true,
+            "fields": [
+                {"name": "tour_id", "required": true},
+                {"name": "name", "required": true},
+                {"name": "total_cost"},
+                {"name": "prepaid"},
+                {"name": "our_price"},
+                {"name": "status"},
+                {"name": "notes"},
+                {"name": "created_at", "creatable": false}
+            ]
+        }
+    ]
+}"""
+
+MINIAPP_CONFIG_SYSTEM_PROMPT = f"""You extract a mini-app schema from a Telegram bot's Python source code, for a factory that builds Telegram bots.
+
+You will be given the bot's full source code (its init_db() function contains the real CREATE TABLE statements — this is your only source of truth for table and column names) and a short description of what the bot does.
+
+Produce a JSON object describing which of the bot's SQLite tables deserve a screen in a generic mini-app (a shared list/detail/create-form UI that reads this schema by convention — you are NOT writing any UI code, only describing the data).
+
+Here is one correct real example, from a tour-operator bot (tours + guests are real tables in that bot's init_db()):
+
+{_TOUR_OPERATOR_MINIAPP_CONFIG_EXAMPLE}
+
+Rules:
+- Respond with ONLY the JSON object, no markdown fences, no explanation.
+- Top-level shape: {{"resources": [...]}}. Each resource: "name" (short identifier), "table" (MUST be a real table name from the given code's CREATE TABLE statements, verbatim), "order_by" (a real column, e.g. "created_at DESC" or "id DESC"), "creatable" (true/false), "fields" (list of {{"name": ..., "required": true/false (optional, default false), "creatable": true/false (optional, default true)}}).
+- Every "table" and every field "name" MUST match a real table/column that appears in the given code's CREATE TABLE statements. Never invent a table or column that isn't there.
+- Only include tables that hold user-facing records worth browsing (bookings, orders, items, clients, etc). Skip purely internal/administrative tables (admins, state, sessions, migration/version tables, FSM storage).
+- If the bot has no table worth showing as a mini-app screen (e.g. a purely conversational bot with no data table, or only internal tables), respond with exactly {{"resources": []}}. This is a valid, expected answer — not an error.
+- Do not include any resource whose table you are not certain is a literal, verbatim CREATE TABLE name in the given code."""
+
+
+def _extract_create_table_names(bot_code: str) -> dict[str, set[str]]:
+    """Best-effort scan of init_db()'s CREATE TABLE statements: table name ->
+    set of column names. Regex, not a SQL parser — good enough to catch a
+    hallucinated table/column (the failure mode this guards against), not
+    meant to validate SQL syntax. Never raises on malformed input."""
+    tables: dict[str, set[str]] = {}
+    for table_match in re.finditer(
+        r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)\s*\((.*?)\)\s*(?:\"\"\"|''')",
+        bot_code,
+        re.IGNORECASE | re.DOTALL,
+    ):
+        table_name = table_match.group(1)
+        columns_blob = table_match.group(2)
+        columns: set[str] = set()
+        for line in columns_blob.split(","):
+            line = line.strip()
+            col_match = re.match(r"(\w+)", line)
+            if col_match and col_match.group(1).upper() not in (
+                "PRIMARY", "FOREIGN", "UNIQUE", "CHECK", "CONSTRAINT",
+            ):
+                columns.add(col_match.group(1))
+        tables[table_name] = columns
+    return tables
+
+
+def _validate_miniapp_config_against_code(config: dict, bot_code: str) -> bool:
+    """True only if every resource's table and every field's name is a real,
+    verbatim match against the bot's own CREATE TABLE statements. Any single
+    mismatch invalidates the whole config (dropped wholesale, not patched) —
+    a partially-hallucinated schema is worse than no mini-app at all."""
+    tables = _extract_create_table_names(bot_code)
+    if not tables:
+        return False
+    for resource in config.get("resources", []):
+        table = resource.get("table")
+        if not isinstance(table, str) or table not in tables:
+            return False
+        columns = tables[table]
+        for field in resource.get("fields", []):
+            name = field.get("name") if isinstance(field, dict) else None
+            if not isinstance(name, str) or name not in columns:
+                return False
+    return True
+
+
+def _parse_miniapp_config(raw: str, bot_code: str) -> dict | None:
+    """Best-effort JSON parse + schema validation — any malformed shape or
+    hallucinated table/column degrades to None (never raises), mirroring
+    _parse_connect_feature_intent's fallback pattern: a parsing hiccup here
+    must never surface an error or block bot creation."""
+    try:
+        data = json.loads(_strip_code_fences(raw))
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("resources"), list):
+        return None
+    if not data["resources"]:
+        return None  # valid "no mini-app for this bot" answer, nothing to store
+    for resource in data["resources"]:
+        if not isinstance(resource, dict):
+            return None
+        if not isinstance(resource.get("name"), str) or not isinstance(resource.get("table"), str):
+            return None
+        if not isinstance(resource.get("fields"), list) or not resource["fields"]:
+            return None
+        for field in resource["fields"]:
+            if not isinstance(field, dict) or not isinstance(field.get("name"), str):
+                return None
+    if not _validate_miniapp_config_against_code(data, bot_code):
+        return None
+    return data
+
+
+async def _generate_miniapp_config(bot_code: str, requirements_summary: str) -> dict | None:
+    """Never raises — any failure (API error, malformed/hallucinated output)
+    returns None, which callers treat as "no mini-app for this bot", exactly
+    like a template with no miniapp_config today. Must never block or delay
+    bot creation on its own error."""
+    try:
+        response = await client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=1500,
+            system=MINIAPP_CONFIG_SYSTEM_PROMPT,
+            messages=[{
+                "role": "user",
+                "content": f"Bot code:\n\n{bot_code}\n\nBot description:\n{requirements_summary}",
+            }],
+        )
+    except Exception as e:
+        logger.warning(f"_generate_miniapp_config: API call failed: {type(e).__name__}: {e}")
+        return None
+    return _parse_miniapp_config(response.content[0].text, bot_code)
 
 
 # ── custom_features (point doctoring of one specific bot) ──────────────────────

@@ -14,7 +14,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import aiosqlite
 from aiohttp.test_utils import TestClient, TestServer
@@ -101,6 +101,15 @@ class MiniAppApiTests(unittest.IsolatedAsyncioTestCase):
         self._patcher = patcher
         patcher.start()
 
+        # DB lookup is checked FIRST (see docs/MINIAPP_DESIGN.md §6) — patched
+        # to "no row" so these tests exercise the module-attribute fallback,
+        # same as before this table existed. MiniappConfigDbPrecedenceTests
+        # below covers the DB-wins-when-present case.
+        self._db_patcher = patch(
+            "runtime.miniapp_api.get_bot_miniapp_config", AsyncMock(return_value=None)
+        )
+        self._db_patcher.start()
+
         self.server = TestServer(self.app)
         self.client = TestClient(self.server)
         await self.client.start_server()
@@ -108,6 +117,7 @@ class MiniAppApiTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         await self.client.close()
         self._patcher.stop()
+        self._db_patcher.stop()
         self._tmpdir.cleanup()
 
     # ── magic-link token auth ──────────────────────────────────────────
@@ -241,6 +251,80 @@ class MiniAppApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resp.status, 404)
 
 
+class MiniappConfigDbPrecedenceTests(unittest.IsolatedAsyncioTestCase):
+    """DB is authoritative when present (see docs/MINIAPP_DESIGN.md §6) — a
+    generate_bot_code()/custom_features-produced config in bot_miniapp_config
+    must win over any stale/absent template module attribute."""
+
+    DB_CONFIG = {
+        "resources": [
+            {
+                "name": "orders",
+                "table": "orders",
+                "order_by": "id DESC",
+                "creatable": True,
+                "fields": [{"name": "customer_name", "required": True}],
+            },
+        ],
+    }
+
+    async def asyncSetUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.db_path = os.path.join(self._tmpdir.name, "bot.db")
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "CREATE TABLE orders (id INTEGER PRIMARY KEY AUTOINCREMENT, customer_name TEXT NOT NULL)"
+            )
+            await db.execute("INSERT INTO orders (customer_name) VALUES ('Ivan')")
+            await db.commit()
+
+        entry = BotEntry(
+            bot=_FakeBot(FAKE_TOKEN),
+            dispatcher=None,
+            # No template_id — a from-scratch bot has none, unlike a
+            # template-based one. DB config must still resolve.
+            template_id=None,
+            config={"bot_id": KNOWN_BOT_ID, "db_path": self.db_path},
+        )
+        self.app = create_app({KNOWN_BOT_ID: entry})
+        register_routes(self.app)
+
+        self._module_patcher = patch(
+            "runtime.miniapp_api._load_template_module_async", return_value=None
+        )
+        self._module_patcher.start()
+
+        self.server = TestServer(self.app)
+        self.client = TestClient(self.server)
+        await self.client.start_server()
+
+    async def asyncTearDown(self):
+        await self.client.close()
+        self._module_patcher.stop()
+
+    async def _auth_query(self) -> str:
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            return f"token={mint_magic_link_token(KNOWN_BOT_ID, 111)}"
+
+    async def test_db_config_serves_resource_with_no_template_id_at_all(self):
+        qs = await self._auth_query()
+        with patch(
+            "runtime.miniapp_api.get_bot_miniapp_config", AsyncMock(return_value=self.DB_CONFIG)
+        ), patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            resp = await self.client.get(f"/api/{KNOWN_BOT_ID}/orders?{qs}")
+        self.assertEqual(resp.status, 200)
+        body = await resp.json()
+        self.assertEqual(body["items"][0]["customer_name"], "Ivan")
+
+    async def test_no_db_row_and_no_template_id_returns_404(self):
+        qs = await self._auth_query()
+        with patch(
+            "runtime.miniapp_api.get_bot_miniapp_config", AsyncMock(return_value=None)
+        ), patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            resp = await self.client.get(f"/api/{KNOWN_BOT_ID}/orders?{qs}")
+        self.assertEqual(resp.status, 404)
+
+
 class MiniAppShellTests(unittest.IsolatedAsyncioTestCase):
     """Covers serve_app_shell + the /app-assets/ static route — the pieces
     that make GET /app/{bot_id} actually serve the built SPA (see
@@ -270,6 +354,11 @@ class MiniAppShellTests(unittest.IsolatedAsyncioTestCase):
         )
         self._config_patcher.start()
 
+        self._db_patcher = patch(
+            "runtime.miniapp_api.get_bot_miniapp_config", AsyncMock(return_value=None)
+        )
+        self._db_patcher.start()
+
         self.server = TestServer(self.app)
         self.client = TestClient(self.server)
         await self.client.start_server()
@@ -277,6 +366,7 @@ class MiniAppShellTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         await self.client.close()
         self._config_patcher.stop()
+        self._db_patcher.stop()
         self._dist_patcher.stop()
         self._dist_tmpdir.cleanup()
 
