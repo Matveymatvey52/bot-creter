@@ -61,6 +61,23 @@ PERSISTENT DATA — always use SQLite for any data the bot needs to remember:
 - This ensures data survives bot restarts and code updates
 - Every user record, appointment, entry must be stored in SQLite, never in memory dicts
 
+MANDATORY init_db FUNCTION — every bot that stores any data must define this exact
+top-level function, even if there is only one table:
+  async def init_db(db_path: str) -> None:
+      async with aiosqlite.connect(db_path) as db:
+          await db.execute("CREATE TABLE IF NOT EXISTS ... (...)")
+          # one execute() per table, all CREATE TABLE IF NOT EXISTS
+          await db.commit()
+  Call it from main() as: await init_db(DB_PATH)
+  Rules:
+  - Takes db_path as a parameter and uses ONLY that parameter for the connection —
+    never reads the module-level DB_PATH global inside this function body (the bot's
+    hosting registry may call init_db with a different path than DB_PATH).
+  - Contains ALL CREATE TABLE statements the bot uses anywhere else in the file —
+    this is the single source of truth for schema, other code must never create
+    tables outside this function.
+  - Must be idempotent and safe to call multiple times (IF NOT EXISTS everywhere).
+
 AVAILABLE PACKAGES — ONLY use these external libraries (everything else will crash with ImportError):
   - aiogram 3.13 — Telegram bot framework
   - aiosqlite — async SQLite
@@ -277,11 +294,12 @@ GROUP CHAT SUPPORT — always include this in every bot (even if the bot is not 
   # Call notify_group when something important happens, e.g.:
   # await notify_group(bot, f"📋 Новая запись: {name}, {service}, {time}")
 
-Correct main entry point (copy exactly):
+Correct main entry point (copy exactly; if the bot has no init_db function, omit that one line):
   async def main():
       bot = Bot(token=os.getenv("BOT_TOKEN"))
       dp = Dispatcher(storage=MemoryStorage())
       dp.include_router(router)
+      await init_db(DB_PATH)
       await bot.set_my_description("...description...")
       await dp.start_polling(bot)
 
@@ -381,9 +399,9 @@ DB SCHEMA (use EXACTLY this):
     created_at TEXT DEFAULT (datetime('now','localtime'))
   );
 
-INIT DB — pre-populate slots at startup (MANDATORY, call from main() before polling):
-  async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
+INIT DB — pre-populate slots at startup (MANDATORY, call from main() as await init_db(DB_PATH) before polling):
+  async def init_db(db_path: str) -> None:
+    async with aiosqlite.connect(db_path) as db:
       await db.execute("CREATE TABLE IF NOT EXISTS slots (...)")
       await db.execute("CREATE TABLE IF NOT EXISTS bookings (...)")
       from datetime import date as _date, timedelta
@@ -912,7 +930,7 @@ _TYPE_REVIEW_HINTS: dict[str, str] = {
         "- Handler for F.data == 'book_unavailable'\n"
         "- Handler for F.data.startswith('adm_day:')\n"
         "- Handler for F.data.startswith('adm_cancel:')\n"
-        "- init_db() is called inside main() before dp.start_polling\n"
+        "- init_db(db_path: str) is defined at module level and called as await init_db(DB_PATH) inside main() before dp.start_polling\n"
         "- Anti-double-booking check inside book_confirm handler\n"
         "If ANY handler is missing — add a stub that answers the callback and shows an error message."
     ),
@@ -1190,12 +1208,150 @@ def _strip_code_fences(code: str) -> str:
     return code
 
 
+# ── from-scratch registry wiring (docs/OFFICE_HOOK_FROM_SCRATCH_BOTS.md) ────
+#
+# From-scratch bots (no matching templates/*.py, GENERATE_SYSTEM_PROMPT branch
+# of _generate_bot_code_inner) are free-form single-file scripts — Claude is
+# NOT asked to hand-write the by-convention exports runtime/registry.py's
+# build_entry() needs (config_from_bot_row/ConfigMiddleware/on_office_event),
+# unlike templates/*.py. That's deliberate: those three are 100% boilerplate
+# (verified identical in shape across every templates/*.py — see the design
+# doc) and asking an LLM to freehand them per-bot is both wasted tokens and a
+# reliability risk (one hallucinated attribute name silently breaks
+# build_entry()'s router/office-hook wiring for that bot). Instead this
+# function deterministically APPENDS them via plain text/AST, never an LLM
+# call — same reasoning as generic_on_office_event() itself being
+# data-driven, not code-generated.
+#
+# Requires DB_PATH and BOT_NAME as module-level globals and (optionally)
+# `async def init_db(db_path: str)` — both guaranteed by GENERATE_SYSTEM_PROMPT
+# ("PERSISTENT DATA" / "MANDATORY init_db FUNCTION" sections). Bots with no
+# persistent data at all (no DB_PATH) skip init_db entirely — config_from_bot_row
+# still needs SOME db_path, so DB_PATH is required unconditionally by the
+# prompt even for bots that never write to it.
+
+_INIT_DB_DEF_RE = re.compile(r"^async def init_db\(", re.MULTILINE)
+_ENTRY_POINT_RE = re.compile(r"^if __name__ == ['\"]__main__['\"]:", re.MULTILINE)
+
+_FROM_SCRATCH_WIRING_TEMPLATE = '''
+
+# ── auto-appended by services.claude_service — DO NOT ask Claude to write this ──
+# Registry wiring for webhook-mode registration (runtime/registry.py's build_entry()).
+# Mirrors the by-convention exports every templates/*.py file provides —
+# including attribute-style config.db_path/config.bot_id access, since
+# runtime/registry.py's build_entry() reads typed_config.db_path directly
+# (not config["db_path"]) for every module regardless of template vs
+# from-scratch origin.
+from types import SimpleNamespace as _SimpleNamespace
+
+from aiogram import BaseMiddleware as _BaseMiddleware
+
+
+def config_from_bot_row(bot_row: dict, data_dir) -> _SimpleNamespace:
+    """Webhook runtime mode — reuses this bot's OWN DB_PATH/BOT_NAME globals
+    (already unique per bot: one file per bot in data/generated_bots/), not a
+    bot_row["bot_id"]-derived path like templates/*.py use, since this file's
+    module-level code and handlers already close over DB_PATH directly."""
+    return _SimpleNamespace(
+        bot_id=bot_row.get("bot_id"),
+        bot_name=BOT_NAME,
+        db_path=DB_PATH,
+        display_name=bot_row.get("display_name"),
+        group_chat_id=bot_row.get("group_chat_id"),
+    )
+
+
+class ConfigMiddleware(_BaseMiddleware):
+    """Injects this bot's config namespace into data["config"] — same contract
+    as every templates/*.py ConfigMiddleware (identical shape, verified across
+    all reference templates)."""
+
+    def __init__(self, config: _SimpleNamespace) -> None:
+        self.config = config
+        super().__init__()
+
+    async def __call__(self, handler, event, data):
+        data["config"] = self.config
+        return await handler(event, data)
+
+
+async def on_office_event(event, config) -> None:
+    """Universal office-hook fallback (docs/OFFICES_DESIGN.md §11) — same
+    generic_on_office_event() every template-based bot with no hand-written
+    hook gets via build_entry(), now reachable for from-scratch bots too."""
+    from db.database import get_bot_office_hook_config
+    from features.office_events import generic_on_office_event
+
+    bot_id = config.bot_id
+    hook_config = await get_bot_office_hook_config(bot_id) if bot_id is not None else None
+    await generic_on_office_event(event, config.db_path, hook_config, bot_id=bot_id)
+'''
+
+
+def _needs_from_scratch_wiring(code: str) -> bool:
+    """True if `code` looks like it's missing the registry-wiring exports this
+    module appends — checked so re-running this on already-wired code (e.g. a
+    future regenerate-in-place flow) doesn't double-append. Cheap substring
+    check, not full AST — mirrors _mentions_payments' style."""
+    return "def config_from_bot_row(" not in code
+
+
+_INIT_DB_FALLBACK = '''
+
+async def init_db(db_path: str) -> None:
+    """Auto-appended fallback — this bot defined no top-level init_db of its
+    own (no persistent data to create tables for). runtime/registry.py's
+    build_entry() calls module.init_db(config.db_path) unconditionally for
+    every module (template-based or from-scratch alike, same contract every
+    templates/*.py file already guarantees) — this no-op keeps that call
+    from raising AttributeError for a stateless bot."""
+    pass
+'''
+
+
+def append_from_scratch_registry_wiring(code: str) -> str:
+    """Deterministically appends config_from_bot_row/ConfigMiddleware/
+    on_office_event (plus a no-op init_db fallback if the bot defined none)
+    to a from-scratch bot's generated code, right before its
+    `if __name__ == "__main__":` block — see the module comment above for why
+    this is text injection, not an LLM step. No-ops (returns code unchanged)
+    if the code already has the wiring (_needs_from_scratch_wiring) or lacks
+    an entry point to insert before (defensive — GENERATE_SYSTEM_PROMPT always
+    produces one; _generate_bot_code_inner's own retry loop guarantees
+    'asyncio.run(main())' is present by the time this runs)."""
+    if not _needs_from_scratch_wiring(code):
+        return code
+    m = _ENTRY_POINT_RE.search(code)
+    if m is None:
+        logger.warning(
+            "append_from_scratch_registry_wiring: no `if __name__ == '__main__':` "
+            "found — skipping wiring injection, bot will only run via its own "
+            "asyncio.run(main()), not through the webhook registry"
+        )
+        return code
+    wiring = _FROM_SCRATCH_WIRING_TEMPLATE
+    if not _INIT_DB_DEF_RE.search(code):
+        wiring += _INIT_DB_FALLBACK
+    wired = code[: m.start()] + wiring.strip() + "\n\n\n" + code[m.start() :]
+    try:
+        _ast.parse(wired)
+    except SyntaxError:
+        logger.warning(
+            "append_from_scratch_registry_wiring: injected code failed to parse — "
+            "keeping original code unwired (bot still works standalone, just not "
+            "through the webhook registry/office-hook)"
+        )
+        return code
+    return wired
+
+
 _TEMPLATES_DIR = __import__("pathlib").Path(__file__).parent.parent / "templates"
 
 # Same "# TEMPLATE: <id>" marker convention runtime/registry.py's
-# infer_template_id() reads (that file untouched, out of this phase's scope —
-# a separate constant/regex lives here instead of importing from runtime/, to
-# avoid a services -> runtime dependency). Read by LINE COUNT, not a byte/char
+# infer_template_id() reads — a separate constant/regex lives here instead of
+# importing from runtime/, to avoid a services -> runtime dependency (this
+# module has its own from-scratch wiring above; that's a different mechanism,
+# not a TEMPLATE:-marker path). Read by LINE COUNT, not a byte/char
 # budget: a byte-sliced read (registry.py's own approach) risks silently
 # truncating mid-line if a future USE FOR: description runs long — reading
 # whole lines instead means TEMPLATE:/USE FOR: either match in full or don't
@@ -1532,7 +1688,9 @@ async def _review_narrow_risk_code(code: str, context: str, reference_code: str 
         return code  # review broke the code — keep pre-review version
 
 
-async def generate_bot_code(requirements_summary: str) -> tuple[str, dict | None, dict | None]:
+async def generate_bot_code(
+    requirements_summary: str,
+) -> tuple[str, dict | None, dict | None, dict | None]:
     """Generates the bot's code, then a mini-app config AND an office-hook
     config for it (docs/MINIAPP_DESIGN.md §6, docs/OFFICES_DESIGN.md §11) —
     two cheap Haiku calls, neither blocking: any failure degrades to None,
@@ -1543,11 +1701,13 @@ async def generate_bot_code(requirements_summary: str) -> tuple[str, dict | None
     fully from-scratch) — cheap to compute and harmless to store even when
     unused. Whether it's actually WIRED into a live on_office_event() hook is
     decided later, at registry build time (runtime/registry.py's
-    build_entry()), which only does so for bots resolved to a known
-    templates/*.py module — see docs/OFFICES_DESIGN.md §11's "Custom-бот
-    scope" decision for why fully from-scratch generated bots (no `#
-    TEMPLATE:` marker, no module.router wired through build_entry()) are out
-    of scope for THIS iteration despite having a config generated here.
+    build_entry()). For from-scratch bots (no `# TEMPLATE:` marker),
+    _generate_bot_code_inner's from-scratch branch appends the by-convention
+    config_from_bot_row/ConfigMiddleware/on_office_event exports via
+    append_from_scratch_registry_wiring() below, and build_entry() imports
+    the generated file directly by path (see docs/OFFICE_HOOK_FROM_SCRATCH_
+    BOTS.md) — the same generic_on_office_event() fallback template-based
+    bots get is now reachable for from-scratch bots too.
 
     miniapp_config and office_hook_config are independent of each other (both
     only depend on `code`, already generated by the time either runs), so
@@ -1557,16 +1717,27 @@ async def generate_bot_code(requirements_summary: str) -> tuple[str, dict | None
     handlers/manage_bots.py's cb_recreate at 240.0) meant a slow/hung Haiku
     call on either cheap step could burn the whole budget and fail an
     otherwise-successful code generation. Concurrency also halves the
-    best-case added latency from these two steps."""
-    code = await _generate_bot_code_inner(requirements_summary)
+    best-case added latency from these two steps.
+
+    fallback_info (docs/TEMPLATE_CANDIDATE_LOGGING_DESIGN.md) is a fourth,
+    optional element: None when a single template was customized or two
+    templates were synthesized successfully, otherwise a dict describing why
+    generation fell through to from-scratch — {"reason": "no_template_match"
+    | "customize_failed" | "synthesis_failed", "selected_templates": [...]}.
+    Callers with a bot_id in hand (handlers/create_bot.py,
+    handlers/manage_bots.py's cb_recreate) persist it via
+    db.database.add_template_candidate so the owner can review recurring
+    from-scratch requests in the /analytics dashboard. No candidate is
+    logged when a template match succeeded — only the fallback cases."""
+    code, fallback_info = await _generate_bot_code_inner(requirements_summary)
     miniapp_config, office_hook_config = await asyncio.gather(
         _generate_miniapp_config(code, requirements_summary),
         _generate_office_hook_config(code, requirements_summary),
     )
-    return code, miniapp_config, office_hook_config
+    return code, miniapp_config, office_hook_config, fallback_info
 
 
-async def _generate_bot_code_inner(requirements_summary: str) -> str:
+async def _generate_bot_code_inner(requirements_summary: str) -> tuple[str, dict | None]:
     # Try template(s) first — saves 5-10x tokens vs generating from scratch
     templates = await _select_template(requirements_summary)
 
@@ -1575,7 +1746,8 @@ async def _generate_bot_code_inner(requirements_summary: str) -> str:
         if "asyncio.run(main())" in code:
             bot_type = await classify_bot_type(requirements_summary)
             code = await _review_bot_code(code, requirements_summary, bot_type=bot_type)
-            return code
+            return code, None
+        fallback_reason = "customize_failed"
 
     elif len(templates) == 2:
         code = await _synthesize_from_templates(templates, requirements_summary)
@@ -1584,7 +1756,13 @@ async def _generate_bot_code_inner(requirements_summary: str) -> str:
             code = await _review_narrow_risk_code(code, requirements_summary)
             bot_type = await classify_bot_type(requirements_summary)
             code = await _review_bot_code(code, requirements_summary, bot_type=bot_type)
-            return code
+            return code, None
+        fallback_reason = "synthesis_failed"
+
+    else:
+        fallback_reason = "no_template_match"
+
+    fallback_info = {"reason": fallback_reason, "selected_templates": templates}
 
     bot_type = await classify_bot_type(requirements_summary)
     extra = _BOT_TYPE_EXTRAS.get(bot_type, "")
@@ -1640,7 +1818,14 @@ async def _generate_bot_code_inner(requirements_summary: str) -> str:
     # Static review pass — find and fix potential runtime issues before deployment
     code = await _review_bot_code(code, requirements_summary, bot_type=bot_type)
 
-    return code
+    # Registry wiring (docs/OFFICE_HOOK_FROM_SCRATCH_BOTS.md) — deliberately
+    # LAST, after every LLM review pass above: those passes aren't told about
+    # this appended boilerplate and could otherwise "fix"/drop it since they
+    # each see and re-emit the whole file. Text injection, not an LLM call —
+    # see append_from_scratch_registry_wiring's own docstring for why.
+    code = append_from_scratch_registry_wiring(code)
+
+    return code, fallback_info
 
 
 # ── mini-app config generation (see docs/MINIAPP_DESIGN.md §6) ─────────────────

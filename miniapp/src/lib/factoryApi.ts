@@ -78,3 +78,18 @@ export function addFactoryFeedback(
     body: JSON.stringify({ rating, comment }),
   })
 }
+
+export interface TemplateCandidateItem {
+  id: number
+  bot_id: number | null
+  bot_name: string | null
+  summary: string
+  fallback_reason: string
+  selected_templates: string[]
+  bot_type: string | null
+  created_at: string
+}
+
+export function listTemplateCandidates(): Promise<{ items: TemplateCandidateItem[] }> {
+  return request('/candidates')
+}

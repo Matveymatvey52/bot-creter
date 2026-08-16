@@ -17,6 +17,7 @@ from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, Inli
 
 from config import ASSEMBLYAI_API_KEY, BOT_TOKEN, DATA_DIR
 from db.database import (
+    add_template_candidate,
     create_bot_record_with_admins,
     get_bot,
     set_bot_display_name,
@@ -542,7 +543,9 @@ async def _run_generation(chat_id: int, user_id: int, bot: Bot, state: FSMContex
 
     gen_msg = await bot.send_message(chat_id, "Генерирую код... 🔧")
     try:
-        code, miniapp_config, office_hook_config = await asyncio.wait_for(generate_bot_code(summary), timeout=360.0)
+        code, miniapp_config, office_hook_config, fallback_info = await asyncio.wait_for(
+            generate_bot_code(summary), timeout=360.0
+        )
     except asyncio.TimeoutError:
         logger.error("Code generation timed out after 360s")
         try:
@@ -589,6 +592,7 @@ async def _run_generation(chat_id: int, user_id: int, bot: Bot, state: FSMContex
         "display_name": data.get("display_name", ""),
         "miniapp_config": miniapp_config,
         "office_hook_config": office_hook_config,
+        "fallback_info": fallback_info,
     }
 
     suggested_username = f"{bot_name}Bot"
@@ -699,6 +703,7 @@ async def auto_launch_managed_bot(managed_data: dict, bot: Bot, storage=None) ->
     display_name: str = pending.get("display_name", "")
     miniapp_config: dict | None = pending.get("miniapp_config")
     office_hook_config: dict | None = pending.get("office_hook_config")
+    fallback_info: dict | None = pending.get("fallback_info")
 
     avatar_path = AVATAR_DIR / f"{bot_name}.jpg"
     if avatar_path.exists():
@@ -727,6 +732,15 @@ async def auto_launch_managed_bot(managed_data: dict, bot: Bot, storage=None) ->
         await set_bot_miniapp_config(bot_record_id, miniapp_config)
     if office_hook_config:
         await set_bot_office_hook_config(bot_record_id, office_hook_config)
+    if fallback_info:
+        await add_template_candidate(
+            creator_user_id=creator_user_id,
+            summary=bot_summary,
+            fallback_reason=fallback_info["reason"],
+            selected_templates=fallback_info["selected_templates"],
+            bot_name=bot_name,
+            bot_id=bot_record_id,
+        )
 
     # The welcome photo was saved during onboarding under the bot's NAME
     # (handle_welcome_photo, before this bot's row/id existed). All five

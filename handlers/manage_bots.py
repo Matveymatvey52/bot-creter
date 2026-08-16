@@ -19,6 +19,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from config import ASSEMBLYAI_API_KEY
 from db.database import (
     add_office_link,
+    add_template_candidate,
     delete_bot,
     disable_bot_feature,
     enable_bot_feature,
@@ -44,7 +45,12 @@ from runtime.registry import _CUSTOM_FEATURES_DIR, discover_features, infer_temp
 from runtime.registry_holder import RegistryHandle
 from runtime.webhook_setup import set_miniapp_menu_button
 from services.bot_runner import _make_extra_env, get_bot_logs, is_running, start_bot, stop_bot
-from services.claude_service import fix_bot_code, generate_bot_code, improve_bot_code
+from services.claude_service import (
+    append_from_scratch_registry_wiring,
+    fix_bot_code,
+    generate_bot_code,
+    improve_bot_code,
+)
 from services.github_sync import push_bot_to_github
 from services.voice_service import transcribe_voice
 
@@ -1147,10 +1153,11 @@ async def cb_recreate(callback: CallbackQuery):
 
         miniapp_config: dict | None = None
         office_hook_config: dict | None = None
+        fallback_info: dict | None = None
         try:
             result = await asyncio.wait_for(task, timeout=240.0)
             if regenerating_from_scratch:
-                code, miniapp_config, office_hook_config = result
+                code, miniapp_config, office_hook_config, fallback_info = result
             else:
                 code = result
         except Exception as e:
@@ -1166,12 +1173,31 @@ async def cb_recreate(callback: CallbackQuery):
 
         await stop_bot(bot_id)
 
+        # improve_bot_code() rewrites the WHOLE file including any previously
+        # appended office-hook wiring (docs/OFFICE_HOOK_FROM_SCRATCH_BOTS.md) —
+        # it's an LLM pass with no instruction to preserve that boilerplate, so
+        # a from-scratch bot's config_from_bot_row/ConfigMiddleware/
+        # on_office_event can silently vanish on "улучшить код" without this.
+        # No-op for template-based bots (file_path always has its own
+        # config_from_bot_row already) and for from-scratch code that still
+        # generated the same exports on its own.
+        code = append_from_scratch_registry_wiring(code)
+
         bot_file = Path(b["file_path"])
         bot_file.write_text(code, encoding="utf-8")
         asyncio.create_task(push_bot_to_github(b["name"], code))
 
         if office_hook_config:
             await set_bot_office_hook_config(bot_id, office_hook_config)
+        if fallback_info:
+            await add_template_candidate(
+                creator_user_id=callback.from_user.id,
+                summary=b.get("description", ""),
+                fallback_reason=fallback_info["reason"],
+                selected_templates=fallback_info["selected_templates"],
+                bot_name=b["name"],
+                bot_id=bot_id,
+            )
         if miniapp_config:
             await set_bot_miniapp_config(bot_id, miniapp_config)
             base_url = os.getenv("PUBLIC_BASE_URL", "").strip()
@@ -1256,6 +1282,9 @@ async def cb_auto_diagnose(callback: CallbackQuery):
             return
 
         await stop_bot(bot_id)
+        # Same re-append as cb_recreate above — fix_bot_code() is also a
+        # whole-file LLM rewrite that can drop the appended office-hook wiring.
+        fixed_code = append_from_scratch_registry_wiring(fixed_code)
         Path(b["file_path"]).write_text(fixed_code, encoding="utf-8")
         asyncio.create_task(push_bot_to_github(b["name"], fixed_code))
 
@@ -1376,6 +1405,9 @@ async def _apply_fix(message: Message, state: FSMContext, bug_description: str, 
             pass
 
         await stop_bot(bot_id)
+        # Same re-append as cb_recreate above — fix_bot_code() is also a
+        # whole-file LLM rewrite that can drop the appended office-hook wiring.
+        fixed_code = append_from_scratch_registry_wiring(fixed_code)
         Path(b["file_path"]).write_text(fixed_code, encoding="utf-8")
         asyncio.create_task(push_bot_to_github(b["name"], fixed_code))
 

@@ -17,6 +17,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 import db.database as db_module
 from db.database import (
+    add_template_candidate,
     create_bot_record_with_admins,
     delete_bot,
     init_db,
@@ -144,3 +145,44 @@ class FactoryAnalyticsApiTests(unittest.IsolatedAsyncioTestCase):
         with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
             resp = await self.client.post(f"/api/factory/bots/not-a-number/feedback?{qs}", json={"rating": 5})
         self.assertEqual(resp.status, 404)
+
+    # ── list_template_candidates_handler ─────────────────────────────
+    async def test_candidates_non_owner_returns_403(self):
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            token = mint_magic_link_token(FACTORY_BOT_ID, OTHER_TELEGRAM_ID)
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            resp = await self.client.get(f"/api/factory/candidates?token={token}")
+        self.assertEqual(resp.status, 403)
+
+    async def test_owner_sees_template_candidates(self):
+        await add_template_candidate(
+            creator_user_id=OWNER_TELEGRAM_ID,
+            summary="хочу бота для учёта смен курьеров",
+            fallback_reason="no_template_match",
+            selected_templates=[],
+            bot_type="general",
+        )
+        await add_template_candidate(
+            creator_user_id=OWNER_TELEGRAM_ID,
+            summary="магазин с бонусной программой",
+            fallback_reason="synthesis_failed",
+            selected_templates=["shop_catalog", "referral_program"],
+            bot_type="ecommerce",
+            bot_id=self.bot_id,
+        )
+
+        qs = await self._owner_qs()
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            resp = await self.client.get(f"/api/factory/candidates?{qs}")
+        self.assertEqual(resp.status, 200)
+        body = await resp.json()
+
+        item = next(i for i in body["items"] if i["summary"] == "магазин с бонусной программой")
+        self.assertEqual(item["bot_id"], self.bot_id)
+        self.assertEqual(item["fallback_reason"], "synthesis_failed")
+        self.assertEqual(item["selected_templates"], ["shop_catalog", "referral_program"])
+        self.assertEqual(item["bot_type"], "ecommerce")
+
+        no_match_item = next(i for i in body["items"] if i["summary"] == "хочу бота для учёта смен курьеров")
+        self.assertIsNone(no_match_item["bot_id"])
+        self.assertEqual(no_match_item["selected_templates"], [])
