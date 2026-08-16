@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -290,4 +291,261 @@ async def generic_on_office_event(
         logger.exception(
             f"generic_on_office_event: failed to record office note — "
             f"bot_id={bot_id} event_type={event.event_type} source_bot_id={event.source_bot_id} db_path={db_path}"
+        )
+
+
+# ── critical-error alerts to the owner (docs/CRITICAL_ALERTS_DESIGN.md) ─────
+#
+# report_critical_error() is the ONE call every interception point (aiogram
+# errors.router, runtime/webhook_app.py's dispatch except, future payment/
+# quota call sites) should use, so every alert has the same shape and goes
+# through the same rate-limit/sanitization — see design doc §5 "единообразие".
+#
+# Deliberately NOT routed through publish_event()/bot_office_links: v1 scope
+# is owner-facing alerts only (design doc §4), not a general-purpose event
+# subscribers can opt into. Reusing bot_office_links would require inserting
+# a link row for every bot at creation time, with the same silent-gap risk
+# already known for other manual-linkage flows (see
+# docs/CRITICAL_ALERTS_DESIGN.md §2's "ключевой вывод"). The delivery target
+# is always FACTORY_BOT_ID, unconditionally, resolved fresh from the live
+# registry on every call — never cached, so a factory-bot reload/restart is
+# picked up without any code here needing to know about it.
+
+# How long a given (bot_id, category, message) combination is suppressed
+# after being sent once. In-memory only — same "no persistence" MVP
+# trade-off as the rest of this module (module docstring above); a process
+# restart clears it, which just means the next occurrence sends immediately,
+# not that anything breaks.
+_CRITICAL_ERROR_RATE_LIMIT_SECONDS = 300
+
+# Cap so a bot producing many DISTINCT error signatures (not just repeats of
+# the same one) can't grow this dict unboundedly for the lifetime of the
+# process — same reasoning as any other in-memory cache with no owner-driven
+# eviction. Oldest entries are dropped first when the cap is hit.
+_CRITICAL_ERROR_RATE_LIMIT_MAX_KEYS = 2000
+
+# key -> last-sent monotonic timestamp
+_critical_error_last_sent: dict[tuple[int, str, str], float] = {}
+
+# Longest a single traceback/exception message is allowed to be once
+# sanitized, before being sent to the owner. Long enough to be useful, short
+# enough that one runaway error can't itself become a spam/flood problem via
+# Telegram's own message-length limits or by burying the owner's chat.
+_CRITICAL_ERROR_DETAIL_MAX_LEN = 500
+
+def _known_secret_values() -> list[str]:
+    """Actual secret VALUES this process's own env currently holds, so
+    _sanitize_detail can redact them by literal match — catches anything a
+    shape-based regex below would miss (e.g. an opaque base64 service-
+    account key with no recognizable prefix). Read from config.py fresh on
+    every call (not cached at import time) so a value rotated via env
+    without a restart is still covered; the cost is negligible next to one
+    Telegram API call. Only covers process-level secrets (config.py's own
+    env vars) — a tenant bot's own per-bot secret (e.g. its YooKassa key,
+    encrypted in the bots table) is NOT covered here, since this process
+    never holds it in plaintext outside that bot's own request handling."""
+    import config
+
+    return [
+        config.BOT_TOKEN,
+        config.ANTHROPIC_API_KEY,
+        config.ASSEMBLYAI_API_KEY,
+        config.ENCRYPTION_KEY,
+        config.GOOGLE_SHEETS_SA_KEY_B64,
+        config.USERBOT_ENCRYPTION_KEY,
+        config.GEMINI_API_KEY,
+    ]
+
+
+# Values that look like they came from something secret-shaped (bot tokens,
+# API keys, connection strings) get replaced before the message ever leaves
+# the process — a leaked exception message is exactly the kind of thing that
+# can carry these (e.g. an aiohttp client error embedding the request URL
+# with a token query param). Conservative and pattern-based, not a claim of
+# completeness: this is a best-effort scrub for the SHAPES most likely to
+# appear in this codebase's own exceptions, not a general secret scanner.
+# No leading \b: a real token embedded in a URL path is literally
+# "bot<digits>:<hash>" (e.g. api.telegram.org/bot123456789:AAA...) — the "t"
+# right before the digits is a word character too, so \b wouldn't match
+# there at all and the token would slip through unredacted. The trailing
+# \b plus the 30-char minimum on the hash segment is enough to avoid
+# matching on plain digit:digit ratios elsewhere in a message.
+_TELEGRAM_TOKEN_RE = re.compile(r"\d{6,12}:[A-Za-z0-9_-]{30,}\b")
+_BEARER_TOKEN_RE = re.compile(r"\b(Bearer|token)[\s=:]+[A-Za-z0-9_\-.]{16,}\b", re.IGNORECASE)
+_URL_CREDENTIALS_RE = re.compile(r"(://)[^/\s:@]+:[^/\s:@]+@")
+# key=/secret=/api_key=/password=<value> in a query string or a formatted
+# f-string (e.g. "Invalid secret_key sk_live_xxx for shop 12345",
+# "...?key=AIzaSyXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX") — review found the
+# earlier three patterns miss exactly this shape, which is how this
+# codebase's own YooKassa/Google Sheets/API-key config values would most
+# likely surface in an exception message (features/payments.py, config.py's
+# GOOGLE_SHEETS_SA_KEY_B64/ANTHROPIC_API_KEY/etc.).
+_KEY_VALUE_SECRET_RE = re.compile(
+    r"\b(api[_-]?key|secret[_-]?key|secret|password|access[_-]?token)\s*[=:]\s*\S{8,}",
+    re.IGNORECASE,
+)
+
+
+def _scrub_secrets(text: str) -> str:
+    """Best-effort scrub of secret-shaped substrings — no length cap here
+    (see _sanitize_detail_for_sending below for why that's kept separate).
+    Never raises — a sanitizer that itself fails must not block an alert
+    the owner otherwise needs to see, so any unexpected input just falls
+    through unchanged rather than propagating.
+
+    Two layers, in order: (1) known process-level secret VALUES (from
+    config.py's own env vars) are redacted by literal substring match first
+    — this catches anything shape-based patterns below would miss, at the
+    cost of only covering secrets this process actually knows about (not
+    per-bot secrets like a tenant's own YooKassa key, which live encrypted
+    in the bots table, never in this process's env); (2) shape-based
+    patterns catch everything else on a best-effort basis. Neither layer
+    claims completeness — see module comment above."""
+    try:
+        for secret_value in _known_secret_values():
+            if secret_value:
+                text = text.replace(secret_value, "[redacted-secret]")
+        text = _TELEGRAM_TOKEN_RE.sub("[redacted-token]", text)
+        text = _BEARER_TOKEN_RE.sub("[redacted-token]", text)
+        text = _URL_CREDENTIALS_RE.sub(r"\1[redacted-credentials]@", text)
+        text = _KEY_VALUE_SECRET_RE.sub(lambda m: f"{m.group(1)}=[redacted-secret]", text)
+    except Exception:
+        logger.warning("_scrub_secrets: pattern substitution failed — using unscrubbed text", exc_info=True)
+    return text
+
+
+def _cap_length(text: str) -> str:
+    """Hard length cap applied only to the text actually SENT to the owner
+    (see _sanitize_detail's docstring for why this is kept separate from
+    scrubbing/rate-limit-keying)."""
+    if len(text) > _CRITICAL_ERROR_DETAIL_MAX_LEN:
+        return text[:_CRITICAL_ERROR_DETAIL_MAX_LEN] + "… (truncated)"
+    return text
+
+
+def _sanitize_detail(text: str) -> str:
+    """_scrub_secrets() plus the hard length cap actually sent to the owner.
+    Kept as two separate steps (not fused) because report_critical_error's
+    rate-limit key needs the SCRUBBED-BUT-UNTRUNCATED text: keying on the
+    truncated text would collide for any two distinct errors sharing a long
+    common prefix (e.g. the same exception type wrapping a long URL/payload
+    dump, differing only after the cap) — review flagged this as a real
+    "distinct errors silently suppressed" risk, see _rate_limit_key's own
+    docstring below. This wrapper exists for callers (and tests) that just
+    want the final send-ready text in one call; report_critical_error itself
+    calls _scrub_secrets() and _cap_length() separately for that reason."""
+    return _cap_length(_scrub_secrets(text))
+
+
+def _rate_limit_key(bot_id: int, category: str, detail: str) -> tuple[int, str, str]:
+    """Groups by the sanitized, truncated detail text itself — two errors
+    with the same category but different messages are different keys (both
+    get delivered), while retries of the literal same failure collapse to
+    one key and get suppressed. Deliberately not a hash of the raw traceback
+    (which would vary per-frame on things like memory addresses in repr()
+    output for some exception types) — the sanitized/truncated text is
+    already the stable, owner-facing signal."""
+    return (bot_id, category, detail)
+
+
+def _should_send(key: tuple[int, str, str]) -> bool:
+    """True if this exact (bot_id, category, detail) hasn't fired in the
+    last _CRITICAL_ERROR_RATE_LIMIT_SECONDS. Evicts the oldest entries once
+    the dict exceeds _CRITICAL_ERROR_RATE_LIMIT_MAX_KEYS, so a bot cycling
+    through many distinct errors can't grow this unboundedly (see module
+    comment above) — done here, on the write path, rather than a separate
+    background sweep, since this module has no other periodic task to hang
+    one off of."""
+    now = time.monotonic()
+    last_sent = _critical_error_last_sent.get(key)
+    if last_sent is not None and now - last_sent < _CRITICAL_ERROR_RATE_LIMIT_SECONDS:
+        return False
+    if len(_critical_error_last_sent) >= _CRITICAL_ERROR_RATE_LIMIT_MAX_KEYS:
+        oldest_key = min(_critical_error_last_sent, key=_critical_error_last_sent.get)
+        del _critical_error_last_sent[oldest_key]
+    _critical_error_last_sent[key] = now
+    return True
+
+
+async def report_critical_error(bot_id: int, category: str, exc: BaseException) -> None:
+    """Delivers a short, sanitized alert about `exc` (raised while processing
+    an update/request for `bot_id`) to the owner via the factory bot, if:
+    - this exact (bot_id, category, sanitized detail) hasn't already fired
+      within the rate-limit window (_should_send), and
+    - the factory bot is actually reachable in the live registry right now.
+
+    Never raises. This is deliberately the LAST line of defense in an
+    already-exceptional path (an error handler, or an except block around
+    per-update dispatch) — an exception escaping FROM here would either mask
+    the original error or crash a process that's already mid-failure-handling.
+    Every failure mode below (no registry, factory bot missing, send_message
+    itself raising — e.g. owner blocked the bot, OWNER_ID unset) degrades to
+    a single logger call, never a raised exception.
+
+    Deliberately synchronous with the caller (awaited, not fire-and-forget
+    like publish_event() is by convention) — callers are already inside an
+    except block for something that already went wrong, so there's no
+    separate "publisher's own request" to protect from this call's latency
+    the way publish_event()'s docstring describes; a couple hundred ms for
+    one Telegram API call is an acceptable cost here."""
+    from handlers.admin_manager import OWNER_ID
+    from runtime.registry import FACTORY_BOT_ID
+
+    try:
+        raw_detail = f"{type(exc).__name__}: {exc}"
+        scrubbed_detail = _scrub_secrets(raw_detail)
+    except Exception:
+        scrubbed_detail = "(failed to format exception detail)"
+
+    # Rate-limit key uses the FULL scrubbed text, not the truncated one sent
+    # to the owner — see _sanitize_detail's docstring for why keying on the
+    # truncated text would collide two distinct errors sharing a long common
+    # prefix.
+    key = _rate_limit_key(bot_id, category, scrubbed_detail)
+    if not _should_send(key):
+        logger.info(
+            f"report_critical_error: bot_id={bot_id} category={category!r} suppressed "
+            "by rate limit (identical error already reported recently)"
+        )
+        return
+
+    detail = _cap_length(scrubbed_detail)
+
+    if not OWNER_ID:
+        logger.warning(
+            f"report_critical_error: OWNER_ID not set — cannot deliver alert for "
+            f"bot_id={bot_id} category={category!r} detail={detail!r}"
+        )
+        return
+
+    registry = _registry_handle.value
+    if registry is None:
+        logger.warning(
+            f"report_critical_error: no live registry — cannot deliver alert for "
+            f"bot_id={bot_id} category={category!r} detail={detail!r}"
+        )
+        return
+
+    factory_entry = registry.get(FACTORY_BOT_ID)
+    if factory_entry is None:
+        logger.warning(
+            f"report_critical_error: FACTORY_BOT_ID not in live registry — cannot deliver "
+            f"alert for bot_id={bot_id} category={category!r} detail={detail!r}"
+        )
+        return
+
+    occurred_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    text = (
+        f"⚠️ Критическая ошибка\n\n"
+        f"Бот: {bot_id}\n"
+        f"Категория: {category}\n"
+        f"Время: {occurred_at}\n\n"
+        f"{detail}"
+    )
+    try:
+        await factory_entry.bot.send_message(OWNER_ID, text)
+    except Exception:
+        logger.exception(
+            f"report_critical_error: failed to deliver alert to owner — "
+            f"bot_id={bot_id} category={category!r} detail={detail!r}"
         )

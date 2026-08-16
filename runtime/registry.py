@@ -21,7 +21,7 @@ from typing import Any, Awaitable, Callable
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, Router
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import BotCommand, BotCommandScopeAllPrivateChats, TelegramObject
+from aiogram.types import BotCommand, BotCommandScopeAllPrivateChats, ErrorEvent, TelegramObject
 
 from config import DATA_DIR
 from db.database import get_all_bots, get_bot, get_bot_features
@@ -621,6 +621,42 @@ class BotEntry:
     config: dict[str, Any] = field(default_factory=dict)
 
 
+def register_critical_error_handler(dp: Dispatcher, bot_id: int) -> None:
+    """Wires dp.errors.register() so any exception aiogram itself catches
+    while routing an update — inside a handler, or in middleware BEFORE a
+    handler is even reached — gets reported to the owner via
+    features/office_events.py's report_critical_error(), per
+    docs/CRITICAL_ALERTS_DESIGN.md §3's "ошибка на уровне aiogram-диспетчера"
+    row. This is a DIFFERENT interception point from runtime/webhook_app.py's
+    own try/except around feed_webhook_update(): that one catches whatever
+    escapes aiogram's own error handling entirely (e.g. a bug in aiogram
+    itself, or feed_webhook_update() failing before dispatch even starts);
+    this one catches everything aiogram's normal per-update flow already
+    isolates per-handler. Both call the same report_critical_error() so the
+    owner sees one alert shape regardless of which layer caught it.
+
+    Called once per Dispatcher — both build_entry() below (one per tenant
+    bot) and runtime/combined_app.py's _build_factory_dispatcher() (the
+    factory bot's own Dispatcher) — so EVERY bot in the registry, including
+    the factory bot itself, reports its own critical errors the same way.
+
+    Imported locally, not at module top, for the same one-way dependency
+    reason register_office_event_hook() is imported locally just below:
+    features/office_events.py must not import runtime.registry at module
+    level (see report_critical_error()'s own local import of FACTORY_BOT_ID
+    for the matching half of this)."""
+    from features.office_events import report_critical_error
+
+    @dp.errors()
+    async def _on_dispatch_error(event: ErrorEvent) -> bool:
+        await report_critical_error(bot_id, "unhandled_exception", event.exception)
+        # True tells aiogram this error was handled — matches the existing
+        # behavior at runtime/webhook_app.py's own except block (log and
+        # continue, update considered "processed", no retry storm from
+        # Telegram re-delivering the same update on a 5xx).
+        return True
+
+
 def build_factory_entry(bot: Bot, dispatcher: Dispatcher) -> BotEntry:
     """Wraps the factory bot's own already-configured Bot + Dispatcher
     (routers and middleware attached by the caller — runtime/combined_app.py,
@@ -683,6 +719,7 @@ async def build_entry(
 
     bot = Bot(token=token)
     dp = Dispatcher(storage=MemoryStorage())
+    register_critical_error_handler(dp, bot_id)
 
     module = await _load_template_module_async(template_id) if template_id else None
     if module is None and file_path:

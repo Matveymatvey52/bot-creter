@@ -56,7 +56,13 @@ from main import ManagedBotMiddleware, build_group_router, restore_bots
 from db.database import get_bot_features
 from features import reminders
 from features.office_events import set_registry as set_office_events_registry
-from runtime.registry import FACTORY_BOT_ID, build_factory_entry, build_registry, get_template_reminders_config
+from runtime.registry import (
+    FACTORY_BOT_ID,
+    build_factory_entry,
+    build_registry,
+    get_template_reminders_config,
+    register_critical_error_handler,
+)
 from runtime.factory_analytics_api import register_routes as register_factory_analytics_routes
 from runtime.miniapp_api import register_routes as register_miniapp_routes
 from runtime.webhook_app import create_app
@@ -75,6 +81,7 @@ async def _build_factory_dispatcher() -> Dispatcher:
     than duplicated."""
     storage = MemoryStorage()
     dp = Dispatcher(storage=storage)
+    register_critical_error_handler(dp, FACTORY_BOT_ID)
     dp.update.outer_middleware(ManagedBotMiddleware(storage))
     dp.include_router(admin_router)
     dp.include_router(start_router)

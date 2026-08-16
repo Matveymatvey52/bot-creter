@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import os
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from aiogram import Bot, Dispatcher, Router
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -131,6 +131,31 @@ class WebhookRoutingTests(unittest.IsolatedAsyncioTestCase):
     async def test_health_endpoint(self):
         resp = await self.client.get("/health")
         self.assertEqual(resp.status, 200)
+
+    async def test_dispatch_failure_reports_critical_error_and_still_returns_200(self):
+        """webhook_handler's except Exception block (runtime/webhook_app.py)
+        must call report_critical_error with category="webhook_failure" —
+        distinct from register_critical_error_handler's aiogram errors()
+        hook, which only fires for exceptions aiogram's OWN routing catches.
+        feed_webhook_update() raising directly (e.g. malformed update data
+        after json parsing) is exactly the case this except still needs to
+        cover — patched here to simulate that without crafting an update
+        shape aiogram itself would choke on."""
+        with patch(
+            "aiogram.Dispatcher.feed_webhook_update",
+            side_effect=RuntimeError("dispatch blew up"),
+        ), patch("features.office_events.report_critical_error", new=AsyncMock()) as mock_report:
+            with patch.dict(os.environ, {"WEBHOOK_SECRET": "expected-secret"}):
+                resp = await self.client.post(
+                    f"/webhook/{KNOWN_BOT_ID}", json=_fake_update("/start"),
+                    headers={WEBHOOK_SECRET_HEADER: "expected-secret"},
+                )
+        self.assertEqual(resp.status, 200)
+        mock_report.assert_awaited_once()
+        args, _ = mock_report.call_args
+        self.assertEqual(args[0], KNOWN_BOT_ID)
+        self.assertEqual(args[1], "webhook_failure")
+        self.assertIsInstance(args[2], RuntimeError)
 
     async def test_health_endpoint_ignores_webhook_secret_state(self):
         """/health has no secret check at all and must stay reachable for
