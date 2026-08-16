@@ -448,6 +448,8 @@ class FallbackInfoReasonsWhenTemplateMatchedButCustomizationFails(unittest.Isola
         async def fake_create(*, model, max_tokens, system, messages):
             if system == select_prompt:
                 return _fake_response("shop_catalog")
+            if system == claude_service._FREEDOM_TIER_PROMPT:
+                return _fake_response("customize")
             if system == claude_service.CUSTOMIZE_TEMPLATE_PROMPT:
                 # Valid Python but missing the entry point — distinct from a
                 # SyntaxError, which _customize_from_template already handles
