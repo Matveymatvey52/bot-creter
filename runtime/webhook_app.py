@@ -64,8 +64,17 @@ async def webhook_handler(request: web.Request) -> web.Response:
     update_data = await request.json()
     try:
         await entry.dispatcher.feed_webhook_update(entry.bot, update_data)
-    except Exception:
+    except Exception as exc:
         logger.exception(f"Failed to process webhook update for bot_id={bot_id}")
+        # Distinct from register_critical_error_handler's dp.errors() hook
+        # (runtime/registry.py) — that one only fires for exceptions aiogram's
+        # OWN per-update routing catches; this except catches whatever escapes
+        # feed_webhook_update() entirely (e.g. malformed update_data raising
+        # before dispatch even starts). Both funnel into the same
+        # report_critical_error() so the owner gets one alert shape either way.
+        from features.office_events import report_critical_error
+
+        await report_critical_error(bot_id, "webhook_failure", exc)
     return web.json_response({"ok": True})
 
 
