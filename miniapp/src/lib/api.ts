@@ -101,3 +101,33 @@ export interface SchemaResource {
 export function getSchema(): Promise<{ resources: SchemaResource[] }> {
   return request('/schema')
 }
+
+export type AnalyticsPeriod = 'week' | 'month' | 'quarter'
+
+export interface AnalyticsVolumePoint {
+  date: string
+  count: number
+}
+
+export interface AnalyticsTopCustomer {
+  match_field: string | number
+  count: number
+}
+
+export interface AnalyticsData {
+  total: number
+  volume: AnalyticsVolumePoint[]
+  delta_pct: number | null
+  top_customers: AnalyticsTopCustomer[]
+  new_vs_returning: { new: number; returning: number } | null
+}
+
+// Mirrors runtime/miniapp_api.py's analytics_handler — owner-only (a 403
+// here, unlike every other call in this file, can mean "authenticated but
+// not this bot's owner", not just "not authenticated at all") and 404s when
+// the bot has no usable office_hook_config (see that handler's docstring),
+// which the caller (screens/AnalyticsScreen.tsx) treats as "hide this
+// section" rather than an error to display.
+export function getAnalytics(period: AnalyticsPeriod): Promise<AnalyticsData> {
+  return request(`/analytics?period=${period}`)
+}

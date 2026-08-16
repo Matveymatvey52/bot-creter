@@ -46,7 +46,8 @@ from urllib.parse import parse_qsl
 import aiosqlite
 from aiohttp import web
 
-from db.database import get_bot_miniapp_config
+from db.database import get_bot_admins, get_bot_miniapp_config, get_bot_office_hook_config
+from features.sales_analytics import Period, compute_metrics
 from runtime.registry import FACTORY_BOT_ID, Registry, _load_template_module_async
 
 logger = logging.getLogger(__name__)
@@ -389,6 +390,61 @@ async def create_resource_handler(request: web.Request) -> web.Response:
     return web.json_response({"resource": resource_name, "id": new_id}, status=201)
 
 
+_ANALYTICS_PERIODS: frozenset[str] = frozenset(("week", "month", "quarter"))
+
+
+async def analytics_handler(request: web.Request) -> web.Response:
+    """GET /api/{bot_id}/analytics?period=week|month|quarter — per-bot sales
+    analytics (docs/SALES_ANALYTICS_DESIGN.md), OWNER-ONLY unlike every other
+    /api/{bot_id}/* route above (those authenticate any of the bot's own
+    Telegram users, since a customer viewing their own booking is a normal
+    use case; analytics about ALL customers is not something a random
+    customer of this bot should ever see). Ownership is checked against
+    db.database.bot_admins — the same factory-level admin list templates'
+    own _is_admin(uid, config.admins_file) checks read from, just consulted
+    here instead of the per-bot admins.json file since this handler has no
+    Config object, only the Registry entry.
+
+    Deliberately does NOT go through _resolve_entry_and_config() (that
+    function 404s when miniapp_config is absent, which is orthogonal to
+    whether analytics is available — a bot can have no miniapp_config yet
+    still have a usable office_hook_config, or vice versa). Only bot
+    existence is required here; office_hook_config availability is instead
+    what compute_metrics()'s own None return communicates."""
+    bot_id_raw = request.match_info.get("bot_id", "")
+    if err := _bad_bot_id(bot_id_raw):
+        return err
+    bot_id = int(bot_id_raw)
+
+    registry: Registry = request.app[REGISTRY_KEY]
+    entry = registry.get(bot_id)
+    if entry is None:
+        return web.json_response({"error": "unknown bot"}, status=404)
+
+    telegram_user_id = await _authenticate(request, bot_id, entry.bot.token)
+    if telegram_user_id is None:
+        return web.json_response({"error": "forbidden"}, status=403)
+
+    admin_ids = await get_bot_admins(bot_id)
+    if str(telegram_user_id) not in admin_ids:
+        return web.json_response({"error": "forbidden"}, status=403)
+
+    period_raw = request.query.get("period", "week")
+    if period_raw not in _ANALYTICS_PERIODS:
+        return web.json_response({"error": "invalid period"}, status=400)
+    period: Period = period_raw  # type: ignore[assignment]  # narrowed by the membership check above
+
+    db_path = entry.config.get("db_path") if isinstance(entry.config, dict) else None
+    if not db_path:
+        return web.json_response({"error": "bot has no database configured"}, status=500)
+
+    hook_config = await get_bot_office_hook_config(bot_id)
+    metrics = await compute_metrics(db_path, hook_config, period)
+    if metrics is None:
+        return web.json_response({"error": "analytics not available for this bot"}, status=404)
+    return web.json_response(metrics)
+
+
 async def serve_app_shell(request: web.Request) -> web.Response:
     """Serves the SPA's index.html for /app/{bot_id} (and any client-side
     sub-route under it — the SPA does its own in-memory routing per
@@ -465,6 +521,10 @@ def register_routes(app: web.Application) -> None:
     # in principle even declare a resource literally named "schema", which
     # this ordering also protects against by reserving the word).
     app.router.add_get("/api/{bot_id}/schema", schema_handler)
+    # Registered before the generic {resource} route for the same reason as
+    # /schema above — "analytics" would otherwise be swallowed as a resource
+    # name, and is reserved the same way "schema" already is.
+    app.router.add_get("/api/{bot_id}/analytics", analytics_handler)
     app.router.add_get("/api/{bot_id}/{resource}", list_resource_handler)
     app.router.add_get("/api/{bot_id}/{resource}/{item_id}", get_resource_handler)
     app.router.add_post("/api/{bot_id}/{resource}", create_resource_handler)

@@ -690,9 +690,12 @@ async def delete_bot_miniapp_config(bot_id: int) -> None:
 async def set_bot_office_hook_config(bot_id: int, config: dict) -> None:
     """Upserts this bot's generic office-hook config (docs/OFFICES_DESIGN.md
     §11) — 1:1 with bots.id, same ON CONFLICT pattern as
-    set_bot_miniapp_config. config is {"table": str, "match_field": str|None}
-    (see services/claude_service.py's _generate_office_hook_config for how
-    it's produced)."""
+    set_bot_miniapp_config. config is {"table": str, "match_field": str|None,
+    "created_at_field": str|None} (see services/claude_service.py's
+    _generate_office_hook_config for how it's produced; created_at_field is
+    also consumed by features/sales_analytics.py for time-bucketed metrics —
+    older rows written before that field existed simply have it absent, read
+    back as None via dict.get, same as any other optional JSON key)."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             """

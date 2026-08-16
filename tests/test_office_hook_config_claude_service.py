@@ -47,15 +47,15 @@ class ParseOfficeHookConfigTests(unittest.TestCase):
     def test_valid_config_with_match_field_parses(self):
         raw = '{"table": "clients", "match_field": "telegram_id"}'
         result = claude_service._parse_office_hook_config(raw, SAMPLE_BOT_CODE)
-        self.assertEqual(result, {"table": "clients", "match_field": "telegram_id"})
+        self.assertEqual(result, {"table": "clients", "match_field": "telegram_id", "created_at_field": None})
 
     def test_valid_config_with_null_match_field_parses(self):
         raw = '{"table": "clients", "match_field": null}'
         result = claude_service._parse_office_hook_config(raw, SAMPLE_BOT_CODE)
-        self.assertEqual(result, {"table": "clients", "match_field": None})
+        self.assertEqual(result, {"table": "clients", "match_field": None, "created_at_field": None})
 
     def test_no_table_at_all_returns_none(self):
-        raw = '{"table": null, "match_field": null}'
+        raw = '{"table": null, "match_field": null, "created_at_field": null}'
         self.assertIsNone(claude_service._parse_office_hook_config(raw, SAMPLE_BOT_CODE))
 
     def test_hallucinated_table_returns_none(self):
@@ -83,7 +83,44 @@ class ParseOfficeHookConfigTests(unittest.TestCase):
     def test_markdown_fenced_response_is_stripped(self):
         raw = '```json\n{"table": "clients", "match_field": "telegram_id"}\n```'
         result = claude_service._parse_office_hook_config(raw, SAMPLE_BOT_CODE)
-        self.assertEqual(result, {"table": "clients", "match_field": "telegram_id"})
+        self.assertEqual(result, {"table": "clients", "match_field": "telegram_id", "created_at_field": None})
+
+    # ── created_at_field (new) ───────────────────────────────────────────
+
+    def test_valid_created_at_field_parses(self):
+        raw = '{"table": "clients", "match_field": "telegram_id", "created_at_field": "created_at"}'
+        result = claude_service._parse_office_hook_config(raw, SAMPLE_BOT_CODE)
+        self.assertEqual(
+            result, {"table": "clients", "match_field": "telegram_id", "created_at_field": "created_at"}
+        )
+
+    def test_null_created_at_field_parses(self):
+        raw = '{"table": "clients", "match_field": "telegram_id", "created_at_field": null}'
+        result = claude_service._parse_office_hook_config(raw, SAMPLE_BOT_CODE)
+        self.assertEqual(
+            result, {"table": "clients", "match_field": "telegram_id", "created_at_field": None}
+        )
+
+    def test_missing_created_at_field_key_defaults_to_none(self):
+        # Older Haiku responses / anything predating this field's rollout —
+        # dict.get() on an absent key, not a KeyError.
+        raw = '{"table": "clients", "match_field": "telegram_id"}'
+        result = claude_service._parse_office_hook_config(raw, SAMPLE_BOT_CODE)
+        self.assertIsNone(result["created_at_field"])
+
+    def test_hallucinated_created_at_field_degrades_to_none_not_whole_config(self):
+        # Unlike a hallucinated table/match_field (which invalidates the
+        # WHOLE config), a hallucinated created_at_field only drops that one
+        # field — table/match_field stay valid. See _parse_office_hook_config's
+        # docstring: this is what lets a bot still get repeat-customer
+        # analytics even if the time-bucketing hint was hallucinated.
+        raw = '{"table": "clients", "match_field": "telegram_id", "created_at_field": "no_such_column"}'
+        result = claude_service._parse_office_hook_config(raw, SAMPLE_BOT_CODE)
+        self.assertEqual(result, {"table": "clients", "match_field": "telegram_id", "created_at_field": None})
+
+    def test_wrong_type_for_created_at_field_returns_none_for_whole_config(self):
+        raw = '{"table": "clients", "match_field": "telegram_id", "created_at_field": 123}'
+        self.assertIsNone(claude_service._parse_office_hook_config(raw, SAMPLE_BOT_CODE))
 
 
 class GenerateOfficeHookConfigTests(unittest.IsolatedAsyncioTestCase):
@@ -96,10 +133,14 @@ class GenerateOfficeHookConfigTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_valid_response_returns_parsed_config(self):
         self.mock_client.messages.create = AsyncMock(
-            return_value=_fake_response('{"table": "clients", "match_field": "telegram_id"}')
+            return_value=_fake_response(
+                '{"table": "clients", "match_field": "telegram_id", "created_at_field": "created_at"}'
+            )
         )
         result = await claude_service._generate_office_hook_config(SAMPLE_BOT_CODE, "a client-tracking bot")
-        self.assertEqual(result, {"table": "clients", "match_field": "telegram_id"})
+        self.assertEqual(
+            result, {"table": "clients", "match_field": "telegram_id", "created_at_field": "created_at"}
+        )
 
     async def test_api_exception_never_raises_returns_none(self):
         self.mock_client.messages.create = AsyncMock(side_effect=RuntimeError("network broke"))
