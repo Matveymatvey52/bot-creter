@@ -173,6 +173,39 @@ async def init_db():
                 created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        # shop_id/secret_key + a cache of the last GET /me lookup (see
+        # services/yookassa_api.py) — separate from provider_token (that
+        # stays the Telegram-side @YooKassaBot token; these are the ЮKassa
+        # merchant API credentials the owner types once so the wizard can
+        # look up payment_methods/status itself). last_status/
+        # last_payment_methods_json are a cache only, refreshed by the
+        # "Проверить статус" button/poll — never the source of truth for
+        # whether the bot can actually take payments (provider_token is).
+        for col in (
+            "shop_id TEXT",
+            "secret_key TEXT",
+            "last_status TEXT",
+            "last_payment_methods_json TEXT",
+            "last_checked_at TIMESTAMP",
+        ):
+            try:
+                await db.execute(f"ALTER TABLE bot_payment_providers ADD COLUMN {col}")
+            except aiosqlite.OperationalError:
+                pass
+        # owner_payment_credentials — the ЮKassa shop_id/secret_key entered
+        # once, reused as a suggested default when connecting payments to a
+        # later bot (owner_user_id-scoped, same pattern as userbot_sessions
+        # below). Telegram's Bot API still requires a separate manual
+        # BotFather trip per bot for provider_token — this table only
+        # removes the need to re-type shop_id/secret_key for every bot.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS owner_payment_credentials (
+                owner_user_id INTEGER PRIMARY KEY,
+                shop_id       TEXT NOT NULL,
+                secret_key    TEXT NOT NULL,
+                updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS bot_features (
                 bot_id       INTEGER NOT NULL REFERENCES bots(id),
@@ -473,6 +506,96 @@ async def get_bot_payment_provider(bot_id: int) -> str | None:
         ) as cursor:
             row = await cursor.fetchone()
             return _decrypt_token(row[0]) if row else None
+
+
+async def set_bot_yookassa_credentials(bot_id: int, shop_id: str, secret_key: str) -> None:
+    """Stores this bot's ЮKassa merchant API credentials (shop_id/secret_key), separate
+    from provider_token — used by services/yookassa_api.py's GET /me lookups. Requires a
+    pre-existing bot_payment_providers row (provider_token already set); callers connect
+    the Telegram provider_token first, same order as the onboarding wizard's steps."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE bot_payment_providers SET shop_id = ?, secret_key = ? WHERE bot_id = ?",
+            (shop_id, _encrypt_token(secret_key), bot_id),
+        )
+        await db.commit()
+    logger.info(f"set_bot_yookassa_credentials: shop_id set for bot_id={bot_id}")
+
+
+async def get_bot_yookassa_credentials(bot_id: int) -> tuple[str, str] | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT shop_id, secret_key FROM bot_payment_providers WHERE bot_id = ?", (bot_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            if not row or not row[0] or not row[1]:
+                return None
+            return row[0], _decrypt_token(row[1])
+
+
+async def set_bot_yookassa_status_cache(bot_id: int, status: str, payment_methods_json: str) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            UPDATE bot_payment_providers
+            SET last_status = ?, last_payment_methods_json = ?, last_checked_at = CURRENT_TIMESTAMP
+            WHERE bot_id = ?
+            """,
+            (status, payment_methods_json, bot_id),
+        )
+        await db.commit()
+
+
+async def get_all_bot_ids_with_yookassa_credentials() -> list[int]:
+    """Bot IDs that have shop_id/secret_key on file — the periodic status-poll loop
+    (runtime/payment_status_poller.py) iterates these instead of every bot, since
+    most bots never opt into the (а)/(в) API layer."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT bot_id FROM bot_payment_providers WHERE shop_id IS NOT NULL AND secret_key IS NOT NULL"
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [row[0] for row in rows]
+
+
+async def get_bot_yookassa_status_cache(bot_id: int) -> dict | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT last_status, last_payment_methods_json, last_checked_at "
+            "FROM bot_payment_providers WHERE bot_id = ?",
+            (bot_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            if not row or not row["last_status"]:
+                return None
+            return dict(row)
+
+
+async def set_owner_payment_credentials(owner_user_id: int, shop_id: str, secret_key: str) -> None:
+    """Upserts the owner's ЮKassa shop_id/secret_key, reused as a suggested default the
+    next time they connect payments to a different bot — see docstring on
+    owner_payment_credentials in init_db()."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO owner_payment_credentials (owner_user_id, shop_id, secret_key) VALUES (?, ?, ?)
+            ON CONFLICT(owner_user_id) DO UPDATE SET
+                shop_id = excluded.shop_id, secret_key = excluded.secret_key, updated_at = CURRENT_TIMESTAMP
+            """,
+            (owner_user_id, shop_id, _encrypt_token(secret_key)),
+        )
+        await db.commit()
+
+
+async def get_owner_payment_credentials(owner_user_id: int) -> tuple[str, str] | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT shop_id, secret_key FROM owner_payment_credentials WHERE owner_user_id = ?",
+            (owner_user_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return (row[0], _decrypt_token(row[1])) if row else None
 
 
 async def enable_bot_feature(bot_id: int, feature_name: str) -> None:
