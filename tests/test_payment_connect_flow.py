@@ -173,7 +173,7 @@ class PaymentConnectTokenTests(unittest.IsolatedAsyncioTestCase):
         self._owner_patcher.stop()
         await delete_bot(self.bot_id)
 
-    async def test_valid_token_is_saved_and_state_cleared(self):
+    async def test_valid_token_is_saved_and_advances_to_shop_id_step(self):
         message = _make_message(self.owner_id, VALID_PROVIDER_TOKEN)
         state = _make_fsm_context(self.owner_id)
         await state.set_state(manage_bots.PaymentConnectFlow.waiting_for_token)
@@ -183,7 +183,10 @@ class PaymentConnectTokenTests(unittest.IsolatedAsyncioTestCase):
 
         saved = await get_bot_payment_provider(self.bot_id)
         self.assertEqual(saved, VALID_PROVIDER_TOKEN)
-        self.assertIsNone(await state.get_state())
+        # provider_token success now offers the optional (а)/(б) shopId/secret key
+        # step instead of clearing immediately — skipping it (payskip:) still
+        # ends the wizard exactly like before.
+        self.assertEqual(await state.get_state(), manage_bots.PaymentConnectFlow.waiting_for_shop_id.state)
 
     async def test_live_token_is_also_accepted(self):
         live_token = "381764678:LIVE:abcXYZ123"
