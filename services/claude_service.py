@@ -2176,31 +2176,42 @@ async def _generate_miniapp_config(bot_code: str, requirements_summary: str) -> 
 # and a bad/missing config just means "generic office hook can't match
 # clients for this bot", not a broken bot.
 
-_EVENT_RSVP_OFFICE_HOOK_CONFIG_EXAMPLE = """{"table": "rsvps", "match_field": "client_user_id"}"""
+_EVENT_RSVP_OFFICE_HOOK_CONFIG_EXAMPLE = (
+    """{"table": "rsvps", "match_field": "client_user_id", "created_at_field": "created_at"}"""
+)
 
-OFFICE_HOOK_CONFIG_SYSTEM_PROMPT = f"""You extract a tiny "client match" hint from a Telegram bot's Python source code, for a factory that builds Telegram bots which can be linked into "офисы" (cross-bot notifications).
+OFFICE_HOOK_CONFIG_SYSTEM_PROMPT = f"""You extract a tiny "client match" hint from a Telegram bot's Python source code, for a factory that builds Telegram bots which can be linked into "офисы" (cross-bot notifications) and for that same bot's own per-bot sales analytics.
 
 You will be given the bot's full source code (its init_db() function contains the real CREATE TABLE statements — this is your only source of truth for table and column names) and a short description of what the bot does.
 
-Context: this factory lets the owner link two of their bots so that when a customer pays in bot A, bot B (if linked) gets notified with that customer's Telegram chat_id. For bot B to react usefully, it needs to know: which of ITS OWN tables holds records about its own customers/clients, and which column on that table is a Telegram chat_id/user_id comparable to the paying customer's chat_id (so bot B can look up "do I already have a record for this same person?").
+Context 1 (офисы): this factory lets the owner link two of their bots so that when a customer pays in bot A, bot B (if linked) gets notified with that customer's Telegram chat_id. For bot B to react usefully, it needs to know: which of ITS OWN tables holds records about its own customers/clients, and which column on that table is a Telegram chat_id/user_id comparable to the paying customer's chat_id (so bot B can look up "do I already have a record for this same person?").
 
-Here is one correct real example, from an event-RSVP bot (rsvps is a real table in that bot's init_db(), client_user_id is a real INTEGER column storing the guest's Telegram user id):
+Context 2 (per-bot analytics): the SAME table/match_field pair also drives a generic sales-analytics feature (record volume over time, top repeat customers) available to any bot's own owner inside that bot's mini-app. That feature additionally needs to know which column on the chosen table stores WHEN each record was created, so it can bucket records by day/week/month.
+
+Here is one correct real example, from an event-RSVP bot (rsvps is a real table in that bot's init_db(), client_user_id is a real INTEGER column storing the guest's Telegram user id, created_at is a real TIMESTAMP column set at insert time):
 
 {_EVENT_RSVP_OFFICE_HOOK_CONFIG_EXAMPLE}
 
 Rules:
 - Respond with ONLY the JSON object, no markdown fences, no explanation.
-- Shape: {{"table": "<real table name from init_db(), verbatim>", "match_field": "<real column name on that table, verbatim>" or null}}.
+- Shape: {{"table": "<real table name from init_db(), verbatim>", "match_field": "<real column name on that table, verbatim>" or null, "created_at_field": "<real column name on that table, verbatim>" or null}}.
 - Pick the table that best represents this bot's own individual customer/client/guest records (e.g. bookings, clients, guests, orders, subscribers) — NOT a purely internal/administrative table (admins, settings, state, sessions, migration tables).
 - match_field must be a column that stores a Telegram user id or chat id (typically named like user_id, client_id, chat_id, telegram_id, customer_id — an INTEGER column that identifies a person via Telegram, not a phone number or free-text name). If no such column exists on the chosen table, or you cannot find any table worth matching against, set match_field to null (table may still be non-null — see below) — this is a valid, expected answer.
-- If the bot has NO table that represents individual customer/client records at all (e.g. a purely broadcast/announcement bot with no such table, or only internal tables), respond with exactly {{"table": null, "match_field": null}}. This is a valid, expected answer — not an error.
+- created_at_field must be a column that stores when each row was created (typically named like created_at, created, timestamp, booked_at — a TIMESTAMP/TEXT/DATETIME column set once at insert time, not a status or an editable date the user picks). If no such column exists, set created_at_field to null — this is a valid, expected answer and does not affect table/match_field.
+- If the bot has NO table that represents individual customer/client records at all (e.g. a purely broadcast/announcement bot with no such table, or only internal tables), respond with exactly {{"table": null, "match_field": null, "created_at_field": null}}. This is a valid, expected answer — not an error.
 - Never invent a table or column that isn't a literal, verbatim CREATE TABLE name/column in the given code."""
 
 
 def _parse_office_hook_config(raw: str, bot_code: str) -> dict | None:
     """Best-effort JSON parse + schema validation, mirroring
     _parse_miniapp_config's fallback posture: any malformed shape or
-    hallucinated table/column degrades to None (never raises)."""
+    hallucinated table/column degrades to None (never raises).
+
+    created_at_field is validated the same way as match_field (must be a
+    real, verbatim column on the chosen table, else dropped to None) but its
+    presence/absence never invalidates table/match_field — see
+    features/sales_analytics.py, which treats a missing created_at_field as
+    "no time-bucketed chart for this bot", not as "no analytics at all"."""
     try:
         data = json.loads(_strip_code_fences(raw))
     except (json.JSONDecodeError, ValueError):
@@ -2209,11 +2220,14 @@ def _parse_office_hook_config(raw: str, bot_code: str) -> dict | None:
         return None
     table = data.get("table")
     match_field = data.get("match_field")
+    created_at_field = data.get("created_at_field")
     if table is None:
         return None  # valid "no client table for this bot" answer, nothing to store
     if not isinstance(table, str):
         return None
     if match_field is not None and not isinstance(match_field, str):
+        return None
+    if created_at_field is not None and not isinstance(created_at_field, str):
         return None
 
     tables = _extract_create_table_names(bot_code)
@@ -2221,7 +2235,9 @@ def _parse_office_hook_config(raw: str, bot_code: str) -> dict | None:
         return None
     if match_field is not None and match_field not in tables[table]:
         return None
-    return {"table": table, "match_field": match_field}
+    if created_at_field is not None and created_at_field not in tables[table]:
+        created_at_field = None
+    return {"table": table, "match_field": match_field, "created_at_field": created_at_field}
 
 
 async def _generate_office_hook_config(bot_code: str, requirements_summary: str) -> dict | None:
