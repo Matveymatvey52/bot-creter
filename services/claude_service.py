@@ -1361,6 +1361,125 @@ async def _select_template(summary: str) -> list[str]:
     return valid if len(valid) == len(names) else []
 
 
+_FREEDOM_TIER_PROMPT = """You are deciding how much freedom a code generator needs when adapting ONE existing bot template to a specific request.
+
+Answer with exactly one word:
+- "customize" — the request can be satisfied by only changing the template's text/constants (business name, welcome text, lists of services/categories/items, wording) — no new tables, no new handlers, no new FSM states, no new integrations.
+- "hybrid" — the request needs the template extended: new database tables/columns, new handlers, new FSM states/steps, or functionality the template's constants cannot express, even though the template is still clearly the right starting point.
+
+Return ONLY "customize" or "hybrid", nothing else — no explanation."""
+
+
+async def _select_freedom_tier(template_code: str, requirements: str) -> str:
+    """Only called when _select_template resolved to exactly one template.
+    Decides whether that template needs pure # CUSTOMIZE-block editing or
+    structural extension (hybrid mode, see docs/HYBRID_GENERATION_MODE_DESIGN.md).
+    Cheap Haiku call, isolated from _select_template's own prompt/contract so
+    that function's existing fail-closed template-name validation is
+    untouched. Fails closed to "customize" (the narrower, safer freedom
+    level) on any response that isn't exactly one of the two expected
+    words — a wrong "customize" call costs an extra generation round trip
+    later at worst; a wrong "hybrid" call skips the # CUSTOMIZE boundary
+    while narrow-risk review still runs, so the fail-closed direction here
+    picks the cheaper mistake, not zero risk. Takes the template's already-
+    read source (not a template_name) so the caller reads the template file
+    from disk exactly once for the whole hybrid pipeline instead of once
+    per function."""
+    response = await client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=10,
+        system=_FREEDOM_TIER_PROMPT,
+        messages=[{
+            "role": "user",
+            "content": f"Requirements:\n{requirements}\n\nTemplate:\n{template_code}",
+        }],
+    )
+    text = response.content[0].text.strip().lower()
+    return "hybrid" if text == "hybrid" else "customize"
+
+
+HYBRID_CUSTOMIZE_EXTRA = """
+
+HYBRID MODE — you are extending ONE existing working template, not designing from a blank page and not merging multiple templates. Treat it as your trusted starting point:
+
+- Preserve its working conventions (existing table names, callback_data prefixes, existing FSM state chains, existing handler structure) — extend them rather than replacing them, whenever the request can be satisfied that way.
+- You ARE allowed full structural freedom when the request genuinely requires it: add new tables/columns, add new handlers, add new FSM states, add new callback routes, or restructure existing ones — do not limit yourself to # CUSTOMIZE blocks like a plain customization pass would.
+- A full rewrite of a section is allowed only when the requirements genuinely cannot be expressed as an extension of what's already there — prefer the smallest structural change that satisfies the request.
+- Keep the template's `# TEMPLATE: <id>` header line and its startup/persistence conventions (DB_PATH via DATA_DIR, BOT_NAME from Path(__file__).stem, CREATE TABLE IF NOT EXISTS) exactly as they already work in the template — these are required for compatibility with the bot factory's office-event hooks, mini-app config generation, and multi-bot registry, regardless of how much else you change.
+
+Return ONLY the complete, single Python file. No markdown fences, no explanations."""
+
+
+HYBRID_REVIEW_SYSTEM_PROMPT = """You are a senior Python code reviewer specializing in aiogram 3.13 Telegram bots. You are reviewing a bot that started from ONE existing template and was then EXTENDED with new structure (tables, handlers, FSM states) to satisfy a specific request (HYBRID MODE — template as trusted base, not from-scratch, not a multi-template merge).
+
+You are given the ORIGINAL template and the HYBRID output. Your job is to catch defects specific to extending a known-good base without a full rewrite, BEFORE deployment. Check for these specific problems:
+
+1. NEEDLESSLY RENAMED CONVENTIONS — an existing table name, callback_data prefix, or FSM state that got renamed/duplicated for no reason tied to the request (the original name still works and nothing in the requirements calls for the rename).
+2. DUPLICATED STRUCTURE — a new table, handler, or state added that duplicates something the original template already had, instead of extending the original.
+3. BROKEN COMPATIBILITY CONVENTIONS — the `# TEMPLATE: <id>` header line, DB_PATH/DATA_DIR/BOT_NAME pattern, or CREATE TABLE IF NOT EXISTS persistence pattern altered or removed from how the original template already had them working.
+4. ORPHANED ORIGINAL CODE — a handler, table, or state from the original template left in the file but now unreachable/unused because the new structure bypasses it.
+5. INCOMPLETE EXTENSION — new structure (e.g. a new table) added but not fully wired (e.g. never read from, or a new FSM state with no handler consuming it).
+
+If you find issues: fix them and return the complete corrected code.
+If the code looks correct: return it unchanged.
+Return ONLY valid Python code. No markdown, no explanations."""
+
+
+async def _review_hybrid_bot_code(code: str, requirements: str, original_template_code: str) -> str:
+    """Template-diff-aware review pass, unique to hybrid mode — has both the
+    original template and the hybrid output so it can specifically check
+    whether existing conventions were needlessly renamed/duplicated/broken,
+    which neither _review_bot_code nor _review_narrow_risk_code check for.
+    Runs first in the hybrid pipeline (see _generate_bot_code_inner), same
+    position _review_merged_bot_code holds in the synthesis pipeline, so
+    later passes review the already-diff-cleaned structure."""
+    response = await client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=25000,
+        system=HYBRID_REVIEW_SYSTEM_PROMPT,
+        messages=[{
+            "role": "user",
+            "content": (
+                f"Bot requirements (for context):\n{requirements}\n\n"
+                f"Original template (for comparison only):\n{original_template_code}\n\n"
+                f"Hybrid-extended code to review:\n{code}"
+            ),
+        }],
+    )
+    reviewed = _strip_code_fences(response.content[0].text)
+    try:
+        _ast.parse(reviewed)
+        return reviewed
+    except SyntaxError:
+        return code  # review broke the code — keep pre-review version
+
+
+async def _hybrid_customize_from_template(template_code: str, requirements: str) -> str:
+    """Hybrid mode: template as trusted structural base with full freedom to
+    extend it (new tables/handlers/FSM), unlike _customize_from_template's
+    # CUSTOMIZE-only ceiling. See docs/HYBRID_GENERATION_MODE_DESIGN.md.
+    Falls back to the unmodified template on SyntaxError, same fail-safe
+    _customize_from_template uses — there's always a known-good file to
+    return to since exactly one template is the starting point. Takes the
+    template's already-read source (not a template_name) — see
+    _select_freedom_tier's docstring for why."""
+    response = await client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=25000,
+        system=GENERATE_SYSTEM_PROMPT + HYBRID_CUSTOMIZE_EXTRA,
+        messages=[{
+            "role": "user",
+            "content": f"User requirements:\n{requirements}\n\nTemplate to extend:\n{template_code}",
+        }],
+    )
+    code = _strip_code_fences(response.content[0].text)
+    try:
+        _ast.parse(code)
+        return code
+    except SyntaxError:
+        return template_code  # fallback to unmodified template
+
+
 async def _customize_from_template(template_name: str, requirements: str) -> str:
     """Customizes a template for specific requirements. Returns Python code."""
     template_path = _TEMPLATES_DIR / f"{template_name}.py"
@@ -1433,19 +1552,23 @@ async def _review_merged_bot_code(code: str, requirements: str) -> str:
         return code  # review broke the code — keep pre-review version
 
 
-# Narrow, risk-targeted review pass — reserved for the two riskiest generation
-# paths (synthesis and custom_features, see their call sites below), plus
-# (unconditionally, see generate_bot_code's from-scratch branch) the
-# from-scratch fallback. Checks three things neither _review_bot_code nor
-# _review_merged_bot_code cover as a dedicated concern: FSM state-transition
+# Narrow, risk-targeted review pass — reserved for the riskiest generation
+# paths (synthesis, hybrid single-template extension, and custom_features,
+# see their call sites below), plus (unconditionally, see
+# generate_bot_code's from-scratch branch) the from-scratch fallback. Checks
+# three things neither _review_bot_code nor _review_merged_bot_code /
+# _review_hybrid_bot_code cover as a dedicated concern: FSM state-transition
 # correctness, SQL parameterization / cross-bot data isolation (not checked
 # ANYWHERE else in the pipeline today), and duplication/dead code — plus a
 # 4th, conditional PAYMENT/MONEY SAFETY category appended only when the code
 # or context mentions payments, so the prompt (and token cost) stays at its
 # original size for the common non-payment case. Deliberately not run for
-# plain single-template customization — that path only changes a
-# `# CUSTOMIZE` block inside an already-reviewed template, so the narrow-risk
-# categories don't apply.
+# plain single-template customization (the "customize" freedom tier) —
+# that path only changes a `# CUSTOMIZE` block inside an already-reviewed
+# template, so the narrow-risk categories don't apply. Once a request is
+# routed to the "hybrid" freedom tier instead, this DOES run — see
+# docs/HYBRID_GENERATION_MODE_DESIGN.md §3: structural freedom over a
+# template reintroduces the same bug classes this pass exists for.
 NARROW_RISK_REVIEW_SYSTEM_PROMPT = """You are a senior Python code reviewer specializing in aiogram 3.13 Telegram bots. You are reviewing code from one of the highest-risk generation paths in an automated bot-factory: synthesized from two templates, generated from scratch, or a from-scratch patch written for one specific bot's unique request. Focus ONLY on these risk categories — do not comment on anything else, do not restyle, do not "improve" unrelated code:
 
 1. FSM STATE-TRANSITION CORRECTNESS
@@ -1571,11 +1694,42 @@ async def _generate_bot_code_inner(requirements_summary: str) -> str:
     templates = await _select_template(requirements_summary)
 
     if len(templates) == 1:
-        code = await _customize_from_template(templates[0], requirements_summary)
-        if "asyncio.run(main())" in code:
-            bot_type = await classify_bot_type(requirements_summary)
-            code = await _review_bot_code(code, requirements_summary, bot_type=bot_type)
-            return code
+        template_name = templates[0]
+        # Single disk read for the whole single-template branch — tier
+        # selection, hybrid generation, and hybrid review all need this same
+        # source text, so it's read once here and threaded through instead
+        # of each function re-reading the file itself.
+        template_code = (_TEMPLATES_DIR / f"{template_name}.py").read_text(encoding="utf-8")
+        # _select_freedom_tier and classify_bot_type are both independent
+        # Haiku calls that only depend on requirements_summary/template_code
+        # (neither needs generated code) — run concurrently rather than
+        # sequentially, same asyncio.gather idiom generate_bot_code already
+        # uses for its own independent post-generation steps. No
+        # return_exceptions=True: if either call raises, the whole
+        # single-template branch is unrecoverable anyway (both results are
+        # required to proceed), and the exception propagates to the same
+        # outer asyncio.wait_for/except Exception safety net every other
+        # generation tier already relies on (handlers/create_bot.py). Known,
+        # accepted tradeoff: on a failure of either call, the other keeps
+        # running to completion as an orphaned task rather than being
+        # cancelled (gather's default behavior) — a small wasted Haiku call,
+        # not a crash risk, since both calls are cheap/fast.
+        tier, bot_type = await asyncio.gather(
+            _select_freedom_tier(template_code, requirements_summary),
+            classify_bot_type(requirements_summary),
+        )
+        if tier == "hybrid":
+            code = await _hybrid_customize_from_template(template_code, requirements_summary)
+            if "asyncio.run(main())" in code:
+                code = await _review_hybrid_bot_code(code, requirements_summary, template_code)
+                code = await _review_narrow_risk_code(code, requirements_summary)
+                code = await _review_bot_code(code, requirements_summary, bot_type=bot_type)
+                return code
+        else:
+            code = await _customize_from_template(template_name, requirements_summary)
+            if "asyncio.run(main())" in code:
+                code = await _review_bot_code(code, requirements_summary, bot_type=bot_type)
+                return code
 
     elif len(templates) == 2:
         code = await _synthesize_from_templates(templates, requirements_summary)
