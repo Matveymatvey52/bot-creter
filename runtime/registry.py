@@ -300,6 +300,19 @@ def get_template_router(template_id: str) -> Router | None:
     return _clone_router(router)
 
 
+def get_template_reminders_config(template_id: str) -> dict[str, Any] | None:
+    """Returns template_id's own module-level `reminders_config` dict (see
+    features/reminders.py's module docstring for the shape), or None if the
+    template doesn't declare one. Same load-once-per-process caching as
+    get_template_router() above, via _load_template_module — this is a
+    plain dict, not a Router, so no cloning is needed (nothing here is
+    mutated per-bot)."""
+    module = _load_template_module(template_id)
+    if module is None:
+        return None
+    return getattr(module, "reminders_config", None)
+
+
 class ConfigMiddleware(BaseMiddleware):
     """Generic fallback: injects the raw bot-metadata dict into data["config"] for
     templates that don't have their own typed config yet (everything except

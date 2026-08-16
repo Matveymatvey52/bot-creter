@@ -33,8 +33,8 @@ CREATE TABLE IF NOT EXISTS template_candidates (
     creator_user_id INTEGER NOT NULL,
     bot_name       TEXT,
     summary        TEXT NOT NULL,                  -- requirements_summary как есть
-    fallback_reason TEXT NOT NULL,                  -- 'no_template_match' | 'customize_failed' | 'synthesis_failed'
-    selected_templates TEXT,                        -- JSON-список того, что _select_template вернул (может быть пусто или 1-2 имени при customize_failed)
+    fallback_reason TEXT NOT NULL,                  -- 'no_template_match' | 'customize_failed' | 'hybrid_failed' | 'synthesis_failed'
+    selected_templates TEXT,                        -- JSON-список того, что _select_template вернул (может быть пусто или 1-2 имени при customize_failed/hybrid_failed)
     bot_type       TEXT,                             -- результат classify_bot_type(), если уже посчитан
     created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )
