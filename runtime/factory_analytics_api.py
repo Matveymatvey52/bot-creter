@@ -6,8 +6,9 @@ keyed by a Registry entry that must have a template_id + miniapp_config. The
 factory pseudo-entry (FACTORY_BOT_ID=0, template_id="__factory__" — see
 runtime/registry.py) has neither, so it can't be served through that path.
 This dashboard instead reads the CENTRAL factory DB directly (db/database.py:
-bots, bot_features, bot_custom_features, bot_feedback) — one row per bot the
-factory has ever created, not one row per record inside a single bot.
+bots, bot_features, bot_custom_features, bot_feedback, template_candidates) —
+one row per bot the factory has ever created, not one row per record inside
+a single bot.
 
 Auth is owner-only (not per-bot-tenant-user like miniapp_api.py): only
 OWNER_ID (handlers/admin_manager.py) may see this data. Reuses the same two
@@ -23,7 +24,7 @@ import logging
 
 from aiohttp import web
 
-from db.database import add_bot_feedback, list_bots_with_stats
+from db.database import add_bot_feedback, list_bots_with_stats, list_template_candidates
 from handlers.admin_manager import OWNER_ID
 from runtime.miniapp_api import _authenticate
 from runtime.registry import FACTORY_BOT_ID, Registry, infer_template_id
@@ -100,6 +101,33 @@ async def add_feedback_handler(request: web.Request) -> web.Response:
     return web.json_response({"ok": True}, status=201)
 
 
+async def list_template_candidates_handler(request: web.Request) -> web.Response:
+    """"Кандидаты на новый шаблон" section (docs/TEMPLATE_CANDIDATE_LOGGING_DESIGN.md)
+    — raw rows, most recent first, no server-side clustering (MVP decision:
+    let the owner read the actual requirement text). creator_user_id is
+    deliberately excluded from the response, same posture as list_bots_handler
+    excluding `token` — an internal Telegram user id the dashboard UI has no
+    use for."""
+    if not await _authenticate_owner(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+
+    rows = await list_template_candidates()
+    items = [
+        {
+            "id": row["id"],
+            "bot_id": row["bot_id"],
+            "bot_name": row["bot_name"],
+            "summary": row["summary"],
+            "fallback_reason": row["fallback_reason"],
+            "selected_templates": row["selected_templates"],
+            "bot_type": row["bot_type"],
+            "created_at": row["created_at"],
+        }
+        for row in rows
+    ]
+    return web.json_response({"items": items})
+
+
 def register_routes(app: web.Application) -> None:
     """Adds owner-only analytics routes to the same Application miniapp_api's
     register_routes() already extends (see combined_app.py's _bootstrap_app,
@@ -108,3 +136,4 @@ def register_routes(app: web.Application) -> None:
     is never 'factory'."""
     app.router.add_get("/api/factory/bots", list_bots_handler)
     app.router.add_post("/api/factory/bots/{bot_id}/feedback", add_feedback_handler)
+    app.router.add_get("/api/factory/candidates", list_template_candidates_handler)

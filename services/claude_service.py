@@ -1532,7 +1532,9 @@ async def _review_narrow_risk_code(code: str, context: str, reference_code: str 
         return code  # review broke the code — keep pre-review version
 
 
-async def generate_bot_code(requirements_summary: str) -> tuple[str, dict | None, dict | None]:
+async def generate_bot_code(
+    requirements_summary: str,
+) -> tuple[str, dict | None, dict | None, dict | None]:
     """Generates the bot's code, then a mini-app config AND an office-hook
     config for it (docs/MINIAPP_DESIGN.md §6, docs/OFFICES_DESIGN.md §11) —
     two cheap Haiku calls, neither blocking: any failure degrades to None,
@@ -1557,16 +1559,27 @@ async def generate_bot_code(requirements_summary: str) -> tuple[str, dict | None
     handlers/manage_bots.py's cb_recreate at 240.0) meant a slow/hung Haiku
     call on either cheap step could burn the whole budget and fail an
     otherwise-successful code generation. Concurrency also halves the
-    best-case added latency from these two steps."""
-    code = await _generate_bot_code_inner(requirements_summary)
+    best-case added latency from these two steps.
+
+    fallback_info (docs/TEMPLATE_CANDIDATE_LOGGING_DESIGN.md) is a fourth,
+    optional element: None when a single template was customized or two
+    templates were synthesized successfully, otherwise a dict describing why
+    generation fell through to from-scratch — {"reason": "no_template_match"
+    | "customize_failed" | "synthesis_failed", "selected_templates": [...]}.
+    Callers with a bot_id in hand (handlers/create_bot.py,
+    handlers/manage_bots.py's cb_recreate) persist it via
+    db.database.add_template_candidate so the owner can review recurring
+    from-scratch requests in the /analytics dashboard. No candidate is
+    logged when a template match succeeded — only the fallback cases."""
+    code, fallback_info = await _generate_bot_code_inner(requirements_summary)
     miniapp_config, office_hook_config = await asyncio.gather(
         _generate_miniapp_config(code, requirements_summary),
         _generate_office_hook_config(code, requirements_summary),
     )
-    return code, miniapp_config, office_hook_config
+    return code, miniapp_config, office_hook_config, fallback_info
 
 
-async def _generate_bot_code_inner(requirements_summary: str) -> str:
+async def _generate_bot_code_inner(requirements_summary: str) -> tuple[str, dict | None]:
     # Try template(s) first — saves 5-10x tokens vs generating from scratch
     templates = await _select_template(requirements_summary)
 
@@ -1575,7 +1588,8 @@ async def _generate_bot_code_inner(requirements_summary: str) -> str:
         if "asyncio.run(main())" in code:
             bot_type = await classify_bot_type(requirements_summary)
             code = await _review_bot_code(code, requirements_summary, bot_type=bot_type)
-            return code
+            return code, None
+        fallback_reason = "customize_failed"
 
     elif len(templates) == 2:
         code = await _synthesize_from_templates(templates, requirements_summary)
@@ -1584,7 +1598,13 @@ async def _generate_bot_code_inner(requirements_summary: str) -> str:
             code = await _review_narrow_risk_code(code, requirements_summary)
             bot_type = await classify_bot_type(requirements_summary)
             code = await _review_bot_code(code, requirements_summary, bot_type=bot_type)
-            return code
+            return code, None
+        fallback_reason = "synthesis_failed"
+
+    else:
+        fallback_reason = "no_template_match"
+
+    fallback_info = {"reason": fallback_reason, "selected_templates": templates}
 
     bot_type = await classify_bot_type(requirements_summary)
     extra = _BOT_TYPE_EXTRAS.get(bot_type, "")
@@ -1640,7 +1660,7 @@ async def _generate_bot_code_inner(requirements_summary: str) -> str:
     # Static review pass — find and fix potential runtime issues before deployment
     code = await _review_bot_code(code, requirements_summary, bot_type=bot_type)
 
-    return code
+    return code, fallback_info
 
 
 # ── mini-app config generation (see docs/MINIAPP_DESIGN.md §6) ─────────────────
