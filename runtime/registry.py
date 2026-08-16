@@ -395,6 +395,85 @@ _BOT_COMMAND_DESCRIPTION_MAX_LEN = 256
 _last_sent_commands: dict[int, frozenset[tuple[str, str]]] = {}
 
 
+async def _register_voice_intake_schema(module: ModuleType, bot_id: int, db_path: str) -> None:
+    """Fetches this bot's generated bot_voice_cashflow_config row (docs/
+    VOICE_CASHFLOW_FROM_SCRATCH_DESIGN.md) and, if it has a non-null
+    voice_intake section, builds and registers a data-driven VoiceSchema for
+    it via module.register_data_driven_schema() — the from-scratch
+    counterpart to a template hand-calling voice_intake.register_schema(...)
+    itself inside its own config_from_bot_row (see
+    templates/tour_operator.py). Called from _load_and_include_features only
+    when feature_name == "voice_intake", right after that module's own
+    init_db(db_path) and before its router is included, so a from-scratch
+    bot's voice message handler never runs against a stale/missing schema.
+
+    Re-validates the stored config against db_path's CURRENT real tables
+    (features/voice_intake.py's own _validate_data_driven_config, using the
+    same _extract_create_table_names ground-truth extractor
+    services/claude_service.py's generation step validates against) rather
+    than trusting the DB row was still accurate — the underlying bot file
+    can be regenerated/edited (handlers/manage_bots.py's cb_recreate,
+    custom_features) between when this config was generated and any later
+    registry reload, and a stale table/column reference here would otherwise
+    surface as a raw sqlite3.OperationalError deep inside a live voice
+    handler instead of a clean, logged skip at registration time.
+
+    Best-effort like every other step in this loop's try/except: any failure
+    (missing register_data_driven_schema on an older/patched module,
+    corrupt config, validation failure) is logged and skipped — the
+    voice_intake router still loads and responds, just with no schema
+    registered for this bot_id (on_voice's own "no registered VoiceSchema"
+    branch then handles it gracefully)."""
+    register = getattr(module, "register_data_driven_schema", None)
+    if register is None:
+        return
+    from db.database import get_bot_voice_cashflow_config
+
+    config = await get_bot_voice_cashflow_config(bot_id)
+    if not config or not config.get("voice_intake"):
+        return
+    voice_intake_config = config["voice_intake"]
+    validate = getattr(module, "_validate_data_driven_config", None)
+    if validate is not None:
+        tables = _extract_create_table_names_for_registry(db_path)
+        if not tables or not validate(voice_intake_config, tables):
+            logger.warning(
+                f"_register_voice_intake_schema: bot_id={bot_id} voice_cashflow_config "
+                "failed re-validation against current db schema — skipped"
+            )
+            return
+    register(bot_id, voice_intake_config)
+
+
+def _extract_create_table_names_for_registry(db_path: str) -> dict[str, set[str]]:
+    """Reads db_path's REAL current sqlite schema (sqlite_master), not the
+    bot's .py source — unlike services/claude_service.py's own
+    _extract_create_table_names (which regex-scans generated CODE before any
+    table exists), this runs at registry-load time, after init_db has
+    already created the tables, so introspecting the live database is both
+    simpler and more accurate than re-parsing source text a second time.
+    Synchronous (sqlite3, not aiosqlite) since this is only ever called from
+    inside an already-running event loop's feature-loading step for one bot
+    at a time — a blocking few-row PRAGMA read is not worth the ceremony of
+    a second async connection here."""
+    import sqlite3
+
+    tables: dict[str, set[str]] = {}
+    try:
+        conn = sqlite3.connect(db_path)
+        try:
+            cur = conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+            for (table_name,) in cur.fetchall():
+                col_cur = conn.execute(f"PRAGMA table_info({table_name})")
+                tables[table_name] = {row[1] for row in col_cur.fetchall()}
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        logger.warning(f"_extract_create_table_names_for_registry: could not read {db_path!r}")
+        return {}
+    return tables
+
+
 async def _load_and_include_features(dp: Dispatcher, bot: Bot, bot_id: int, db_path: str) -> None:
     """Loads and wires every feature enabled for this bot (db/database.py's
     bot_features table) into its Dispatcher, the same clone-then-include_router
@@ -431,6 +510,8 @@ async def _load_and_include_features(dp: Dispatcher, bot: Bot, bot_id: int, db_p
             init_db = getattr(module, "init_db", None)
             if init_db is not None:
                 await init_db(db_path)
+            if feature_name == "voice_intake":
+                await _register_voice_intake_schema(module, bot_id, db_path)
             raw_router = getattr(module, "router", None)
             if raw_router is None:
                 logger.warning(
