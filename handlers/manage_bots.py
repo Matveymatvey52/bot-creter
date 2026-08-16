@@ -19,6 +19,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from config import ASSEMBLYAI_API_KEY
 from db.database import (
     add_office_link,
+    add_template_candidate,
     delete_bot,
     disable_bot_feature,
     enable_bot_feature,
@@ -1147,10 +1148,11 @@ async def cb_recreate(callback: CallbackQuery):
 
         miniapp_config: dict | None = None
         office_hook_config: dict | None = None
+        fallback_info: dict | None = None
         try:
             result = await asyncio.wait_for(task, timeout=240.0)
             if regenerating_from_scratch:
-                code, miniapp_config, office_hook_config = result
+                code, miniapp_config, office_hook_config, fallback_info = result
             else:
                 code = result
         except Exception as e:
@@ -1172,6 +1174,15 @@ async def cb_recreate(callback: CallbackQuery):
 
         if office_hook_config:
             await set_bot_office_hook_config(bot_id, office_hook_config)
+        if fallback_info:
+            await add_template_candidate(
+                creator_user_id=callback.from_user.id,
+                summary=b.get("description", ""),
+                fallback_reason=fallback_info["reason"],
+                selected_templates=fallback_info["selected_templates"],
+                bot_name=b["name"],
+                bot_id=bot_id,
+            )
         if miniapp_config:
             await set_bot_miniapp_config(bot_id, miniapp_config)
             base_url = os.getenv("PUBLIC_BASE_URL", "").strip()

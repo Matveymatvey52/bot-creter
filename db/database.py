@@ -284,6 +284,31 @@ async def init_db():
                 summary              TEXT
             )
         """)
+        # template_candidates (docs/TEMPLATE_CANDIDATE_LOGGING_DESIGN.md) —
+        # one row per bot whose generation fell through to from-scratch
+        # (services/claude_service.py's generate_bot_code's fallback_info):
+        # either no template matched at all, or a matched template's
+        # customize/synthesis step produced invalid code. bot_id is nullable
+        # because the row is written from handlers/create_bot.py's
+        # auto_launch_managed_bot AFTER the bot record exists, but a failure
+        # between generation and that point must not silently lose the
+        # candidate — see add_template_candidate(). Feeds the "Кандидаты на
+        # новый шаблон" section of the /analytics factory dashboard so the
+        # owner can spot recurring from-scratch requests worth turning into a
+        # permanent template — the decision always stays manual.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS template_candidates (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                bot_id              INTEGER REFERENCES bots(id),
+                creator_user_id     INTEGER NOT NULL,
+                bot_name            TEXT,
+                summary             TEXT NOT NULL,
+                fallback_reason     TEXT NOT NULL,
+                selected_templates  TEXT,
+                bot_type            TEXT,
+                created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         await db.commit()
     await migrate_encrypt_tokens()
 
@@ -705,6 +730,67 @@ async def get_bot_feedback(bot_id: int) -> list[dict]:
         ) as cursor:
             rows = await cursor.fetchall()
             return [dict(row) for row in rows]
+
+
+async def add_template_candidate(
+    creator_user_id: int,
+    summary: str,
+    fallback_reason: str,
+    selected_templates: list[str],
+    bot_type: str | None = None,
+    bot_name: str | None = None,
+    bot_id: int | None = None,
+) -> None:
+    """Append-only log of from-scratch fallback generations (see
+    template_candidates' comment in init_db()). selected_templates is stored
+    as a JSON array — even an empty list is meaningful (the classifier saw no
+    match at all, vs. matched-but-customize/synthesis-failed)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO template_candidates "
+            "(bot_id, creator_user_id, bot_name, summary, fallback_reason, selected_templates, bot_type) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                bot_id,
+                creator_user_id,
+                bot_name,
+                summary,
+                fallback_reason,
+                json.dumps(selected_templates, ensure_ascii=False),
+                bot_type,
+            ),
+        )
+        await db.commit()
+    logger.info(
+        f"add_template_candidate: bot_id={bot_id} reason={fallback_reason} "
+        f"selected_templates={selected_templates}"
+    )
+
+
+async def list_template_candidates(limit: int = 200) -> list[dict]:
+    """Most recent candidates first, for the /analytics dashboard's
+    "Кандидаты на новый шаблон" section. No clustering/grouping here — kept
+    as raw rows (per the design doc's MVP decision) so the owner reads the
+    actual requirement text rather than a heuristic summary; the frontend or
+    caller may group by bot_type itself."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT id, bot_id, creator_user_id, bot_name, summary, fallback_reason, "
+            "selected_templates, bot_type, created_at "
+            "FROM template_candidates ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+            result = []
+            for row in rows:
+                item = dict(row)
+                try:
+                    item["selected_templates"] = json.loads(item["selected_templates"] or "[]")
+                except (json.JSONDecodeError, TypeError):
+                    item["selected_templates"] = []
+                result.append(item)
+            return result
 
 
 async def list_bots_with_stats() -> list[dict]:

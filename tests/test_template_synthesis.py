@@ -259,7 +259,7 @@ class GenerateBotCodeTwoTemplateBranch(unittest.IsolatedAsyncioTestCase):
         with patch.object(
             claude_service, "_generate_miniapp_config", AsyncMock(return_value=None)
         ), patch.object(claude_service, "_generate_office_hook_config", AsyncMock(return_value=None)):
-            code, _miniapp_config, _office_hook_config = await claude_service.generate_bot_code(
+            code, _miniapp_config, _office_hook_config, fallback_info = await claude_service.generate_bot_code(
                 "sells products and rewards loyalty points"
             )
 
@@ -268,6 +268,7 @@ class GenerateBotCodeTwoTemplateBranch(unittest.IsolatedAsyncioTestCase):
             ["select", "synthesize", "merge_review", "narrow_risk_review", "classify", "general_review"],
         )
         self.assertEqual(code, "FINAL_REVIEWED\nasyncio.run(main())")
+        self.assertIsNone(fallback_info)
 
 
 class SynthesisModeIsolatedFromSingleTemplateRequests(unittest.IsolatedAsyncioTestCase):
@@ -317,7 +318,7 @@ class SynthesisModeIsolatedFromSingleTemplateRequests(unittest.IsolatedAsyncioTe
         with patch.object(
             claude_service, "_generate_miniapp_config", AsyncMock(return_value=None)
         ), patch.object(claude_service, "_generate_office_hook_config", AsyncMock(return_value=None)):
-            code, _miniapp_config, _office_hook_config = await claude_service.generate_bot_code("sells products online")
+            code, _miniapp_config, _office_hook_config, fallback_info = await claude_service.generate_bot_code("sells products online")
 
         self.mock_synth.assert_not_called()
         self.mock_merge_review.assert_not_called()
@@ -329,6 +330,9 @@ class SynthesisModeIsolatedFromSingleTemplateRequests(unittest.IsolatedAsyncioTe
         # customize path used to return right after customization, with no
         # general review pass at all.
         self.assertEqual(code, "REVIEWED\nasyncio.run(main())")
+        # A successful single-template customization is not a fallback — no
+        # template_candidates row should be logged for it.
+        self.assertIsNone(fallback_info)
 
     async def test_no_template_match_never_calls_synthesis_or_merge_review(self):
         """The from-scratch fallback still never touches synthesis-specific
@@ -354,7 +358,7 @@ class SynthesisModeIsolatedFromSingleTemplateRequests(unittest.IsolatedAsyncioTe
         with patch.object(
             claude_service, "_generate_miniapp_config", AsyncMock(return_value=None)
         ), patch.object(claude_service, "_generate_office_hook_config", AsyncMock(return_value=None)):
-            code, _miniapp_config, _office_hook_config = await claude_service.generate_bot_code(
+            code, _miniapp_config, _office_hook_config, fallback_info = await claude_service.generate_bot_code(
                 "a completely novel kind of bot"
             )
 
@@ -362,6 +366,10 @@ class SynthesisModeIsolatedFromSingleTemplateRequests(unittest.IsolatedAsyncioTe
         self.mock_merge_review.assert_not_called()
         self.mock_narrow_review.assert_called_once()
         self.assertEqual(code, "SCRATCH_REVIEWED\nasyncio.run(main())")
+        # _select_template returned [] ("none") — this is the "no matching
+        # template at all" fallback, the primary signal the template-candidate
+        # log exists to capture (docs/TEMPLATE_CANDIDATE_LOGGING_DESIGN.md).
+        self.assertEqual(fallback_info, {"reason": "no_template_match", "selected_templates": []})
 
 
 class GenerateBotCodeFromScratchBranch(unittest.IsolatedAsyncioTestCase):
@@ -404,7 +412,7 @@ class GenerateBotCodeFromScratchBranch(unittest.IsolatedAsyncioTestCase):
         with patch.object(
             claude_service, "_generate_miniapp_config", AsyncMock(return_value=None)
         ), patch.object(claude_service, "_generate_office_hook_config", AsyncMock(return_value=None)):
-            code, _miniapp_config, _office_hook_config = await claude_service.generate_bot_code(
+            code, _miniapp_config, _office_hook_config, fallback_info = await claude_service.generate_bot_code(
                 "a completely novel kind of bot"
             )
 
@@ -413,6 +421,92 @@ class GenerateBotCodeFromScratchBranch(unittest.IsolatedAsyncioTestCase):
             ["classify", "generate", "narrow_risk_review", "general_review"],
         )
         self.assertEqual(code, "FINAL_REVIEWED\nasyncio.run(main())")
+        self.assertEqual(fallback_info, {"reason": "no_template_match", "selected_templates": []})
+
+
+class FallbackInfoReasonsWhenTemplateMatchedButCustomizationFails(unittest.IsolatedAsyncioTestCase):
+    """docs/TEMPLATE_CANDIDATE_LOGGING_DESIGN.md's second fallback case: a
+    template WAS selected, but its customize/synthesis output never produced
+    a valid 'asyncio.run(main())' entry point, so generation still falls
+    through to from-scratch. fallback_info must record which templates were
+    tried (not an empty list), with a reason distinct from
+    'no_template_match' so the owner can tell "nothing matched" apart from
+    "matched but broke" in the /analytics candidates dashboard."""
+
+    async def asyncSetUp(self):
+        self._patcher = patch.object(claude_service, "client")
+        self.mock_client = self._patcher.start()
+
+    async def asyncTearDown(self):
+        self._patcher.stop()
+
+    async def test_single_template_customize_without_entry_point_logs_customize_failed(self):
+        select_prompt = claude_service._build_template_select_prompt()
+
+        async def fake_create(*, model, max_tokens, system, messages):
+            if system == select_prompt:
+                return _fake_response("shop_catalog")
+            if system == claude_service.CUSTOMIZE_TEMPLATE_PROMPT:
+                # Valid Python but missing the entry point — distinct from a
+                # SyntaxError, which _customize_from_template already handles
+                # by falling back to the pristine template file itself.
+                return _fake_response("CUSTOMIZED_BUT_INCOMPLETE = True")
+            if system == claude_service.BOT_TYPE_CLASSIFY_PROMPT:
+                return _fake_response("general")
+            if system == claude_service.GENERATE_SYSTEM_PROMPT:
+                return _fake_response("SCRATCH_CODE\nasyncio.run(main())")
+            if system == claude_service.NARROW_RISK_REVIEW_SYSTEM_PROMPT:
+                return _fake_response("SCRATCH_CODE\nasyncio.run(main())")
+            if system == claude_service.REVIEW_SYSTEM_PROMPT:
+                return _fake_response("SCRATCH_REVIEWED\nasyncio.run(main())")
+            raise AssertionError(f"unexpected system prompt: {system[:120]!r}")
+
+        self.mock_client.messages.create = AsyncMock(side_effect=fake_create)
+
+        with patch.object(
+            claude_service, "_generate_miniapp_config", AsyncMock(return_value=None)
+        ), patch.object(claude_service, "_generate_office_hook_config", AsyncMock(return_value=None)):
+            code, _miniapp_config, _office_hook_config, fallback_info = await claude_service.generate_bot_code(
+                "sells products online"
+            )
+
+        self.assertEqual(code, "SCRATCH_REVIEWED\nasyncio.run(main())")
+        self.assertEqual(
+            fallback_info, {"reason": "customize_failed", "selected_templates": ["shop_catalog"]}
+        )
+
+    async def test_two_template_synthesis_without_entry_point_logs_synthesis_failed(self):
+        select_prompt = claude_service._build_template_select_prompt()
+
+        async def fake_create(*, model, max_tokens, system, messages):
+            if system == select_prompt:
+                return _fake_response("shop_catalog,referral_program")
+            if system == claude_service.GENERATE_SYSTEM_PROMPT + claude_service.MERGE_TEMPLATES_EXTRA:
+                return _fake_response("SYNTH_BUT_INCOMPLETE = True")
+            if system == claude_service.BOT_TYPE_CLASSIFY_PROMPT:
+                return _fake_response("general")
+            if system == claude_service.GENERATE_SYSTEM_PROMPT:
+                return _fake_response("SCRATCH_CODE\nasyncio.run(main())")
+            if system == claude_service.NARROW_RISK_REVIEW_SYSTEM_PROMPT:
+                return _fake_response("SCRATCH_CODE\nasyncio.run(main())")
+            if system == claude_service.REVIEW_SYSTEM_PROMPT:
+                return _fake_response("SCRATCH_REVIEWED\nasyncio.run(main())")
+            raise AssertionError(f"unexpected system prompt: {system[:120]!r}")
+
+        self.mock_client.messages.create = AsyncMock(side_effect=fake_create)
+
+        with patch.object(
+            claude_service, "_generate_miniapp_config", AsyncMock(return_value=None)
+        ), patch.object(claude_service, "_generate_office_hook_config", AsyncMock(return_value=None)):
+            code, _miniapp_config, _office_hook_config, fallback_info = await claude_service.generate_bot_code(
+                "sells products and rewards loyalty points"
+            )
+
+        self.assertEqual(code, "SCRATCH_REVIEWED\nasyncio.run(main())")
+        self.assertEqual(
+            fallback_info,
+            {"reason": "synthesis_failed", "selected_templates": ["shop_catalog", "referral_program"]},
+        )
 
 
 if __name__ == "__main__":
