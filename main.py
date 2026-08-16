@@ -17,6 +17,7 @@ from handlers.feature_connect import router as feature_connect_router
 from handlers.general import router as general_router
 from handlers.manage_bots import router as manage_router
 from handlers.start import router as start_router
+from runtime.payment_status_poller import payment_status_poll_loop
 from services.bot_runner import _make_extra_env, start_bot
 
 logging.basicConfig(
@@ -177,6 +178,7 @@ async def main():
         )
 
     await init_db()
+    asyncio.create_task(payment_status_poll_loop())
 
     bot = Bot(token=BOT_TOKEN)
 
