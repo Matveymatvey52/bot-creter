@@ -305,6 +305,8 @@ class SynthesisModeIsolatedFromSingleTemplateRequests(unittest.IsolatedAsyncioTe
         async def fake_create(*, model, max_tokens, system, messages):
             if system == select_prompt:
                 return _fake_response("shop_catalog")
+            if system == claude_service._FREEDOM_TIER_PROMPT:
+                return _fake_response("customize")
             if system == claude_service.CUSTOMIZE_TEMPLATE_PROMPT:
                 return _fake_response("CUSTOMIZED\nasyncio.run(main())")
             if system == claude_service.BOT_TYPE_CLASSIFY_PROMPT:
@@ -323,8 +325,8 @@ class SynthesisModeIsolatedFromSingleTemplateRequests(unittest.IsolatedAsyncioTe
         self.mock_synth.assert_not_called()
         self.mock_merge_review.assert_not_called()
         # The narrow risk/FSM/SQL-safety/dedup review is reserved for
-        # synthesis and custom_features — ordinary single-template
-        # customization must never touch it.
+        # synthesis, hybrid, and custom_features — ordinary single-template
+        # "customize" tier must never touch it.
         self.mock_narrow_review.assert_not_called()
         # Regression check for the gap found during design: the single-template
         # customize path used to return right after customization, with no
