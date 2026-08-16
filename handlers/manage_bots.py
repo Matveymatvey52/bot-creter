@@ -416,9 +416,22 @@ async def disable_feature_and_reload(bot_id: int, feature_name: str) -> None:
 
 async def _compatible_features(template_id: str | None) -> list[dict]:
     """Features whose # COMPATIBLE_WITH: header explicitly lists this bot's
-    template_id — never "all" (see runtime/registry.py's discover_features()),
-    so a bot with an unrecognized/missing template_id simply has none."""
-    return [f for f in discover_features() if template_id in f["compatible_with"]]
+    template_id — never a blanket "all" for ordinary features (see
+    runtime/registry.py's discover_features()), so a bot with an
+    unrecognized/missing template_id simply has none of those.
+
+    "*" is the one deliberate exception: a feature module opts into it only
+    when it is provably template-agnostic (see features/notifications.py's
+    header comment for the reasoning) — without this, template_id=None
+    (every from-scratch bot, see runtime/registry.py's infer_template_id())
+    could never match any entry in compatible_with, so such a feature would
+    never appear in the "🧩 Фичи" list for a from-scratch bot even though
+    runtime/registry.py's build_entry() (post design-office-hook-scratch-bots)
+    now loads and wires it for them just fine."""
+    return [
+        f for f in discover_features()
+        if template_id in f["compatible_with"] or "*" in f["compatible_with"]
+    ]
 
 
 @router.callback_query(F.data.startswith("features:"))
@@ -470,7 +483,7 @@ async def cb_toggle_feature(callback: CallbackQuery):
             return
         enabled = set(await get_bot_features(bot_id))
         is_enabled = feature_name in enabled
-        if not is_enabled and template_id not in feature["compatible_with"]:
+        if not is_enabled and template_id not in feature["compatible_with"] and "*" not in feature["compatible_with"]:
             await callback.answer("⛔ Эта фича не подходит шаблону этого бота.", show_alert=True)
             return
         if is_enabled:
