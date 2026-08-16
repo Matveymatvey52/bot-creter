@@ -99,6 +99,35 @@ miniapp_config = {
 }
 
 
+# ── reminders (features/reminders.py, docs/REMINDERS_DESIGN.md) ────────────
+# event_details.event_date is free-form user-typed text (see
+# EventSetupFlow.event_date's handler above — no strptime validation on
+# write, just a 100-char cap), so date_format below is a best-effort match:
+# rows whose event_date doesn't parse under it are silently skipped by
+# features/reminders.py (never treated as fatal), not "no reminder ever
+# fires" for the whole bot. Bots whose admin types dates in this exact
+# "ДД.ММ.ГГГГ ЧЧ:ММ" shape get working reminders; free-form text outside it
+# does not, until event_date gets real input validation (a separate, larger
+# change, out of scope here).
+#
+# recipient_query, not recipient_field: event_details is a singleton with no
+# owner column at all (see its CHECK(id=1) comment above) — every confirmed
+# RSVP's client is a recipient, found by joining off rsvps instead.
+reminders_config = {
+    "rules": [
+        {
+            "id": "event_rsvp_upcoming",
+            "table": "event_details",
+            "date_field": "event_date",
+            "date_format": "%d.%m.%Y %H:%M",
+            "recipient_query": "SELECT client_user_id AS chat_id FROM rsvps WHERE status = 'confirmed'",
+            "offsets_hours": [24, 2],
+            "message_template": "🔔 Напоминание: «{title}» начнётся {event_date:%d.%m %H:%M}",
+        },
+    ],
+}
+
+
 # ── config ───────────────────────────────────────────────────────────────────
 
 @dataclass

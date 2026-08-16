@@ -24,6 +24,7 @@ for local development/debugging only — it is not what runs in prod.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import sys
@@ -52,8 +53,10 @@ from handlers.general import router as general_router
 from handlers.manage_bots import router as manage_router, set_registry as set_manage_bots_registry
 from handlers.start import router as start_router
 from main import ManagedBotMiddleware, build_group_router, restore_bots
+from db.database import get_bot_features
+from features import reminders
 from features.office_events import set_registry as set_office_events_registry
-from runtime.registry import FACTORY_BOT_ID, build_factory_entry, build_registry
+from runtime.registry import FACTORY_BOT_ID, build_factory_entry, build_registry, get_template_reminders_config
 from runtime.factory_analytics_api import register_routes as register_factory_analytics_routes
 from runtime.miniapp_api import register_routes as register_miniapp_routes
 from runtime.webhook_app import create_app
@@ -82,6 +85,61 @@ async def _build_factory_dispatcher() -> Dispatcher:
     dp.include_router(general_router)  # must be last — catch-all
     dp.include_router(build_group_router())
     return dp
+
+
+# docs/REMINDERS_DESIGN.md Part 3: fixed-interval sweep, same shape as
+# runtime/userbot_worker.py's own _summarize_loop() (plain while True +
+# sleep — no APScheduler dependency, matches this codebase's only existing
+# background-loop precedent). Module-level so tests can import/tune it
+# without needing a real event loop running _bootstrap_app().
+REMINDERS_SWEEP_INTERVAL_SECONDS = 300
+
+
+async def _run_reminders_sweep(registry) -> None:
+    """One pass over every registered tenant bot with "reminders" enabled
+    (db/database.py's bot_features — same enablement table payments.py
+    uses) and a reminders_config on its template module. The factory bot
+    (FACTORY_BOT_ID) has template_id="__factory__", which never resolves to
+    a templates/*.py module, so get_template_reminders_config() returns
+    None for it and it is skipped without any special-casing here."""
+    for bot_id in registry.bot_ids():
+        entry = registry.get(bot_id)
+        if entry is None or not entry.template_id:
+            continue
+        try:
+            enabled_features = await get_bot_features(bot_id)
+        except Exception:
+            logger.exception(f"_run_reminders_sweep: bot_id={bot_id} — failed to read bot_features, skipped")
+            continue
+        if "reminders" not in enabled_features:
+            continue
+        reminders_config = get_template_reminders_config(entry.template_id)
+        if not reminders_config:
+            continue
+        db_path = entry.config.get("db_path")
+        if not db_path:
+            logger.warning(f"_run_reminders_sweep: bot_id={bot_id} has reminders enabled but no db_path — skipped")
+            continue
+        try:
+            sent = await reminders.run_reminders_sweep_for_bot(entry.bot, db_path, reminders_config)
+            if sent:
+                logger.info(f"_run_reminders_sweep: bot_id={bot_id} sent {sent} reminder(s)")
+        except Exception:
+            # One bot's broken reminders_config/db must never abort the
+            # sweep for every other bot — same isolation principle as
+            # features/payments.py's office_events publish try/except.
+            logger.exception(f"_run_reminders_sweep: bot_id={bot_id} — sweep failed")
+
+
+async def _reminders_sweep_loop(registry) -> None:
+    while True:
+        try:
+            await _run_reminders_sweep(registry)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("_reminders_sweep_loop: unexpected error escaped _run_reminders_sweep")
+        await asyncio.sleep(REMINDERS_SWEEP_INTERVAL_SECONDS)
 
 
 async def _bootstrap_app() -> web.Application:
@@ -150,6 +208,31 @@ async def _bootstrap_app() -> web.Application:
     # its own port. See docs/MINIAPP_DESIGN.md §2.2.
     register_miniapp_routes(app)
     register_factory_analytics_routes(app)
+
+    # aiohttp's own on_startup/on_cleanup hooks, not a bare asyncio.create_task
+    # here in _bootstrap_app() — _bootstrap_app() runs to completion BEFORE
+    # web.run_app()'s event loop takes over serving requests (it's the
+    # coroutine passed to web.run_app(), not a request handler), so a task
+    # created here would start running detached from the app's own lifecycle
+    # (nothing would ever cancel it on shutdown, and tests that build an app
+    # via this function without serving it would leak the task). on_cleanup
+    # guarantees cancellation happens even if the process is stopped via
+    # web.run_app()'s normal signal handling.
+    async def _start_reminders_sweep(app: web.Application) -> None:
+        app["reminders_sweep_task"] = asyncio.create_task(_reminders_sweep_loop(registry))
+
+    async def _stop_reminders_sweep(app: web.Application) -> None:
+        task = app.get("reminders_sweep_task")
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    app.on_startup.append(_start_reminders_sweep)
+    app.on_cleanup.append(_stop_reminders_sweep)
+
     return app
 
 
