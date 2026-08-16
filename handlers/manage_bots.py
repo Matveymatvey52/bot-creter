@@ -44,7 +44,12 @@ from runtime.registry import _CUSTOM_FEATURES_DIR, discover_features, infer_temp
 from runtime.registry_holder import RegistryHandle
 from runtime.webhook_setup import set_miniapp_menu_button
 from services.bot_runner import _make_extra_env, get_bot_logs, is_running, start_bot, stop_bot
-from services.claude_service import fix_bot_code, generate_bot_code, improve_bot_code
+from services.claude_service import (
+    append_from_scratch_registry_wiring,
+    fix_bot_code,
+    generate_bot_code,
+    improve_bot_code,
+)
 from services.github_sync import push_bot_to_github
 from services.voice_service import transcribe_voice
 
@@ -1166,6 +1171,16 @@ async def cb_recreate(callback: CallbackQuery):
 
         await stop_bot(bot_id)
 
+        # improve_bot_code() rewrites the WHOLE file including any previously
+        # appended office-hook wiring (docs/OFFICE_HOOK_FROM_SCRATCH_BOTS.md) —
+        # it's an LLM pass with no instruction to preserve that boilerplate, so
+        # a from-scratch bot's config_from_bot_row/ConfigMiddleware/
+        # on_office_event can silently vanish on "улучшить код" without this.
+        # No-op for template-based bots (file_path always has its own
+        # config_from_bot_row already) and for from-scratch code that still
+        # generated the same exports on its own.
+        code = append_from_scratch_registry_wiring(code)
+
         bot_file = Path(b["file_path"])
         bot_file.write_text(code, encoding="utf-8")
         asyncio.create_task(push_bot_to_github(b["name"], code))
@@ -1256,6 +1271,9 @@ async def cb_auto_diagnose(callback: CallbackQuery):
             return
 
         await stop_bot(bot_id)
+        # Same re-append as cb_recreate above — fix_bot_code() is also a
+        # whole-file LLM rewrite that can drop the appended office-hook wiring.
+        fixed_code = append_from_scratch_registry_wiring(fixed_code)
         Path(b["file_path"]).write_text(fixed_code, encoding="utf-8")
         asyncio.create_task(push_bot_to_github(b["name"], fixed_code))
 
@@ -1376,6 +1394,9 @@ async def _apply_fix(message: Message, state: FSMContext, bug_description: str, 
             pass
 
         await stop_bot(bot_id)
+        # Same re-append as cb_recreate above — fix_bot_code() is also a
+        # whole-file LLM rewrite that can drop the appended office-hook wiring.
+        fixed_code = append_from_scratch_registry_wiring(fixed_code)
         Path(b["file_path"]).write_text(fixed_code, encoding="utf-8")
         asyncio.create_task(push_bot_to_github(b["name"], fixed_code))
 
