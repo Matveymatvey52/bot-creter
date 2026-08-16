@@ -258,8 +258,10 @@ class GenerateBotCodeTwoTemplateBranch(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(
             claude_service, "_generate_miniapp_config", AsyncMock(return_value=None)
-        ), patch.object(claude_service, "_generate_office_hook_config", AsyncMock(return_value=None)):
-            code, _miniapp_config, _office_hook_config, fallback_info = await claude_service.generate_bot_code(
+        ), patch.object(
+            claude_service, "_generate_office_hook_config", AsyncMock(return_value=None)
+        ), patch.object(claude_service, "_generate_voice_cashflow_config", AsyncMock(return_value=None)):
+            code, _miniapp_config, _office_hook_config, _voice_cashflow_config, fallback_info = await claude_service.generate_bot_code(
                 "sells products and rewards loyalty points"
             )
 
@@ -319,8 +321,10 @@ class SynthesisModeIsolatedFromSingleTemplateRequests(unittest.IsolatedAsyncioTe
 
         with patch.object(
             claude_service, "_generate_miniapp_config", AsyncMock(return_value=None)
-        ), patch.object(claude_service, "_generate_office_hook_config", AsyncMock(return_value=None)):
-            code, _miniapp_config, _office_hook_config, fallback_info = await claude_service.generate_bot_code("sells products online")
+        ), patch.object(
+            claude_service, "_generate_office_hook_config", AsyncMock(return_value=None)
+        ), patch.object(claude_service, "_generate_voice_cashflow_config", AsyncMock(return_value=None)):
+            code, _miniapp_config, _office_hook_config, _voice_cashflow_config, fallback_info = await claude_service.generate_bot_code("sells products online")
 
         self.mock_synth.assert_not_called()
         self.mock_merge_review.assert_not_called()
@@ -359,8 +363,10 @@ class SynthesisModeIsolatedFromSingleTemplateRequests(unittest.IsolatedAsyncioTe
 
         with patch.object(
             claude_service, "_generate_miniapp_config", AsyncMock(return_value=None)
-        ), patch.object(claude_service, "_generate_office_hook_config", AsyncMock(return_value=None)):
-            code, _miniapp_config, _office_hook_config, fallback_info = await claude_service.generate_bot_code(
+        ), patch.object(
+            claude_service, "_generate_office_hook_config", AsyncMock(return_value=None)
+        ), patch.object(claude_service, "_generate_voice_cashflow_config", AsyncMock(return_value=None)):
+            code, _miniapp_config, _office_hook_config, _voice_cashflow_config, fallback_info = await claude_service.generate_bot_code(
                 "a completely novel kind of bot"
             )
 
@@ -413,8 +419,10 @@ class GenerateBotCodeFromScratchBranch(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(
             claude_service, "_generate_miniapp_config", AsyncMock(return_value=None)
-        ), patch.object(claude_service, "_generate_office_hook_config", AsyncMock(return_value=None)):
-            code, _miniapp_config, _office_hook_config, fallback_info = await claude_service.generate_bot_code(
+        ), patch.object(
+            claude_service, "_generate_office_hook_config", AsyncMock(return_value=None)
+        ), patch.object(claude_service, "_generate_voice_cashflow_config", AsyncMock(return_value=None)):
+            code, _miniapp_config, _office_hook_config, _voice_cashflow_config, fallback_info = await claude_service.generate_bot_code(
                 "a completely novel kind of bot"
             )
 
@@ -469,8 +477,10 @@ class FallbackInfoReasonsWhenTemplateMatchedButCustomizationFails(unittest.Isola
 
         with patch.object(
             claude_service, "_generate_miniapp_config", AsyncMock(return_value=None)
-        ), patch.object(claude_service, "_generate_office_hook_config", AsyncMock(return_value=None)):
-            code, _miniapp_config, _office_hook_config, fallback_info = await claude_service.generate_bot_code(
+        ), patch.object(
+            claude_service, "_generate_office_hook_config", AsyncMock(return_value=None)
+        ), patch.object(claude_service, "_generate_voice_cashflow_config", AsyncMock(return_value=None)):
+            code, _miniapp_config, _office_hook_config, _voice_cashflow_config, fallback_info = await claude_service.generate_bot_code(
                 "sells products online"
             )
 
@@ -501,8 +511,10 @@ class FallbackInfoReasonsWhenTemplateMatchedButCustomizationFails(unittest.Isola
 
         with patch.object(
             claude_service, "_generate_miniapp_config", AsyncMock(return_value=None)
-        ), patch.object(claude_service, "_generate_office_hook_config", AsyncMock(return_value=None)):
-            code, _miniapp_config, _office_hook_config, fallback_info = await claude_service.generate_bot_code(
+        ), patch.object(
+            claude_service, "_generate_office_hook_config", AsyncMock(return_value=None)
+        ), patch.object(claude_service, "_generate_voice_cashflow_config", AsyncMock(return_value=None)):
+            code, _miniapp_config, _office_hook_config, _voice_cashflow_config, fallback_info = await claude_service.generate_bot_code(
                 "sells products and rewards loyalty points"
             )
 

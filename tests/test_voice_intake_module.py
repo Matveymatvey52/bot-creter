@@ -462,5 +462,190 @@ class BotIsolationTests(VoiceIntakeTestCase):
         self.assertIsNone(state)
 
 
+# ── Data-driven mode (from-scratch bots — register_data_driven_schema) ──────
+async def _init_inventory_db(db_path: str) -> None:
+    """A minimal from-scratch-shaped bot: a top-level `warehouses` table (the
+    context concept, tour_operator's `user_prefs`/`tours` equivalent) and an
+    `items` table linked to it — no hand-written closures anywhere, matching
+    what services/claude_service.py's _generate_voice_cashflow_config would
+    produce for a bot like this."""
+    async with aiosqlite.connect(db_path) as db:
+        await db.executescript("""
+            CREATE TABLE IF NOT EXISTS warehouses (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, user_id TEXT
+            );
+            CREATE TABLE IF NOT EXISTS items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                warehouse_id INTEGER, title TEXT, quantity INTEGER
+            );
+        """)
+        await db.commit()
+
+
+_INVENTORY_DATA_DRIVEN_CONFIG = {
+    "context_table": "warehouses",
+    "context_column": "id",
+    "record_types": [
+        {
+            "key": "item", "label": "Item", "icon": "📦",
+            "prompt_desc": "title, quantity",
+            "table": "items",
+            "context_column": "warehouse_id",
+            "fields": [
+                {"name": "title", "label": "Title", "column": "title"},
+                {"name": "quantity", "label": "Quantity", "column": "quantity"},
+            ],
+        },
+    ],
+}
+
+
+class DataDrivenSchemaTests(VoiceIntakeTestCase):
+    """register_data_driven_schema builds a fully working VoiceSchema from a
+    plain dict — the from-scratch counterpart to TourOperatorSchemaTests'
+    hand-written closures above. Same voice -> confirm -> save flow, driven
+    through the real router, proving the generic _generic_save/
+    _generic_get_context_id path behaves identically to a closure-mode
+    schema from the outside."""
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.db_path = self._tmp_db("inventory.db")
+        await _init_inventory_db(self.db_path)
+        self.bot_id = 601
+        voice_intake.register_data_driven_schema(self.bot_id, _INVENTORY_DATA_DRIVEN_CONFIG)
+        self.config = FixtureConfig(db_path=self.db_path)
+        self.dp = _build_dispatcher(self.config, self.bot_id)
+
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute("INSERT INTO warehouses(name, user_id) VALUES('Main', ?)", (str(USER_ID),))
+            await db.commit()
+            self.warehouse_id = cur.lastrowid
+
+    async def test_voice_to_item_record_via_generic_save(self):
+        with patch.object(voice_intake, "_transcribe_voice", new=AsyncMock(return_value="Ten hammers")), \
+             patch.object(voice_intake, "_parse_with_claude", new=AsyncMock(
+                 return_value={"type": "item", "data": {"title": "Hammer", "quantity": 10}, "confidence": 0.9})):
+            await self.dp.feed_webhook_update(self.bot, _voice_update(1, USER_ID))
+            await self.dp.feed_webhook_update(self.bot, _callback_update(2, USER_ID, "vs_save"))
+
+        conn = sqlite3.connect(self.db_path)
+        rows = conn.execute("SELECT warehouse_id, title, quantity FROM items").fetchall()
+        conn.close()
+        self.assertEqual(rows, [(self.warehouse_id, "Hammer", 10)])
+
+    async def test_no_context_id_replies_and_does_not_transcribe(self):
+        other_user_id = USER_ID + 1  # no warehouses row keyed by this user_id
+        transcribe_mock = AsyncMock(return_value="doesn't matter")
+        with patch.object(voice_intake, "_transcribe_voice", new=transcribe_mock):
+            await self.dp.feed_webhook_update(self.bot, _voice_update(1, other_user_id))
+        transcribe_mock.assert_not_called()
+
+    async def test_unmapped_field_is_dropped_not_inserted(self):
+        # "notes" isn't in column_map for the "item" record type — must be
+        # silently dropped (parsed but never written), same as a closure
+        # that simply doesn't reference an extra key in `d`.
+        with patch.object(voice_intake, "_transcribe_voice", new=AsyncMock(return_value="text")), \
+             patch.object(voice_intake, "_parse_with_claude", new=AsyncMock(
+                 return_value={
+                     "type": "item",
+                     "data": {"title": "Wrench", "quantity": 3, "notes": "should be dropped"},
+                     "confidence": 0.9,
+                 })):
+            await self.dp.feed_webhook_update(self.bot, _voice_update(1, USER_ID))
+            await self.dp.feed_webhook_update(self.bot, _callback_update(2, USER_ID, "vs_save"))
+
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM items WHERE title='Wrench'").fetchone()
+        conn.close()
+        self.assertNotIn("notes", row.keys())
+
+
+class DataDrivenNoContextConceptTests(VoiceIntakeTestCase):
+    """A schema with no context_table/context_column at all (most from-scratch
+    bots — no per-user "active X" concept) must accept every record
+    unconditionally rather than block on _schema_has_context_concept."""
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.db_path = self._tmp_db("standalone.db")
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "CREATE TABLE IF NOT EXISTS expenses (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, amount REAL)"
+            )
+            await db.commit()
+        self.bot_id = 602
+        voice_intake.register_data_driven_schema(self.bot_id, {
+            "context_table": None,
+            "context_column": None,
+            "record_types": [{
+                "key": "expense", "label": "Expense", "icon": "💸",
+                "prompt_desc": "title, amount",
+                "table": "expenses",
+                "context_column": None,
+                "fields": [
+                    {"name": "title", "label": "Title", "column": "title"},
+                    {"name": "amount", "label": "Amount", "column": "amount"},
+                ],
+            }],
+        })
+        self.config = FixtureConfig(db_path=self.db_path)
+        self.dp = _build_dispatcher(self.config, self.bot_id)
+
+    async def test_saves_without_any_context_gating(self):
+        with patch.object(voice_intake, "_transcribe_voice", new=AsyncMock(return_value="Lunch 500")), \
+             patch.object(voice_intake, "_parse_with_claude", new=AsyncMock(
+                 return_value={"type": "expense", "data": {"title": "Lunch", "amount": 500}, "confidence": 0.9})):
+            await self.dp.feed_webhook_update(self.bot, _voice_update(1, USER_ID))
+            await self.dp.feed_webhook_update(self.bot, _callback_update(2, USER_ID, "vs_save"))
+
+        conn = sqlite3.connect(self.db_path)
+        rows = conn.execute("SELECT title, amount FROM expenses").fetchall()
+        conn.close()
+        self.assertEqual(rows, [("Lunch", 500)])
+
+
+class ValidateDataDrivenConfigTests(unittest.TestCase):
+    """_validate_data_driven_config — the defensive re-check registry.py runs
+    against the bot's CURRENT real tables before ever trusting a stored
+    config, mirroring _validate_miniapp_config_against_code's posture."""
+
+    def setUp(self):
+        self.tables = {"items": {"id", "warehouse_id", "title", "quantity"}, "warehouses": {"id", "name", "user_id"}}
+
+    def test_valid_config_passes(self):
+        self.assertTrue(voice_intake._validate_data_driven_config(_INVENTORY_DATA_DRIVEN_CONFIG, self.tables))
+
+    def test_hallucinated_table_fails(self):
+        bad = {**_INVENTORY_DATA_DRIVEN_CONFIG, "record_types": [{
+            **_INVENTORY_DATA_DRIVEN_CONFIG["record_types"][0], "table": "does_not_exist",
+        }]}
+        self.assertFalse(voice_intake._validate_data_driven_config(bad, self.tables))
+
+    def test_hallucinated_column_fails(self):
+        bad_rt = dict(_INVENTORY_DATA_DRIVEN_CONFIG["record_types"][0])
+        bad_rt["fields"] = [{"name": "title", "label": "Title", "column": "not_a_real_column"}]
+        bad = {**_INVENTORY_DATA_DRIVEN_CONFIG, "record_types": [bad_rt]}
+        self.assertFalse(voice_intake._validate_data_driven_config(bad, self.tables))
+
+    def test_empty_record_types_fails(self):
+        self.assertFalse(voice_intake._validate_data_driven_config({"record_types": []}, self.tables))
+
+    def test_missing_record_types_key_fails(self):
+        self.assertFalse(voice_intake._validate_data_driven_config({}, self.tables))
+
+    def test_context_table_not_in_real_tables_fails(self):
+        bad = {**_INVENTORY_DATA_DRIVEN_CONFIG, "context_table": "not_real"}
+        self.assertFalse(voice_intake._validate_data_driven_config(bad, self.tables))
+
+    def test_none_context_table_and_column_is_valid(self):
+        config = {
+            "context_table": None, "context_column": None,
+            "record_types": [_INVENTORY_DATA_DRIVEN_CONFIG["record_types"][0]],
+        }
+        self.assertTrue(voice_intake._validate_data_driven_config(config, self.tables))
+
+
 if __name__ == "__main__":
     unittest.main()

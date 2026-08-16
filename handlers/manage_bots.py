@@ -39,6 +39,7 @@ from db.database import (
     set_bot_office_hook_config,
     set_bot_payment_provider,
     set_bot_sheets_config,
+    set_bot_voice_cashflow_config,
     set_bot_yookassa_credentials,
     set_bot_yookassa_status_cache,
     set_owner_payment_credentials,
@@ -432,24 +433,41 @@ async def disable_feature_and_reload(bot_id: int, feature_name: str) -> None:
     await _reload_registry(bot_id)
 
 
-async def _compatible_features(template_id: str | None) -> list[dict]:
+async def _compatible_features(template_id: str | None, bot_id: int | None = None) -> list[dict]:
     """Features whose # COMPATIBLE_WITH: header explicitly lists this bot's
     template_id — never a blanket "all" for ordinary features (see
     runtime/registry.py's discover_features()), so a bot with an
-    unrecognized/missing template_id simply has none of those.
+    unrecognized/missing template_id simply has none of those from the
+    static header check alone.
 
-    "*" is the one deliberate exception: a feature module opts into it only
-    when it is provably template-agnostic (see features/notifications.py's
-    header comment for the reasoning) — without this, template_id=None
-    (every from-scratch bot, see runtime/registry.py's infer_template_id())
-    could never match any entry in compatible_with, so such a feature would
-    never appear in the "🧩 Фичи" list for a from-scratch bot even though
-    runtime/registry.py's build_entry() (post design-office-hook-scratch-bots)
-    now loads and wires it for them just fine."""
-    return [
-        f for f in discover_features()
-        if template_id in f["compatible_with"] or "*" in f["compatible_with"]
-    ]
+    Two independent ways a feature can still show up for a from-scratch bot
+    (template_id is None — no `# TEMPLATE:` marker, infer_template_id() can
+    never resolve one):
+
+    1. "*" — a feature module opts into it only when it is PROVABLY
+       template-agnostic (see features/notifications.py's header comment):
+       the same feature works identically for every bot regardless of
+       template or from-scratch origin, so it's always safe to offer.
+    2. Already ENABLED for this specific bot_id — for a feature like
+       voice_intake/cashflow_ledger that is NOT universally compatible (it
+       needs a schema specific to that bot's own generated tables) but was
+       still auto-enabled for THIS particular from-scratch bot instance by
+       services/claude_service.py's generation step (see
+       handlers/create_bot.py's _apply_voice_cashflow_config) — the owner
+       can see and toggle off what was auto-enabled for them, without this
+       ever letting them discover and enable a NEW non-"*" feature for a
+       from-scratch bot that wasn't already turned on for it.
+
+    A from-scratch bot with bot_id=None (caller has no bot row yet) only
+    ever sees "*" features, never per-instance-enabled ones."""
+    features = discover_features()
+    compatible = [f for f in features if template_id in f["compatible_with"] or "*" in f["compatible_with"]]
+    if template_id is not None or bot_id is None:
+        return compatible
+    enabled = set(await get_bot_features(bot_id))
+    already_shown = {f["name"] for f in compatible}
+    compatible += [f for f in features if f["name"] in enabled and f["name"] not in already_shown]
+    return compatible
 
 
 @router.callback_query(F.data.startswith("features:"))
@@ -464,13 +482,13 @@ async def cb_features_list(callback: CallbackQuery):
         await callback.message.answer("Бот не найден.")
         return
     template_id = infer_template_id(b.get("file_path"))
-    compatible = await _compatible_features(template_id)
+    compatible = await _compatible_features(template_id, bot_id)
     enabled = set(await get_bot_features(bot_id))
     sheets_config = await get_bot_sheets_config(bot_id) if "sheets" in enabled else None
     has_yookassa_creds = bool(await get_bot_yookassa_credentials(bot_id)) if "payments" in enabled else False
     text = "🧩 <b>Фичи для этого бота</b> — нажми, чтобы включить/выключить:"
     if not compatible:
-        text = "🧩 Для этого бота пока нет доступных фич (нет совместимых по шаблону)."
+        text = "🧩 Для этого бота пока нет доступных фич."
     await _edit_or_resend(
         callback,
         text,
@@ -502,6 +520,15 @@ async def cb_toggle_feature(callback: CallbackQuery):
             return
         enabled = set(await get_bot_features(bot_id))
         is_enabled = feature_name in enabled
+        # For a from-scratch bot (template_id is None) turning ON a
+        # non-"*" feature, _compatible_features only ever offers
+        # already-ENABLED features (see its own docstring) — so
+        # "not is_enabled" reaching this check for such a feature would mean
+        # the owner somehow got a togglefeature: callback for a feature the
+        # keyboard never actually showed them; the static COMPATIBLE_WITH/"*"
+        # check below still guards that case defensively. Turning an
+        # already-enabled from-scratch feature back OFF is always allowed
+        # (is_enabled short-circuits the check).
         if not is_enabled and template_id not in feature["compatible_with"] and "*" not in feature["compatible_with"]:
             await callback.answer("⛔ Эта фича не подходит шаблону этого бота.", show_alert=True)
             return
@@ -510,7 +537,7 @@ async def cb_toggle_feature(callback: CallbackQuery):
         else:
             await enable_feature_and_reload(bot_id, feature_name)
         await callback.answer("✅ Включено" if not is_enabled else "🔴 Выключено")
-        compatible = await _compatible_features(template_id)
+        compatible = await _compatible_features(template_id, bot_id)
         new_enabled = set(await get_bot_features(bot_id))
         new_sheets_config = await get_bot_sheets_config(bot_id) if "sheets" in new_enabled else None
         new_has_yookassa_creds = (
@@ -1493,11 +1520,12 @@ async def cb_recreate(callback: CallbackQuery):
 
         miniapp_config: dict | None = None
         office_hook_config: dict | None = None
+        voice_cashflow_config: dict | None = None
         fallback_info: dict | None = None
         try:
             result = await asyncio.wait_for(task, timeout=240.0)
             if regenerating_from_scratch:
-                code, miniapp_config, office_hook_config, fallback_info = result
+                code, miniapp_config, office_hook_config, voice_cashflow_config, fallback_info = result
             else:
                 code = result
         except Exception as e:
@@ -1529,6 +1557,12 @@ async def cb_recreate(callback: CallbackQuery):
 
         if office_hook_config:
             await set_bot_office_hook_config(bot_id, office_hook_config)
+        if voice_cashflow_config:
+            await set_bot_voice_cashflow_config(bot_id, voice_cashflow_config)
+            if voice_cashflow_config.get("voice_intake"):
+                await enable_bot_feature(bot_id, "voice_intake")
+            if voice_cashflow_config.get("cashflow_ledger"):
+                await enable_bot_feature(bot_id, "cashflow_ledger")
         if fallback_info:
             await add_template_candidate(
                 creator_user_id=callback.from_user.id,

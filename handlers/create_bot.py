@@ -19,10 +19,12 @@ from config import ASSEMBLYAI_API_KEY, BOT_TOKEN, DATA_DIR
 from db.database import (
     add_template_candidate,
     create_bot_record_with_admins,
+    enable_bot_feature,
     get_bot,
     set_bot_display_name,
     set_bot_miniapp_config,
     set_bot_office_hook_config,
+    set_bot_voice_cashflow_config,
     update_bot_status,
 )
 from runtime.registry_holder import RegistryHandle
@@ -108,6 +110,31 @@ async def _register_new_bot_in_registry(bot_id: int, bot_name: str) -> None:
             logger.info(f"Bot id={bot_id} ({bot_name}) registered in the live registry")
     except Exception as e:
         logger.error(f"Registry registration raised for bot id={bot_id} ({bot_name}): {e}")
+
+
+async def _apply_voice_cashflow_config(bot_id: int, voice_cashflow_config: dict | None) -> None:
+    """Persists voice_cashflow_config (if non-null) and auto-enables the
+    voice_intake/cashflow_ledger bot_features rows it implies — see docs/
+    VOICE_CASHFLOW_FROM_SCRATCH_DESIGN.md. Auto-enabled rather than left for
+    the owner to manually toggle: the owner has no way to discover or enable
+    a feature for a from-scratch bot through the existing Features UI unless
+    it's already been generated as relevant for that specific bot (see the
+    _compatible_features per-bot-instance fix in handlers/manage_bots.py).
+
+    Called BEFORE _register_new_bot_in_registry so the bot_features rows
+    already exist the first time this bot is registered in the live
+    registry — _load_and_include_features reads bot_features fresh on every
+    registration/reload, so ordering here only affects whether the very
+    first registration already has voice_intake/cashflow_ledger wired, not
+    whether they eventually get wired at all (a later /admin/reload would
+    pick them up regardless)."""
+    if not voice_cashflow_config:
+        return
+    await set_bot_voice_cashflow_config(bot_id, voice_cashflow_config)
+    if voice_cashflow_config.get("voice_intake"):
+        await enable_bot_feature(bot_id, "voice_intake")
+    if voice_cashflow_config.get("cashflow_ledger"):
+        await enable_bot_feature(bot_id, "cashflow_ledger")
 
 
 class _Activation(NamedTuple):
@@ -543,7 +570,7 @@ async def _run_generation(chat_id: int, user_id: int, bot: Bot, state: FSMContex
 
     gen_msg = await bot.send_message(chat_id, "Генерирую код... 🔧")
     try:
-        code, miniapp_config, office_hook_config, fallback_info = await asyncio.wait_for(
+        code, miniapp_config, office_hook_config, voice_cashflow_config, fallback_info = await asyncio.wait_for(
             generate_bot_code(summary), timeout=360.0
         )
     except asyncio.TimeoutError:
@@ -581,7 +608,13 @@ async def _run_generation(chat_id: int, user_id: int, bot: Bot, state: FSMContex
     except Exception:
         pass
 
-    await state.update_data(bot_code=code, miniapp_config=miniapp_config, office_hook_config=office_hook_config)
+    await state.update_data(
+        bot_code=code,
+        miniapp_config=miniapp_config,
+        office_hook_config=office_hook_config,
+        voice_cashflow_config=voice_cashflow_config,
+        fallback_info=fallback_info,
+    )
     await state.set_state(CreateBotStates.waiting_for_token)
 
     _pending[user_id] = {
@@ -592,6 +625,7 @@ async def _run_generation(chat_id: int, user_id: int, bot: Bot, state: FSMContex
         "display_name": data.get("display_name", ""),
         "miniapp_config": miniapp_config,
         "office_hook_config": office_hook_config,
+        "voice_cashflow_config": voice_cashflow_config,
         "fallback_info": fallback_info,
     }
 
@@ -703,6 +737,7 @@ async def auto_launch_managed_bot(managed_data: dict, bot: Bot, storage=None) ->
     display_name: str = pending.get("display_name", "")
     miniapp_config: dict | None = pending.get("miniapp_config")
     office_hook_config: dict | None = pending.get("office_hook_config")
+    voice_cashflow_config: dict | None = pending.get("voice_cashflow_config")
     fallback_info: dict | None = pending.get("fallback_info")
 
     avatar_path = AVATAR_DIR / f"{bot_name}.jpg"
@@ -732,6 +767,7 @@ async def auto_launch_managed_bot(managed_data: dict, bot: Bot, storage=None) ->
         await set_bot_miniapp_config(bot_record_id, miniapp_config)
     if office_hook_config:
         await set_bot_office_hook_config(bot_record_id, office_hook_config)
+    await _apply_voice_cashflow_config(bot_record_id, voice_cashflow_config)
     if fallback_info:
         await add_template_candidate(
             creator_user_id=creator_user_id,
@@ -786,6 +822,7 @@ async def handle_token(message: Message, state: FSMContext, bot: Bot):
     display_name: str = data.get("display_name", "")
     miniapp_config: dict | None = data.get("miniapp_config")
     office_hook_config: dict | None = data.get("office_hook_config")
+    voice_cashflow_config: dict | None = data.get("voice_cashflow_config")
 
     real_username: str | None = None
     try:
@@ -821,6 +858,7 @@ async def handle_token(message: Message, state: FSMContext, bot: Bot):
         await set_bot_miniapp_config(bot_id, miniapp_config)
     if office_hook_config:
         await set_bot_office_hook_config(bot_id, office_hook_config)
+    await _apply_voice_cashflow_config(bot_id, voice_cashflow_config)
 
     # See the equivalent comment in _run_generation() above — the welcome
     # photo was saved under the bot's name before its row/id existed; all
