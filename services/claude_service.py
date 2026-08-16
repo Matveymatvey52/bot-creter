@@ -61,6 +61,23 @@ PERSISTENT DATA — always use SQLite for any data the bot needs to remember:
 - This ensures data survives bot restarts and code updates
 - Every user record, appointment, entry must be stored in SQLite, never in memory dicts
 
+MANDATORY init_db FUNCTION — every bot that stores any data must define this exact
+top-level function, even if there is only one table:
+  async def init_db(db_path: str) -> None:
+      async with aiosqlite.connect(db_path) as db:
+          await db.execute("CREATE TABLE IF NOT EXISTS ... (...)")
+          # one execute() per table, all CREATE TABLE IF NOT EXISTS
+          await db.commit()
+  Call it from main() as: await init_db(DB_PATH)
+  Rules:
+  - Takes db_path as a parameter and uses ONLY that parameter for the connection —
+    never reads the module-level DB_PATH global inside this function body (the bot's
+    hosting registry may call init_db with a different path than DB_PATH).
+  - Contains ALL CREATE TABLE statements the bot uses anywhere else in the file —
+    this is the single source of truth for schema, other code must never create
+    tables outside this function.
+  - Must be idempotent and safe to call multiple times (IF NOT EXISTS everywhere).
+
 AVAILABLE PACKAGES — ONLY use these external libraries (everything else will crash with ImportError):
   - aiogram 3.13 — Telegram bot framework
   - aiosqlite — async SQLite
@@ -277,11 +294,12 @@ GROUP CHAT SUPPORT — always include this in every bot (even if the bot is not 
   # Call notify_group when something important happens, e.g.:
   # await notify_group(bot, f"📋 Новая запись: {name}, {service}, {time}")
 
-Correct main entry point (copy exactly):
+Correct main entry point (copy exactly; if the bot has no init_db function, omit that one line):
   async def main():
       bot = Bot(token=os.getenv("BOT_TOKEN"))
       dp = Dispatcher(storage=MemoryStorage())
       dp.include_router(router)
+      await init_db(DB_PATH)
       await bot.set_my_description("...description...")
       await dp.start_polling(bot)
 
@@ -381,9 +399,9 @@ DB SCHEMA (use EXACTLY this):
     created_at TEXT DEFAULT (datetime('now','localtime'))
   );
 
-INIT DB — pre-populate slots at startup (MANDATORY, call from main() before polling):
-  async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
+INIT DB — pre-populate slots at startup (MANDATORY, call from main() as await init_db(DB_PATH) before polling):
+  async def init_db(db_path: str) -> None:
+    async with aiosqlite.connect(db_path) as db:
       await db.execute("CREATE TABLE IF NOT EXISTS slots (...)")
       await db.execute("CREATE TABLE IF NOT EXISTS bookings (...)")
       from datetime import date as _date, timedelta
@@ -912,7 +930,7 @@ _TYPE_REVIEW_HINTS: dict[str, str] = {
         "- Handler for F.data == 'book_unavailable'\n"
         "- Handler for F.data.startswith('adm_day:')\n"
         "- Handler for F.data.startswith('adm_cancel:')\n"
-        "- init_db() is called inside main() before dp.start_polling\n"
+        "- init_db(db_path: str) is defined at module level and called as await init_db(DB_PATH) inside main() before dp.start_polling\n"
         "- Anti-double-booking check inside book_confirm handler\n"
         "If ANY handler is missing — add a stub that answers the callback and shows an error message."
     ),
@@ -1190,12 +1208,150 @@ def _strip_code_fences(code: str) -> str:
     return code
 
 
+# ── from-scratch registry wiring (docs/OFFICE_HOOK_FROM_SCRATCH_BOTS.md) ────
+#
+# From-scratch bots (no matching templates/*.py, GENERATE_SYSTEM_PROMPT branch
+# of _generate_bot_code_inner) are free-form single-file scripts — Claude is
+# NOT asked to hand-write the by-convention exports runtime/registry.py's
+# build_entry() needs (config_from_bot_row/ConfigMiddleware/on_office_event),
+# unlike templates/*.py. That's deliberate: those three are 100% boilerplate
+# (verified identical in shape across every templates/*.py — see the design
+# doc) and asking an LLM to freehand them per-bot is both wasted tokens and a
+# reliability risk (one hallucinated attribute name silently breaks
+# build_entry()'s router/office-hook wiring for that bot). Instead this
+# function deterministically APPENDS them via plain text/AST, never an LLM
+# call — same reasoning as generic_on_office_event() itself being
+# data-driven, not code-generated.
+#
+# Requires DB_PATH and BOT_NAME as module-level globals and (optionally)
+# `async def init_db(db_path: str)` — both guaranteed by GENERATE_SYSTEM_PROMPT
+# ("PERSISTENT DATA" / "MANDATORY init_db FUNCTION" sections). Bots with no
+# persistent data at all (no DB_PATH) skip init_db entirely — config_from_bot_row
+# still needs SOME db_path, so DB_PATH is required unconditionally by the
+# prompt even for bots that never write to it.
+
+_INIT_DB_DEF_RE = re.compile(r"^async def init_db\(", re.MULTILINE)
+_ENTRY_POINT_RE = re.compile(r"^if __name__ == ['\"]__main__['\"]:", re.MULTILINE)
+
+_FROM_SCRATCH_WIRING_TEMPLATE = '''
+
+# ── auto-appended by services.claude_service — DO NOT ask Claude to write this ──
+# Registry wiring for webhook-mode registration (runtime/registry.py's build_entry()).
+# Mirrors the by-convention exports every templates/*.py file provides —
+# including attribute-style config.db_path/config.bot_id access, since
+# runtime/registry.py's build_entry() reads typed_config.db_path directly
+# (not config["db_path"]) for every module regardless of template vs
+# from-scratch origin.
+from types import SimpleNamespace as _SimpleNamespace
+
+from aiogram import BaseMiddleware as _BaseMiddleware
+
+
+def config_from_bot_row(bot_row: dict, data_dir) -> _SimpleNamespace:
+    """Webhook runtime mode — reuses this bot's OWN DB_PATH/BOT_NAME globals
+    (already unique per bot: one file per bot in data/generated_bots/), not a
+    bot_row["bot_id"]-derived path like templates/*.py use, since this file's
+    module-level code and handlers already close over DB_PATH directly."""
+    return _SimpleNamespace(
+        bot_id=bot_row.get("bot_id"),
+        bot_name=BOT_NAME,
+        db_path=DB_PATH,
+        display_name=bot_row.get("display_name"),
+        group_chat_id=bot_row.get("group_chat_id"),
+    )
+
+
+class ConfigMiddleware(_BaseMiddleware):
+    """Injects this bot's config namespace into data["config"] — same contract
+    as every templates/*.py ConfigMiddleware (identical shape, verified across
+    all reference templates)."""
+
+    def __init__(self, config: _SimpleNamespace) -> None:
+        self.config = config
+        super().__init__()
+
+    async def __call__(self, handler, event, data):
+        data["config"] = self.config
+        return await handler(event, data)
+
+
+async def on_office_event(event, config) -> None:
+    """Universal office-hook fallback (docs/OFFICES_DESIGN.md §11) — same
+    generic_on_office_event() every template-based bot with no hand-written
+    hook gets via build_entry(), now reachable for from-scratch bots too."""
+    from db.database import get_bot_office_hook_config
+    from features.office_events import generic_on_office_event
+
+    bot_id = config.bot_id
+    hook_config = await get_bot_office_hook_config(bot_id) if bot_id is not None else None
+    await generic_on_office_event(event, config.db_path, hook_config, bot_id=bot_id)
+'''
+
+
+def _needs_from_scratch_wiring(code: str) -> bool:
+    """True if `code` looks like it's missing the registry-wiring exports this
+    module appends — checked so re-running this on already-wired code (e.g. a
+    future regenerate-in-place flow) doesn't double-append. Cheap substring
+    check, not full AST — mirrors _mentions_payments' style."""
+    return "def config_from_bot_row(" not in code
+
+
+_INIT_DB_FALLBACK = '''
+
+async def init_db(db_path: str) -> None:
+    """Auto-appended fallback — this bot defined no top-level init_db of its
+    own (no persistent data to create tables for). runtime/registry.py's
+    build_entry() calls module.init_db(config.db_path) unconditionally for
+    every module (template-based or from-scratch alike, same contract every
+    templates/*.py file already guarantees) — this no-op keeps that call
+    from raising AttributeError for a stateless bot."""
+    pass
+'''
+
+
+def append_from_scratch_registry_wiring(code: str) -> str:
+    """Deterministically appends config_from_bot_row/ConfigMiddleware/
+    on_office_event (plus a no-op init_db fallback if the bot defined none)
+    to a from-scratch bot's generated code, right before its
+    `if __name__ == "__main__":` block — see the module comment above for why
+    this is text injection, not an LLM step. No-ops (returns code unchanged)
+    if the code already has the wiring (_needs_from_scratch_wiring) or lacks
+    an entry point to insert before (defensive — GENERATE_SYSTEM_PROMPT always
+    produces one; _generate_bot_code_inner's own retry loop guarantees
+    'asyncio.run(main())' is present by the time this runs)."""
+    if not _needs_from_scratch_wiring(code):
+        return code
+    m = _ENTRY_POINT_RE.search(code)
+    if m is None:
+        logger.warning(
+            "append_from_scratch_registry_wiring: no `if __name__ == '__main__':` "
+            "found — skipping wiring injection, bot will only run via its own "
+            "asyncio.run(main()), not through the webhook registry"
+        )
+        return code
+    wiring = _FROM_SCRATCH_WIRING_TEMPLATE
+    if not _INIT_DB_DEF_RE.search(code):
+        wiring += _INIT_DB_FALLBACK
+    wired = code[: m.start()] + wiring.strip() + "\n\n\n" + code[m.start() :]
+    try:
+        _ast.parse(wired)
+    except SyntaxError:
+        logger.warning(
+            "append_from_scratch_registry_wiring: injected code failed to parse — "
+            "keeping original code unwired (bot still works standalone, just not "
+            "through the webhook registry/office-hook)"
+        )
+        return code
+    return wired
+
+
 _TEMPLATES_DIR = __import__("pathlib").Path(__file__).parent.parent / "templates"
 
 # Same "# TEMPLATE: <id>" marker convention runtime/registry.py's
-# infer_template_id() reads (that file untouched, out of this phase's scope —
-# a separate constant/regex lives here instead of importing from runtime/, to
-# avoid a services -> runtime dependency). Read by LINE COUNT, not a byte/char
+# infer_template_id() reads — a separate constant/regex lives here instead of
+# importing from runtime/, to avoid a services -> runtime dependency (this
+# module has its own from-scratch wiring above; that's a different mechanism,
+# not a TEMPLATE:-marker path). Read by LINE COUNT, not a byte/char
 # budget: a byte-sliced read (registry.py's own approach) risks silently
 # truncating mid-line if a future USE FOR: description runs long — reading
 # whole lines instead means TEMPLATE:/USE FOR: either match in full or don't
@@ -1361,6 +1517,125 @@ async def _select_template(summary: str) -> list[str]:
     return valid if len(valid) == len(names) else []
 
 
+_FREEDOM_TIER_PROMPT = """You are deciding how much freedom a code generator needs when adapting ONE existing bot template to a specific request.
+
+Answer with exactly one word:
+- "customize" — the request can be satisfied by only changing the template's text/constants (business name, welcome text, lists of services/categories/items, wording) — no new tables, no new handlers, no new FSM states, no new integrations.
+- "hybrid" — the request needs the template extended: new database tables/columns, new handlers, new FSM states/steps, or functionality the template's constants cannot express, even though the template is still clearly the right starting point.
+
+Return ONLY "customize" or "hybrid", nothing else — no explanation."""
+
+
+async def _select_freedom_tier(template_code: str, requirements: str) -> str:
+    """Only called when _select_template resolved to exactly one template.
+    Decides whether that template needs pure # CUSTOMIZE-block editing or
+    structural extension (hybrid mode, see docs/HYBRID_GENERATION_MODE_DESIGN.md).
+    Cheap Haiku call, isolated from _select_template's own prompt/contract so
+    that function's existing fail-closed template-name validation is
+    untouched. Fails closed to "customize" (the narrower, safer freedom
+    level) on any response that isn't exactly one of the two expected
+    words — a wrong "customize" call costs an extra generation round trip
+    later at worst; a wrong "hybrid" call skips the # CUSTOMIZE boundary
+    while narrow-risk review still runs, so the fail-closed direction here
+    picks the cheaper mistake, not zero risk. Takes the template's already-
+    read source (not a template_name) so the caller reads the template file
+    from disk exactly once for the whole hybrid pipeline instead of once
+    per function."""
+    response = await client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=10,
+        system=_FREEDOM_TIER_PROMPT,
+        messages=[{
+            "role": "user",
+            "content": f"Requirements:\n{requirements}\n\nTemplate:\n{template_code}",
+        }],
+    )
+    text = response.content[0].text.strip().lower()
+    return "hybrid" if text == "hybrid" else "customize"
+
+
+HYBRID_CUSTOMIZE_EXTRA = """
+
+HYBRID MODE — you are extending ONE existing working template, not designing from a blank page and not merging multiple templates. Treat it as your trusted starting point:
+
+- Preserve its working conventions (existing table names, callback_data prefixes, existing FSM state chains, existing handler structure) — extend them rather than replacing them, whenever the request can be satisfied that way.
+- You ARE allowed full structural freedom when the request genuinely requires it: add new tables/columns, add new handlers, add new FSM states, add new callback routes, or restructure existing ones — do not limit yourself to # CUSTOMIZE blocks like a plain customization pass would.
+- A full rewrite of a section is allowed only when the requirements genuinely cannot be expressed as an extension of what's already there — prefer the smallest structural change that satisfies the request.
+- Keep the template's `# TEMPLATE: <id>` header line and its startup/persistence conventions (DB_PATH via DATA_DIR, BOT_NAME from Path(__file__).stem, CREATE TABLE IF NOT EXISTS) exactly as they already work in the template — these are required for compatibility with the bot factory's office-event hooks, mini-app config generation, and multi-bot registry, regardless of how much else you change.
+
+Return ONLY the complete, single Python file. No markdown fences, no explanations."""
+
+
+HYBRID_REVIEW_SYSTEM_PROMPT = """You are a senior Python code reviewer specializing in aiogram 3.13 Telegram bots. You are reviewing a bot that started from ONE existing template and was then EXTENDED with new structure (tables, handlers, FSM states) to satisfy a specific request (HYBRID MODE — template as trusted base, not from-scratch, not a multi-template merge).
+
+You are given the ORIGINAL template and the HYBRID output. Your job is to catch defects specific to extending a known-good base without a full rewrite, BEFORE deployment. Check for these specific problems:
+
+1. NEEDLESSLY RENAMED CONVENTIONS — an existing table name, callback_data prefix, or FSM state that got renamed/duplicated for no reason tied to the request (the original name still works and nothing in the requirements calls for the rename).
+2. DUPLICATED STRUCTURE — a new table, handler, or state added that duplicates something the original template already had, instead of extending the original.
+3. BROKEN COMPATIBILITY CONVENTIONS — the `# TEMPLATE: <id>` header line, DB_PATH/DATA_DIR/BOT_NAME pattern, or CREATE TABLE IF NOT EXISTS persistence pattern altered or removed from how the original template already had them working.
+4. ORPHANED ORIGINAL CODE — a handler, table, or state from the original template left in the file but now unreachable/unused because the new structure bypasses it.
+5. INCOMPLETE EXTENSION — new structure (e.g. a new table) added but not fully wired (e.g. never read from, or a new FSM state with no handler consuming it).
+
+If you find issues: fix them and return the complete corrected code.
+If the code looks correct: return it unchanged.
+Return ONLY valid Python code. No markdown, no explanations."""
+
+
+async def _review_hybrid_bot_code(code: str, requirements: str, original_template_code: str) -> str:
+    """Template-diff-aware review pass, unique to hybrid mode — has both the
+    original template and the hybrid output so it can specifically check
+    whether existing conventions were needlessly renamed/duplicated/broken,
+    which neither _review_bot_code nor _review_narrow_risk_code check for.
+    Runs first in the hybrid pipeline (see _generate_bot_code_inner), same
+    position _review_merged_bot_code holds in the synthesis pipeline, so
+    later passes review the already-diff-cleaned structure."""
+    response = await client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=25000,
+        system=HYBRID_REVIEW_SYSTEM_PROMPT,
+        messages=[{
+            "role": "user",
+            "content": (
+                f"Bot requirements (for context):\n{requirements}\n\n"
+                f"Original template (for comparison only):\n{original_template_code}\n\n"
+                f"Hybrid-extended code to review:\n{code}"
+            ),
+        }],
+    )
+    reviewed = _strip_code_fences(response.content[0].text)
+    try:
+        _ast.parse(reviewed)
+        return reviewed
+    except SyntaxError:
+        return code  # review broke the code — keep pre-review version
+
+
+async def _hybrid_customize_from_template(template_code: str, requirements: str) -> str:
+    """Hybrid mode: template as trusted structural base with full freedom to
+    extend it (new tables/handlers/FSM), unlike _customize_from_template's
+    # CUSTOMIZE-only ceiling. See docs/HYBRID_GENERATION_MODE_DESIGN.md.
+    Falls back to the unmodified template on SyntaxError, same fail-safe
+    _customize_from_template uses — there's always a known-good file to
+    return to since exactly one template is the starting point. Takes the
+    template's already-read source (not a template_name) — see
+    _select_freedom_tier's docstring for why."""
+    response = await client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=25000,
+        system=GENERATE_SYSTEM_PROMPT + HYBRID_CUSTOMIZE_EXTRA,
+        messages=[{
+            "role": "user",
+            "content": f"User requirements:\n{requirements}\n\nTemplate to extend:\n{template_code}",
+        }],
+    )
+    code = _strip_code_fences(response.content[0].text)
+    try:
+        _ast.parse(code)
+        return code
+    except SyntaxError:
+        return template_code  # fallback to unmodified template
+
+
 async def _customize_from_template(template_name: str, requirements: str) -> str:
     """Customizes a template for specific requirements. Returns Python code."""
     template_path = _TEMPLATES_DIR / f"{template_name}.py"
@@ -1433,19 +1708,23 @@ async def _review_merged_bot_code(code: str, requirements: str) -> str:
         return code  # review broke the code — keep pre-review version
 
 
-# Narrow, risk-targeted review pass — reserved for the two riskiest generation
-# paths (synthesis and custom_features, see their call sites below), plus
-# (unconditionally, see generate_bot_code's from-scratch branch) the
-# from-scratch fallback. Checks three things neither _review_bot_code nor
-# _review_merged_bot_code cover as a dedicated concern: FSM state-transition
+# Narrow, risk-targeted review pass — reserved for the riskiest generation
+# paths (synthesis, hybrid single-template extension, and custom_features,
+# see their call sites below), plus (unconditionally, see
+# generate_bot_code's from-scratch branch) the from-scratch fallback. Checks
+# three things neither _review_bot_code nor _review_merged_bot_code /
+# _review_hybrid_bot_code cover as a dedicated concern: FSM state-transition
 # correctness, SQL parameterization / cross-bot data isolation (not checked
 # ANYWHERE else in the pipeline today), and duplication/dead code — plus a
 # 4th, conditional PAYMENT/MONEY SAFETY category appended only when the code
 # or context mentions payments, so the prompt (and token cost) stays at its
 # original size for the common non-payment case. Deliberately not run for
-# plain single-template customization — that path only changes a
-# `# CUSTOMIZE` block inside an already-reviewed template, so the narrow-risk
-# categories don't apply.
+# plain single-template customization (the "customize" freedom tier) —
+# that path only changes a `# CUSTOMIZE` block inside an already-reviewed
+# template, so the narrow-risk categories don't apply. Once a request is
+# routed to the "hybrid" freedom tier instead, this DOES run — see
+# docs/HYBRID_GENERATION_MODE_DESIGN.md §3: structural freedom over a
+# template reintroduces the same bug classes this pass exists for.
 NARROW_RISK_REVIEW_SYSTEM_PROMPT = """You are a senior Python code reviewer specializing in aiogram 3.13 Telegram bots. You are reviewing code from one of the highest-risk generation paths in an automated bot-factory: synthesized from two templates, generated from scratch, or a from-scratch patch written for one specific bot's unique request. Focus ONLY on these risk categories — do not comment on anything else, do not restyle, do not "improve" unrelated code:
 
 1. FSM STATE-TRANSITION CORRECTNESS
@@ -1545,11 +1824,13 @@ async def generate_bot_code(
     fully from-scratch) — cheap to compute and harmless to store even when
     unused. Whether it's actually WIRED into a live on_office_event() hook is
     decided later, at registry build time (runtime/registry.py's
-    build_entry()), which only does so for bots resolved to a known
-    templates/*.py module — see docs/OFFICES_DESIGN.md §11's "Custom-бот
-    scope" decision for why fully from-scratch generated bots (no `#
-    TEMPLATE:` marker, no module.router wired through build_entry()) are out
-    of scope for THIS iteration despite having a config generated here.
+    build_entry()). For from-scratch bots (no `# TEMPLATE:` marker),
+    _generate_bot_code_inner's from-scratch branch appends the by-convention
+    config_from_bot_row/ConfigMiddleware/on_office_event exports via
+    append_from_scratch_registry_wiring() below, and build_entry() imports
+    the generated file directly by path (see docs/OFFICE_HOOK_FROM_SCRATCH_
+    BOTS.md) — the same generic_on_office_event() fallback template-based
+    bots get is now reachable for from-scratch bots too.
 
     miniapp_config and office_hook_config are independent of each other (both
     only depend on `code`, already generated by the time either runs), so
@@ -1562,10 +1843,11 @@ async def generate_bot_code(
     best-case added latency from these two steps.
 
     fallback_info (docs/TEMPLATE_CANDIDATE_LOGGING_DESIGN.md) is a fourth,
-    optional element: None when a single template was customized or two
-    templates were synthesized successfully, otherwise a dict describing why
-    generation fell through to from-scratch — {"reason": "no_template_match"
-    | "customize_failed" | "synthesis_failed", "selected_templates": [...]}.
+    optional element: None when a single template was customized/hybrid-
+    extended or two templates were synthesized successfully, otherwise a
+    dict describing why generation fell through to from-scratch —
+    {"reason": "no_template_match" | "customize_failed" | "hybrid_failed"
+    | "synthesis_failed", "selected_templates": [...]}.
     Callers with a bot_id in hand (handlers/create_bot.py,
     handlers/manage_bots.py's cb_recreate) persist it via
     db.database.add_template_candidate so the owner can review recurring
@@ -1584,12 +1866,44 @@ async def _generate_bot_code_inner(requirements_summary: str) -> tuple[str, dict
     templates = await _select_template(requirements_summary)
 
     if len(templates) == 1:
-        code = await _customize_from_template(templates[0], requirements_summary)
-        if "asyncio.run(main())" in code:
-            bot_type = await classify_bot_type(requirements_summary)
-            code = await _review_bot_code(code, requirements_summary, bot_type=bot_type)
-            return code, None
-        fallback_reason = "customize_failed"
+        template_name = templates[0]
+        # Single disk read for the whole single-template branch — tier
+        # selection, hybrid generation, and hybrid review all need this same
+        # source text, so it's read once here and threaded through instead
+        # of each function re-reading the file itself.
+        template_code = (_TEMPLATES_DIR / f"{template_name}.py").read_text(encoding="utf-8")
+        # _select_freedom_tier and classify_bot_type are both independent
+        # Haiku calls that only depend on requirements_summary/template_code
+        # (neither needs generated code) — run concurrently rather than
+        # sequentially, same asyncio.gather idiom generate_bot_code already
+        # uses for its own independent post-generation steps. No
+        # return_exceptions=True: if either call raises, the whole
+        # single-template branch is unrecoverable anyway (both results are
+        # required to proceed), and the exception propagates to the same
+        # outer asyncio.wait_for/except Exception safety net every other
+        # generation tier already relies on (handlers/create_bot.py). Known,
+        # accepted tradeoff: on a failure of either call, the other keeps
+        # running to completion as an orphaned task rather than being
+        # cancelled (gather's default behavior) — a small wasted Haiku call,
+        # not a crash risk, since both calls are cheap/fast.
+        tier, bot_type = await asyncio.gather(
+            _select_freedom_tier(template_code, requirements_summary),
+            classify_bot_type(requirements_summary),
+        )
+        if tier == "hybrid":
+            code = await _hybrid_customize_from_template(template_code, requirements_summary)
+            if "asyncio.run(main())" in code:
+                code = await _review_hybrid_bot_code(code, requirements_summary, template_code)
+                code = await _review_narrow_risk_code(code, requirements_summary)
+                code = await _review_bot_code(code, requirements_summary, bot_type=bot_type)
+                return code, None
+            fallback_reason = "hybrid_failed"
+        else:
+            code = await _customize_from_template(template_name, requirements_summary)
+            if "asyncio.run(main())" in code:
+                code = await _review_bot_code(code, requirements_summary, bot_type=bot_type)
+                return code, None
+            fallback_reason = "customize_failed"
 
     elif len(templates) == 2:
         code = await _synthesize_from_templates(templates, requirements_summary)
@@ -1659,6 +1973,13 @@ async def _generate_bot_code_inner(requirements_summary: str) -> tuple[str, dict
 
     # Static review pass — find and fix potential runtime issues before deployment
     code = await _review_bot_code(code, requirements_summary, bot_type=bot_type)
+
+    # Registry wiring (docs/OFFICE_HOOK_FROM_SCRATCH_BOTS.md) — deliberately
+    # LAST, after every LLM review pass above: those passes aren't told about
+    # this appended boilerplate and could otherwise "fix"/drop it since they
+    # each see and re-emit the whole file. Text injection, not an LLM call —
+    # see append_from_scratch_registry_wiring's own docstring for why.
+    code = append_from_scratch_registry_wiring(code)
 
     return code, fallback_info
 

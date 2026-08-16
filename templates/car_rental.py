@@ -121,6 +121,33 @@ miniapp_config = {
 }
 
 
+# ── reminders (features/reminders.py, docs/REMINDERS_DESIGN.md) ────────────
+# Unlike event_rsvp.py's event_date, rental_bookings.start_date is strictly
+# validated on write (BookingFlow.start_date's handler above rejects
+# anything _parse_date can't parse as ГГГГ-ММ-ДД) — so date_format below is
+# guaranteed to match every stored row, not best-effort. start_date has no
+# time component (date-only), so offsets are whole-day multiples of 24h;
+# reminders.py's DUE_WINDOW_MINUTES still applies the same way since
+# strptime("%Y-%m-%d") parses to midnight.
+#
+# recipient_field, not recipient_query: client_user_id lives on the SAME
+# rental_bookings row as start_date — the simpler of the two shapes.
+reminders_config = {
+    "rules": [
+        {
+            "id": "car_rental_upcoming",
+            "table": "rental_bookings",
+            "date_field": "start_date",
+            "date_format": "%Y-%m-%d",
+            "recipient_field": "client_user_id",
+            "active_field": "status IN ('pending','confirmed')",
+            "offsets_hours": [24],
+            "message_template": "🔔 Напоминание: аренда автомобиля начинается {start_date:%d.%m.%Y}",
+        },
+    ],
+}
+
+
 # ── config ───────────────────────────────────────────────────────────────────
 # Same pattern as every other template — see docs/STAGE2_DESIGN.md.
 

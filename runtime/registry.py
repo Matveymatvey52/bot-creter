@@ -193,6 +193,57 @@ async def _load_template_module_async(template_id: str) -> ModuleType | None:
     return module
 
 
+_GENERATED_BOT_MODULE_NAME_RE = re.compile(r"[^A-Za-z0-9_]")
+
+
+async def _load_generated_bot_module_async(bot_id: int, file_path: str) -> ModuleType | None:
+    """Imports a from-scratch bot's own file DIRECTLY by path — the counterpart
+    to _load_template_module_async for bots with no `# TEMPLATE:` marker (no
+    match in the shared templates/ library, GENERATE_SYSTEM_PROMPT branch of
+    services/claude_service.py's _generate_bot_code_inner). Those files live in
+    data/generated_bots/, not the `templates` package, so
+    importlib.import_module(f"templates.{template_id}") can never resolve them
+    regardless of what template_id is — see docs/OFFICE_HOOK_FROM_SCRATCH_BOTS.md
+    for why this needed a second resolution path, not a tweak to the first.
+
+    services/claude_service.py's append_from_scratch_registry_wiring()
+    guarantees config_from_bot_row/ConfigMiddleware/on_office_event are present
+    in every from-scratch bot's file by the time it's saved — this function
+    only handles the import mechanics, build_entry() below reads those
+    attributes exactly like it does for a templates/*.py module.
+
+    Deliberately UNCACHED, unlike _load_template_module_async's
+    _template_module_cache: templates/*.py only changes via a git deploy
+    (safe to cache for the process lifetime), but a from-scratch bot's file
+    CAN change at runtime — handlers/manage_bots.py's cb_recreate overwrites
+    the same file_path in place via improve_bot_code(). Caching by bot_id
+    would silently keep serving pre-regeneration code/router until the next
+    process restart. build_entry() only runs at registration/reload (owner
+    action), not per-update, so re-importing every time is cheap enough that
+    correctness wins over the micro-optimization.
+
+    Module name includes bot_id so a from-scratch bot can never collide with
+    a real templates.* module of the same filename stem."""
+    loop = asyncio.get_running_loop()
+
+    def _import() -> ModuleType:
+        module_name = f"_generated_bot_{bot_id}_{_GENERATED_BOT_MODULE_NAME_RE.sub('_', Path(file_path).stem)}"
+        spec = importlib.util.spec_from_file_location(module_name, file_path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"could not build an import spec for {file_path!r}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    try:
+        return await loop.run_in_executor(None, _import)
+    except Exception:
+        logger.exception(
+            f"_load_generated_bot_module_async: failed to import bot_id={bot_id} from {file_path!r}"
+        )
+        return None
+
+
 _feature_module_cache: dict[str, ModuleType] = {}
 
 
@@ -247,6 +298,19 @@ def get_template_router(template_id: str) -> Router | None:
     if router is None:
         return None
     return _clone_router(router)
+
+
+def get_template_reminders_config(template_id: str) -> dict[str, Any] | None:
+    """Returns template_id's own module-level `reminders_config` dict (see
+    features/reminders.py's module docstring for the shape), or None if the
+    template doesn't declare one. Same load-once-per-process caching as
+    get_template_router() above, via _load_template_module — this is a
+    plain dict, not a Router, so no cloning is needed (nothing here is
+    mutated per-bot)."""
+    module = _load_template_module(template_id)
+    if module is None:
+        return None
+    return getattr(module, "reminders_config", None)
 
 
 class ConfigMiddleware(BaseMiddleware):
@@ -583,6 +647,7 @@ async def build_entry(
     token: str,
     template_id: str | None,
     config: dict[str, Any] | None = None,
+    file_path: str | None = None,
 ) -> BotEntry:
     """Build one BotEntry: a Bot + a fresh Dispatcher wired to the shared template
     Router (if the template is known) and the config middleware.
@@ -598,7 +663,21 @@ async def build_entry(
     it logs a WARNING (loud, visible in Deploy Logs) and falls back to the
     generic ConfigMiddleware with no router. Previously this was a silent
     partial registration with no log at all — the bot would sit in the
-    registry answering nothing, and nobody would know why."""
+    registry answering nothing, and nobody would know why.
+
+    `file_path` (optional): for a from-scratch generated bot (no `# TEMPLATE:`
+    marker, template_id is None), this is the bot's own .py file under
+    data/generated_bots/. See docs/OFFICE_HOOK_FROM_SCRATCH_BOTS.md — such
+    files are appended with config_from_bot_row/ConfigMiddleware/
+    on_office_event by services.claude_service.append_from_scratch_registry_
+    wiring at generation time, so importing them directly here (instead of
+    via the templates.<id> namespace) gives them the SAME module-based
+    office-hook wiring path template-based bots already get below — no
+    separate code path needed. Deliberately still attempted even when
+    template_id is set (mutually exclusive in practice: a bot resolves to
+    EITHER a template marker OR a from-scratch file, never both) only as a
+    fallback if the template path failed to resolve, since a from-scratch bot
+    always has a file_path but never a template_id."""
     config = dict(config or {})
     config.setdefault("bot_id", bot_id)
 
@@ -606,12 +685,26 @@ async def build_entry(
     dp = Dispatcher(storage=MemoryStorage())
 
     module = await _load_template_module_async(template_id) if template_id else None
+    if module is None and file_path:
+        module = await _load_generated_bot_module_async(bot_id, file_path)
     if template_id and module is None:
         logger.warning(
             f"build_entry: bot_id={bot_id} has template_id={template_id!r} that does not "
             "match any templates/*.py module — registering with generic middleware and "
             "NO router; this bot will not respond to any update until its template_id is "
             "fixed or a matching template is added"
+        )
+    elif not template_id and module is None and file_path:
+        # From-scratch bot (no `# TEMPLATE:` marker) whose own file failed to
+        # import directly — _load_generated_bot_module_async already logged
+        # the full exception; this WARNING is the bot_id-contextualized
+        # summary callers get (same split as _load_template_module_async's
+        # own exception logging vs this function's warnings).
+        logger.warning(
+            f"build_entry: bot_id={bot_id} is a from-scratch bot (file_path={file_path!r}) "
+            "that failed to import directly — registering with generic middleware and NO "
+            "router; this bot will not respond to any update until the file's syntax/imports "
+            "are fixed"
         )
 
     typed_config = None
@@ -675,17 +768,17 @@ async def build_entry(
             register_office_event_hook(config, _office_event_hook)
         elif typed_config is not None:
             # docs/OFFICES_DESIGN.md §11 — the universal fallback: a
-            # TEMPLATE-resolved bot (module is not None, so it has a real
-            # db_path via typed_config) with NO hand-written on_office_event
-            # still gets wired to features/office_events.py's
-            # generic_on_office_event(), driven by this bot's own
-            # bot_office_hook_config row (may be None — generic_on_office_event
-            # degrades to a plain fallback note in that case, never raises).
-            # Scoped to template-based bots only (typed_config requires a
-            # resolved module with config_from_bot_row) — fully from-scratch
-            # generated bots (no `# TEMPLATE:` marker, module is None) are out
-            # of scope for this iteration, see docs/OFFICES_DESIGN.md §11's
-            # "Custom-бот scope" decision.
+            # resolved bot (module is not None, so it has a real db_path via
+            # typed_config) with NO hand-written on_office_event still gets
+            # wired to features/office_events.py's generic_on_office_event(),
+            # driven by this bot's own bot_office_hook_config row (may be
+            # None — generic_on_office_event degrades to a plain fallback
+            # note in that case, never raises). Covers template-based bots
+            # AND from-scratch bots whose appended wiring (see
+            # append_from_scratch_registry_wiring) didn't define
+            # on_office_event for some reason — in practice the appended
+            # wiring always defines it, so from-scratch bots normally hit
+            # the branch above instead, not this one.
             from db.database import get_bot_office_hook_config
             from features.office_events import generic_on_office_event, register_office_event_hook
 
@@ -757,7 +850,9 @@ class Registry:
         try:
             template_id = infer_template_id(bot_row.get("file_path"))
             config = _config_from_row(bot_row)
-            entry = await build_entry(bot_row["id"], bot_row["token"], template_id, config)
+            entry = await build_entry(
+                bot_row["id"], bot_row["token"], template_id, config, file_path=bot_row.get("file_path")
+            )
         except Exception:
             logger.exception(
                 f"add_or_replace: bot id={bot_row.get('id')} template={template_id!r} "
@@ -811,7 +906,9 @@ class Registry:
             try:
                 template_id = infer_template_id(b.get("file_path"))
                 config = _config_from_row(b)
-                new_entries[b["id"]] = await build_entry(b["id"], b["token"], template_id, config)
+                new_entries[b["id"]] = await build_entry(
+                    b["id"], b["token"], template_id, config, file_path=b.get("file_path")
+                )
             except Exception:
                 logger.exception(
                     f"reload_all: skipping bot id={b.get('id')} template={template_id!r} "
