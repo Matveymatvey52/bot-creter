@@ -127,6 +127,33 @@ if __name__ == "__main__":
         broken = "x = 1\n"
         self.assertEqual(claude_service.append_from_scratch_registry_wiring(broken), broken)
 
+    def test_partial_wiring_from_an_llm_rewrite_gets_completed_not_skipped(self):
+        # Regression: an LLM improve/fix pass (cb_recreate's improve_bot_code,
+        # or _apply_fix) has no knowledge of this appended boilerplate and can
+        # keep config_from_bot_row while dropping ConfigMiddleware/
+        # on_office_event when it rewrites the whole file. The old
+        # _needs_from_scratch_wiring only checked config_from_bot_row's
+        # presence, so this case was silently treated as "already wired" —
+        # the bot then crashed at registration (module.ConfigMiddleware
+        # AttributeError) instead of getting the missing pieces re-appended.
+        import ast
+
+        wired = claude_service.append_from_scratch_registry_wiring(_FROM_SCRATCH_BOT_SOURCE)
+        # Simulate an LLM rewrite that kept config_from_bot_row but dropped
+        # the other two exports (delete everything from "class ConfigMiddleware"
+        # through the on_office_event function).
+        cut_start = wired.index("class ConfigMiddleware(")
+        cut_end = wired.index('if __name__ ==')
+        partially_stripped = wired[:cut_start] + wired[cut_end:]
+        self.assertIn("def config_from_bot_row(", partially_stripped)
+        self.assertNotIn("class ConfigMiddleware(", partially_stripped)
+        self.assertNotIn("async def on_office_event(", partially_stripped)
+
+        rewired = claude_service.append_from_scratch_registry_wiring(partially_stripped)
+        ast.parse(rewired)
+        self.assertIn("class ConfigMiddleware(", rewired)
+        self.assertIn("async def on_office_event(", rewired)
+
 
 class BuildEntryResolvesFromScratchBotsByFilePath(unittest.IsolatedAsyncioTestCase):
     """Layer 2 + 3 — build_entry() with template_id=None + file_path, through
