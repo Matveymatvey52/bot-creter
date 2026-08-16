@@ -7,6 +7,7 @@ import { ListScreen } from './screens/ListScreen'
 import { DetailScreen } from './screens/DetailScreen'
 import { CreateFormScreen } from './screens/CreateFormScreen'
 import { FactoryDashboardScreen } from './screens/FactoryDashboardScreen'
+import { AnalyticsScreen } from './screens/AnalyticsScreen'
 
 // bot_id=0 is the reserved FACTORY_BOT_ID (runtime/registry.py) — the
 // factory's own /app command opens /app/0, which has no per-bot
@@ -21,6 +22,7 @@ type Route =
   | { kind: 'list'; resource: string }
   | { kind: 'detail'; resource: string; itemId: number }
   | { kind: 'create'; resource: string }
+  | { kind: 'analytics' }
 
 export default function App() {
   // Telegram's own bootstrap sequence — no-op outside the WebView (see
@@ -55,7 +57,15 @@ function TenantApp() {
         const normalized = normalizeResources(data.resources)
         setResources(normalized)
         const firstName = Object.keys(normalized)[0]
-        setRoute(firstName ? { kind: 'list', resource: firstName } : null)
+        // A bot can have office_hook_config (analytics available) with NO
+        // exposed CRUD resources at all — miniapp_config/office_hook_config
+        // are independently configured (see runtime/miniapp_api.py's
+        // serve_app_shell docstring on that same orthogonality). Falling
+        // back to `null` here used to strand the UI on "Загрузка…" forever
+        // (no resource tab to land on, and the analytics tab itself only
+        // renders once `route` is non-null) — landing on the analytics
+        // route instead keeps the app usable for exactly that bot shape.
+        setRoute(firstName ? { kind: 'list', resource: firstName } : { kind: 'analytics' })
       })
       .catch((err) => {
         if (cancelled) return
@@ -77,14 +87,14 @@ function TenantApp() {
 
   return (
     <div>
-      {route.kind !== 'list' ? null : (
+      {(route.kind === 'list' || route.kind === 'analytics') && (
         <div className="chip-row" style={{ padding: '16px 16px 0' }}>
           {resourceNames.map((name) => (
             <button
               key={name}
               className="chip"
               style={
-                name === route.resource
+                route.kind === 'list' && name === route.resource
                   ? { background: 'var(--accent)', color: 'var(--accent-text)' }
                   : undefined
               }
@@ -93,6 +103,19 @@ function TenantApp() {
               {resources[name].title}
             </button>
           ))}
+          {/* Always rendered — analytics_handler is the one that decides per-
+              bot/per-viewer availability (owner-only, needs office_hook_config);
+              AnalyticsScreen renders nothing (returns null) when it 403s/404s,
+              so a non-owner or unsupported bot just sees an inert tab that
+              opens an empty screen rather than a tab that's conspicuously
+              missing (which would itself leak "you're not the owner"). */}
+          <button
+            className="chip"
+            style={route.kind === 'analytics' ? { background: 'var(--accent)', color: 'var(--accent-text)' } : undefined}
+            onClick={() => setRoute({ kind: 'analytics' })}
+          >
+            Аналитика
+          </button>
         </div>
       )}
 
@@ -119,6 +142,8 @@ function TenantApp() {
           onCancel={() => setRoute({ kind: 'list', resource: route.resource })}
         />
       )}
+
+      {route.kind === 'analytics' && <AnalyticsScreen />}
     </div>
   )
 }

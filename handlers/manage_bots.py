@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import html
+import json
 import logging
 import os
 import re
@@ -19,6 +20,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from config import ASSEMBLYAI_API_KEY
 from db.database import (
     add_office_link,
+    add_template_candidate,
     delete_bot,
     disable_bot_feature,
     enable_bot_feature,
@@ -28,13 +30,19 @@ from db.database import (
     get_bot_features,
     get_bot_payment_provider,
     get_bot_sheets_config,
+    get_bot_yookassa_credentials,
+    get_bot_yookassa_status_cache,
     get_office_links_for_bot,
+    get_owner_payment_credentials,
     remove_office_link,
     set_bot_miniapp_config,
     set_bot_office_hook_config,
     set_bot_payment_provider,
     set_bot_sheets_config,
     set_bot_voice_cashflow_config,
+    set_bot_yookassa_credentials,
+    set_bot_yookassa_status_cache,
+    set_owner_payment_credentials,
     update_bot_status,
     update_bot_username,
 )
@@ -53,6 +61,7 @@ from services.claude_service import (
 )
 from services.github_sync import push_bot_to_github
 from services.voice_service import transcribe_voice
+from services.yookassa_api import YooKassaAuthError, fetch_shop_info
 
 
 logger = logging.getLogger(__name__)
@@ -86,6 +95,8 @@ class SheetsConnectFlow(StatesGroup):
 class PaymentConnectFlow(StatesGroup):
     browsing_step = State()
     waiting_for_token = State()
+    waiting_for_shop_id = State()
+    waiting_for_secret_key = State()
 
 router = Router()
 
@@ -359,7 +370,11 @@ async def cb_info(callback: CallbackQuery):
 
 
 def _features_keyboard(
-    bot_id: int, compatible: list[dict], enabled: set[str], sheets_config: dict | None = None
+    bot_id: int,
+    compatible: list[dict],
+    enabled: set[str],
+    sheets_config: dict | None = None,
+    has_yookassa_creds: bool = False,
 ) -> InlineKeyboardMarkup:
     rows = []
     for feature in compatible:
@@ -374,6 +389,10 @@ def _features_keyboard(
             rows.append([
                 InlineKeyboardButton(text="💳 Как подключить оплату", callback_data=f"paystart:{bot_id}")
             ])
+            if has_yookassa_creds:
+                rows.append([
+                    InlineKeyboardButton(text="🔄 Проверить статус ЮKassa", callback_data=f"paycheck:{bot_id}")
+                ])
         if name == "sheets" and name in enabled:
             label = "📊 Подключить Google Таблицу"
             if sheets_config:
@@ -416,33 +435,39 @@ async def disable_feature_and_reload(bot_id: int, feature_name: str) -> None:
 
 async def _compatible_features(template_id: str | None, bot_id: int | None = None) -> list[dict]:
     """Features whose # COMPATIBLE_WITH: header explicitly lists this bot's
-    template_id — never "all" (see runtime/registry.py's discover_features()),
-    so a bot with an unrecognized/missing template_id has none from the
+    template_id — never a blanket "all" for ordinary features (see
+    runtime/registry.py's discover_features()), so a bot with an
+    unrecognized/missing template_id simply has none of those from the
     static header check alone.
 
-    For a from-scratch bot (template_id is None — no `# TEMPLATE:` marker,
-    infer_template_id() can never resolve one), that static check would
-    ALWAYS return empty: no feature's COMPATIBLE_WITH header can ever
-    contain the literal None, by design (adding a 13th template must never
-    silently make it compatible with everything — see discover_features()'s
-    own docstring). Compatibility for a from-scratch bot is inherently
-    per-instance (it depends on that specific bot's own generated tables,
-    not a fixed template), so there's no static list to check against at
-    all — instead, a feature already ENABLED for this specific bot_id is
-    always shown as compatible, so the owner can see and toggle off
-    whatever services/claude_service.py's generation step auto-enabled for
-    them (see handlers/create_bot.py's _apply_voice_cashflow_config). A
-    from-scratch bot with bot_id=None (caller has no bot row yet) or no
-    enabled features simply sees none, same as before this fix — this does
-    NOT let the owner discover and enable a NEW feature for a from-scratch
-    bot from scratch, only see/manage ones already turned on for it."""
+    Two independent ways a feature can still show up for a from-scratch bot
+    (template_id is None — no `# TEMPLATE:` marker, infer_template_id() can
+    never resolve one):
+
+    1. "*" — a feature module opts into it only when it is PROVABLY
+       template-agnostic (see features/notifications.py's header comment):
+       the same feature works identically for every bot regardless of
+       template or from-scratch origin, so it's always safe to offer.
+    2. Already ENABLED for this specific bot_id — for a feature like
+       voice_intake/cashflow_ledger that is NOT universally compatible (it
+       needs a schema specific to that bot's own generated tables) but was
+       still auto-enabled for THIS particular from-scratch bot instance by
+       services/claude_service.py's generation step (see
+       handlers/create_bot.py's _apply_voice_cashflow_config) — the owner
+       can see and toggle off what was auto-enabled for them, without this
+       ever letting them discover and enable a NEW non-"*" feature for a
+       from-scratch bot that wasn't already turned on for it.
+
+    A from-scratch bot with bot_id=None (caller has no bot row yet) only
+    ever sees "*" features, never per-instance-enabled ones."""
     features = discover_features()
-    if template_id is not None:
-        return [f for f in features if template_id in f["compatible_with"]]
-    if bot_id is None:
-        return []
+    compatible = [f for f in features if template_id in f["compatible_with"] or "*" in f["compatible_with"]]
+    if template_id is not None or bot_id is None:
+        return compatible
     enabled = set(await get_bot_features(bot_id))
-    return [f for f in features if f["name"] in enabled]
+    already_shown = {f["name"] for f in compatible}
+    compatible += [f for f in features if f["name"] in enabled and f["name"] not in already_shown]
+    return compatible
 
 
 @router.callback_query(F.data.startswith("features:"))
@@ -460,6 +485,7 @@ async def cb_features_list(callback: CallbackQuery):
     compatible = await _compatible_features(template_id, bot_id)
     enabled = set(await get_bot_features(bot_id))
     sheets_config = await get_bot_sheets_config(bot_id) if "sheets" in enabled else None
+    has_yookassa_creds = bool(await get_bot_yookassa_credentials(bot_id)) if "payments" in enabled else False
     text = "🧩 <b>Фичи для этого бота</b> — нажми, чтобы включить/выключить:"
     if not compatible:
         text = "🧩 Для этого бота пока нет доступных фич."
@@ -467,7 +493,7 @@ async def cb_features_list(callback: CallbackQuery):
         callback,
         text,
         parse_mode="HTML",
-        reply_markup=_features_keyboard(bot_id, compatible, enabled, sheets_config),
+        reply_markup=_features_keyboard(bot_id, compatible, enabled, sheets_config, has_yookassa_creds),
     )
 
 
@@ -494,13 +520,16 @@ async def cb_toggle_feature(callback: CallbackQuery):
             return
         enabled = set(await get_bot_features(bot_id))
         is_enabled = feature_name in enabled
-        # For a from-scratch bot (template_id is None), _compatible_features
-        # only ever returns already-ENABLED features (see its own docstring)
-        # — so "not is_enabled" here is only reachable for a template-based
-        # bot, where the static COMPATIBLE_WITH check below is meaningful.
-        # Turning an already-enabled from-scratch feature back OFF is always
-        # allowed (is_enabled short-circuits the check).
-        if not is_enabled and template_id not in feature["compatible_with"]:
+        # For a from-scratch bot (template_id is None) turning ON a
+        # non-"*" feature, _compatible_features only ever offers
+        # already-ENABLED features (see its own docstring) — so
+        # "not is_enabled" reaching this check for such a feature would mean
+        # the owner somehow got a togglefeature: callback for a feature the
+        # keyboard never actually showed them; the static COMPATIBLE_WITH/"*"
+        # check below still guards that case defensively. Turning an
+        # already-enabled from-scratch feature back OFF is always allowed
+        # (is_enabled short-circuits the check).
+        if not is_enabled and template_id not in feature["compatible_with"] and "*" not in feature["compatible_with"]:
             await callback.answer("⛔ Эта фича не подходит шаблону этого бота.", show_alert=True)
             return
         if is_enabled:
@@ -511,11 +540,14 @@ async def cb_toggle_feature(callback: CallbackQuery):
         compatible = await _compatible_features(template_id, bot_id)
         new_enabled = set(await get_bot_features(bot_id))
         new_sheets_config = await get_bot_sheets_config(bot_id) if "sheets" in new_enabled else None
+        new_has_yookassa_creds = (
+            bool(await get_bot_yookassa_credentials(bot_id)) if "payments" in new_enabled else False
+        )
         await _edit_or_resend(
             callback,
             "🧩 <b>Фичи для этого бота</b> — нажми, чтобы включить/выключить:",
             parse_mode="HTML",
-            reply_markup=_features_keyboard(bot_id, compatible, new_enabled, new_sheets_config),
+            reply_markup=_features_keyboard(bot_id, compatible, new_enabled, new_sheets_config, new_has_yookassa_creds),
         )
     finally:
         _busy_bots.discard(bot_id)
@@ -705,10 +737,11 @@ async def _back_to_features_panel(bot_id: int, edit_target) -> None:
     compatible = await _compatible_features(template_id)
     enabled = set(await get_bot_features(bot_id))
     sheets_config = await get_bot_sheets_config(bot_id) if "sheets" in enabled else None
+    has_yookassa_creds = bool(await get_bot_yookassa_credentials(bot_id)) if "payments" in enabled else False
     await edit_target.answer(
         "🧩 <b>Фичи для этого бота</b> — нажми, чтобы включить/выключить:",
         parse_mode="HTML",
-        reply_markup=_features_keyboard(bot_id, compatible, enabled, sheets_config),
+        reply_markup=_features_keyboard(bot_id, compatible, enabled, sheets_config, has_yookassa_creds),
     )
 
 
@@ -979,11 +1012,40 @@ async def msg_payment_connect_token(message: Message, state: FSMContext):
             await message.answer("Бот не найден.")
             return
         await set_bot_payment_provider(bot_id, token)
-        await state.clear()
-        await message.answer("✅ Платёжный провайдер подключён. Бот теперь может принимать оплату.")
-        await _back_to_features_panel(bot_id, message)
     finally:
         _busy_bots.discard(bot_id)
+
+    # Step 5 (optional): if the owner already has shop_id/secret_key on file from a
+    # previous bot, offer to reuse them straight away instead of re-asking — this is
+    # the "(б) переиспользование" half of the improvement; the actual provider_token
+    # above still had to go through BotFather manually, no way around that.
+    owner_creds = await get_owner_payment_credentials(message.from_user.id)
+    await state.set_state(PaymentConnectFlow.waiting_for_shop_id)
+    await state.update_data(bot_id=bot_id)
+    if owner_creds:
+        shop_id, _ = owner_creds
+        await message.answer(
+            "✅ Платёжный провайдер подключён. Бот теперь может принимать оплату.\n\n"
+            f"💳 У тебя уже есть сохранённые данные ЮKassa (shopId <code>{html.escape(shop_id)}</code>). "
+            "Использовать их для этого бота тоже, или ввести другие?",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="✅ Использовать те же", callback_data=f"payreuse:{bot_id}")],
+                [InlineKeyboardButton(text="✏️ Ввести другие", callback_data=f"payownnew:{bot_id}")],
+                [InlineKeyboardButton(text="⏭ Пропустить", callback_data=f"payskip:{bot_id}")],
+            ]),
+        )
+        return
+    await message.answer(
+        "✅ Платёжный провайдер подключён. Бот теперь может принимать оплату.\n\n"
+        "💳 Хочешь, чтобы бот сам подтянул детали магазина (методы оплаты, тестовый/боевой "
+        "режим) через API ЮKassa? Пришли <b>shopId</b> магазина (числовой ID из личного "
+        "кабинета ЮKassa, раздел Интеграция → API), либо нажми «Пропустить».",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⏭ Пропустить", callback_data=f"payskip:{bot_id}")],
+        ]),
+    )
 
 
 @router.message(PaymentConnectFlow.waiting_for_token)
@@ -991,6 +1053,281 @@ async def msg_payment_connect_invalid(message: Message) -> None:
     if not _is_owner(message.from_user.id):
         return
     await message.answer("Пришли токен от @YooKassaBot текстом, либо нажми ❌ Отмена.")
+
+
+# ── step 5/6: optional ЮKassa API credentials (shopId + secret key) ─────────
+# Separate from provider_token above — see services/yookassa_api.py. Purely
+# additive: skipping this leaves payments fully working exactly as before,
+# it only unlocks the auto-fetched-details and status-check conveniences.
+
+@router.callback_query(F.data.startswith("payskip:"))
+async def cb_payment_details_skip(callback: CallbackQuery, state: FSMContext):
+    if not _is_owner(callback.from_user.id):
+        await _deny_callback(callback)
+        return
+    await callback.answer()
+    bot_id = int(callback.data.split(":")[1])
+    await state.clear()
+    await _back_to_features_panel(bot_id, callback.message)
+
+
+@router.callback_query(F.data.startswith("payownnew:"))
+async def cb_payment_details_own_new(callback: CallbackQuery, state: FSMContext):
+    if not _is_owner(callback.from_user.id):
+        await _deny_callback(callback)
+        return
+    await callback.answer()
+    bot_id = int(callback.data.split(":")[1])
+    await state.set_state(PaymentConnectFlow.waiting_for_shop_id)
+    await state.update_data(bot_id=bot_id)
+    await callback.message.answer(
+        "Пришли <b>shopId</b> магазина (числовой ID из личного кабинета ЮKassa, "
+        "раздел Интеграция → API).",
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data.startswith("payreuse:"))
+async def cb_payment_details_reuse(callback: CallbackQuery, state: FSMContext):
+    if not _is_owner(callback.from_user.id):
+        await _deny_callback(callback)
+        return
+    await callback.answer()
+    bot_id = int(callback.data.split(":")[1])
+    if bot_id not in _busy_bots:
+        _busy_bots.add(bot_id)
+        try:
+            if not await get_bot(bot_id):
+                await state.clear()
+                await callback.message.answer("Бот не найден.")
+                return
+            owner_creds = await get_owner_payment_credentials(callback.from_user.id)
+            if not owner_creds:
+                await callback.message.answer("Сохранённые данные не найдены, введи shopId заново.")
+                await state.set_state(PaymentConnectFlow.waiting_for_shop_id)
+                await state.update_data(bot_id=bot_id)
+                return
+            shop_id, secret_key = owner_creds
+            await _apply_yookassa_credentials(callback.message, bot_id, shop_id, secret_key)
+        finally:
+            _busy_bots.discard(bot_id)
+    await state.clear()
+    await _offer_multi_bot_connect(callback.message, bot_id)
+
+
+@router.message(PaymentConnectFlow.waiting_for_shop_id, F.text, ~F.text.startswith("/"))
+async def msg_payment_shop_id(message: Message, state: FSMContext):
+    if not _is_owner(message.from_user.id):
+        return
+    data = await state.get_data()
+    bot_id = data.get("bot_id")
+    if bot_id is None:
+        await state.clear()
+        return
+    shop_id = message.text.strip()
+    if not shop_id.isdigit():
+        await message.answer("⚠️ shopId — это число. Проверь в личном кабинете ЮKassa (Интеграция → API) и пришли ещё раз.")
+        return
+    await state.update_data(bot_id=bot_id, shop_id=shop_id)
+    await state.set_state(PaymentConnectFlow.waiting_for_secret_key)
+    await message.answer(
+        "Теперь пришли <b>secret key</b> (тоже из раздела Интеграция → API — "
+        "строка вида <code>live_AbCdEf...</code> или <code>test_AbCdEf...</code>).",
+        parse_mode="HTML",
+    )
+
+
+@router.message(PaymentConnectFlow.waiting_for_shop_id)
+async def msg_payment_shop_id_invalid(message: Message) -> None:
+    if not _is_owner(message.from_user.id):
+        return
+    await message.answer("Пришли shopId текстом (число), либо нажми ❌ Отмена.")
+
+
+@router.message(PaymentConnectFlow.waiting_for_secret_key, F.text, ~F.text.startswith("/"))
+async def msg_payment_secret_key(message: Message, state: FSMContext):
+    if not _is_owner(message.from_user.id):
+        return
+    data = await state.get_data()
+    bot_id = data.get("bot_id")
+    shop_id = data.get("shop_id")
+    if bot_id is None or shop_id is None:
+        await state.clear()
+        return
+    secret_key = message.text.strip()
+    if bot_id in _busy_bots:
+        await message.answer(_BUSY_TEXT)
+        return
+    _busy_bots.add(bot_id)
+    try:
+        if not await get_bot(bot_id):
+            await state.clear()
+            await message.answer("Бот не найден.")
+            return
+        await _apply_yookassa_credentials(message, bot_id, shop_id, secret_key)
+    finally:
+        _busy_bots.discard(bot_id)
+    await state.clear()
+    await _offer_multi_bot_connect(message, bot_id)
+
+
+@router.message(PaymentConnectFlow.waiting_for_secret_key)
+async def msg_payment_secret_key_invalid(message: Message) -> None:
+    if not _is_owner(message.from_user.id):
+        return
+    await message.answer("Пришли secret key текстом, либо нажми ❌ Отмена.")
+
+
+async def _apply_yookassa_credentials(present: Message, bot_id: int, shop_id: str, secret_key: str) -> None:
+    """Calls GET /me, saves shop_id/secret_key for this bot AND as the owner's reusable
+    default, caches the status/payment_methods snapshot. Any failure here (bad
+    credentials, network error) is reported but doesn't roll back provider_token —
+    payments already work without this, it's purely the auto-fetched-details layer."""
+    try:
+        info = await fetch_shop_info(shop_id, secret_key)
+    except YooKassaAuthError:
+        await present.answer(
+            "⚠️ ЮKassa не приняла shopId/secret key — проверь их в личном кабинете и "
+            "подключи детали позже через «Проверить статус» в панели фич."
+        )
+        return
+    except Exception:
+        logger.exception(f"_apply_yookassa_credentials: GET /me failed for bot_id={bot_id}")
+        await present.answer(
+            "⚠️ Не удалось связаться с ЮKassa (сеть/сервис недоступен). Данные не сохранены — "
+            "попробуй ещё раз позже через «Проверить статус» в панели фич."
+        )
+        return
+
+    await set_bot_yookassa_credentials(bot_id, shop_id, secret_key)
+    await set_owner_payment_credentials(present.from_user.id, shop_id, secret_key)
+    await set_bot_yookassa_status_cache(bot_id, str(info.get("status", "unknown")), json.dumps(info.get("payment_methods", [])))
+    await present.answer(_format_shop_info(info), parse_mode="HTML")
+
+
+def _format_shop_info(info: dict) -> str:
+    status = info.get("status", "unknown")
+    mode = "🧪 тестовый режим" if info.get("test") else "🔴 боевой режим (реальные платежи)"
+    methods = info.get("payment_methods") or []
+    methods_line = ", ".join(str(m) for m in methods) if methods else "не указаны"
+    status_emoji = "✅" if status == "enabled" else "⚠️"
+    return (
+        f"{status_emoji} Магазин ЮKassa подключён к API.\n"
+        f"Статус аккаунта: <code>{html.escape(status)}</code>\n"
+        f"Режим: {mode}\n"
+        f"Доступные методы оплаты: {html.escape(methods_line)}"
+    )
+
+
+async def _offer_multi_bot_connect(present: Message, bot_id: int) -> None:
+    """(б) Мульти-бот привязка: lists the owner's OTHER bots that don't have a
+    provider_token yet and offers a per-bot copy-paste BotFather block. Telegram's
+    Bot API has no way to set provider_token programmatically (see the module-level
+    comment above PaymentConnectFlow's wizard) — this only removes the friction of
+    re-typing shop_id/secret_key from memory for every bot's BotFather trip."""
+    all_bots = await get_all_bots()
+    candidates = []
+    for b in all_bots:
+        if b["id"] == bot_id:
+            continue
+        if await get_bot_payment_provider(b["id"]):
+            continue
+        candidates.append(b)
+    if not candidates:
+        return
+    rows = [
+        [InlineKeyboardButton(text=b.get("display_name") or b["name"], callback_data=f"paymulti:{bot_id}:{b['id']}")]
+        for b in candidates[:20]
+    ]
+    rows.append([InlineKeyboardButton(text="Не сейчас", callback_data=f"paymultiskip:{bot_id}")])
+    await present.answer(
+        "🔗 Подключить эту же оплату к другим твоим ботам?\n\n"
+        "Провести токен через BotFather всё равно придётся для каждого бота отдельно "
+        "(Telegram этого не автоматизирует), но я подготовлю тебе готовый блок с уже "
+        "подставленными shopId и secret key — не нужно искать их заново.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+@router.callback_query(F.data.startswith("paymultiskip:"))
+async def cb_payment_multi_skip(callback: CallbackQuery):
+    if not _is_owner(callback.from_user.id):
+        await _deny_callback(callback)
+        return
+    await callback.answer()
+    await callback.message.edit_reply_markup(reply_markup=None)
+
+
+@router.callback_query(F.data.startswith("paymulti:"))
+async def cb_payment_multi_connect(callback: CallbackQuery):
+    if not _is_owner(callback.from_user.id):
+        await _deny_callback(callback)
+        return
+    await callback.answer()
+    _, _source_bot_id_str, target_bot_id_str = callback.data.split(":", 2)
+    target_bot_id = int(target_bot_id_str)
+    target_bot = await get_bot(target_bot_id)
+    if not target_bot:
+        await callback.message.answer("Бот не найден.")
+        return
+    owner_creds = await get_owner_payment_credentials(callback.from_user.id)
+    if not owner_creds:
+        await callback.message.answer("Сохранённые данные ЮKassa не найдены.")
+        return
+    shop_id, secret_key = owner_creds
+    bot_label = html.escape(target_bot.get("display_name") or target_bot["name"])
+    await callback.message.answer(
+        f"💳 Подключение оплаты к боту «{bot_label}»\n\n"
+        "1️⃣ Открой @BotFather → <code>/mybots</code> → выбери этого бота → "
+        "<b>Bot Settings</b> → <b>Payments</b> → <b>YooKassa</b>.\n"
+        "2️⃣ В открывшемся чате с @YooKassaBot введи:\n\n"
+        f"shopId: <code>{html.escape(shop_id)}</code>\n"
+        f"secret key: <code>{html.escape(secret_key)}</code>\n\n"
+        "3️⃣ @YooKassaBot пришлёт токен вида <code>381764678:LIVE:...</code> — скопируй "
+        "его и вернись в панель фич этого бота, чтобы вставить через «Подключить оплату».",
+        parse_mode="HTML",
+    )
+
+
+# ── (в) статус готовности магазина ───────────────────────────────────────────
+
+def _format_status_line(cache: dict | None) -> str:
+    if not cache:
+        return "Статус ещё не проверялся."
+    status = cache.get("last_status") or "unknown"
+    checked_at = cache.get("last_checked_at") or "—"
+    status_emoji = "✅" if status == "enabled" else "⚠️"
+    return f"{status_emoji} Статус: <code>{html.escape(status)}</code> (проверено: {checked_at})"
+
+
+@router.callback_query(F.data.startswith("paycheck:"))
+async def cb_payment_check_status(callback: CallbackQuery):
+    """'Проверить статус' button — re-runs GET /me on demand using the bot's saved
+    shop_id/secret_key and reports whether the shop is ready to accept payments."""
+    if not _is_owner(callback.from_user.id):
+        await _deny_callback(callback)
+        return
+    await callback.answer()
+    bot_id = int(callback.data.split(":")[1])
+    creds = await get_bot_yookassa_credentials(bot_id)
+    if not creds:
+        await callback.message.answer(
+            "⚠️ Для этого бота не сохранены shopId/secret key ЮKassa — подключи их через "
+            "мастер оплаты (⚙️ Подключить оплату), чтобы включить автопроверку статуса."
+        )
+        return
+    shop_id, secret_key = creds
+    try:
+        info = await fetch_shop_info(shop_id, secret_key)
+    except YooKassaAuthError:
+        await callback.message.answer("⚠️ ЮKassa отклонила сохранённые shopId/secret key — данные могли устареть.")
+        return
+    except Exception:
+        logger.exception(f"cb_payment_check_status: GET /me failed for bot_id={bot_id}")
+        await callback.message.answer("⚠️ Не удалось связаться с ЮKassa. Попробуй ещё раз чуть позже.")
+        return
+    await set_bot_yookassa_status_cache(bot_id, str(info.get("status", "unknown")), json.dumps(info.get("payment_methods", [])))
+    await callback.message.answer(_format_shop_info(info), parse_mode="HTML")
 
 
 @router.callback_query(F.data.startswith("start:"))
@@ -1184,10 +1521,11 @@ async def cb_recreate(callback: CallbackQuery):
         miniapp_config: dict | None = None
         office_hook_config: dict | None = None
         voice_cashflow_config: dict | None = None
+        fallback_info: dict | None = None
         try:
             result = await asyncio.wait_for(task, timeout=240.0)
             if regenerating_from_scratch:
-                code, miniapp_config, office_hook_config, voice_cashflow_config = result
+                code, miniapp_config, office_hook_config, voice_cashflow_config, fallback_info = result
             else:
                 code = result
         except Exception as e:
@@ -1225,6 +1563,15 @@ async def cb_recreate(callback: CallbackQuery):
                 await enable_bot_feature(bot_id, "voice_intake")
             if voice_cashflow_config.get("cashflow_ledger"):
                 await enable_bot_feature(bot_id, "cashflow_ledger")
+        if fallback_info:
+            await add_template_candidate(
+                creator_user_id=callback.from_user.id,
+                summary=b.get("description", ""),
+                fallback_reason=fallback_info["reason"],
+                selected_templates=fallback_info["selected_templates"],
+                bot_name=b["name"],
+                bot_id=bot_id,
+            )
         if miniapp_config:
             await set_bot_miniapp_config(bot_id, miniapp_config)
             base_url = os.getenv("PUBLIC_BASE_URL", "").strip()

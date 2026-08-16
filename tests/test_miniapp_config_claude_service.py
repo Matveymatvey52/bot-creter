@@ -260,7 +260,7 @@ class GenerateBotCodeReturnsCodeAndMiniappConfig(unittest.IsolatedAsyncioTestCas
 
     async def test_wraps_inner_generation_and_appends_miniapp_config(self):
         with patch.object(
-            claude_service, "_generate_bot_code_inner", AsyncMock(return_value=SAMPLE_BOT_CODE)
+            claude_service, "_generate_bot_code_inner", AsyncMock(return_value=(SAMPLE_BOT_CODE, None))
         ), patch.object(
             claude_service, "_generate_miniapp_config", AsyncMock(return_value={"resources": [{"name": "orders"}]})
         ), patch.object(
@@ -268,7 +268,7 @@ class GenerateBotCodeReturnsCodeAndMiniappConfig(unittest.IsolatedAsyncioTestCas
         ), patch.object(
             claude_service, "_generate_voice_cashflow_config", AsyncMock(return_value=None)
         ):
-            code, miniapp_config, office_hook_config, voice_cashflow_config = await claude_service.generate_bot_code("an order bot")
+            code, miniapp_config, office_hook_config, voice_cashflow_config, _fallback_info = await claude_service.generate_bot_code("an order bot")
         self.assertEqual(code, SAMPLE_BOT_CODE)
         self.assertEqual(miniapp_config, {"resources": [{"name": "orders"}]})
         self.assertIsNone(office_hook_config)
@@ -276,7 +276,7 @@ class GenerateBotCodeReturnsCodeAndMiniappConfig(unittest.IsolatedAsyncioTestCas
 
     async def test_miniapp_config_none_still_returns_the_code(self):
         with patch.object(
-            claude_service, "_generate_bot_code_inner", AsyncMock(return_value=SAMPLE_BOT_CODE)
+            claude_service, "_generate_bot_code_inner", AsyncMock(return_value=(SAMPLE_BOT_CODE, None))
         ), patch.object(
             claude_service, "_generate_miniapp_config", AsyncMock(return_value=None)
         ), patch.object(
@@ -284,7 +284,7 @@ class GenerateBotCodeReturnsCodeAndMiniappConfig(unittest.IsolatedAsyncioTestCas
         ), patch.object(
             claude_service, "_generate_voice_cashflow_config", AsyncMock(return_value=None)
         ):
-            code, miniapp_config, office_hook_config, voice_cashflow_config = await claude_service.generate_bot_code("an order bot")
+            code, miniapp_config, office_hook_config, voice_cashflow_config, _fallback_info = await claude_service.generate_bot_code("an order bot")
         self.assertEqual(code, SAMPLE_BOT_CODE)
         self.assertIsNone(miniapp_config)
         self.assertIsNone(office_hook_config)
@@ -292,7 +292,7 @@ class GenerateBotCodeReturnsCodeAndMiniappConfig(unittest.IsolatedAsyncioTestCas
 
     async def test_office_hook_config_is_appended_when_generated(self):
         with patch.object(
-            claude_service, "_generate_bot_code_inner", AsyncMock(return_value=SAMPLE_BOT_CODE)
+            claude_service, "_generate_bot_code_inner", AsyncMock(return_value=(SAMPLE_BOT_CODE, None))
         ), patch.object(
             claude_service, "_generate_miniapp_config", AsyncMock(return_value=None)
         ), patch.object(
@@ -301,12 +301,12 @@ class GenerateBotCodeReturnsCodeAndMiniappConfig(unittest.IsolatedAsyncioTestCas
         ), patch.object(
             claude_service, "_generate_voice_cashflow_config", AsyncMock(return_value=None)
         ):
-            code, miniapp_config, office_hook_config, voice_cashflow_config = await claude_service.generate_bot_code("an order bot")
+            code, miniapp_config, office_hook_config, voice_cashflow_config, _fallback_info = await claude_service.generate_bot_code("an order bot")
         self.assertEqual(office_hook_config, {"table": "orders", "match_field": "user_id"})
 
     async def test_voice_cashflow_config_is_appended_when_generated(self):
         with patch.object(
-            claude_service, "_generate_bot_code_inner", AsyncMock(return_value=SAMPLE_BOT_CODE)
+            claude_service, "_generate_bot_code_inner", AsyncMock(return_value=(SAMPLE_BOT_CODE, None))
         ), patch.object(
             claude_service, "_generate_miniapp_config", AsyncMock(return_value=None)
         ), patch.object(
@@ -315,7 +315,7 @@ class GenerateBotCodeReturnsCodeAndMiniappConfig(unittest.IsolatedAsyncioTestCas
             claude_service, "_generate_voice_cashflow_config",
             AsyncMock(return_value={"voice_intake": None, "cashflow_ledger": True}),
         ):
-            code, miniapp_config, office_hook_config, voice_cashflow_config = await claude_service.generate_bot_code("an order bot")
+            code, miniapp_config, office_hook_config, voice_cashflow_config, _fallback_info = await claude_service.generate_bot_code("an order bot")
         self.assertEqual(voice_cashflow_config, {"voice_intake": None, "cashflow_ledger": True})
 
 

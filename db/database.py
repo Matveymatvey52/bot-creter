@@ -173,6 +173,39 @@ async def init_db():
                 created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        # shop_id/secret_key + a cache of the last GET /me lookup (see
+        # services/yookassa_api.py) — separate from provider_token (that
+        # stays the Telegram-side @YooKassaBot token; these are the ЮKassa
+        # merchant API credentials the owner types once so the wizard can
+        # look up payment_methods/status itself). last_status/
+        # last_payment_methods_json are a cache only, refreshed by the
+        # "Проверить статус" button/poll — never the source of truth for
+        # whether the bot can actually take payments (provider_token is).
+        for col in (
+            "shop_id TEXT",
+            "secret_key TEXT",
+            "last_status TEXT",
+            "last_payment_methods_json TEXT",
+            "last_checked_at TIMESTAMP",
+        ):
+            try:
+                await db.execute(f"ALTER TABLE bot_payment_providers ADD COLUMN {col}")
+            except aiosqlite.OperationalError:
+                pass
+        # owner_payment_credentials — the ЮKassa shop_id/secret_key entered
+        # once, reused as a suggested default when connecting payments to a
+        # later bot (owner_user_id-scoped, same pattern as userbot_sessions
+        # below). Telegram's Bot API still requires a separate manual
+        # BotFather trip per bot for provider_token — this table only
+        # removes the need to re-type shop_id/secret_key for every bot.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS owner_payment_credentials (
+                owner_user_id INTEGER PRIMARY KEY,
+                shop_id       TEXT NOT NULL,
+                secret_key    TEXT NOT NULL,
+                updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS bot_features (
                 bot_id       INTEGER NOT NULL REFERENCES bots(id),
@@ -301,6 +334,31 @@ async def init_db():
                 text                 TEXT,
                 posted_at            TEXT DEFAULT (datetime('now','localtime')),
                 summary              TEXT
+            )
+        """)
+        # template_candidates (docs/TEMPLATE_CANDIDATE_LOGGING_DESIGN.md) —
+        # one row per bot whose generation fell through to from-scratch
+        # (services/claude_service.py's generate_bot_code's fallback_info):
+        # either no template matched at all, or a matched template's
+        # customize/synthesis step produced invalid code. bot_id is nullable
+        # because the row is written from handlers/create_bot.py's
+        # auto_launch_managed_bot AFTER the bot record exists, but a failure
+        # between generation and that point must not silently lose the
+        # candidate — see add_template_candidate(). Feeds the "Кандидаты на
+        # новый шаблон" section of the /analytics factory dashboard so the
+        # owner can spot recurring from-scratch requests worth turning into a
+        # permanent template — the decision always stays manual.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS template_candidates (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                bot_id              INTEGER REFERENCES bots(id),
+                creator_user_id     INTEGER NOT NULL,
+                bot_name            TEXT,
+                summary             TEXT NOT NULL,
+                fallback_reason     TEXT NOT NULL,
+                selected_templates  TEXT,
+                bot_type            TEXT,
+                created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
         await db.commit()
@@ -470,6 +528,96 @@ async def get_bot_payment_provider(bot_id: int) -> str | None:
             return _decrypt_token(row[0]) if row else None
 
 
+async def set_bot_yookassa_credentials(bot_id: int, shop_id: str, secret_key: str) -> None:
+    """Stores this bot's ЮKassa merchant API credentials (shop_id/secret_key), separate
+    from provider_token — used by services/yookassa_api.py's GET /me lookups. Requires a
+    pre-existing bot_payment_providers row (provider_token already set); callers connect
+    the Telegram provider_token first, same order as the onboarding wizard's steps."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE bot_payment_providers SET shop_id = ?, secret_key = ? WHERE bot_id = ?",
+            (shop_id, _encrypt_token(secret_key), bot_id),
+        )
+        await db.commit()
+    logger.info(f"set_bot_yookassa_credentials: shop_id set for bot_id={bot_id}")
+
+
+async def get_bot_yookassa_credentials(bot_id: int) -> tuple[str, str] | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT shop_id, secret_key FROM bot_payment_providers WHERE bot_id = ?", (bot_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            if not row or not row[0] or not row[1]:
+                return None
+            return row[0], _decrypt_token(row[1])
+
+
+async def set_bot_yookassa_status_cache(bot_id: int, status: str, payment_methods_json: str) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            UPDATE bot_payment_providers
+            SET last_status = ?, last_payment_methods_json = ?, last_checked_at = CURRENT_TIMESTAMP
+            WHERE bot_id = ?
+            """,
+            (status, payment_methods_json, bot_id),
+        )
+        await db.commit()
+
+
+async def get_all_bot_ids_with_yookassa_credentials() -> list[int]:
+    """Bot IDs that have shop_id/secret_key on file — the periodic status-poll loop
+    (runtime/payment_status_poller.py) iterates these instead of every bot, since
+    most bots never opt into the (а)/(в) API layer."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT bot_id FROM bot_payment_providers WHERE shop_id IS NOT NULL AND secret_key IS NOT NULL"
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [row[0] for row in rows]
+
+
+async def get_bot_yookassa_status_cache(bot_id: int) -> dict | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT last_status, last_payment_methods_json, last_checked_at "
+            "FROM bot_payment_providers WHERE bot_id = ?",
+            (bot_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            if not row or not row["last_status"]:
+                return None
+            return dict(row)
+
+
+async def set_owner_payment_credentials(owner_user_id: int, shop_id: str, secret_key: str) -> None:
+    """Upserts the owner's ЮKassa shop_id/secret_key, reused as a suggested default the
+    next time they connect payments to a different bot — see docstring on
+    owner_payment_credentials in init_db()."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO owner_payment_credentials (owner_user_id, shop_id, secret_key) VALUES (?, ?, ?)
+            ON CONFLICT(owner_user_id) DO UPDATE SET
+                shop_id = excluded.shop_id, secret_key = excluded.secret_key, updated_at = CURRENT_TIMESTAMP
+            """,
+            (owner_user_id, shop_id, _encrypt_token(secret_key)),
+        )
+        await db.commit()
+
+
+async def get_owner_payment_credentials(owner_user_id: int) -> tuple[str, str] | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT shop_id, secret_key FROM owner_payment_credentials WHERE owner_user_id = ?",
+            (owner_user_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return (row[0], _decrypt_token(row[1])) if row else None
+
+
 async def enable_bot_feature(bot_id: int, feature_name: str) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
@@ -562,9 +710,12 @@ async def delete_bot_miniapp_config(bot_id: int) -> None:
 async def set_bot_office_hook_config(bot_id: int, config: dict) -> None:
     """Upserts this bot's generic office-hook config (docs/OFFICES_DESIGN.md
     §11) — 1:1 with bots.id, same ON CONFLICT pattern as
-    set_bot_miniapp_config. config is {"table": str, "match_field": str|None}
-    (see services/claude_service.py's _generate_office_hook_config for how
-    it's produced)."""
+    set_bot_miniapp_config. config is {"table": str, "match_field": str|None,
+    "created_at_field": str|None} (see services/claude_service.py's
+    _generate_office_hook_config for how it's produced; created_at_field is
+    also consumed by features/sales_analytics.py for time-bucketed metrics —
+    older rows written before that field existed simply have it absent, read
+    back as None via dict.get, same as any other optional JSON key)."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             """
@@ -766,6 +917,67 @@ async def get_bot_feedback(bot_id: int) -> list[dict]:
         ) as cursor:
             rows = await cursor.fetchall()
             return [dict(row) for row in rows]
+
+
+async def add_template_candidate(
+    creator_user_id: int,
+    summary: str,
+    fallback_reason: str,
+    selected_templates: list[str],
+    bot_type: str | None = None,
+    bot_name: str | None = None,
+    bot_id: int | None = None,
+) -> None:
+    """Append-only log of from-scratch fallback generations (see
+    template_candidates' comment in init_db()). selected_templates is stored
+    as a JSON array — even an empty list is meaningful (the classifier saw no
+    match at all, vs. matched-but-customize/synthesis-failed)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO template_candidates "
+            "(bot_id, creator_user_id, bot_name, summary, fallback_reason, selected_templates, bot_type) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                bot_id,
+                creator_user_id,
+                bot_name,
+                summary,
+                fallback_reason,
+                json.dumps(selected_templates, ensure_ascii=False),
+                bot_type,
+            ),
+        )
+        await db.commit()
+    logger.info(
+        f"add_template_candidate: bot_id={bot_id} reason={fallback_reason} "
+        f"selected_templates={selected_templates}"
+    )
+
+
+async def list_template_candidates(limit: int = 200) -> list[dict]:
+    """Most recent candidates first, for the /analytics dashboard's
+    "Кандидаты на новый шаблон" section. No clustering/grouping here — kept
+    as raw rows (per the design doc's MVP decision) so the owner reads the
+    actual requirement text rather than a heuristic summary; the frontend or
+    caller may group by bot_type itself."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT id, bot_id, creator_user_id, bot_name, summary, fallback_reason, "
+            "selected_templates, bot_type, created_at "
+            "FROM template_candidates ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+            result = []
+            for row in rows:
+                item = dict(row)
+                try:
+                    item["selected_templates"] = json.loads(item["selected_templates"] or "[]")
+                except (json.JSONDecodeError, TypeError):
+                    item["selected_templates"] = []
+                result.append(item)
+            return result
 
 
 async def list_bots_with_stats() -> list[dict]:
