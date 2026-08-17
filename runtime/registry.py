@@ -803,7 +803,15 @@ async def build_entry(
     register_critical_error_handler(dp, bot_id)
 
     module = await _load_template_module_async(template_id) if template_id else None
-    if module is None and file_path:
+    # Only attempted when template_id is unset (the genuine from-scratch
+    # case), NOT as a catch-all whenever module is None — a bot with a
+    # template_id that fails to resolve (stale/renamed template) must fall
+    # through to the WARNING below and register with no router, not silently
+    # succeed via a completely different import path (this bot's own
+    # file_path may itself still define config_from_bot_row et al. if it was
+    # template-derived, which would mask the real problem: template_id is
+    # broken and needs fixing, not that the file can't be imported at all).
+    if module is None and file_path and not template_id:
         module = await _load_generated_bot_module_async(bot_id, file_path)
     if template_id and module is None:
         logger.warning(
@@ -885,8 +893,8 @@ async def build_entry(
 
             register_office_event_hook(config, _office_event_hook)
         elif typed_config is not None:
-            # docs/OFFICES_DESIGN.md §11 — the universal fallback: a
-            # resolved bot (module is not None, so it has a real db_path via
+            # docs/OFFICE_HOOK_FROM_SCRATCH_BOTS.md — the universal fallback:
+            # a resolved bot (module is not None, so it has a real db_path via
             # typed_config) with NO hand-written on_office_event still gets
             # wired to features/office_events.py's generic_on_office_event(),
             # driven by this bot's own bot_office_hook_config row (may be
