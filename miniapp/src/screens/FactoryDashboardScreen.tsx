@@ -10,6 +10,7 @@ import {
   type TemplateCandidateClusterItem,
 } from '../lib/factoryApi'
 import { Card, CardHeader, CardTitle, ChipRow, Chip, Badge } from '../components/Card'
+import { iconForTemplate } from '../lib/botIcons'
 
 const FALLBACK_REASON_LABELS: Record<string, string> = {
   no_template_match: 'нет подходящего шаблона',
@@ -19,8 +20,23 @@ const FALLBACK_REASON_LABELS: Record<string, string> = {
 
 const ACTIVE_STATUSES = new Set(['running'])
 
-function statusTone(status: string): 'success' | 'neutral' {
-  return ACTIVE_STATUSES.has(status) ? 'success' : 'neutral'
+function isBotActive(status: string): boolean {
+  return ACTIVE_STATUSES.has(status)
+}
+
+// weekly_count is a generic "records created this week" number (see
+// runtime/factory_analytics_api.py's _weekly_count_for_bot) — the label
+// stays generic ("записей") rather than guessing per-template wording
+// ("заказов"/"записей на приём"/...), since the backend has no per-template
+// vocabulary either, only office_hook_config's table name.
+function weeklyMetricLabel(bot: FactoryBotItem): string {
+  if (!isBotActive(bot.status)) return 'бот приостановлен'
+  if (bot.weekly_count == null) return 'нет данных за неделю'
+  return 'записей на этой неделе'
+}
+
+function openBotApp(botId: number) {
+  window.location.href = `/app/${botId}`
 }
 
 function FeedbackForm({ bot, onDone }: { bot: FactoryBotItem; onDone: () => void }) {
@@ -261,37 +277,73 @@ export function FactoryDashboardScreen() {
 
       {items !== null && filtered.length === 0 && <div className="state-message">Ничего не найдено</div>}
 
-      {filtered.map((bot) => (
-        <Card key={bot.id}>
-          <CardHeader>
-            <CardTitle>{bot.display_name || bot.name}</CardTitle>
-            <Badge tone={statusTone(bot.status)}>{bot.status}</Badge>
-          </CardHeader>
-          <ChipRow>
-            {bot.template && <Chip>шаблон: {bot.template}</Chip>}
-            <Chip>создан: {bot.created_at}</Chip>
-            <Chip>правок: {bot.edits_count}</Chip>
-            {bot.avg_rating != null && (
-              <Chip>рейтинг: {bot.avg_rating.toFixed(1)} ({bot.feedback_count})</Chip>
-            )}
-            {bot.archived_at && <Chip>архив: {bot.archived_at}</Chip>}
-          </ChipRow>
-          {bot.features.length > 0 && (
-            <ChipRow>
-              {bot.features.map((f) => (
-                <Chip key={f}>{f}</Chip>
-              ))}
-            </ChipRow>
-          )}
-          {feedbackTargetId === bot.id ? (
-            <FeedbackForm bot={bot} onDone={refreshAfterFeedback} />
-          ) : (
-            <button className="btn-primary" style={{ marginTop: 8 }} onClick={() => setFeedbackTargetId(bot.id)}>
-              Оценить
+      {filtered.map((bot) => {
+        const active = isBotActive(bot.status)
+        return (
+          <div className="bot-card" key={bot.id}>
+            <button
+              className="bot-card-top"
+              style={{ background: 'transparent', border: 'none', padding: 0, cursor: 'pointer', textAlign: 'left' }}
+              onClick={() => openBotApp(bot.id)}
+            >
+              <span className="bot-card-icon">{iconForTemplate(bot.template)}</span>
+              <span className="bot-card-id">
+                <span className="bot-card-name">{bot.display_name || bot.name}</span>
+                {bot.template && <span className="bot-card-template">{bot.template}</span>}
+              </span>
+              <span className={`status-pill ${active ? 'status-pill-active' : 'status-pill-paused'}`}>
+                {active ? (
+                  <>
+                    <span className="status-dot status-dot-active" />
+                    Активен
+                  </>
+                ) : (
+                  '⏸ На паузе'
+                )}
+              </span>
             </button>
-          )}
-        </Card>
-      ))}
+
+            <button
+              className={`bot-card-metric ${active ? '' : 'bot-card-metric-muted'}`}
+              style={{ background: 'transparent', border: 'none', padding: 0, cursor: 'pointer', textAlign: 'left' }}
+              onClick={() => openBotApp(bot.id)}
+            >
+              {active && bot.weekly_count != null && <span className="num">{bot.weekly_count}</span>}
+              <span className="label">{weeklyMetricLabel(bot)}</span>
+            </button>
+
+            {bot.features.length > 0 && (
+              <ChipRow>
+                {bot.features.map((f) => (
+                  <Chip key={f}>{f}</Chip>
+                ))}
+              </ChipRow>
+            )}
+
+            <div className="bot-card-foot">
+              <span>создан: {bot.created_at}</span>
+              <button
+                className="bot-card-open"
+                style={{ background: 'transparent', border: 'none', padding: 0, cursor: 'pointer' }}
+                onClick={() => openBotApp(bot.id)}
+              >
+                Открыть
+                <svg viewBox="0 0 16 16" width="13" height="13" fill="none">
+                  <path d="M6 3l5 5-5 5" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
+              </button>
+            </div>
+
+            {feedbackTargetId === bot.id ? (
+              <FeedbackForm bot={bot} onDone={refreshAfterFeedback} />
+            ) : (
+              <button className="btn-secondary" onClick={() => setFeedbackTargetId(bot.id)}>
+                Оценить
+              </button>
+            )}
+          </div>
+        )
+      })}
 
       <TemplateCandidateClustersSection />
       <TemplateCandidatesSection />

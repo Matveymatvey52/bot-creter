@@ -154,3 +154,141 @@
   text-align: center;
   padding: 40px 20px;
 }
+
+/* ── Bot card (FactoryDashboardScreen "Мои боты") ─────────────────────────
+   Richer than the generic .card above: icon plate, status pill with dot,
+   one headline metric, "Открыть →" affordance. See docs/MINIAPP_DESIGN.md
+   bot-card-premium-design mockup — approved direction. */
+
+.bot-card {
+  background: linear-gradient(155deg, var(--surface) 0%, #15151a 100%);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  padding: 16px 16px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  text-align: left;
+  width: 100%;
+  transition: border-color 0.15s ease, transform 0.15s ease;
+}
+
+.bot-card:hover {
+  border-color: rgba(124, 92, 255, 0.35);
+}
+
+.bot-card:active {
+  transform: scale(0.988);
+}
+
+.bot-card-top {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.bot-card-icon {
+  width: 46px;
+  height: 46px;
+  border-radius: var(--radius-md);
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 22px;
+  background: var(--accent-soft);
+  box-shadow: 0 0 0 1px rgba(124, 92, 255, 0.25) inset, 0 6px 18px -6px var(--accent-glow);
+}
+
+.bot-card-id {
+  flex: 1;
+  min-width: 0;
+}
+
+.bot-card-name {
+  font-size: 16px;
+  font-weight: 650;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.bot-card-template {
+  font-size: 12.5px;
+  color: var(--text-tertiary);
+  margin-top: 1px;
+}
+
+.status-pill {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border-radius: var(--radius-pill);
+  padding: 4px 9px 4px 7px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.status-pill-active {
+  background: var(--success-bg);
+  color: var(--success-text);
+}
+
+.status-pill-paused {
+  background: var(--warning-bg);
+  color: var(--warning-text);
+}
+
+.status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.status-dot-active {
+  box-shadow: 0 0 0 3px rgba(74, 222, 128, 0.18);
+}
+
+.bot-card-metric {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding-top: 2px;
+}
+
+.bot-card-metric .num {
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+}
+
+.bot-card-metric .label {
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+.bot-card-metric-muted .num {
+  color: var(--text-tertiary);
+}
+
+.bot-card-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-top: 10px;
+  border-top: 1px solid var(--border-hair);
+  font-size: 12.5px;
+  color: var(--text-tertiary);
+}
+
+.bot-card-open {
+  color: var(--accent);
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}

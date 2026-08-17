@@ -16,7 +16,7 @@ from datetime import datetime, timedelta
 
 import aiosqlite
 
-from features.sales_analytics import compute_metrics, _resolve_config
+from features.sales_analytics import compute_metrics, weekly_record_count, _resolve_config
 
 
 def _now_iso(days_ago: float = 0) -> str:
@@ -202,6 +202,43 @@ class ComputeMetricsTests(unittest.IsolatedAsyncioTestCase):
         result = await compute_metrics(db_path, hook_config, "week")
         self.assertEqual(result["total"], 1)
         self.assertEqual(result["top_customers"], [{"match_field": 7, "count": 1}])
+
+
+class WeeklyRecordCountTests(unittest.IsolatedAsyncioTestCase):
+    async def test_no_hook_config_returns_none(self):
+        db_path = await _make_db([])
+        result = await weekly_record_count(db_path, None)
+        self.assertIsNone(result)
+
+    async def test_hallucinated_table_returns_none(self):
+        db_path = await _make_db([])
+        hook_config = {"table": "does_not_exist", "match_field": None, "created_at_field": None}
+        result = await weekly_record_count(db_path, hook_config)
+        self.assertIsNone(result)
+
+    async def test_counts_only_rows_within_the_last_week(self):
+        db_path = await _make_db(
+            [
+                (1, _now_iso(), "today"),
+                (2, _now_iso(days_ago=6), "within week"),
+                (3, _now_iso(days_ago=30), "outside week"),
+            ]
+        )
+        hook_config = {"table": "bookings", "match_field": None, "created_at_field": "created_at"}
+        result = await weekly_record_count(db_path, hook_config)
+        self.assertEqual(result, 2)
+
+    async def test_no_created_at_field_falls_back_to_all_time_count(self):
+        db_path = await _make_db([(1, _now_iso(days_ago=90), "old"), (2, _now_iso(), "new")])
+        hook_config = {"table": "bookings", "match_field": None, "created_at_field": None}
+        result = await weekly_record_count(db_path, hook_config)
+        self.assertEqual(result, 2)  # no way to scope to "this week" — total row count instead
+
+    async def test_hallucinated_created_at_field_falls_back_to_all_time_count(self):
+        db_path = await _make_db([(1, _now_iso(days_ago=90), "old"), (2, _now_iso(), "new")])
+        hook_config = {"table": "bookings", "match_field": None, "created_at_field": "no_such_column"}
+        result = await weekly_record_count(db_path, hook_config)
+        self.assertEqual(result, 2)
 
 
 if __name__ == "__main__":

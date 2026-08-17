@@ -10,9 +10,12 @@ db.database.list_bots_with_stats), and add_feedback_handler's validation.
 from __future__ import annotations
 
 import os
+import tempfile
 import unittest
+from datetime import datetime, timedelta
 from unittest.mock import patch
 
+import aiosqlite
 from aiohttp.test_utils import TestClient, TestServer
 
 import db.database as db_module
@@ -21,6 +24,7 @@ from db.database import (
     create_bot_record_with_admins,
     delete_bot,
     init_db,
+    set_bot_office_hook_config,
 )
 from runtime.factory_analytics_api import register_routes
 from runtime.miniapp_api import mint_magic_link_token
@@ -57,7 +61,20 @@ class FactoryAnalyticsApiTests(unittest.IsolatedAsyncioTestCase):
             template_id="__factory__",
             config={"bot_id": FACTORY_BOT_ID},
         )
-        registry = {FACTORY_BOT_ID: entry}
+        # A second registry entry for self.bot_id (its own real db_path, a
+        # temp sqlite file) — needed so list_bots_handler's weekly_count
+        # aggregation (runtime/factory_analytics_api.py's
+        # _weekly_count_for_bot) has a live Registry entry + db_path to read,
+        # same as the real webhook process would have for a running bot.
+        tmpdir = tempfile.mkdtemp()
+        self.bot_db_path = os.path.join(tmpdir, "bot.db")
+        bot_entry = BotEntry(
+            bot=_FakeBot(FAKE_TOKEN),
+            dispatcher=None,
+            template_id="tour_operator",
+            config={"db_path": self.bot_db_path},
+        )
+        registry = {FACTORY_BOT_ID: entry, self.bot_id: bot_entry}
         self.app = create_app(registry)
         register_routes(self.app)
 
@@ -111,6 +128,36 @@ class FactoryAnalyticsApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item["feedback_count"], 2)
         self.assertAlmostEqual(item["avg_rating"], 4.5)
         self.assertNotIn("token", item)
+
+    async def test_bot_list_includes_weekly_count_from_office_hook_config(self):
+        async with aiosqlite.connect(self.bot_db_path) as db:
+            await db.execute(
+                "CREATE TABLE bookings (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT)"
+            )
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            old = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
+            await db.execute("INSERT INTO bookings (created_at) VALUES (?)", (now,))
+            await db.execute("INSERT INTO bookings (created_at) VALUES (?)", (now,))
+            await db.execute("INSERT INTO bookings (created_at) VALUES (?)", (old,))
+            await db.commit()
+        await set_bot_office_hook_config(
+            self.bot_id, {"table": "bookings", "match_field": None, "created_at_field": "created_at"}
+        )
+
+        qs = await self._owner_qs()
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            resp = await self.client.get(f"/api/factory/bots?{qs}")
+        body = await resp.json()
+        item = next(i for i in body["items"] if i["id"] == self.bot_id)
+        self.assertEqual(item["weekly_count"], 2)  # the 30-days-ago row excluded
+
+    async def test_bot_list_weekly_count_is_none_without_office_hook_config(self):
+        qs = await self._owner_qs()
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            resp = await self.client.get(f"/api/factory/bots?{qs}")
+        body = await resp.json()
+        item = next(i for i in body["items"] if i["id"] == self.bot_id)
+        self.assertIsNone(item["weekly_count"])
 
     # ── add_feedback_handler ─────────────────────────────────────────
     async def test_add_feedback_valid_rating_persists(self):

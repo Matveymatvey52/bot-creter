@@ -153,6 +153,53 @@ async def compute_metrics(db_path: str, hook_config: dict[str, Any] | None, peri
     return result
 
 
+async def weekly_record_count(db_path: str, hook_config: dict[str, Any] | None) -> int | None:
+    """Records created in the last 7 days for one bot's primary resource
+    table — the single-number metric the factory dashboard card shows (see
+    runtime/factory_analytics_api.py's list_bots_handler). Deliberately a
+    thin, standalone entry point rather than making callers pull `volume`
+    out of compute_metrics()'s full week-period payload: the dashboard card
+    needs exactly one number, not the chart/top-customers/new-vs-returning
+    machinery compute_metrics() also computes.
+
+    Returns None if there's no usable office_hook_config, its table no
+    longer exists (stale config), or the request otherwise can't be
+    answered — same "degrade to unavailable" contract as compute_metrics(),
+    never raises. Falls back to the table's all-time row count when
+    created_at_field is unset/invalid — no way to scope to "this week"
+    without it, but the bot still has a real "how many records" signal
+    worth showing instead of nothing."""
+    resolved = _resolve_config(hook_config)
+    if resolved is None:
+        return None
+    table, _match_field, created_at_field = resolved
+
+    try:
+        async with aiosqlite.connect(db_path) as db:
+            columns = await _table_columns(db, table)
+            if columns is None:
+                return None
+            if created_at_field is not None and created_at_field not in columns:
+                created_at_field = None
+
+            if created_at_field is None:
+                async with db.execute(f'SELECT COUNT(*) FROM "{table}"') as cursor:
+                    row = await cursor.fetchone()
+                    return row[0] if row else 0
+
+            modifier = _period_start_modifier("week")
+            async with db.execute(
+                f'''SELECT COUNT(*) FROM "{table}"
+                    WHERE "{created_at_field}" >= datetime('now', 'localtime', ?)''',
+                (modifier,),
+            ) as cursor:
+                row = await cursor.fetchone()
+                return row[0] if row else 0
+    except Exception:
+        logger.warning(f"weekly_record_count: failed for table={table!r}", exc_info=True)
+        return None
+
+
 def _period_start_modifier(period: Period, *, offset_periods: int = 0) -> str:
     """A SQLite datetime() modifier string like '-7 days', for use as
     datetime('now', 'localtime', <this>) in the queries below — computed

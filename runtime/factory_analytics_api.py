@@ -26,10 +26,12 @@ from aiohttp import web
 
 from db.database import (
     add_bot_feedback,
+    get_bot_office_hook_config,
     list_bots_with_stats,
     list_template_candidate_clusters_with_stats,
     list_template_candidates,
 )
+from features.sales_analytics import weekly_record_count
 from handlers.admin_manager import OWNER_ID
 from runtime.miniapp_api import _authenticate
 from runtime.registry import FACTORY_BOT_ID, Registry, infer_template_id
@@ -57,6 +59,7 @@ async def list_bots_handler(request: web.Request) -> web.Response:
     if not await _authenticate_owner(request):
         return web.json_response({"error": "forbidden"}, status=403)
 
+    registry: Registry = request.app[REGISTRY_KEY]
     rows = await list_bots_with_stats()
     items = []
     for row in rows:
@@ -75,9 +78,28 @@ async def list_bots_handler(request: web.Request) -> web.Response:
                 "edits_count": row["edits_count"],
                 "avg_rating": row["avg_rating"],
                 "feedback_count": row["feedback_count"],
+                "weekly_count": await _weekly_count_for_bot(registry, row["id"]),
             }
         )
     return web.json_response({"items": items})
+
+
+async def _weekly_count_for_bot(registry: Registry, bot_id: int) -> int | None:
+    """Records this bot's own data got in the last 7 days, for the dashboard
+    card's headline metric — see features/sales_analytics.weekly_record_count.
+    None (not 0) if unavailable so the SPA can distinguish "genuinely zero
+    new records this week" from "no data source to count at all" (e.g. bot
+    not currently running, so no live db_path — or a template like
+    moderator whose office_hook_config is intentionally absent, same
+    posture as compute_metrics()'s own None return)."""
+    entry = registry.get(bot_id)
+    if entry is None:
+        return None
+    db_path = entry.config.get("db_path") if isinstance(entry.config, dict) else None
+    if not db_path:
+        return None
+    hook_config = await get_bot_office_hook_config(bot_id)
+    return await weekly_record_count(db_path, hook_config)
 
 
 async def add_feedback_handler(request: web.Request) -> web.Response:

@@ -62,6 +62,7 @@ export interface FactoryBotItem {
   edits_count: number
   avg_rating: number | null
   feedback_count: number
+  weekly_count: number | null
 }
 
 export function listFactoryBots(): Promise<{ items: FactoryBotItem[] }> {
