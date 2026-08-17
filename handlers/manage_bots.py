@@ -32,8 +32,10 @@ from db.database import (
     get_bot_sheets_config,
     get_bot_yookassa_credentials,
     get_bot_yookassa_status_cache,
+    get_group_task_config,
     get_office_links_for_bot,
     get_owner_payment_credentials,
+    delete_group_task_config,
     remove_office_link,
     set_bot_miniapp_config,
     set_bot_office_hook_config,
@@ -190,6 +192,7 @@ def _bot_keyboard(bot_id: int) -> InlineKeyboardMarkup:
     ])
     rows.append([
         InlineKeyboardButton(text="🏢 Офисы", callback_data=f"office:{bot_id}"),
+        InlineKeyboardButton(text="💬 Рабочая группа", callback_data=f"grouptask:{bot_id}"),
     ])
     rows.append([
         InlineKeyboardButton(text="◀ К списку", callback_data="list"),
@@ -699,6 +702,88 @@ async def cb_office_unlink(callback: CallbackQuery):
         return
     await remove_office_link(source_id, target_id, event_type)
     text, keyboard = await _office_panel_text_and_keyboard(panel_bot_id)
+    await _edit_or_resend(callback, text, parse_mode="HTML", reply_markup=keyboard)
+
+
+# ── "Рабочая группа" (docs/GROUP_TASK_CHANNEL_DESIGN.md §5) ─────────────────
+# Unlike office:/officeconnect: above, connection is NOT confirmed through a
+# button tap here — features/group_task.py's own router auto-captures
+# group_chat_id from the first mention/reply update it sees in a group with
+# no existing bot_group_task_config row. This panel is read-only status +
+# the setup guide + a disconnect action; enable_feature_and_reload() below
+# is the only WRITE this panel itself performs (turning the feature on, the
+# same action "🧩 Фичи" would do, so the owner doesn't have to visit that
+# screen first just to reach this one).
+
+
+async def _group_task_panel_text_and_keyboard(bot_id: int, bot_row: dict) -> tuple[str, InlineKeyboardMarkup]:
+    username = bot_row.get("username") or "bot"
+    config = await get_group_task_config(bot_id)
+    if config and config["enabled"]:
+        text = (
+            f"💬 <b>Рабочая группа для {html.escape(bot_row['name'])}</b>\n\n"
+            "Подключено. Пиши боту задачи в группе, упоминая "
+            f"@{html.escape(username)} или отвечая на его сообщения."
+        )
+        rows = [[InlineKeyboardButton(text="🔌 Отключить", callback_data=f"grouptaskdisconnect:{bot_id}")]]
+    else:
+        text = (
+            f"💬 <b>Рабочая группа для {html.escape(bot_row['name'])}</b>\n\n"
+            "Подключи бота к своей Telegram-группе — сможешь писать ему задачи "
+            f"прямо там (<code>@{html.escape(username)} сделай то-то</code> или "
+            "ответом на его сообщение), и он будет отвечать в группе. Отвечает "
+            "только тебе (владельцу), другие участники группы бота не получат ответа.\n\n"
+            "<b>Как подключить:</b>\n"
+            "1. Создай новую Telegram-группу (или используй существующую).\n"
+            f"2. Добавь туда бота @{html.escape(username)}.\n"
+            f"3. Зайди в BotFather → выбери @{html.escape(username)} → "
+            "<b>Bot Settings</b> → <b>Group Privacy</b> → <b>Turn off</b>. "
+            "Без этого шага бот не увидит твои сообщения в группе, даже если "
+            "упомянуть его по имени.\n"
+            "4. Напиши в группе что угодно, упомянув бота — фабрика подхватит "
+            "группу автоматически."
+        )
+        rows = []
+    rows.append([InlineKeyboardButton(text="◀ Назад", callback_data=f"info:{bot_id}")])
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data.startswith("grouptask:"))
+async def cb_group_task_panel(callback: CallbackQuery):
+    if not _is_owner(callback.from_user.id):
+        await _deny_callback(callback)
+        return
+    await callback.answer()
+    bot_id = int(callback.data.split(":")[1])
+    bot_row = await get_bot(bot_id)
+    if not bot_row:
+        await callback.message.answer("Бот не найден.")
+        return
+    # The feature must be enabled for features/group_task.py's router to ever
+    # run for this bot — same enable_feature_and_reload() the "🧩 Фичи" toggle
+    # uses, so opening this panel is enough to turn the channel on without a
+    # separate trip through the Features screen first. A no-op (INSERT OR
+    # IGNORE under the hood) if already enabled.
+    enabled_features = await get_bot_features(bot_id)
+    if "group_task" not in enabled_features:
+        await enable_feature_and_reload(bot_id, "group_task")
+    text, keyboard = await _group_task_panel_text_and_keyboard(bot_id, bot_row)
+    await _edit_or_resend(callback, text, parse_mode="HTML", reply_markup=keyboard)
+
+
+@router.callback_query(F.data.startswith("grouptaskdisconnect:"))
+async def cb_group_task_disconnect(callback: CallbackQuery):
+    if not _is_owner(callback.from_user.id):
+        await _deny_callback(callback)
+        return
+    await callback.answer()
+    bot_id = int(callback.data.split(":")[1])
+    bot_row = await get_bot(bot_id)
+    if not bot_row:
+        await callback.message.answer("Бот не найден.")
+        return
+    await delete_group_task_config(bot_id)
+    text, keyboard = await _group_task_panel_text_and_keyboard(bot_id, bot_row)
     await _edit_or_resend(callback, text, parse_mode="HTML", reply_markup=keyboard)
 
 
@@ -1471,6 +1556,9 @@ async def cb_delete(callback: CallbackQuery):
     name = b["name"]
     await stop_bot(bot_id)
     await delete_bot(bot_id)
+    from features.group_task import invalidate_group_task_state
+
+    invalidate_group_task_state(bot_id)
     _delete_custom_feature_file(bot_id)
     await callback.message.edit_text(
         f"✅ Бот <b>{name}</b> удалён.\n\nСоздай нового: /create",
