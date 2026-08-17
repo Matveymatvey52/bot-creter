@@ -15,7 +15,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from config import ASSEMBLYAI_API_KEY
 from db.database import (
@@ -953,28 +953,46 @@ async def msg_sheets_connect_invalid(message: Message) -> None:
 
 _PROVIDER_TOKEN_RE = re.compile(r"^\d+:(TEST|LIVE):.{1,256}$")
 
+# Checklist format ("☐ сделай → скопируй") instead of prose — cuts cognitive
+# load on each step down to the concrete action plus the concrete thing to
+# carry into the next screen. Not real Telegram checkboxes (messages don't
+# support those) — plain characters used purely as a visual marker.
 _PAYMENT_STEP_1_TEXT = (
     "💳 <b>Подключение оплаты (Telegram Payments)</b>\n\n"
     "Шаг 1 из 4 — Регистрация у платёжного провайдера\n\n"
-    "Если у тебя ещё нет магазина в ЮKassa — зарегистрируй его по кнопке ниже. "
-    "Понадобятся данные ИП/самозанятости/юрлица — это требование платёжного "
-    "законодательства, тут это не обойти."
+    "☐ Если у тебя ещё нет магазина в ЮKassa — зарегистрируй его по кнопке ниже\n"
+    "☐ Понадобятся данные ИП/самозанятости/юрлица — это требование платёжного "
+    "законодательства, тут это не обойти"
 )
 _PAYMENT_STEP_2_TEXT = (
     "💳 Шаг 2 из 4 — Открой BotFather\n\n"
-    "В открывшемся чате отправь:\n"
-    "<code>/mybots</code> → выбери своего бота → <b>Bot Settings</b> → <b>Payments</b>."
+    "☐ Перейди в чат BotFather по кнопке ниже\n"
+    "☐ Отправь туда: <code>/mybots</code>\n"
+    "☐ Выбери своего бота → <b>Bot Settings</b> → <b>Payments</b>"
 )
 _PAYMENT_STEP_3_TEXT = (
     "💳 Шаг 3 из 4 — Выбери провайдера в списке\n\n"
-    "В списке провайдеров выбери <b>YooKassa</b> — BotFather откроет чат с "
-    "@YooKassaBot. Войди там в свой аккаунт ЮKassa и подтверди — он пришлёт "
-    "тебе токен вида <code>381764678:TEST:...</code> или <code>381764678:LIVE:...</code>."
+    "☐ В списке провайдеров выбери <b>YooKassa</b>\n"
+    "☐ BotFather откроет чат с @YooKassaBot — войди там в свой аккаунт ЮKassa\n"
+    "☐ Подтверди — @YooKassaBot пришлёт токен вида "
+    "<code>381764678:TEST:...</code> или <code>381764678:LIVE:...</code>"
 )
 _PAYMENT_STEP_4_TEXT = (
     "💳 Шаг 4 из 4 — Вставь токен сюда\n\n"
-    "Скопируй токен, который прислал @YooKassaBot, и пришли его сюда сообщением."
+    "→ Скопируй токен, который прислал @YooKassaBot, и пришли его сюда сообщением"
 )
+
+# Static screenshots of the corresponding BotFather/@YooKassaBot screen, one per
+# step. Prepared and dropped in by the project owner separately (BotFather's UI
+# isn't ours to snapshot automatically); step 1 has no BotFather screen yet, so
+# it stays text-only. A missing/placeholder file degrades to plain text — a
+# stale or absent screenshot must never block the wizard, since the caption
+# always carries the instruction independent of the image.
+_PAYMENT_STEP_SCREENSHOTS = {
+    2: Path(__file__).resolve().parent.parent / "assets" / "payment_guide" / "step2_botfather_payments.png",
+    3: Path(__file__).resolve().parent.parent / "assets" / "payment_guide" / "step3_choose_provider.png",
+    4: Path(__file__).resolve().parent.parent / "assets" / "payment_guide" / "step4_token_message.png",
+}
 
 
 def _payment_step_keyboard(bot_id: int, step: int) -> InlineKeyboardMarkup:
@@ -1002,6 +1020,28 @@ _PAYMENT_STEP_TEXTS = {
 }
 
 
+async def _show_payment_step(callback: CallbackQuery, bot_id: int, step: int) -> None:
+    """Renders one wizard step: photo+caption when a screenshot asset exists for
+    this step, otherwise the plain-text card exactly as before. Telegram can't
+    turn a text message into a photo message (or back) via edit_text/edit_media,
+    so a step with a screenshot always deletes the old card and resends fresh —
+    the small navigation flicker is an acceptable trade for never crashing on a
+    missing/placeholder asset."""
+    text = _PAYMENT_STEP_TEXTS[step]
+    markup = _payment_step_keyboard(bot_id, step)
+    screenshot = _PAYMENT_STEP_SCREENSHOTS.get(step)
+    if screenshot is not None and screenshot.exists():
+        try:
+            await callback.message.delete()
+        except TelegramBadRequest:
+            pass  # already gone / too old to delete for the bot — resend anyway
+        await callback.message.answer_photo(
+            FSInputFile(str(screenshot)), caption=text, parse_mode="HTML", reply_markup=markup,
+        )
+        return
+    await _edit_or_resend(callback, text, parse_mode="HTML", reply_markup=markup)
+
+
 @router.callback_query(F.data.startswith("paystart:"))
 async def cb_payment_connect_start(callback: CallbackQuery, state: FSMContext):
     if not _is_owner(callback.from_user.id):
@@ -1019,12 +1059,7 @@ async def cb_payment_connect_start(callback: CallbackQuery, state: FSMContext):
     # clobber this wizard's stashed bot_id.
     await state.set_state(PaymentConnectFlow.browsing_step)
     await state.update_data(bot_id=bot_id)
-    await _edit_or_resend(
-        callback,
-        _PAYMENT_STEP_1_TEXT,
-        parse_mode="HTML",
-        reply_markup=_payment_step_keyboard(bot_id, 1),
-    )
+    await _show_payment_step(callback, bot_id, 1)
 
 
 @router.callback_query(F.data.startswith("paystep:"))
@@ -1050,12 +1085,7 @@ async def cb_payment_connect_step(callback: CallbackQuery, state: FSMContext):
     else:
         await state.set_state(PaymentConnectFlow.browsing_step)
     await state.update_data(bot_id=bot_id)
-    await _edit_or_resend(
-        callback,
-        _PAYMENT_STEP_TEXTS[step],
-        parse_mode="HTML",
-        reply_markup=_payment_step_keyboard(bot_id, step),
-    )
+    await _show_payment_step(callback, bot_id, step)
 
 
 @router.callback_query(F.data.startswith("paycancel:"))

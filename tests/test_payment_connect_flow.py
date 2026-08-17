@@ -10,7 +10,9 @@ bots.token) via set_bot_payment_provider.
 """
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from aiogram.fsm.context import FSMContext
@@ -31,6 +33,8 @@ def _make_callback(user_id: int, data: str) -> MagicMock:
     callback.answer = AsyncMock()
     callback.message.edit_text = AsyncMock()
     callback.message.answer = AsyncMock()
+    callback.message.answer_photo = AsyncMock()
+    callback.message.delete = AsyncMock()
     return callback
 
 
@@ -232,6 +236,80 @@ class PaymentConnectTokenTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNone(await get_bot_payment_provider(self.bot_id))
         message.answer.assert_not_awaited()
+
+
+class PaymentStepScreenshotTests(unittest.IsolatedAsyncioTestCase):
+    """_show_payment_step: screenshot-present -> photo+caption via delete+resend;
+    screenshot-missing/placeholder -> plain-text fallback via _edit_or_resend,
+    exactly like before the screenshots feature existed. Real screenshot files
+    are supplied by the project owner separately (see _PAYMENT_STEP_SCREENSHOTS
+    docstring) — these tests only prove the wizard degrades gracefully around
+    whatever is or isn't on disk, using a throwaway placeholder PNG."""
+    owner_id = 555104
+
+    async def asyncSetUp(self):
+        self.bot_id = await create_bot_record_with_admins(
+            name="payment_screenshot_bot", description="test", token=FAKE_TOKEN,
+            file_path="templates/inventory.py", admin_ids=[str(self.owner_id)],
+        )
+        self._owner_patcher = patch.object(manage_bots, "_is_owner", lambda uid: uid == self.owner_id)
+        self._owner_patcher.start()
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._placeholder_path = Path(self._tmpdir.name) / "step2_placeholder.png"
+        self._placeholder_path.write_bytes(b"\x89PNG\r\n\x1a\n")  # minimal PNG magic bytes, not a real image
+
+    async def asyncTearDown(self):
+        self._owner_patcher.stop()
+        self._tmpdir.cleanup()
+        await delete_bot(self.bot_id)
+
+    async def test_step_with_existing_screenshot_sends_photo_and_deletes_old_card(self):
+        callback = _make_callback(self.owner_id, f"paystep:{self.bot_id}:2")
+        state = _make_fsm_context(self.owner_id)
+        with patch.dict(manage_bots._PAYMENT_STEP_SCREENSHOTS, {2: self._placeholder_path}):
+            await manage_bots.cb_payment_connect_step(callback, state)
+
+        callback.message.delete.assert_awaited_once()
+        callback.message.answer_photo.assert_awaited_once()
+        callback.message.edit_text.assert_not_awaited()
+        caption = callback.message.answer_photo.call_args.kwargs["caption"]
+        self.assertIn("Шаг 2 из 4", caption)
+
+    async def test_step_with_missing_screenshot_falls_back_to_text(self):
+        missing_path = Path(self._tmpdir.name) / "does_not_exist.png"
+        callback = _make_callback(self.owner_id, f"paystep:{self.bot_id}:2")
+        state = _make_fsm_context(self.owner_id)
+        with patch.dict(manage_bots._PAYMENT_STEP_SCREENSHOTS, {2: missing_path}):
+            await manage_bots.cb_payment_connect_step(callback, state)
+
+        callback.message.answer_photo.assert_not_awaited()
+        callback.message.delete.assert_not_awaited()
+        callback.message.edit_text.assert_awaited_once()
+        text = callback.message.edit_text.call_args[0][0]
+        self.assertIn("Шаг 2 из 4", text)
+
+    async def test_step_without_configured_screenshot_uses_text_as_before(self):
+        # Step 1 has no entry in _PAYMENT_STEP_SCREENSHOTS at all.
+        callback = _make_callback(self.owner_id, f"paystart:{self.bot_id}")
+        state = _make_fsm_context(self.owner_id)
+
+        await manage_bots.cb_payment_connect_start(callback, state)
+
+        callback.message.answer_photo.assert_not_awaited()
+        callback.message.edit_text.assert_awaited_once()
+
+    async def test_delete_failure_on_stale_card_does_not_crash_the_step(self):
+        from aiogram.exceptions import TelegramBadRequest
+
+        callback = _make_callback(self.owner_id, f"paystep:{self.bot_id}:2")
+        callback.message.delete = AsyncMock(
+            side_effect=TelegramBadRequest(method=MagicMock(), message="message to delete not found")
+        )
+        state = _make_fsm_context(self.owner_id)
+        with patch.dict(manage_bots._PAYMENT_STEP_SCREENSHOTS, {2: self._placeholder_path}):
+            await manage_bots.cb_payment_connect_step(callback, state)
+
+        callback.message.answer_photo.assert_awaited_once()
 
 
 if __name__ == "__main__":
