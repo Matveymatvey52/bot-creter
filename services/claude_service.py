@@ -1386,11 +1386,22 @@ async def on_office_event(event, config) -> None:
 
 
 def _needs_from_scratch_wiring(code: str) -> bool:
-    """True if `code` looks like it's missing the registry-wiring exports this
-    module appends — checked so re-running this on already-wired code (e.g. a
-    future regenerate-in-place flow) doesn't double-append. Cheap substring
-    check, not full AST — mirrors _mentions_payments' style."""
-    return "def config_from_bot_row(" not in code
+    """True if `code` is missing ANY of the three registry-wiring exports this
+    module appends — checked so re-running this on already-wired code (e.g.
+    after a cb_recreate/improve_bot_code LLM rewrite) re-appends whatever the
+    rewrite dropped, instead of trusting one export's presence to mean all
+    three survived. Checking only config_from_bot_row() was a false-negative
+    risk: an LLM rewrite pass (IMPROVE_SYSTEM_PROMPT etc.) has no knowledge of
+    this appended boilerplate and could keep config_from_bot_row while
+    dropping ConfigMiddleware or on_office_event, leaving a module that
+    passes this check but still crashes _build_generic_middleware with
+    AttributeError at registration. Cheap substring check, not full AST —
+    mirrors _mentions_payments' style."""
+    return not (
+        "def config_from_bot_row(" in code
+        and "class ConfigMiddleware(" in code
+        and "async def on_office_event(" in code
+    )
 
 
 _INIT_DB_FALLBACK = '''
@@ -1418,7 +1429,15 @@ def append_from_scratch_registry_wiring(code: str) -> str:
     'asyncio.run(main())' is present by the time this runs)."""
     if not _needs_from_scratch_wiring(code):
         return code
-    m = _ENTRY_POINT_RE.search(code)
+    # Last match, not first: a column-0 `if __name__ == "__main__":` line
+    # could in principle appear inside an unindented docstring/comment
+    # example earlier in the file — the REAL entry point is always the last
+    # such line in valid generated code (nothing meaningful follows
+    # asyncio.run(main())), so this reduces (does not eliminate — the
+    # _ast.parse safety net below is the real guard) the chance of splicing
+    # into the wrong place.
+    matches = list(_ENTRY_POINT_RE.finditer(code))
+    m = matches[-1] if matches else None
     if m is None:
         logger.warning(
             "append_from_scratch_registry_wiring: no `if __name__ == '__main__':` "
@@ -2001,13 +2020,25 @@ async def _generate_bot_code_inner(requirements_summary: str) -> tuple[str, dict
                 code = await _review_hybrid_bot_code(code, requirements_summary, template_code)
                 code = await _review_narrow_risk_code(code, requirements_summary)
                 code = await _review_bot_code(code, requirements_summary, bot_type=bot_type)
-                return code, None
+                # append_from_scratch_registry_wiring no-ops for a genuine
+                # template-derived file (its # TEMPLATE: marker survived, so
+                # _needs_from_scratch_wiring finds config_from_bot_row/
+                # ConfigMiddleware/on_office_event already present via the
+                # template's own definitions) — but the hybrid tier is
+                # explicitly allowed MORE structural freedom than plain
+                # customize (that's the whole point of the tier), so the
+                # marker/exports surviving is not guaranteed here either.
+                # Same protection the from-scratch path gets.
+                return append_from_scratch_registry_wiring(code), None
             fallback_reason = "hybrid_failed"
         else:
             code = await _customize_from_template(template_name, requirements_summary)
             if "asyncio.run(main())" in code:
                 code = await _review_bot_code(code, requirements_summary, bot_type=bot_type)
-                return code, None
+                # CUSTOMIZE_TEMPLATE_PROMPT never GUARANTEES the marker/
+                # exports survive an LLM rewrite either — not a redundant
+                # safety net, same protection as the hybrid tier above.
+                return append_from_scratch_registry_wiring(code), None
             fallback_reason = "customize_failed"
 
     elif len(templates) == 2:
@@ -2017,7 +2048,18 @@ async def _generate_bot_code_inner(requirements_summary: str) -> tuple[str, dict
             code = await _review_narrow_risk_code(code, requirements_summary)
             bot_type = await classify_bot_type(requirements_summary)
             code = await _review_bot_code(code, requirements_summary, bot_type=bot_type)
-            return code, None
+            # _synthesize_from_templates uses GENERATE_SYSTEM_PROMPT (the
+            # from-scratch prompt) + MERGE_TEMPLATES_EXTRA — synthesized code
+            # is structurally from-scratch (no guaranteed # TEMPLATE: marker
+            # or config_from_bot_row/ConfigMiddleware/on_office_event) even
+            # though it started from two templates as reference material.
+            # Without this, a synthesized bot has neither a resolvable
+            # template_id NOR the appended wiring — build_entry() would
+            # import it fine via file_path (module is not None) but crash
+            # _build_generic_middleware with AttributeError on
+            # module.config_from_bot_row, silently dropping the bot from the
+            # registry (Registry.add_or_replace swallows the exception).
+            return append_from_scratch_registry_wiring(code), None
         fallback_reason = "synthesis_failed"
 
     else:
