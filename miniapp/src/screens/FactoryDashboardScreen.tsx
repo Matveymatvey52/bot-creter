@@ -3,9 +3,11 @@ import {
   listFactoryBots,
   addFactoryFeedback,
   listTemplateCandidates,
+  listTemplateCandidateClusters,
   ApiError,
   type FactoryBotItem,
   type TemplateCandidateItem,
+  type TemplateCandidateClusterItem,
 } from '../lib/factoryApi'
 import { Card, CardHeader, CardTitle, ChipRow, Chip, Badge } from '../components/Card'
 
@@ -63,6 +65,53 @@ function FeedbackForm({ bot, onDone }: { bot: FactoryBotItem; onDone: () => void
       <button className="btn-primary" disabled={submitting} onClick={submit} style={{ marginTop: 8 }}>
         Сохранить оценку
       </button>
+    </div>
+  )
+}
+
+// docs/TEMPLATE_CANDIDATE_CLUSTERING_DESIGN.md §4 — server-side clusters from
+// runtime/template_candidate_clustering.py's daily background pass, largest
+// first. Highlight threshold (count >= 3) is pure display, not a DB
+// invariant — the owner-approved starting point, tunable here without a
+// migration.
+const CLUSTER_HIGHLIGHT_THRESHOLD = 3
+
+function TemplateCandidateClustersSection() {
+  const [clusters, setClusters] = useState<TemplateCandidateClusterItem[] | null>(null)
+  const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => {
+    listTemplateCandidateClusters()
+      .then((data) => setClusters(data.items))
+      .catch((err) => setError(err instanceof ApiError ? err.message : 'Не удалось загрузить паттерны'))
+  }, [])
+
+  return (
+    <div className="screen-section">
+      <h2 style={{ margin: '16px 0 8px' }}>Топ незакрытых паттернов</h2>
+      {error && <div className="state-message">{error}</div>}
+      {!error && clusters === null && <div className="state-message">Загрузка…</div>}
+      {clusters !== null && clusters.length === 0 && (
+        <div className="state-message">Пока нет обработанных кластеров — ждём следующий проход анализа.</div>
+      )}
+      {clusters?.map((c) => (
+        <Card key={c.id}>
+          <CardHeader>
+            <CardTitle>{c.label}</CardTitle>
+            <Badge tone={c.count >= CLUSTER_HIGHLIGHT_THRESHOLD ? 'success' : 'neutral'}>{c.count}</Badge>
+          </CardHeader>
+          {c.description && <div style={{ marginTop: 4, opacity: 0.8 }}>{c.description}</div>}
+          <ChipRow>
+            <Chip>впервые: {c.first_seen}</Chip>
+            <Chip>последний раз: {c.last_seen}</Chip>
+          </ChipRow>
+          {c.examples.map((summary, i) => (
+            <div key={i} style={{ marginTop: 8, paddingTop: 8, borderTop: '1px solid var(--border, #333)' }}>
+              {summary}
+            </div>
+          ))}
+        </Card>
+      ))}
     </div>
   )
 }
@@ -244,6 +293,7 @@ export function FactoryDashboardScreen() {
         </Card>
       ))}
 
+      <TemplateCandidateClustersSection />
       <TemplateCandidatesSection />
     </div>
   )

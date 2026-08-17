@@ -900,6 +900,103 @@ async def classify_connect_feature_intent(text: str) -> dict:
     return _parse_connect_feature_intent(response.content[0].text)
 
 
+# docs/TEMPLATE_CANDIDATE_CLUSTERING_DESIGN.md §3 — one incremental batch
+# classification call per pass of runtime/template_candidate_clustering.py.
+# Given the domains already known and a batch of new from-scratch summaries,
+# routes each summary to an existing domain or proposes a new one. No
+# embeddings/vector search (see §2 of the design doc for why) — this keeps
+# the classify-layer entirely inside the Haiku-call pattern every other
+# classifier in this file already uses (_select_template, classify_bot_type,
+# classify_connect_feature_intent).
+TEMPLATE_CANDIDATE_CLUSTER_PROMPT = """You group Russian-language Telegram-bot build requests into recurring domain clusters, for a bot-factory owner deciding which requests are common enough to justify building a permanent reusable template.
+
+You will receive:
+1. A list of ALREADY-KNOWN domain clusters, each with an id, a short label, and a description.
+2. A batch of NEW requests to classify, each with an index, a summary of what the client asked for, and a rough bot_type tag.
+
+For EACH new request, decide:
+- It belongs to an EXISTING cluster if its underlying need genuinely matches that cluster's domain (not just superficial keyword overlap — "voice-based expense logging for a car workshop" and "voice-based expense logging for a delivery service" belong together; "car workshop booking" and "car workshop expense voice log" do NOT, different needs).
+- Otherwise it needs a NEW cluster — propose a short Russian label (a few words, naming the domain, not the specific business) and a one-sentence Russian description of what unites requests in it.
+
+Respond with ONLY a single line of valid JSON, no markdown fences, no explanation, in exactly this shape:
+{"assignments": [{"index": 0, "existing_cluster_id": 3, "new_label": null, "new_description": null}, {"index": 1, "existing_cluster_id": null, "new_label": "голосовой учёт расходов для сервисов", "new_description": "Клиент хочет надиктовывать траты голосом вместо ручного ввода в таблицу."}]}
+
+Rules:
+- Exactly one of existing_cluster_id / (new_label + new_description) is non-null per assignment — never both, never neither.
+- existing_cluster_id must be one of the ids from the ALREADY-KNOWN list — never invent an id.
+- If two or more NEW requests in this same batch belong together, give them the SAME new_label/new_description (do not mint duplicate near-identical clusters within one batch).
+- Prefer routing to an existing cluster over minting a near-duplicate new one — but do not force a match that isn't real; a wrong merge is worse than a small number of clusters.
+- index must match the input index exactly, one assignment per input request, no omissions."""
+
+
+def _parse_template_candidate_cluster_assignments(raw: str, batch_size: int) -> list[dict]:
+    """Best-effort JSON parse — any malformed/incomplete response degrades to
+    "give up on this batch" (empty list) rather than raising, since a
+    classification hiccup here must not crash the periodic sweep (see
+    runtime/template_candidate_clustering.py's per-pass try/except)."""
+    try:
+        data = json.loads(_strip_code_fences(raw))
+    except (json.JSONDecodeError, ValueError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    assignments = data.get("assignments")
+    if not isinstance(assignments, list):
+        return []
+    result = []
+    for item in assignments:
+        if not isinstance(item, dict):
+            continue
+        index = item.get("index")
+        if not isinstance(index, int) or not (0 <= index < batch_size):
+            continue
+        existing_cluster_id = item.get("existing_cluster_id")
+        new_label = item.get("new_label")
+        new_description = item.get("new_description")
+        if isinstance(existing_cluster_id, int):
+            result.append(
+                {"index": index, "existing_cluster_id": existing_cluster_id, "new_label": None, "new_description": None}
+            )
+        elif isinstance(new_label, str) and new_label.strip():
+            result.append(
+                {
+                    "index": index,
+                    "existing_cluster_id": None,
+                    "new_label": new_label.strip(),
+                    "new_description": new_description.strip() if isinstance(new_description, str) else None,
+                }
+            )
+        # else: neither shape present — drop this assignment, candidate stays
+        # unclustered and is retried on the next pass.
+    return result
+
+
+async def classify_template_candidate_clusters(known_clusters: list[dict], batch: list[dict]) -> list[dict]:
+    """known_clusters: [{"id", "label", "description"}, ...] (existing
+    domains). batch: [{"summary", "bot_type"}, ...] (new candidates, in the
+    same order callers must map results back by "index"). Returns a list of
+    {"index", "existing_cluster_id", "new_label", "new_description"} — see
+    _parse_template_candidate_cluster_assignments for the exact shape and
+    degrade-on-malformed-response behavior. Haiku, same cost tier as the
+    other classifiers in this file; batch is expected to be small (tens of
+    rows per daily pass, not thousands — see design doc §3)."""
+    known_lines = (
+        "\n".join(f"- id={c['id']}: {c['label']} — {c.get('description') or ''}" for c in known_clusters)
+        or "(пока нет ни одного кластера)"
+    )
+    batch_lines = "\n".join(
+        f"{i}. bot_type={item.get('bot_type') or 'general'}: {item['summary']}" for i, item in enumerate(batch)
+    )
+    user_content = f"ALREADY-KNOWN domain clusters:\n{known_lines}\n\nNEW requests to classify:\n{batch_lines}"
+    response = await client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=4096,
+        system=TEMPLATE_CANDIDATE_CLUSTER_PROMPT,
+        messages=[{"role": "user", "content": user_content}],
+    )
+    return _parse_template_candidate_cluster_assignments(response.content[0].text, len(batch))
+
+
 REVIEW_SYSTEM_PROMPT = """You are a senior Python code reviewer specializing in aiogram 3.13 Telegram bots.
 
 You will receive a generated bot's Python code. Your job is to find and fix ALL potential runtime issues BEFORE the bot is deployed.

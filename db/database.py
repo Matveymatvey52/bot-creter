@@ -361,6 +361,29 @@ async def init_db():
                 created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        # template_candidate_clusters (docs/TEMPLATE_CANDIDATE_CLUSTERING_DESIGN.md) —
+        # domain groups an incremental LLM classification pass assigns to
+        # otherwise-unclustered template_candidates rows (cluster_id column
+        # added below). label/description are both LLM-generated free text,
+        # not a fixed enum (unlike bot_type) — the whole point is to surface
+        # domains the 5-value bot_type vocabulary is too coarse to
+        # distinguish. Created BEFORE the ALTER TABLE below so the FK target
+        # already exists. Feeds the /analytics "Топ незакрытых паттернов"
+        # section.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS template_candidate_clusters (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                label         TEXT NOT NULL,
+                description   TEXT,
+                created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        for col in ("cluster_id INTEGER REFERENCES template_candidate_clusters(id)",):
+            try:
+                await db.execute(f"ALTER TABLE template_candidates ADD COLUMN {col}")
+            except aiosqlite.OperationalError:
+                pass
         await db.commit()
     await migrate_encrypt_tokens()
 
@@ -978,6 +1001,90 @@ async def list_template_candidates(limit: int = 200) -> list[dict]:
                     item["selected_templates"] = []
                 result.append(item)
             return result
+
+
+async def list_unclustered_template_candidates() -> list[dict]:
+    """template_candidates rows not yet assigned a cluster_id — the input to
+    each incremental pass of runtime/template_candidate_clustering.py. Oldest
+    first (unlike list_template_candidates' newest-first) so a pass that gets
+    interrupted partway still processes candidates in a stable, resumable
+    order rather than re-picking whichever happen to sort first."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT id, summary, bot_type FROM template_candidates "
+            "WHERE cluster_id IS NULL ORDER BY id ASC"
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
+
+async def list_template_candidate_cluster_labels() -> list[dict]:
+    """{id, label, description} for every existing cluster — the context an
+    incremental classification pass shows the model so it can route a new
+    candidate to an existing domain instead of always minting a new one."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT id, label, description FROM template_candidate_clusters ORDER BY id ASC"
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
+
+async def create_template_candidate_cluster(label: str, description: str | None) -> int:
+    """Mints a new domain cluster and returns its id, for the classification
+    pass to assign to candidates it decided don't match any existing label."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "INSERT INTO template_candidate_clusters (label, description) VALUES (?, ?)",
+            (label, description),
+        )
+        await db.commit()
+        return cursor.lastrowid
+
+
+async def assign_template_candidate_cluster(candidate_id: int, cluster_id: int) -> None:
+    """Marks one candidate as processed by this pass — the row drops out of
+    list_unclustered_template_candidates() on the next call, which is what
+    keeps the pass incremental (§3 of the design doc: never re-cluster
+    already-assigned rows)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE template_candidates SET cluster_id = ? WHERE id = ?",
+            (cluster_id, candidate_id),
+        )
+        await db.commit()
+
+
+async def list_template_candidate_clusters_with_stats(limit_examples: int = 3) -> list[dict]:
+    """Clusters with member count + a few example summaries, largest first —
+    the data behind /analytics' "Топ незакрытых паттернов" section
+    (runtime/factory_analytics_api.py). Unclustered candidates (cluster_id
+    IS NULL, not yet picked up by a clustering pass) are deliberately
+    excluded here — list_template_candidates() already surfaces the raw feed
+    for anyone who wants to see everything including the not-yet-processed
+    tail."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT c.id, c.label, c.description, "
+            "COUNT(t.id) AS count, MIN(t.created_at) AS first_seen, MAX(t.created_at) AS last_seen "
+            "FROM template_candidate_clusters c "
+            "JOIN template_candidates t ON t.cluster_id = c.id "
+            "GROUP BY c.id ORDER BY count DESC, c.id ASC"
+        ) as cursor:
+            cluster_rows = [dict(row) for row in await cursor.fetchall()]
+
+        for cluster in cluster_rows:
+            async with db.execute(
+                "SELECT summary FROM template_candidates WHERE cluster_id = ? "
+                "ORDER BY id DESC LIMIT ?",
+                (cluster["id"], limit_examples),
+            ) as cursor:
+                cluster["examples"] = [row["summary"] for row in await cursor.fetchall()]
+
+        return cluster_rows
 
 
 async def list_bots_with_stats() -> list[dict]:

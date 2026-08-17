@@ -65,6 +65,7 @@ from runtime.registry import (
 )
 from runtime.factory_analytics_api import register_routes as register_factory_analytics_routes
 from runtime.miniapp_api import register_routes as register_miniapp_routes
+from runtime.template_candidate_clustering import template_candidate_clustering_loop
 from runtime.webhook_app import create_app
 
 logging.basicConfig(
@@ -239,6 +240,24 @@ async def _bootstrap_app() -> web.Application:
 
     app.on_startup.append(_start_reminders_sweep)
     app.on_cleanup.append(_stop_reminders_sweep)
+
+    # docs/TEMPLATE_CANDIDATE_CLUSTERING_DESIGN.md §3 — same on_startup/
+    # on_cleanup shape as the reminders sweep above, and for the same
+    # reason (task must be tied to the app's own lifecycle, not detached).
+    async def _start_template_candidate_clustering(app: web.Application) -> None:
+        app["template_candidate_clustering_task"] = asyncio.create_task(template_candidate_clustering_loop())
+
+    async def _stop_template_candidate_clustering(app: web.Application) -> None:
+        task = app.get("template_candidate_clustering_task")
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    app.on_startup.append(_start_template_candidate_clustering)
+    app.on_cleanup.append(_stop_template_candidate_clustering)
 
     return app
 

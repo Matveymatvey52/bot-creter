@@ -24,7 +24,12 @@ import logging
 
 from aiohttp import web
 
-from db.database import add_bot_feedback, list_bots_with_stats, list_template_candidates
+from db.database import (
+    add_bot_feedback,
+    list_bots_with_stats,
+    list_template_candidate_clusters_with_stats,
+    list_template_candidates,
+)
 from handlers.admin_manager import OWNER_ID
 from runtime.miniapp_api import _authenticate
 from runtime.registry import FACTORY_BOT_ID, Registry, infer_template_id
@@ -128,6 +133,32 @@ async def list_template_candidates_handler(request: web.Request) -> web.Response
     return web.json_response({"items": items})
 
 
+async def list_template_candidate_clusters_handler(request: web.Request) -> web.Response:
+    """"Топ незакрытых паттернов" section
+    (docs/TEMPLATE_CANDIDATE_CLUSTERING_DESIGN.md §4) — clusters an
+    incremental background pass (runtime/template_candidate_clustering.py)
+    has already assigned candidates to, largest first. Candidates not yet
+    picked up by a pass (cluster_id IS NULL) are excluded here on purpose —
+    they still show up in list_template_candidates_handler's raw feed above."""
+    if not await _authenticate_owner(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+
+    rows = await list_template_candidate_clusters_with_stats()
+    items = [
+        {
+            "id": row["id"],
+            "label": row["label"],
+            "description": row["description"],
+            "count": row["count"],
+            "first_seen": row["first_seen"],
+            "last_seen": row["last_seen"],
+            "examples": row["examples"],
+        }
+        for row in rows
+    ]
+    return web.json_response({"items": items})
+
+
 def register_routes(app: web.Application) -> None:
     """Adds owner-only analytics routes to the same Application miniapp_api's
     register_routes() already extends (see combined_app.py's _bootstrap_app,
@@ -137,3 +168,4 @@ def register_routes(app: web.Application) -> None:
     app.router.add_get("/api/factory/bots", list_bots_handler)
     app.router.add_post("/api/factory/bots/{bot_id}/feedback", add_feedback_handler)
     app.router.add_get("/api/factory/candidates", list_template_candidates_handler)
+    app.router.add_get("/api/factory/candidate-clusters", list_template_candidate_clusters_handler)

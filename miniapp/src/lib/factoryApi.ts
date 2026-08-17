@@ -93,3 +93,17 @@ export interface TemplateCandidateItem {
 export function listTemplateCandidates(): Promise<{ items: TemplateCandidateItem[] }> {
   return request('/candidates')
 }
+
+export interface TemplateCandidateClusterItem {
+  id: number
+  label: string
+  description: string | null
+  count: number
+  first_seen: string
+  last_seen: string
+  examples: string[]
+}
+
+export function listTemplateCandidateClusters(): Promise<{ items: TemplateCandidateClusterItem[] }> {
+  return request('/candidate-clusters')
+}
