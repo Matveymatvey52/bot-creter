@@ -35,7 +35,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from db.database import get_office_subscribers
+from db.database import get_bot, get_office_subscribers
 from runtime.registry_holder import RegistryHandle
 
 logger = logging.getLogger(__name__)
@@ -83,6 +83,16 @@ _EVENT_TYPES: dict[str, type] = {
     "task.assigned": TaskAssignedEvent,
 }
 
+# Human-readable labels for the picker/confirmation screens in
+# handlers/manage_bots.py's "🏢 Офисы" flow — kept alongside _EVENT_TYPES so
+# a new event_type can't be added there without a caller-facing label. Falls
+# back to the raw event_type string if a key is somehow missing (see
+# EVENT_TYPE_LABELS.get usage) rather than raising in a UI render path.
+EVENT_TYPE_LABELS: dict[str, str] = {
+    "order.created": "новый заказ",
+    "task.assigned": "новая задача",
+}
+
 
 @dataclass(frozen=True)
 class OfficeEvent:
@@ -96,6 +106,43 @@ class OfficeEvent:
     event_type: str
     source_bot_id: int
     payload: Any = field(default=None)
+
+
+async def _mirror_to_digest_group(registry, source_bot_id: int, event_type: str) -> None:
+    """Best-effort, read-only mirror of ONE line per office_event into the
+    owner's bound showcase group (db.database.get_office_digest_group), if
+    any — see docs/OFFICES_DESIGN.md §12. Sent via the FACTORY bot, never a
+    tenant bot: the group is a Creator-bot-owned "витрина", not a chat any
+    client bot participates in (client bots are never added to it — see the
+    design doc's "клиентские боты в группу не добавляются").
+
+    Deliberately isolated from the real delivery loop in publish_event(): a
+    digest-group failure (group deleted, factory bot kicked, no group bound
+    at all) must never affect actual subscriber delivery, so this is called
+    unconditionally before the subscriber loop and swallows every exception
+    itself, same isolation contract as every other office_events failure
+    mode in this module."""
+    from db.database import get_office_digest_group
+    from runtime.registry import FACTORY_BOT_ID
+
+    try:
+        chat_id = await get_office_digest_group()
+        if not chat_id:
+            return
+        factory_entry = registry.get(FACTORY_BOT_ID)
+        if factory_entry is None:
+            return
+        source_bot = await get_bot(source_bot_id)
+        source_name = source_bot["name"] if source_bot else str(source_bot_id)
+        label = EVENT_TYPE_LABELS.get(event_type, event_type)
+        text = f"🏢 «{source_name}»: {label}"
+        await factory_entry.bot.send_message(chat_id, text)
+    except Exception:
+        logger.warning(
+            f"_mirror_to_digest_group: failed to mirror event_type={event_type!r} "
+            f"source_bot_id={source_bot_id} to digest group",
+            exc_info=True,
+        )
 
 
 async def publish_event(source_bot_id: int, event_type: str, payload: object) -> int:
@@ -132,6 +179,8 @@ async def publish_event(source_bot_id: int, event_type: str, payload: object) ->
             f"source_bot_id={source_bot_id} dropped (expected under main.py's polling process)"
         )
         return 0
+
+    await _mirror_to_digest_group(registry, source_bot_id, event_type)
 
     subscriber_ids = await get_office_subscribers(source_bot_id, event_type)
     if not subscriber_ids:

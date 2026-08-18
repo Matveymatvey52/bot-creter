@@ -274,6 +274,22 @@ async def init_db():
                 PRIMARY KEY (source_bot_id, target_bot_id, event_type)
             )
         """)
+        # office_digest_group — the Telegram group the OWNER has opted to bind
+        # as a read-only showcase/mirror of office_events activity (see
+        # docs/OFFICES_DESIGN.md §12 "витрина"). Deliberately a single row
+        # (id fixed at 1, upserted), not one row per bot: the digest is
+        # emitted by the Creator/factory bot itself, not by any tenant bot,
+        # and there is only ever one such group for the whole factory
+        # instance — unlike bots.group_chat_id, which is a PER-BOT fallback
+        # destination for that bot's own moderator-style notifications and is
+        # semantically unrelated to this.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS office_digest_group (
+                id         INTEGER PRIMARY KEY CHECK (id = 1),
+                chat_id    TEXT NOT NULL,
+                bound_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         # mini-app config (see docs/MINIAPP_DESIGN.md §6) — one row per bot,
         # JSON blob (same shape as templates/tour_operator.py's miniapp_config
         # dict: {"resources": [...]}). Stored in the factory DB, not inline in
@@ -984,6 +1000,30 @@ async def get_office_links_for_bot(bot_id: int) -> list[dict]:
         ) as cursor:
             rows = await cursor.fetchall()
             return [dict(row) for row in rows]
+
+
+async def set_office_digest_group(chat_id: str) -> None:
+    """Upserts the single office-digest showcase group — see
+    office_digest_group's CREATE TABLE comment above for why this is
+    deliberately one row, not per-bot."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO office_digest_group (id, chat_id) VALUES (1, ?)
+            ON CONFLICT(id) DO UPDATE SET chat_id = excluded.chat_id, bound_at = CURRENT_TIMESTAMP
+            """,
+            (chat_id,),
+        )
+        await db.commit()
+
+
+async def get_office_digest_group() -> str | None:
+    """The bound showcase group's chat_id, or None if the owner never bound
+    one — see features/office_events.py's publish_event(), the only reader."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT chat_id FROM office_digest_group WHERE id = 1") as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else None
 
 
 async def get_office_subscribers(source_bot_id: int, event_type: str) -> list[int]:

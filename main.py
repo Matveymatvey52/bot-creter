@@ -9,7 +9,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import ChatMemberUpdated, InlineKeyboardButton, InlineKeyboardMarkup, Update
 
 from config import BOT_TOKEN
-from db.database import get_all_bots, init_db, set_bot_group, update_bot_status
+from db.database import get_all_bots, init_db, set_bot_group, set_office_digest_group, update_bot_status
 from handlers.admin_manager import OWNER_ID, router as admin_router
 from handlers.create_bot import auto_launch_managed_bot, router as create_router, set_bot_id, set_manager_username
 from handlers.custom_features import router as custom_features_router
@@ -80,6 +80,19 @@ def build_group_router() -> Router:
             callback_data=f"setgroup:{b['id']}:{group_id}",
         )] for b in bots]
         rows.append([InlineKeyboardButton(text="✅ Всем ботам", callback_data=f"setgroup:all:{group_id}")])
+        # This handler fires for whichever bot dispatched the update —
+        # build_group_router() is shared between main.py's own factory-bot
+        # dispatcher and combined_app.py's per-managed-bot dispatchers (see
+        # this function's docstring). Only offer the office-events digest
+        # option when it's the FACTORY/Creator bot itself being added — a
+        # tenant bot added to a group is always for its own per-bot
+        # moderator-style fallback (set_bot_group), never the factory-wide
+        # digest showcase, which docs/OFFICES_DESIGN.md §12 is explicit is
+        # bound to the Creator bot only (client bots never join that group).
+        if bot.token == BOT_TOKEN:
+            rows.append([InlineKeyboardButton(
+                text="🏢 Как витрина связей офисов", callback_data=f"setgroup:officedigest:{group_id}",
+            )])
         await bot.send_message(
             user_id,
             f"Я добавлен в группу <b>«{group_name}»</b>.\n\nДля каких ботов настроить эту группу?",
@@ -93,6 +106,12 @@ def build_group_router() -> Router:
         parts = callback.data.split(":")
         bot_target = parts[1]
         group_id = ":".join(parts[2:])
+        if bot_target == "officedigest":
+            await set_office_digest_group(group_id)
+            await callback.message.edit_text(
+                "🏢 Эта группа теперь витрина связей офисов — сюда будет приходить сводка по office_event."
+            )
+            return
         bots = await get_all_bots()
         if bot_target == "all":
             targets = bots

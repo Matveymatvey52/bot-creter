@@ -132,3 +132,67 @@ async def test_publish_event_never_raises_for_subscriber_hook_exception(monkeypa
     # Must not propagate — a broken subscriber must never interrupt the publisher.
     delivered = await publish_event(1, "order.created", OrderCreatedEvent(1, 100, "RUB", 999))
     assert delivered == 0
+
+
+# ── digest-group mirroring (docs/OFFICES_DESIGN.md §12) ─────────────────────
+# _mirror_to_digest_group does its own imports of db.database.get_office_
+# digest_group and runtime.registry.FACTORY_BOT_ID inside the function body
+# (see that function's own docstring for why), so these tests monkeypatch
+# db.database directly rather than office_events' own module namespace.
+
+import db.database as database  # noqa: E402
+
+
+@pytest.mark.asyncio
+async def test_publish_event_skips_digest_mirror_when_no_group_bound(monkeypatch):
+    monkeypatch.setattr(office_events, "get_office_subscribers", AsyncMock(return_value=[]))
+    monkeypatch.setattr(database, "get_office_digest_group", AsyncMock(return_value=None))
+    factory_entry = SimpleNamespace(bot=AsyncMock())
+    office_events.set_registry(FakeRegistry({0: factory_entry}))
+
+    await publish_event(1, "order.created", OrderCreatedEvent(1, 100, "RUB", 999))
+
+    factory_entry.bot.send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_publish_event_mirrors_to_bound_digest_group(monkeypatch):
+    monkeypatch.setattr(office_events, "get_office_subscribers", AsyncMock(return_value=[]))
+    monkeypatch.setattr(database, "get_office_digest_group", AsyncMock(return_value="-100999"))
+    monkeypatch.setattr(office_events, "get_bot", AsyncMock(return_value={"id": 1, "name": "SourceBot"}))
+    factory_entry = SimpleNamespace(bot=AsyncMock())
+    office_events.set_registry(FakeRegistry({0: factory_entry}))
+
+    await publish_event(1, "order.created", OrderCreatedEvent(1, 100, "RUB", 999))
+
+    factory_entry.bot.send_message.assert_awaited_once()
+    (chat_id, text), _ = factory_entry.bot.send_message.call_args
+    assert chat_id == "-100999"
+    assert "SourceBot" in text
+    assert "новый заказ" in text
+
+
+@pytest.mark.asyncio
+async def test_publish_event_digest_mirror_failure_does_not_block_delivery(monkeypatch):
+    monkeypatch.setattr(office_events, "get_office_subscribers", AsyncMock(return_value=[2]))
+    monkeypatch.setattr(
+        database, "get_office_digest_group", AsyncMock(side_effect=RuntimeError("db down"))
+    )
+    hook = AsyncMock()
+    office_events.set_registry(FakeRegistry({2: _entry_with_hook(hook)}))
+
+    delivered = await publish_event(1, "order.created", OrderCreatedEvent(1, 100, "RUB", 999))
+
+    assert delivered == 1
+    hook.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_publish_event_skips_digest_mirror_when_factory_bot_not_live(monkeypatch):
+    monkeypatch.setattr(office_events, "get_office_subscribers", AsyncMock(return_value=[]))
+    monkeypatch.setattr(database, "get_office_digest_group", AsyncMock(return_value="-100999"))
+    office_events.set_registry(FakeRegistry({}))  # factory bot (id 0) not registered
+
+    # Must not raise even though the factory bot isn't in the live registry.
+    delivered = await publish_event(1, "order.created", OrderCreatedEvent(1, 100, "RUB", 999))
+    assert delivered == 0
