@@ -20,6 +20,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 import db.database as db_module
 from db.database import (
+    add_template_candidate,
     create_bot_record_with_admins,
     delete_bot,
     init_db,
@@ -593,6 +594,133 @@ class FactoryAnalyticsApiTests(unittest.IsolatedAsyncioTestCase):
         with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
             resp = await self.client.get(f"/api/factory/bots/{self.bot_id}/logs?token={token}")
         self.assertEqual(resp.status, 403)
+
+    # ── creation_prompt in bot detail (item 2) ──────────────────────────
+    async def test_bot_detail_includes_creation_prompt(self):
+        prompt_bot_id = await create_bot_record_with_admins(
+            name="factory_analytics_prompt_bot", description="test",
+            token="4444:AAprompt-fake-token-1234567890",
+            file_path="templates/shop_catalog.py", admin_ids=["1"],
+            creation_prompt="хочу бота для продажи цветов",
+        )
+        qs = await self._owner_qs()
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            resp = await self.client.get(f"/api/factory/bots/{prompt_bot_id}?{qs}")
+        self.assertEqual(resp.status, 200)
+        body = await resp.json()
+        self.assertEqual(body["creation_prompt"], "хочу бота для продажи цветов")
+
+    async def test_bot_detail_creation_prompt_is_none_when_absent(self):
+        qs = await self._owner_qs()
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            resp = await self.client.get(f"/api/factory/bots/{self.bot_id}?{qs}")
+        body = await resp.json()
+        self.assertIsNone(body["creation_prompt"])
+
+    # ── template candidates / clusters (item 1) ─────────────────────────
+    async def test_candidates_non_owner_returns_403(self):
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            token = mint_magic_link_token(FACTORY_BOT_ID, OTHER_TELEGRAM_ID)
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            resp = await self.client.get(f"/api/factory/candidates?token={token}")
+        self.assertEqual(resp.status, 403)
+
+    async def test_owner_sees_template_candidates(self):
+        await add_template_candidate(
+            creator_user_id=OWNER_TELEGRAM_ID,
+            summary="хочу бота для учёта смен курьеров",
+            fallback_reason="no_template_match",
+            selected_templates=[],
+            bot_type="general",
+        )
+        qs = await self._owner_qs()
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            resp = await self.client.get(f"/api/factory/candidates?{qs}")
+        self.assertEqual(resp.status, 200)
+        body = await resp.json()
+        self.assertTrue(any(c["summary"] == "хочу бота для учёта смен курьеров" for c in body["items"]))
+
+    async def test_candidate_clusters_non_owner_returns_403(self):
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            token = mint_magic_link_token(FACTORY_BOT_ID, OTHER_TELEGRAM_ID)
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            resp = await self.client.get(f"/api/factory/candidate-clusters?token={token}")
+        self.assertEqual(resp.status, 403)
+
+    async def test_owner_sees_candidate_clusters(self):
+        """Uses the shared dev DB (may already have clusters from other
+        tests/passes) — just asserts the owner-only route returns a
+        well-shaped list, same posture as list_template_candidate_clusters_
+        with_stats' own docstring (largest cluster first)."""
+        qs = await self._owner_qs()
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            resp = await self.client.get(f"/api/factory/candidate-clusters?{qs}")
+        self.assertEqual(resp.status, 200)
+        body = await resp.json()
+        self.assertIsInstance(body["items"], list)
+
+    # ── bot activity log (item 3) ───────────────────────────────────────
+    async def test_bot_activity_merges_feedback_and_per_bot_db_sources(self):
+        """Activity merges bot_feedback (central DB, seeded by asyncSetUp)
+        with office_notes/payments rows written straight to self.bot_db_path
+        — no new table involved, and a bot whose db lacks either table just
+        contributes nothing from that source (see the two OperationalError
+        try/excepts in bot_activity_handler)."""
+        async with aiosqlite.connect(self.bot_db_path) as db:
+            await db.execute(
+                "CREATE TABLE office_notes (id INTEGER PRIMARY KEY, source_bot_id INTEGER, "
+                "event_type TEXT, note TEXT, created_at TEXT)"
+            )
+            await db.execute(
+                "INSERT INTO office_notes (source_bot_id, event_type, note, created_at) "
+                "VALUES (1, 'order.created', 'test note', '2099-01-01 00:00:00')"
+            )
+            await db.execute(
+                "CREATE TABLE payments (id INTEGER PRIMARY KEY, telegram_payment_charge_id TEXT, "
+                "user_id INTEGER, invoice_payload TEXT, currency TEXT, total_amount INTEGER, "
+                "status TEXT, created_at TEXT)"
+            )
+            await db.execute(
+                "INSERT INTO payments (telegram_payment_charge_id, user_id, invoice_payload, "
+                "currency, total_amount, status, created_at) "
+                "VALUES ('ch1', 1, 'p', 'RUB', 10000, 'paid', '2099-01-02 00:00:00')"
+            )
+            await db.commit()
+
+        qs = await self._owner_qs()
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            resp = await self.client.get(f"/api/factory/bots/{self.bot_id}/activity?{qs}")
+        self.assertEqual(resp.status, 200)
+        body = await resp.json()
+        sources = {item["source"] for item in body["items"]}
+        self.assertEqual(sources, {"feedback", "office_event", "payment"})
+        # most-recent-first: the 2099 payment sorts ahead of feedback/office_note
+        self.assertEqual(body["items"][0]["source"], "payment")
+
+    async def test_bot_activity_missing_per_bot_tables_degrades_to_feedback_only(self):
+        """self.bot_db_path exists but has neither office_notes nor payments
+        tables — both OperationalError branches should be swallowed, not
+        turn into a 500, leaving just the central bot_feedback rows."""
+        qs = await self._owner_qs()
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            resp = await self.client.get(f"/api/factory/bots/{self.bot_id}/activity?{qs}")
+        self.assertEqual(resp.status, 200)
+        body = await resp.json()
+        self.assertTrue(all(item["source"] == "feedback" for item in body["items"]))
+        self.assertEqual(len(body["items"]), 2)  # the two add_bot_feedback calls in asyncSetUp
+
+    async def test_bot_activity_forbidden_for_non_owner_non_owner_bot(self):
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            token = mint_magic_link_token(FACTORY_BOT_ID, OTHER_TELEGRAM_ID)
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            resp = await self.client.get(f"/api/factory/bots/{self.bot_id}/activity?token={token}")
+        self.assertEqual(resp.status, 403)
+
+    async def test_bot_activity_bad_bot_id_returns_404(self):
+        qs = await self._owner_qs()
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            resp = await self.client.get(f"/api/factory/bots/not-a-number/activity?{qs}")
+        self.assertEqual(resp.status, 404)
 
     async def test_delete_bot_removes_record(self):
         deletable_id = await create_bot_record_with_admins(

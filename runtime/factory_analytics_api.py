@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 
+import aiosqlite
 from aiohttp import web
 
 from db.database import (
@@ -40,6 +41,9 @@ from db.database import (
     get_office_digest_group,
     get_office_links_for_bot,
     list_bots_with_stats,
+    list_feedback_activity,
+    list_template_candidate_clusters_with_stats,
+    list_template_candidates,
     remove_bot_admin,
     remove_office_link,
     set_bot_feature_description,
@@ -215,6 +219,124 @@ async def owner_registry_handler(request: web.Request) -> web.Response:
     return web.json_response({"items": items})
 
 
+async def candidates_handler(request: web.Request) -> web.Response:
+    """GET /api/factory/candidates — "Кандидаты на новый шаблон" for
+    OwnerRegistryScreen.tsx. Same underlying db.database.list_template_candidates()
+    query the /owner-report app's own patterns tab already uses
+    (runtime/owner_report_api.py) — exposed here too, under this owner-scoped
+    factory API, so it's reachable from the registry screen linked straight
+    off the dashboard/[Creator bot's own /start] rather than only the
+    separate, unlinked /owner-report route."""
+    if not await _authenticate_owner(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    items = await list_template_candidates()
+    return web.json_response({"items": items})
+
+
+async def candidate_clusters_handler(request: web.Request) -> web.Response:
+    """GET /api/factory/candidate-clusters — "Топ незакрытых паттернов" for
+    OwnerRegistryScreen.tsx, same data source as candidates_handler's
+    docstring explains."""
+    if not await _authenticate_owner(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    items = await list_template_candidate_clusters_with_stats()
+    return web.json_response({"items": items})
+
+
+# Recent rows pulled per source when assembling one bot's activity feed — see
+# bot_activity_handler. Same cap reasoning as owner_report_api.py's own
+# _PER_BOT_SOURCE_LIMIT, just scoped to a single bot instead of every bot in
+# the factory.
+_ACTIVITY_PER_SOURCE_LIMIT = 100
+
+
+async def bot_activity_handler(request: web.Request) -> web.Response:
+    """GET /api/factory/bots/{bot_id}/activity — MVP "who's interacting with
+    this bot" feed for BotDetailPanel.tsx, built entirely from data already
+    logged elsewhere (no new table — same posture as
+    runtime/owner_report_api.py's cross-owner activity feed, just scoped to
+    one bot instead of merged across all of them):
+      - bot_feedback (central DB) via db.database.list_feedback_activity
+      - office_notes and payments — this bot's OWN per-bot sqlite file
+        (features/office_events.py, features/payments.py), read straight off
+        the live Registry's resolved db_path.
+    Merged and sorted most-recent-first. A bot with no live Registry entry/
+    db_path, or whose db_path lacks an office_notes/payments table (most
+    templates never get one or the other), just contributes nothing from
+    that source rather than erroring — same "operational error -> skip"
+    handling as owner_report_api.py's _office_notes_activity/_payments_activity."""
+    bot_id = _bot_id_from_match_info(request)
+    if bot_id is None:
+        return web.json_response({"error": "bad bot_id"}, status=404)
+    if not await _authenticate_bot_access(request, bot_id):
+        return web.json_response({"error": "forbidden"}, status=403)
+    b = await get_bot(bot_id)
+    if not b:
+        return web.json_response({"error": "not found"}, status=404)
+
+    entries: list[dict] = []
+    for row in await list_feedback_activity(bot_id=bot_id):
+        entries.append(
+            {
+                "source": "feedback",
+                "event_type": f"rating={row['rating']}",
+                "detail": row["comment"],
+                "telegram_user_id": None,
+                "created_at": row["created_at"],
+            }
+        )
+
+    registry: Registry = request.app[REGISTRY_KEY]
+    entry = registry.get(bot_id)
+    db_path = entry.config.get("db_path") if entry is not None and isinstance(entry.config, dict) else None
+    if db_path:
+        try:
+            async with aiosqlite.connect(db_path) as db:
+                db.row_factory = aiosqlite.Row
+                try:
+                    async with db.execute(
+                        "SELECT event_type, note, created_at FROM office_notes "
+                        "ORDER BY created_at DESC LIMIT ?",
+                        (_ACTIVITY_PER_SOURCE_LIMIT,),
+                    ) as cursor:
+                        for r in await cursor.fetchall():
+                            entries.append(
+                                {
+                                    "source": "office_event",
+                                    "event_type": r["event_type"],
+                                    "detail": r["note"],
+                                    "telegram_user_id": None,
+                                    "created_at": r["created_at"],
+                                }
+                            )
+                except aiosqlite.OperationalError:
+                    pass  # this bot never received an office_event — no office_notes table
+
+                try:
+                    async with db.execute(
+                        "SELECT user_id, total_amount, currency, status, created_at FROM payments "
+                        "ORDER BY created_at DESC LIMIT ?",
+                        (_ACTIVITY_PER_SOURCE_LIMIT,),
+                    ) as cursor:
+                        for r in await cursor.fetchall():
+                            entries.append(
+                                {
+                                    "source": "payment",
+                                    "event_type": r["status"],
+                                    "detail": f"{r['total_amount']} {r['currency']}",
+                                    "telegram_user_id": r["user_id"],
+                                    "created_at": r["created_at"],
+                                }
+                            )
+                except aiosqlite.OperationalError:
+                    pass  # payments feature not enabled/never used on this bot
+        except Exception:
+            logger.warning(f"bot_activity_handler: failed to read db_path for bot_id={bot_id}", exc_info=True)
+
+    entries.sort(key=lambda e: e["created_at"] or "", reverse=True)
+    return web.json_response({"items": entries[:100]})
+
+
 async def _weekly_count_for_bot(registry: Registry, bot_id: int) -> int | None:
     """Records this bot's own data got in the last 7 days, for the dashboard
     card's headline metric — see features/sales_analytics.weekly_record_count.
@@ -290,6 +412,7 @@ async def bot_detail_handler(request: web.Request) -> web.Response:
             "running": is_running(bot_id),
             "template": template_id,
             "created_at": b.get("created_at"),
+            "creation_prompt": b.get("creation_prompt"),
             "admins": admins,
             "offices": offices,
             "features": features,
@@ -772,6 +895,8 @@ def register_routes(app: web.Application) -> None:
     app.router.add_get("/api/factory/session", refresh_session_handler)
     app.router.add_get("/api/factory/bots", list_bots_handler)
     app.router.add_get("/api/factory/owner-registry", owner_registry_handler)
+    app.router.add_get("/api/factory/candidates", candidates_handler)
+    app.router.add_get("/api/factory/candidate-clusters", candidate_clusters_handler)
     app.router.add_post("/api/factory/bots/{bot_id}/feedback", add_feedback_handler)
 
     # Detail panel — level 2 of the dashboard (docs discussion: "Детальная
@@ -782,6 +907,7 @@ def register_routes(app: web.Application) -> None:
     app.router.add_post("/api/factory/bots/{bot_id}/restart", restart_bot_handler)
     app.router.add_delete("/api/factory/bots/{bot_id}", delete_bot_handler)
     app.router.add_get("/api/factory/bots/{bot_id}/logs", bot_logs_handler)
+    app.router.add_get("/api/factory/bots/{bot_id}/activity", bot_activity_handler)
     app.router.add_post("/api/factory/bots/{bot_id}/recreate", recreate_bot_handler)
     app.router.add_post("/api/factory/bots/{bot_id}/autofix", autofix_bot_handler)
     app.router.add_post("/api/factory/bots/{bot_id}/fixbug", fixbug_bot_handler)

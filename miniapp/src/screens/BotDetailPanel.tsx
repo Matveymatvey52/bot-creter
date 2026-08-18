@@ -18,10 +18,12 @@ import {
   getShowcaseGroupStatus,
   addAdmin,
   removeAdmin,
+  getBotActivity,
   ApiError,
   type BotDetail,
   type FeatureStatusItem,
   type FactoryBotItem,
+  type BotActivityItem,
 } from '../lib/factoryApi'
 import { iconForTemplate } from '../lib/botIcons'
 import { FeedbackForm } from './FactoryDashboardScreen'
@@ -265,14 +267,24 @@ function BackIcon() {
   )
 }
 
+const ACTIVITY_SOURCE_LABELS: Record<BotActivityItem['source'], string> = {
+  feedback: 'отзыв',
+  office_event: 'офис-событие',
+  payment: 'платёж',
+}
+
 function OverviewTab({ botId, detail }: { botId: number; detail: BotDetail }) {
   const [logs, setLogs] = useState<string | null>(null)
+  const [activity, setActivity] = useState<BotActivityItem[] | null>(null)
   const enabledCount = detail.features.filter((f) => f.state === 'on').length
 
   useEffect(() => {
     getBotLogs(botId)
       .then((r) => setLogs(r.logs))
       .catch(() => setLogs(null))
+    getBotActivity(botId)
+      .then((r) => setActivity(r.items))
+      .catch(() => setActivity(null))
   }, [botId])
 
   return (
@@ -295,6 +307,49 @@ function OverviewTab({ botId, detail }: { botId: number; detail: BotDetail }) {
           <div className="l">создан</div>
         </div>
       </div>
+
+      {detail.creation_prompt && (
+        <>
+          <div className="feature-name" style={{ marginBottom: 6 }}>
+            Промпт создания
+          </div>
+          <div className="feature-desc" style={{ marginBottom: 16 }}>
+            {detail.creation_prompt}
+          </div>
+        </>
+      )}
+
+      <div className="feature-name" style={{ marginBottom: 6 }}>
+        Активность
+      </div>
+      {activity && activity.length > 0 ? (
+        <div style={{ marginBottom: 16 }}>
+          {activity.slice(0, 20).map((item, i) => (
+            <div
+              key={i}
+              style={{
+                display: 'flex',
+                justifyContent: 'space-between',
+                gap: 8,
+                padding: '6px 0',
+                borderBottom: '1px solid var(--border, #333)',
+                fontSize: 12.5,
+              }}
+            >
+              <span style={{ color: 'var(--text-secondary)' }}>
+                {ACTIVITY_SOURCE_LABELS[item.source]} · {item.event_type}
+                {item.detail ? ` — ${item.detail}` : ''}
+              </span>
+              <span style={{ color: 'var(--text-secondary)', whiteSpace: 'nowrap' }}>{item.created_at}</span>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div className="feature-desc" style={{ marginBottom: 16 }}>
+          {activity === null ? 'Не удалось загрузить активность.' : 'Активности пока нет.'}
+        </div>
+      )}
+
       <div className="feature-name" style={{ marginBottom: 6 }}>
         Логи
       </div>

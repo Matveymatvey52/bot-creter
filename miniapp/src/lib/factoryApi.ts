@@ -141,6 +141,40 @@ export function listOwnerRegistry(): Promise<{ items: OwnerRegistryItem[] }> {
   return request('/owner-registry')
 }
 
+// "Топ незакрытых паттернов" / "Кандидаты на новый шаблон" — same
+// backing data as the separate /owner-report app's patterns tab
+// (lib/ownerReportApi.ts), exposed here too so OwnerRegistryScreen.tsx
+// (reachable straight from the dashboard/Creator bot's own /start, unlike
+// /owner-report) can show them without a second, unlinked app.
+export interface TemplateCandidateItem {
+  id: number
+  bot_id: number | null
+  bot_name: string | null
+  summary: string
+  fallback_reason: string
+  selected_templates: string[]
+  bot_type: string | null
+  created_at: string
+}
+
+export function listTemplateCandidates(): Promise<{ items: TemplateCandidateItem[] }> {
+  return request('/candidates')
+}
+
+export interface TemplateCandidateClusterItem {
+  id: number
+  label: string
+  description: string | null
+  count: number
+  first_seen: string
+  last_seen: string
+  examples: string[]
+}
+
+export function listTemplateCandidateClusters(): Promise<{ items: TemplateCandidateClusterItem[] }> {
+  return request('/candidate-clusters')
+}
+
 export function addFactoryFeedback(
   botId: number,
   rating: number,
@@ -182,6 +216,7 @@ export interface BotDetail {
   running: boolean
   template: string | null
   created_at: string
+  creation_prompt: string | null
   admins: string[]
   offices: OfficeLink[]
   features: FeatureStatusItem[]
@@ -209,6 +244,20 @@ export function deleteBot(botId: number): Promise<{ ok: true }> {
 
 export function getBotLogs(botId: number): Promise<{ logs: string }> {
   return request(`/bots/${botId}/logs`)
+}
+
+// MVP "who's interacting with this bot" feed — bot_feedback + this bot's own
+// office_notes/payments (see bot_activity_handler's docstring), no new table.
+export interface BotActivityItem {
+  source: 'feedback' | 'office_event' | 'payment'
+  event_type: string
+  detail: string | null
+  telegram_user_id: number | null
+  created_at: string
+}
+
+export function getBotActivity(botId: number): Promise<{ items: BotActivityItem[] }> {
+  return request(`/bots/${botId}/activity`)
 }
 
 export function recreateBot(botId: number): Promise<{ ok: boolean; error: string | null; bot_name: string | null }> {
