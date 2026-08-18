@@ -35,7 +35,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from db.database import add_custom_feature_record, get_bot, get_custom_feature_history, set_bot_miniapp_config
-from handlers.admin_manager import _is_owner
+from handlers.admin_manager import _can_manage_bot
 from handlers.create_bot import cancel_keyboard
 from handlers.manage_bots import _bot_keyboard, _busy_bots, _recognize_voice_fix
 from runtime.registry import _CUSTOM_FEATURES_DIR, invalidate_custom_feature_cache
@@ -116,12 +116,12 @@ def _hash_main_code(main_code: str) -> str:
 
 @router.callback_query(F.data.startswith("customfeature:"))
 async def cb_start_custom_feature(callback: CallbackQuery, state: FSMContext) -> None:
-    if not _is_owner(callback.from_user.id):
-        await _deny_callback(callback)
-        return
     bot_id = int(callback.data.split(":")[1])
     b = await get_bot(bot_id)
-    if not b or not b.get("file_path") or not Path(b["file_path"]).exists():
+    if not b or not _can_manage_bot(callback.from_user.id, b):
+        await _deny_callback(callback)
+        return
+    if not b.get("file_path") or not Path(b["file_path"]).exists():
         await callback.answer()
         await callback.message.edit_text("❌ Файл бота не найден — попробуй Перегенерировать.")
         return
@@ -228,12 +228,25 @@ async def _generate_and_preview(message: Message, state: FSMContext, request_tex
         _busy_bots.discard(bot_id)
 
 
+async def _can_manage_pending_custom_feature(user_id: int, data: dict) -> bool:
+    """Per-bot ownership check for the describing_request FSM state — reads
+    cf_bot_id (set by cb_start_custom_feature, itself already ownership-
+    checked) and re-verifies against the CURRENT caller, same posture as
+    every other per-message check in this state machine. bot_id missing/
+    bot deleted mid-flow fails closed."""
+    bot_id = data.get("cf_bot_id")
+    if bot_id is None:
+        return False
+    b = await get_bot(bot_id)
+    return bool(b) and _can_manage_bot(user_id, b)
+
+
 @router.message(CustomFeatureStates.describing_request, F.voice)
 async def msg_custom_feature_voice(message: Message, state: FSMContext, bot: Bot) -> None:
-    if not _is_owner(message.from_user.id):
+    data = await state.get_data()
+    if not await _can_manage_pending_custom_feature(message.from_user.id, data):
         await _deny_message(message)
         return
-    data = await state.get_data()
     if "cf_pending_code" in data:
         # Same guard as msg_custom_feature_text below — a preview is already
         # sitting in front of the owner, don't let a voice message silently
@@ -247,10 +260,10 @@ async def msg_custom_feature_voice(message: Message, state: FSMContext, bot: Bot
 
 @router.message(CustomFeatureStates.describing_request, F.text, ~F.text.startswith("/"))
 async def msg_custom_feature_text(message: Message, state: FSMContext) -> None:
-    if not _is_owner(message.from_user.id):
+    data = await state.get_data()
+    if not await _can_manage_pending_custom_feature(message.from_user.id, data):
         await _deny_message(message)
         return
-    data = await state.get_data()
     if "cf_pending_code" in data:
         # A preview is already sitting in front of the owner — a new text
         # message here is ambiguous (new request? more detail?) and would
@@ -270,10 +283,10 @@ async def msg_custom_feature_text(message: Message, state: FSMContext) -> None:
 
 @router.message(CustomFeatureStates.describing_request)
 async def msg_custom_feature_fallback(message: Message, state: FSMContext) -> None:
-    if not _is_owner(message.from_user.id):
+    data = await state.get_data()
+    if not await _can_manage_pending_custom_feature(message.from_user.id, data):
         await _deny_message(message)
         return
-    data = await state.get_data()
     if "cf_pending_code" in data:
         return  # preview pending — only the buttons or /cancel act on it
     await message.answer(
@@ -305,10 +318,11 @@ async def _regenerate_miniapp_config_after_custom_feature(
 
 @router.callback_query(F.data.startswith("applycustom:"))
 async def cb_apply_custom_feature(callback: CallbackQuery, state: FSMContext) -> None:
-    if not _is_owner(callback.from_user.id):
+    bot_id = int(callback.data.split(":")[1])
+    b = await get_bot(bot_id)
+    if not b or not _can_manage_bot(callback.from_user.id, b):
         await _deny_callback(callback)
         return
-    bot_id = int(callback.data.split(":")[1])
     # Check-then-add with NO await in between — closes a double-tap race a
     # prior version of this handler had (busy-check before await
     # callback.answer(), a real network suspension point, .add() only after;
@@ -467,14 +481,10 @@ def _truncate(text: str, limit: int) -> str:
 
 @router.callback_query(F.data.startswith("customfeaturehistory:"))
 async def cb_custom_feature_history(callback: CallbackQuery) -> None:
-    if not _is_owner(callback.from_user.id):
-        await _deny_callback(callback)
-        return
     bot_id = int(callback.data.split(":")[1])
     b = await get_bot(bot_id)
-    if not b:
-        await callback.answer()
-        await callback.message.edit_text("❌ Бот не найден.")
+    if not b or not _can_manage_bot(callback.from_user.id, b):
+        await _deny_callback(callback)
         return
     await callback.answer()
 
@@ -510,10 +520,11 @@ async def cb_custom_feature_history(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("cancelcustom:"))
 async def cb_cancel_custom_feature(callback: CallbackQuery, state: FSMContext) -> None:
-    if not _is_owner(callback.from_user.id):
+    bot_id = int(callback.data.split(":")[1])
+    b = await get_bot(bot_id)
+    if not b or not _can_manage_bot(callback.from_user.id, b):
         await _deny_callback(callback)
         return
-    bot_id = int(callback.data.split(":")[1])
     await state.clear()
     await callback.answer()
     await callback.message.edit_text(

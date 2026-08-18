@@ -20,6 +20,7 @@ Telethon error this module is required to handle explicitly (design doc §2).
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -40,6 +41,7 @@ BOT_ID = 777
 @dataclass
 class FixtureConfig:
     db_path: str
+    admins_file: Path
 
 
 class ConfigAndBotIdMiddleware:
@@ -81,8 +83,15 @@ class FakeBotAPI:
 
 
 def _make_dispatcher(db_path: str) -> Dispatcher:
+    # admins_file added alongside channel_monitor.py's SECURITY fix
+    # (_is_bot_admin gate) — OWNER_ID pre-seeded as the bot's own admin,
+    # same {"ids": [...]} shape test_sellable_items_module.py's fixture uses.
+    admins_file = Path(db_path).parent / "admins.json"
+    admins_file.write_text('{"ids": ["555"]}')
     dp = Dispatcher(storage=MemoryStorage())
-    dp.update.outer_middleware(ConfigAndBotIdMiddleware(FixtureConfig(db_path=db_path), BOT_ID))
+    dp.update.outer_middleware(
+        ConfigAndBotIdMiddleware(FixtureConfig(db_path=db_path, admins_file=admins_file), BOT_ID)
+    )
     dp.include_router(_clone_router(channel_monitor.router))
     return dp
 
@@ -101,6 +110,27 @@ def _message_update(text: str, update_id: int) -> Update:
 
 def _callback_update(data: str, update_id: int) -> Update:
     user, chat = _user_chat()
+    msg = Message(message_id=update_id, date=0, chat=chat, from_user=user, text="menu")
+    cb = CallbackQuery(id=str(update_id), from_user=user, chat_instance="x", data=data, message=msg)
+    return Update(update_id=update_id, callback_query=cb)
+
+
+STRANGER_ID = 424242
+
+
+def _stranger_message_update(text: str, update_id: int) -> Update:
+    """Same shape as _message_update but from a Telegram user who is NOT in
+    the bot's admins_file — used to prove the SECURITY fix (_is_bot_admin
+    gate) actually rejects a non-admin, not just a happy-path smoke test."""
+    user = User(id=STRANGER_ID, is_bot=False, first_name="Stranger")
+    chat = Chat(id=STRANGER_ID, type="private")
+    msg = Message(message_id=update_id, date=0, chat=chat, from_user=user, text=text)
+    return Update(update_id=update_id, message=msg)
+
+
+def _stranger_callback_update(data: str, update_id: int) -> Update:
+    user = User(id=STRANGER_ID, is_bot=False, first_name="Stranger")
+    chat = Chat(id=STRANGER_ID, type="private")
     msg = Message(message_id=update_id, date=0, chat=chat, from_user=user, text="menu")
     cb = CallbackQuery(id=str(update_id), from_user=user, chat_instance="x", data=data, message=msg)
     return Update(update_id=update_id, callback_query=cb)
@@ -453,3 +483,75 @@ async def test_risk_screen_shown_before_phone_requested(isolated_db, userbot_key
 
     state = dp.fsm.resolve_context(bot, OWNER_ID, OWNER_ID)
     assert (await state.get_state()) == channel_monitor.UserbotAuthStates.waiting_risk_ack.state
+
+
+# ── SECURITY: non-admin rejection (docs audit 2026-08-19) ───────────────────
+# Regression coverage for the _is_bot_admin gate added to every handler in
+# this module — before this fix, ANY user in a private chat with the bot
+# could read the feed, list/toggle channels, or even hijack the whole
+# feature by authorizing the userbot session with their own phone number.
+
+@pytest.mark.asyncio
+async def test_stranger_cannot_open_monitor_menu(isolated_db, userbot_key, bot, api_patch):
+    dp = _make_dispatcher(isolated_db)
+    from db.database import init_channel_monitor_tables
+    await init_channel_monitor_tables(isolated_db)
+
+    await _feed(dp, bot, _stranger_message_update("/monitor", 1))
+
+    assert api_patch.calls == []
+
+
+@pytest.mark.asyncio
+async def test_stranger_cannot_start_connect_flow(isolated_db, userbot_key, bot, api_patch):
+    dp = _make_dispatcher(isolated_db)
+    from db.database import init_channel_monitor_tables
+    await init_channel_monitor_tables(isolated_db)
+
+    await _feed(dp, bot, _stranger_callback_update("cm_connect", 1))
+
+    edited = [c for c in api_patch.calls if isinstance(c, EditMessageText)]
+    assert not edited, "a non-admin must never see the risk/phone screen"
+
+    state = dp.fsm.resolve_context(bot, STRANGER_ID, STRANGER_ID)
+    assert (await state.get_state()) is None
+
+
+@pytest.mark.asyncio
+async def test_stranger_cannot_read_feed(isolated_db, userbot_key, bot, api_patch):
+    dp = _make_dispatcher(isolated_db)
+    from db.database import init_channel_monitor_tables
+    await init_channel_monitor_tables(isolated_db)
+
+    await _feed(dp, bot, _stranger_callback_update("cm_feed", 1))
+
+    edited = [c for c in api_patch.calls if isinstance(c, EditMessageText)]
+    assert not edited
+
+
+@pytest.mark.asyncio
+async def test_stranger_cannot_disconnect_monitor(isolated_db, userbot_key, bot, api_patch):
+    dp = _make_dispatcher(isolated_db)
+    from db.database import get_userbot_sessions_by_bot, init_channel_monitor_tables, create_userbot_session, activate_userbot_session
+    await init_channel_monitor_tables(isolated_db)
+    session_id = await create_userbot_session(isolated_db, BOT_ID, "+79991234567")
+    await activate_userbot_session(isolated_db, session_id, "encoded-session")
+
+    await _feed(dp, bot, _stranger_message_update("/disconnect_monitor", 1))
+
+    sessions = await get_userbot_sessions_by_bot(isolated_db, BOT_ID)
+    assert sessions[0]["status"] == "active", "a non-admin must not be able to revoke the owner's session"
+
+
+@pytest.mark.asyncio
+async def test_admin_can_still_do_everything_a_stranger_cannot(isolated_db, userbot_key, bot, api_patch):
+    """Sanity check alongside the stranger-rejection tests above — the gate
+    must not accidentally lock out the bot's own admin too."""
+    dp = _make_dispatcher(isolated_db)
+    from db.database import init_channel_monitor_tables
+    await init_channel_monitor_tables(isolated_db)
+
+    await _feed(dp, bot, _callback_update("cm_feed", 1))
+
+    edited = [c for c in api_patch.calls if isinstance(c, EditMessageText)]
+    assert edited, "the bot's own admin must still be able to open the feed"

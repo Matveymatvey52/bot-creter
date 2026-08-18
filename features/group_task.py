@@ -31,13 +31,15 @@ bot_id (see _TOOL_FEATURES below):
   surface is deliberately limited to these two shared feature modules
   rather than any template-specific table.
 
-Only OWNER_ID may address a bot here (checked on every message, not just at
-connect time) — anyone else's mention/reply is silently ignored. Without
-this, a bot connected to a group becomes an open, factory-owner-funded
-Anthropic API endpoint for anyone who ends up in that group. The same check
-gates the confirm/cancel buttons below — a tool call proposed to the owner
-must also only be confirmable by the owner, not by anyone else added to the
-group later.
+Only this bot's OWN owner may address it here (checked on every message, not
+just at connect time — see _is_bot_owner: the system owner for a
+factory-owned bot, or bots.owner_telegram_id for a tenant's own bot) —
+anyone else's mention/reply is silently ignored. Without this, a bot
+connected to a group becomes an open, factory-owner-funded Anthropic API
+endpoint for anyone who ends up in that group. The same check gates the
+confirm/cancel buttons below — a tool call proposed to the owner must also
+only be confirmable by the owner, not by anyone else added to the group
+later.
 
 Requires Telegram Privacy Mode DISABLED for the bot (BotFather → Bot
 Settings → Group Privacy → Turn off) — with Privacy Mode on, ordinary group
@@ -57,12 +59,28 @@ from typing import Protocol
 from aiogram import Bot, F, Router
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-from handlers.admin_manager import OWNER_ID, _is_owner
+from handlers.admin_manager import _is_owner
 from db.database import get_bot, get_bot_features, get_group_task_config, set_group_task_config
 
 logger = logging.getLogger(__name__)
 
 router = Router()
+
+
+async def _is_bot_owner(user_id: int, bot_id: int) -> bool:
+    """Per-bot equivalent of handlers.admin_manager._can_manage_bot for this
+    feature module — SECURITY fix (project_multitenancy_audit_gaps memory,
+    item 2, 2026-08-19): the three gates below used to compare against the
+    SYSTEM-wide OWNER_ID, which meant a tenant's own bot could never be
+    addressed by that tenant (only the factory's system owner), silently
+    breaking the whole feature for every customer bot. Falls back to
+    _is_owner() when the bot row is missing/unowned (defensive — every bot
+    has had owner_telegram_id backfilled since multitenancy stage 1, but a
+    row that somehow has none should never grant blanket access)."""
+    bot_row = await get_bot(bot_id)
+    if bot_row and bot_row.get("owner_telegram_id") is not None:
+        return user_id == bot_row["owner_telegram_id"]
+    return _is_owner(user_id)
 
 
 class _DbPathConfig(Protocol):
@@ -76,7 +94,8 @@ class _DbPathConfig(Protocol):
 # Minimum seconds between two Haiku calls for the SAME bot_id — guards
 # against an accidental double-send/rapid edit-and-resend from the owner
 # triggering two API calls for what's really one task, not a hard usage cap
-# (only OWNER_ID can ever reach this handler at all — see module docstring).
+# (only this bot's own owner can ever reach this handler at all — see
+# module docstring / _is_bot_owner).
 # Same "cheap in-memory guard, no persistence" MVP tradeoff as
 # features/office_events.py's _CRITICAL_ERROR_RATE_LIMIT_SECONDS.
 _RATE_LIMIT_SECONDS = 3
@@ -205,9 +224,9 @@ _TOOL_SYSTEM_PROMPT_SUFFIX = (
 
 # Model used only when this bot_id has at least one of the features above
 # enabled (tool-use branch) — Sonnet, not Haiku: tool-call/parameter
-# selection reliability matters more than the extra cost here, and only
-# OWNER_ID can ever trigger a call at all (see module docstring), so the
-# volume this cost applies to is inherently small.
+# selection reliability matters more than the extra cost here, and only this
+# bot's own owner can ever trigger a call at all (see module docstring), so
+# the volume this cost applies to is inherently small.
 _TOOL_MODEL = "claude-sonnet-5"
 _CHAT_MODEL = "claude-haiku-4-5-20251001"
 
@@ -429,7 +448,9 @@ async def on_group_message(message: Message, bot: Bot, bot_id: int, config: _DbP
     many messages not meant for this bot — most of this function's job is
     recognizing which single message actually is):
 
-    1. Sender must be OWNER_ID (see module docstring).
+    1. Sender must own this bot (see _is_bot_owner — system owner for
+       factory-owned bots, or this bot's own owner_telegram_id for a
+       tenant's bot).
     2. Message must address this bot (mention/reply — _bot_is_mentioned_or_replied).
     3. If this bot has no bot_group_task_config row yet, THIS message's chat
        becomes its bound group (auto-connect, docs/GROUP_TASK_CHANNEL_DESIGN.md
@@ -437,7 +458,7 @@ async def on_group_message(message: Message, bot: Bot, bot_id: int, config: _DbP
        message's chat must match the ALREADY bound group (a bot bound to
        group A ignores mentions from group B, same isolation principle as
        _attach_bot_id_middleware's bot_id inject)."""
-    if not message.from_user or message.from_user.id != OWNER_ID:
+    if not message.from_user or not await _is_bot_owner(message.from_user.id, bot_id):
         return
 
     me = await bot.get_me()
@@ -564,7 +585,7 @@ async def cb_grouptask_confirm(callback: CallbackQuery, bot_id: int, config: _Db
     (not just token match) for the same reason on_group_message's own gates
     do: a stale/forwarded callback_data from outside the bound group must
     not be honorable just because it happens to carry a valid-looking token."""
-    if not callback.from_user or not _is_owner(callback.from_user.id):
+    if not callback.from_user or not await _is_bot_owner(callback.from_user.id, bot_id):
         await callback.answer()
         return
 
@@ -627,7 +648,7 @@ async def cb_grouptask_confirm(callback: CallbackQuery, bot_id: int, config: _Db
 
 @router.callback_query(F.data.startswith("gt_no:"))
 async def cb_grouptask_cancel(callback: CallbackQuery, bot_id: int) -> None:
-    if not callback.from_user or not _is_owner(callback.from_user.id):
+    if not callback.from_user or not await _is_bot_owner(callback.from_user.id, bot_id):
         await callback.answer()
         return
 

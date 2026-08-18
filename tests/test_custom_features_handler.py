@@ -20,6 +20,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.base import StorageKey
 from aiogram.fsm.storage.memory import MemoryStorage
 
+import handlers.admin_manager as admin_manager_module
 import handlers.custom_features as cf_module
 import runtime.registry as reg
 from db.database import (
@@ -97,7 +98,13 @@ class _CustomFeatureHandlerTestBase(unittest.IsolatedAsyncioTestCase):
         self._registry_cf_dir_patcher = patch.object(reg, "_CUSTOM_FEATURES_DIR", self.cf_dir)
         self._registry_cf_dir_patcher.start()
 
-        self._owner_patcher = patch.object(cf_module, "_is_owner", lambda uid: uid == self.owner_id)
+        # handlers/custom_features.py migrated from _is_owner to per-bot
+        # _can_manage_bot (project_multitenancy_audit_gaps memory, item 3,
+        # 2026-08-19) — patch it where _can_manage_bot actually resolves it
+        # (admin_manager's own module globals). Every bot row these tests
+        # create has owner_telegram_id=None, so _can_manage_bot() falls
+        # through to this same _is_owner check unchanged.
+        self._owner_patcher = patch.object(admin_manager_module, "_is_owner", lambda uid: uid == self.owner_id)
         self._owner_patcher.start()
 
         self._fake_registry = MagicMock()

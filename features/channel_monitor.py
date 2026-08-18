@@ -34,7 +34,9 @@ now bot_id-scoped).
 from __future__ import annotations
 
 import html
+import json
 import logging
+from pathlib import Path
 from typing import Protocol
 
 from aiogram import F, Router
@@ -107,10 +109,30 @@ _last_phone_request_at: dict[tuple[int, int], float] = {}
 
 
 class ChannelMonitorConfig(Protocol):
-    """Any template Config dataclass with a db_path works — duck-typed so this
-    module doesn't need to know about any specific template's Config shape,
-    same convention as features/payments.py's PaymentsConfig."""
+    """Any template Config dataclass with db_path + admins_file works —
+    duck-typed so this module doesn't need to know about any specific
+    template's Config shape, same convention as features/payments.py's
+    PaymentsConfig. admins_file added alongside the SECURITY fix below (see
+    _is_bot_admin) — same {"ids": [...]} JSON shape every template's
+    admins_file already has (features/sellable_items.py verified this is
+    uniform across all COMPATIBLE_WITH templates)."""
     db_path: str
+    admins_file: Path | str
+
+
+# _load_admins/_is_bot_admin duplicated on purpose — no shared
+# features/_common.py exists yet in this project (see
+# features/sellable_items.py's own copy of the same helpers).
+def _load_admins(admins_file: Path | str) -> set[str]:
+    try:
+        return set(json.loads(Path(admins_file).read_text()).get("ids", []))
+    except Exception as e:
+        logger.warning(f"_load_admins: failed to read {admins_file!r}: {e}")
+        return set()
+
+
+def _is_bot_admin(user_id: int, config: ChannelMonitorConfig) -> bool:
+    return str(user_id) in _load_admins(config.admins_file)
 
 
 async def init_db(db_path: str) -> None:
@@ -227,22 +249,39 @@ async def _feed_text(db_path: str, bot_id: int) -> str:
 
 
 # ── handlers: entry ──────────────────────────────────────────────────────────
+#
+# SECURITY (docs audit 2026-08-19, project_multitenancy_audit_gaps memory):
+# every handler in this router used to be reachable by ANY user in a private
+# chat with the bot — no owner/admin check at all — letting an arbitrary
+# stranger read the bot owner's monitoring feed, or worse, hijack the whole
+# feature by authorizing the userbot session with their OWN phone number
+# (the session is stored per bot_id, not per requesting user). Every handler
+# below now requires _is_bot_admin() first, same posture as
+# features/sellable_items.py's management handlers.
 
 @router.message(F.text == "/monitor", F.chat.type == "private")
-async def cmd_monitor(message: Message, state: FSMContext):
+async def cmd_monitor(message: Message, state: FSMContext, bot_id: int, config: ChannelMonitorConfig):
+    if not _is_bot_admin(message.from_user.id, config):
+        return
     await state.clear()
     await message.answer(WELCOME_TEXT, parse_mode="HTML", reply_markup=kb_start_menu())
 
 
 @router.callback_query(F.data == "cm_menu")
-async def cb_menu(cb: CallbackQuery, state: FSMContext):
+async def cb_menu(cb: CallbackQuery, state: FSMContext, bot_id: int, config: ChannelMonitorConfig):
+    if not _is_bot_admin(cb.from_user.id, config):
+        await cb.answer("⛔ Доступно только владельцу бота.", show_alert=True)
+        return
     await cb.answer()
     await state.clear()
     await cb.message.edit_text(WELCOME_TEXT, parse_mode="HTML", reply_markup=kb_start_menu())
 
 
 @router.callback_query(F.data == "cm_cancel")
-async def cb_cancel(cb: CallbackQuery, state: FSMContext):
+async def cb_cancel(cb: CallbackQuery, state: FSMContext, bot_id: int, config: ChannelMonitorConfig):
+    if not _is_bot_admin(cb.from_user.id, config):
+        await cb.answer("⛔ Доступно только владельцу бота.", show_alert=True)
+        return
     await cb.answer("Отменено")
     await state.clear()
     await cb.message.edit_text(WELCOME_TEXT, parse_mode="HTML", reply_markup=kb_start_menu())
@@ -251,17 +290,23 @@ async def cb_cancel(cb: CallbackQuery, state: FSMContext):
 # ── handlers: auth FSM ───────────────────────────────────────────────────────
 
 @router.callback_query(F.data == "cm_connect")
-async def cb_connect_start(cb: CallbackQuery, state: FSMContext):
+async def cb_connect_start(cb: CallbackQuery, state: FSMContext, bot_id: int, config: ChannelMonitorConfig):
     """§6 of docs/USERBOT_CHANNEL_MONITOR_DESIGN.md: the risk screen must be
     shown BEFORE the phone number is ever requested — this is the entry
     point, not waiting_phone."""
+    if not _is_bot_admin(cb.from_user.id, config):
+        await cb.answer("⛔ Доступно только владельцу бота.", show_alert=True)
+        return
     await cb.answer()
     await state.set_state(UserbotAuthStates.waiting_risk_ack)
     await cb.message.edit_text(RISK_TEXT, parse_mode="HTML", reply_markup=kb_risk_ack())
 
 
 @router.callback_query(UserbotAuthStates.waiting_risk_ack, F.data == "cm_risk_ack")
-async def cb_risk_ack(cb: CallbackQuery, state: FSMContext):
+async def cb_risk_ack(cb: CallbackQuery, state: FSMContext, bot_id: int, config: ChannelMonitorConfig):
+    if not _is_bot_admin(cb.from_user.id, config):
+        await cb.answer("⛔ Доступно только владельцу бота.", show_alert=True)
+        return
     await cb.answer()
     await state.set_state(UserbotAuthStates.waiting_phone)
     await cb.message.edit_text(
@@ -273,6 +318,9 @@ async def cb_risk_ack(cb: CallbackQuery, state: FSMContext):
 
 @router.message(UserbotAuthStates.waiting_phone, F.text, ~F.text.startswith("/"))
 async def on_phone_entered(message: Message, state: FSMContext, bot_id: int, config: ChannelMonitorConfig):
+    if not _is_bot_admin(message.from_user.id, config):
+        await state.clear()
+        return
     phone = message.text.strip()
 
     import time
@@ -352,6 +400,9 @@ async def _resume_client(state_data: dict):
 
 @router.message(UserbotAuthStates.waiting_code, F.text, ~F.text.startswith("/"))
 async def on_code_entered(message: Message, state: FSMContext, config: ChannelMonitorConfig):
+    if not _is_bot_admin(message.from_user.id, config):
+        await state.clear()
+        return
     from telethon.errors import (
         FloodWaitError, PhoneCodeExpiredError, PhoneCodeInvalidError, SessionPasswordNeededError,
     )
@@ -425,6 +476,9 @@ async def on_code_entered(message: Message, state: FSMContext, config: ChannelMo
 
 @router.message(UserbotAuthStates.waiting_2fa_password, F.text, ~F.text.startswith("/"))
 async def on_2fa_password_entered(message: Message, state: FSMContext, config: ChannelMonitorConfig):
+    if not _is_bot_admin(message.from_user.id, config):
+        await state.clear()
+        return
     from telethon.errors import FloodWaitError, PasswordHashInvalidError
 
     password = message.text.strip()
@@ -495,6 +549,9 @@ async def _finish_auth_success(
 
 @router.callback_query(F.data == "cm_channels")
 async def cb_channels(cb: CallbackQuery, state: FSMContext, bot_id: int, config: ChannelMonitorConfig):
+    if not _is_bot_admin(cb.from_user.id, config):
+        await cb.answer("⛔ Доступно только владельцу бота.", show_alert=True)
+        return
     await cb.answer()
     await state.clear()
     text, channels = await _channels_panel_text(config.db_path, bot_id)
@@ -503,6 +560,9 @@ async def cb_channels(cb: CallbackQuery, state: FSMContext, bot_id: int, config:
 
 @router.callback_query(F.data.startswith("cm_toggle:"))
 async def cb_toggle_channel(cb: CallbackQuery, bot_id: int, config: ChannelMonitorConfig):
+    if not _is_bot_admin(cb.from_user.id, config):
+        await cb.answer("⛔ Доступно только владельцу бота.", show_alert=True)
+        return
     channel_id = int(cb.data.split(":", 1)[1])
     channels = await get_monitored_channels_by_bot(config.db_path, bot_id)
     target = next((c for c in channels if c["id"] == channel_id), None)
@@ -517,7 +577,10 @@ async def cb_toggle_channel(cb: CallbackQuery, bot_id: int, config: ChannelMonit
 
 
 @router.callback_query(F.data == "cm_add_channel")
-async def cb_add_channel_start(cb: CallbackQuery, state: FSMContext):
+async def cb_add_channel_start(cb: CallbackQuery, state: FSMContext, bot_id: int, config: ChannelMonitorConfig):
+    if not _is_bot_admin(cb.from_user.id, config):
+        await cb.answer("⛔ Доступно только владельцу бота.", show_alert=True)
+        return
     await cb.answer()
     await state.set_state(_AddChannelState.waiting_username)
     await cb.message.edit_text(
@@ -534,6 +597,9 @@ async def on_channel_username_entered(message: Message, state: FSMContext, bot_i
     its own account has joined applies identically regardless of which bot
     hosts this feature — see docs/USERBOT_FEATURE_DESIGN.md §5). A private/
     inaccessible channel gets an explicit error, never a silent no-op."""
+    if not _is_bot_admin(message.from_user.id, config):
+        await state.clear()
+        return
     username = message.text.strip().lstrip("@")
     await state.clear()
 
@@ -592,6 +658,9 @@ async def on_channel_username_entered(message: Message, state: FSMContext, bot_i
 
 @router.callback_query(F.data == "cm_feed")
 async def cb_feed(cb: CallbackQuery, state: FSMContext, bot_id: int, config: ChannelMonitorConfig):
+    if not _is_bot_admin(cb.from_user.id, config):
+        await cb.answer("⛔ Доступно только владельцу бота.", show_alert=True)
+        return
     await cb.answer()
     await state.clear()
     text = await _feed_text(config.db_path, bot_id)
@@ -602,6 +671,8 @@ async def cb_feed(cb: CallbackQuery, state: FSMContext, bot_id: int, config: Cha
 
 @router.message(F.text == "/disconnect_monitor", F.chat.type == "private")
 async def cmd_disconnect(message: Message, state: FSMContext, bot_id: int, config: ChannelMonitorConfig):
+    if not _is_bot_admin(message.from_user.id, config):
+        return
     await state.clear()
     sessions = await get_userbot_sessions_by_bot(config.db_path, bot_id)
     active = [s for s in sessions if s.get("status") == "active"]

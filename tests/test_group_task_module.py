@@ -94,7 +94,11 @@ def _make_callback(*, user_id: int, data: str, chat_id: int):
 
 @pytest.fixture(autouse=True)
 def _owner_and_context(monkeypatch):
-    monkeypatch.setattr(group_task, "OWNER_ID", OWNER_ID)
+    # group_task no longer imports OWNER_ID directly (SECURITY fix,
+    # project_multitenancy_audit_gaps memory item 2, 2026-08-19) — every
+    # bot row created by _make_bot_row() below has owner_telegram_id=None
+    # (legacy/system-owned bot), so _is_bot_owner() falls back to _is_owner()
+    # for these tests, same as before.
     monkeypatch.setattr(group_task, "_is_owner", lambda uid: uid == OWNER_ID)
     group_task._conversation_context.clear()
     group_task._last_reply_sent.clear()
@@ -114,6 +118,31 @@ async def test_ignores_message_from_non_owner(isolated_db, tmp_path):
 
     message.reply.assert_not_awaited()
     assert await get_group_task_config(bot_id) is None
+
+
+@pytest.mark.asyncio
+async def test_tenant_owner_can_address_their_own_bot(isolated_db, tmp_path):
+    """SECURITY/UX regression (project_multitenancy_audit_gaps memory, item
+    2): before this fix, on_group_message compared against the SYSTEM-wide
+    OWNER_ID, so a tenant's own bot could never be addressed by that tenant
+    at all — only the factory's system owner. A bot with owner_telegram_id
+    set must now be addressable by that owner, and the unrelated system
+    OWNER_ID from _owner_and_context's patch must NOT work for it."""
+    tenant_id = 730200
+    bot_id = await create_bot_record_with_admins(
+        "tenant-group-task-bot", "desc", "654321:test-token-not-real-2",
+        "templates/tour_operator.py", [], owner_telegram_id=tenant_id,
+    )
+
+    system_owner_message = _make_message(user_id=OWNER_ID, text=f"@{BOT_USERNAME} hello")
+    await group_task.on_group_message(system_owner_message, _make_bot(), bot_id, _make_config(tmp_path, bot_id))
+    system_owner_message.reply.assert_not_awaited()
+    assert await get_group_task_config(bot_id) is None
+
+    tenant_message = _make_message(user_id=tenant_id, text=f"@{BOT_USERNAME} hello")
+    await group_task.on_group_message(tenant_message, _make_bot(), bot_id, _make_config(tmp_path, bot_id))
+    tenant_message.reply.assert_awaited_once()
+    assert await get_group_task_config(bot_id) is not None
 
 
 @pytest.mark.asyncio
