@@ -10,7 +10,7 @@ from aiogram.types import ChatMemberUpdated, InlineKeyboardButton, InlineKeyboar
 
 from config import BOT_TOKEN
 from db.database import get_all_bots, init_db, set_bot_group, set_office_digest_group, update_bot_status
-from handlers.admin_manager import OWNER_ID, router as admin_router
+from handlers.admin_manager import OWNER_ID, _is_owner, router as admin_router
 from handlers.create_bot import auto_launch_managed_bot, router as create_router, set_bot_id, set_manager_username
 from handlers.custom_features import router as custom_features_router
 from handlers.feature_connect import router as feature_connect_router
@@ -102,6 +102,9 @@ def build_group_router() -> Router:
 
     @group_router.callback_query(lambda c: c.data and c.data.startswith("setgroup:"))
     async def cb_set_group(callback):
+        if not _is_owner(callback.from_user.id):
+            await callback.answer("⛔ Доступно только владельцу.", show_alert=True)
+            return
         await callback.answer()
         parts = callback.data.split(":")
         bot_target = parts[1]
