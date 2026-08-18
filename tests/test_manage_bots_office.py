@@ -98,12 +98,30 @@ class OfficeTargetPicksTargetTests(_OfficeUiTestBase):
         self.assertNotIn("office_ui_bot_a", button_texts)
 
 
-class OfficeTypeAutoConfirmsWithOneEventTypeTests(_OfficeUiTestBase):
+class OfficeTypePickerTests(_OfficeUiTestBase):
     owner_id = 525207
 
-    async def test_officetype_skips_straight_to_confirm_screen(self):
+    async def test_officetype_shows_picker_when_multiple_event_types_exist(self):
+        # As of this test, _EVENT_TYPES has >1 entry (order.created,
+        # task.assigned) — officetype: must show a picker, not auto-confirm.
         callback = _make_callback(self.owner_id, f"officetype:{self.bot_a}:{self.bot_b}")
         await manage_bots.cb_office_pick_type(callback)
+
+        callback.message.edit_text.assert_awaited_once()
+        text = callback.message.edit_text.call_args.args[0]
+        _, kwargs = callback.message.edit_text.call_args
+        button_texts = [
+            btn.text for row in kwargs["reply_markup"].inline_keyboard for btn in row
+        ]
+        self.assertIn("office_ui_bot_a", text)
+        self.assertIn("office_ui_bot_b", text)
+        self.assertIn("новый заказ", button_texts)
+
+    async def test_officeconfirm_renders_what_will_happen_screen(self):
+        callback = _make_callback(
+            self.owner_id, f"officeconfirm:{self.bot_a}:{self.bot_b}:order.created"
+        )
+        await manage_bots.cb_office_confirm(callback)
 
         callback.message.edit_text.assert_awaited_once()
         text = callback.message.edit_text.call_args.args[0]

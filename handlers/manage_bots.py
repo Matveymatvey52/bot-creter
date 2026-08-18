@@ -725,6 +725,14 @@ _SPREADSHEET_ID_RE = re.compile(r"/d/([a-zA-Z0-9_-]{20,})")
 _BARE_SPREADSHEET_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{20,}$")
 
 
+# Default event_type for callers outside this UI's own multi-step picker
+# (runtime/factory_analytics_api.py's REST add_office_handler/remove_office_
+# handler — the miniapp dashboard's bot-detail-panel office links, which has
+# no picker step of its own yet) — kept as the same "order.created" default
+# this UI itself used before the officetype: step was added.
+_OFFICE_EVENT_TYPE = "order.created"
+
+
 # ── "Офисы" (docs/OFFICES_DESIGN.md §9, §12) ────────────────────────────────
 # Full flow: office:{bot_id} panel → officeconnect:{bot_id} picks the SOURCE
 # bot (all bots offered, including the panel's own) → officetarget:{source_id}

@@ -90,6 +90,7 @@ _EVENT_TYPES: dict[str, type] = {
 # EVENT_TYPE_LABELS.get usage) rather than raising in a UI render path.
 EVENT_TYPE_LABELS: dict[str, str] = {
     "order.created": "новый заказ",
+    "task.assigned": "новая задача",
 }
 
 
