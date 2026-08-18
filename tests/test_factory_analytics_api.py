@@ -608,6 +608,27 @@ class FactoryAnalyticsApiTests(unittest.IsolatedAsyncioTestCase):
         body = await resp.json()
         self.assertEqual(body["logs"], "")
 
+    async def test_bot_logs_owning_customer_can_view_own_bot(self):
+        customer_bot_id = await db_module.create_bot_record_with_admins(
+            name="factory_analytics_logs_customer_bot", description="test",
+            token="5555:AAlogs-fake-token-1234567890",
+            file_path="templates/shop_catalog.py", admin_ids=["1"], owner_telegram_id=OTHER_TELEGRAM_ID,
+        )
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            token = mint_magic_link_token(FACTORY_BOT_ID, OTHER_TELEGRAM_ID)
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            resp = await self.client.get(f"/api/factory/bots/{customer_bot_id}/logs?token={token}")
+        self.assertEqual(resp.status, 200)
+        body = await resp.json()
+        self.assertEqual(body["logs"], "")
+
+    async def test_bot_logs_non_owner_returns_403(self):
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            token = mint_magic_link_token(FACTORY_BOT_ID, OTHER_TELEGRAM_ID)
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            resp = await self.client.get(f"/api/factory/bots/{self.bot_id}/logs?token={token}")
+        self.assertEqual(resp.status, 403)
+
     async def test_delete_bot_removes_record(self):
         deletable_id = await create_bot_record_with_admins(
             name="factory_analytics_deletable_bot", description="test", token="2222:AAdeletable-fake-tok-123456",

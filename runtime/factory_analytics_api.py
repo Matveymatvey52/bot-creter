@@ -461,11 +461,11 @@ async def delete_bot_handler(request: web.Request) -> web.Response:
 
 
 async def bot_logs_handler(request: web.Request) -> web.Response:
-    if not await _authenticate_owner(request):
-        return web.json_response({"error": "forbidden"}, status=403)
     bot_id = _bot_id_from_match_info(request)
     if bot_id is None:
         return web.json_response({"error": "bad bot_id"}, status=404)
+    if not await _authenticate_bot_access(request, bot_id):
+        return web.json_response({"error": "forbidden"}, status=403)
     b = await get_bot(bot_id)
     if not b:
         return web.json_response({"error": "not found"}, status=404)
