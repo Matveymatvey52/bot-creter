@@ -19,7 +19,7 @@ Run with: python -m unittest tests.test_start_buttons
 from __future__ import annotations
 
 import unittest
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.base import StorageKey
@@ -27,6 +27,8 @@ from aiogram.fsm.storage.memory import MemoryStorage
 
 import handlers.create_bot as create_bot_module
 import handlers.start as start_module
+from db.database import add_bot_admin, init_db, remove_bot_admin
+from runtime.registry import FACTORY_BOT_ID
 
 PRESSER_USER_ID = 222
 
@@ -99,6 +101,46 @@ class StartCreateButtonIdentityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await state.get_state(), create_bot_module.CreateBotStates.gathering.state)
         callback.answer.assert_awaited_once()
         callback.message.answer.assert_awaited_once()
+
+
+class StartRegistryButtonTests(unittest.IsolatedAsyncioTestCase):
+    """The "📋 Реестр ботов" button (multitenancy stage 3, item 4) — visible
+    to any admin of the Creator bot itself (bot_admins for bot_id=0), reusing
+    the exact same get_bot_admins(bot_id) + str(telegram_user_id) membership
+    check runtime/miniapp_api.py's compute_metrics route already uses to gate
+    a bot's own analytics to that bot's admins — NOT an OWNER_ID check."""
+
+    ADMIN_USER_ID = 424242
+
+    async def asyncSetUp(self):
+        await init_db()
+        await add_bot_admin(FACTORY_BOT_ID, str(self.ADMIN_USER_ID))
+        self._env_patcher = patch.dict("os.environ", {"MINIAPP_SECRET": "s3cret"})
+        self._env_patcher.start()
+
+    async def asyncTearDown(self):
+        self._env_patcher.stop()
+        await remove_bot_admin(FACTORY_BOT_ID, str(self.ADMIN_USER_ID))
+
+    async def test_creator_bot_admin_sees_registry_button(self):
+        message = _make_message(self.ADMIN_USER_ID, "/start")
+
+        await start_module.cmd_start(message)
+
+        message.answer_photo.assert_awaited_once()
+        markup = message.answer_photo.call_args.kwargs["reply_markup"]
+        labels = [btn.text for row in markup.inline_keyboard for btn in row]
+        self.assertIn("📋 Реестр ботов", labels)
+
+    async def test_non_admin_does_not_see_registry_button(self):
+        message = _make_message(PRESSER_USER_ID, "/start")
+
+        await start_module.cmd_start(message)
+
+        message.answer_photo.assert_awaited_once()
+        markup = message.answer_photo.call_args.kwargs["reply_markup"]
+        labels = [btn.text for row in markup.inline_keyboard for btn in row]
+        self.assertNotIn("📋 Реестр ботов", labels)
 
 
 if __name__ == "__main__":

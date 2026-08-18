@@ -1,8 +1,31 @@
 import { useEffect, useMemo, useState } from 'react'
-import { listOwnerRegistry, ApiError, type OwnerRegistryItem } from '../lib/factoryApi'
+import {
+  listOwnerRegistry,
+  listTemplateCandidates,
+  listTemplateCandidateClusters,
+  ApiError,
+  type OwnerRegistryItem,
+  type TemplateCandidateItem,
+  type TemplateCandidateClusterItem,
+} from '../lib/factoryApi'
 import { Card, CardHeader, CardTitle, ChipRow, Chip, Badge } from '../components/Card'
 import { iconForTemplate } from '../lib/botIcons'
 import { BotDetailPanel } from './BotDetailPanel'
+
+// "Топ незакрытых паттернов" / "Кандидаты на новый шаблон" — moved here
+// (multitenancy stage 3) from wherever they previously lived, onto the
+// registry screen that's actually reachable from the dashboard/Creator
+// bot's own /start, rather than only the separate, unlinked /owner-report
+// app (OwnerReportScreen.tsx) which already carries an equivalent "Незакрытые
+// паттерны" tab. Kept as its own section here too since this screen, not
+// that one, is the discoverable entry point (see item 4 in the design note).
+const FALLBACK_REASON_LABELS: Record<string, string> = {
+  no_template_match: 'нет подходящего шаблона',
+  customize_failed: 'шаблон подошёл, но кастомизация не удалась',
+  synthesis_failed: 'два шаблона подошли, но синтез не удался',
+}
+
+const CLUSTER_HIGHLIGHT_THRESHOLD = 3
 
 // The separate owner-wide registry (multitenancy design item 3):
 // FactoryDashboardScreen's "Моя фабрика" already lists every bot to the
@@ -179,6 +202,9 @@ export function OwnerRegistryScreen({ onBack }: { onBack: () => void }) {
         </ChipRow>
       )}
 
+      <TemplateCandidateClustersSection />
+      <TemplateCandidatesSection />
+
       {filtered.length > 0 && (
         <div className="registry-table-wrap">
           <table className="registry-table">
@@ -217,6 +243,103 @@ export function OwnerRegistryScreen({ onBack }: { onBack: () => void }) {
           </table>
         </div>
       )}
+    </div>
+  )
+}
+
+function TemplateCandidateClustersSection() {
+  const [clusters, setClusters] = useState<TemplateCandidateClusterItem[] | null>(null)
+  const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => {
+    listTemplateCandidateClusters()
+      .then((data) => setClusters(data.items))
+      .catch((err) => setError(err instanceof ApiError ? err.message : 'Не удалось загрузить паттерны'))
+  }, [])
+
+  return (
+    <div className="screen-section">
+      <h2 style={{ margin: '16px 0 8px' }}>Топ незакрытых паттернов</h2>
+      {error && <div className="state-message">{error}</div>}
+      {!error && clusters === null && <div className="state-message">Загрузка…</div>}
+      {clusters !== null && clusters.length === 0 && (
+        <div className="state-message">Пока нет обработанных кластеров — ждём следующий проход анализа.</div>
+      )}
+      {clusters?.map((c) => (
+        <Card key={c.id}>
+          <CardHeader>
+            <CardTitle>{c.label}</CardTitle>
+            <Badge tone={c.count >= CLUSTER_HIGHLIGHT_THRESHOLD ? 'success' : 'neutral'}>{c.count}</Badge>
+          </CardHeader>
+          {c.description && <div style={{ marginTop: 4, opacity: 0.8 }}>{c.description}</div>}
+          <ChipRow>
+            <Chip>впервые: {c.first_seen}</Chip>
+            <Chip>последний раз: {c.last_seen}</Chip>
+          </ChipRow>
+          {c.examples.map((summary, i) => (
+            <div key={i} style={{ marginTop: 8, paddingTop: 8, borderTop: '1px solid var(--border, #333)' }}>
+              {summary}
+            </div>
+          ))}
+        </Card>
+      ))}
+    </div>
+  )
+}
+
+function TemplateCandidatesSection() {
+  const [candidates, setCandidates] = useState<TemplateCandidateItem[] | null>(null)
+  const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => {
+    listTemplateCandidates()
+      .then((data) => setCandidates(data.items))
+      .catch((err) => setError(err instanceof ApiError ? err.message : 'Не удалось загрузить кандидатов'))
+  }, [])
+
+  // Lightweight signal, not real clustering (see docs/TEMPLATE_CANDIDATE_LOGGING_DESIGN.md
+  // §3's MVP decision) — group by bot_type so recurring requests for the
+  // same kind of bot are visually obvious without inventing NLP clustering.
+  const groups = useMemo(() => {
+    if (!candidates) return []
+    const byType = new Map<string, TemplateCandidateItem[]>()
+    for (const c of candidates) {
+      const key = c.bot_type || 'без категории'
+      if (!byType.has(key)) byType.set(key, [])
+      byType.get(key)!.push(c)
+    }
+    return Array.from(byType.entries()).sort((a, b) => b[1].length - a[1].length)
+  }, [candidates])
+
+  return (
+    <div className="screen-section">
+      <h2 style={{ margin: '16px 0 8px' }}>Кандидаты на новый шаблон</h2>
+      {error && <div className="state-message">{error}</div>}
+      {!error && candidates === null && <div className="state-message">Загрузка…</div>}
+      {candidates !== null && candidates.length === 0 && (
+        <div className="state-message">Пока нет ботов, для которых не нашёлся подходящий шаблон.</div>
+      )}
+      {groups.map(([botType, group]) => (
+        <Card key={botType}>
+          <CardHeader>
+            <CardTitle>{botType}</CardTitle>
+            <Badge tone="neutral">{group.length}</Badge>
+          </CardHeader>
+          {group.map((c) => (
+            <div key={c.id} style={{ marginTop: 8, paddingTop: 8, borderTop: '1px solid var(--border, #333)' }}>
+              <div>{c.summary}</div>
+              <ChipRow>
+                <Chip>{FALLBACK_REASON_LABELS[c.fallback_reason] || c.fallback_reason}</Chip>
+                <Chip>{c.created_at}</Chip>
+                {c.bot_name && <Chip>бот: {c.bot_name}</Chip>}
+                {c.selected_templates.length > 0 && (
+                  <Chip>рассматривались: {c.selected_templates.join(', ')}</Chip>
+                )}
+              </ChipRow>
+            </div>
+          ))}
+        </Card>
+      ))}
     </div>
   )
 }

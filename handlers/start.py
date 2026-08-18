@@ -14,6 +14,8 @@ from aiogram.types import (
     WebAppInfo,
 )
 
+from db.database import get_bot_admins
+
 router = Router()
 
 WELCOME_IMAGE = Path(__file__).resolve().parent.parent / "assets" / "welcome.png"
@@ -46,7 +48,32 @@ def _dashboard_url(telegram_user_id: int) -> str | None:
     return f"{base_url}/app/{FACTORY_BOT_ID}?token={token}"
 
 
-def _start_keyboard(telegram_user_id: int) -> InlineKeyboardMarkup:
+async def _is_creator_bot_admin(telegram_user_id: int) -> bool:
+    # Same check runtime/miniapp_api.py's compute_metrics route uses to gate
+    # a bot's own analytics to that bot's admins (get_bot_admins(bot_id),
+    # membership by str(telegram_user_id)) — reused as-is here, scoped to
+    # FACTORY_BOT_ID (bot_id=0, the Creator bot itself), rather than
+    # inventing a separate check. Deliberately NOT the same thing as
+    # OWNER_ID: any admin of the Creator bot (db/database.py's bot_admins
+    # table for bot_id=0) qualifies, not just the single system owner.
+    from runtime.registry import FACTORY_BOT_ID
+
+    admin_ids = await get_bot_admins(FACTORY_BOT_ID)
+    return str(telegram_user_id) in admin_ids
+
+
+def _registry_url(telegram_user_id: int) -> str | None:
+    # Same magic-link dashboard URL as _dashboard_url, with ?view=registry
+    # appended — OwnerRegistryScreen.tsx's own routing convention
+    # (FactoryDashboardScreen.tsx reads this query param).
+    dashboard_url = _dashboard_url(telegram_user_id)
+    if dashboard_url is None:
+        return None
+    separator = "&" if "?" in dashboard_url else "?"
+    return f"{dashboard_url}{separator}view=registry"
+
+
+async def _start_keyboard(telegram_user_id: int) -> InlineKeyboardMarkup:
     # "list" callback_data matches handlers/manage_bots.py's existing cb_list
     # handler exactly — reused as-is, not duplicated. "start_create"
     # matches handlers/create_bot.py's cb_start_create (added alongside this).
@@ -63,12 +90,21 @@ def _start_keyboard(telegram_user_id: int) -> InlineKeyboardMarkup:
     if dashboard_url is not None:
         label = "📊 Панель управления" if (_OWNER_ID != 0 and telegram_user_id == _OWNER_ID) else "🏭 Моя фабрика"
         rows.append([InlineKeyboardButton(text=label, web_app=WebAppInfo(url=dashboard_url))])
+
+    # Registry button (multitenancy stage 3, item 4): visible to any admin of
+    # the Creator bot itself (bot_admins for bot_id=0), not OWNER_ID-gated —
+    # see _is_creator_bot_admin's docstring.
+    if dashboard_url is not None and await _is_creator_bot_admin(telegram_user_id):
+        registry_url = _registry_url(telegram_user_id)
+        if registry_url is not None:
+            rows.append([InlineKeyboardButton(text="📋 Реестр ботов", web_app=WebAppInfo(url=registry_url))])
+
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 @router.message(Command("start"))
 async def cmd_start(message: Message):
-    keyboard = _start_keyboard(message.from_user.id)
+    keyboard = await _start_keyboard(message.from_user.id)
     if WELCOME_IMAGE.exists():
         await message.answer_photo(FSInputFile(WELCOME_IMAGE), caption=_WELCOME_CAPTION, reply_markup=keyboard)
     else:
@@ -80,7 +116,7 @@ async def cb_start_menu(callback: CallbackQuery):
     # Same content as /start — this is Баг 3's "◀ В главное меню" target,
     # reuses _WELCOME_CAPTION/_start_keyboard rather than duplicating the text.
     await callback.answer()
-    keyboard = _start_keyboard(callback.from_user.id)
+    keyboard = await _start_keyboard(callback.from_user.id)
     if WELCOME_IMAGE.exists():
         await callback.message.answer_photo(FSInputFile(WELCOME_IMAGE), caption=_WELCOME_CAPTION, reply_markup=keyboard)
     else:
