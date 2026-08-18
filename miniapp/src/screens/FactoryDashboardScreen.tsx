@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   listFactoryBots,
   addFactoryFeedback,
@@ -24,6 +24,59 @@ const ACTIVE_STATUSES = new Set(['running'])
 
 function isBotActive(status: string): boolean {
   return ACTIVE_STATUSES.has(status)
+}
+
+// Compact multi-select checkbox dropdown for the top filter bar — replaces
+// the old row of individual chip buttons (design change: filters must take
+// minimal vertical space and support selecting several values at once).
+function MultiSelectDropdown({
+  label,
+  options,
+  selected,
+  onChange,
+}: {
+  label: string
+  options: string[]
+  selected: Set<string>
+  onChange: (next: Set<string>) => void
+}) {
+  const [open, setOpen] = useState(false)
+  const rootRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    if (!open) return
+    const onClick = (e: MouseEvent) => {
+      if (rootRef.current && !rootRef.current.contains(e.target as Node)) setOpen(false)
+    }
+    document.addEventListener('mousedown', onClick)
+    return () => document.removeEventListener('mousedown', onClick)
+  }, [open])
+
+  const toggle = (opt: string) => {
+    const next = new Set(selected)
+    if (next.has(opt)) next.delete(opt)
+    else next.add(opt)
+    onChange(next)
+  }
+
+  return (
+    <div className="filter-dropdown" ref={rootRef}>
+      <button type="button" className="filter-dropdown-trigger" onClick={() => setOpen(!open)}>
+        <span>{label}{selected.size > 0 ? ` (${selected.size})` : ''}</span>
+        <span className="filter-dropdown-caret">{open ? '▲' : '▼'}</span>
+      </button>
+      {open && (
+        <div className="filter-dropdown-panel">
+          {options.map((opt) => (
+            <label key={opt} className="filter-dropdown-item">
+              <input type="checkbox" checked={selected.has(opt)} onChange={() => toggle(opt)} />
+              <span>{opt}</span>
+            </label>
+          ))}
+        </div>
+      )}
+    </div>
+  )
 }
 
 // weekly_count is a generic "records created this week" number (see
@@ -192,8 +245,8 @@ export function FactoryDashboardScreen() {
   const [items, setItems] = useState<FactoryBotItem[] | null>(null)
   const [isOwner, setIsOwner] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [templateFilter, setTemplateFilter] = useState<string | null>(null)
-  const [featureFilter, setFeatureFilter] = useState<string | null>(null)
+  const [templateFilter, setTemplateFilter] = useState<Set<string>>(new Set())
+  const [featureFilter, setFeatureFilter] = useState<Set<string>>(new Set())
   const [selectedBotId, setSelectedBotId] = useState<number | null>(() => {
     const raw = new URLSearchParams(window.location.search).get('bot')
     return raw && /^\d+$/.test(raw) ? Number(raw) : null
@@ -259,8 +312,8 @@ export function FactoryDashboardScreen() {
 
   const filtered = (items ?? []).filter(
     (b) =>
-      (!templateFilter || b.template === templateFilter) &&
-      (!featureFilter || b.features.includes(featureFilter)),
+      (templateFilter.size === 0 || (!!b.template && templateFilter.has(b.template))) &&
+      (featureFilter.size === 0 || b.features.some((f) => featureFilter.has(f))),
   )
 
   if (selectedBotId != null) {
@@ -294,47 +347,14 @@ export function FactoryDashboardScreen() {
       {error && <div className="state-message">{error}</div>}
       {!error && items === null && <div className="state-message">Загрузка…</div>}
 
-      {isOwner && templates.length > 0 && (
-        <div className="chip-row" style={{ padding: '0 0 8px' }}>
-          <button
-            className="chip"
-            style={!templateFilter ? { background: 'var(--accent)', color: 'var(--accent-text)' } : undefined}
-            onClick={() => setTemplateFilter(null)}
-          >
-            Все шаблоны
-          </button>
-          {templates.map((t) => (
-            <button
-              key={t}
-              className="chip"
-              style={t === templateFilter ? { background: 'var(--accent)', color: 'var(--accent-text)' } : undefined}
-              onClick={() => setTemplateFilter(t === templateFilter ? null : t)}
-            >
-              {t}
-            </button>
-          ))}
-        </div>
-      )}
-
-      {isOwner && features.length > 0 && (
-        <div className="chip-row" style={{ padding: '0 0 8px' }}>
-          <button
-            className="chip"
-            style={!featureFilter ? { background: 'var(--accent)', color: 'var(--accent-text)' } : undefined}
-            onClick={() => setFeatureFilter(null)}
-          >
-            Все фичи
-          </button>
-          {features.map((f) => (
-            <button
-              key={f}
-              className="chip"
-              style={f === featureFilter ? { background: 'var(--accent)', color: 'var(--accent-text)' } : undefined}
-              onClick={() => setFeatureFilter(f === featureFilter ? null : f)}
-            >
-              {f}
-            </button>
-          ))}
+      {(templates.length > 0 || features.length > 0) && (
+        <div className="filter-bar">
+          {templates.length > 0 && (
+            <MultiSelectDropdown label="Шаблоны" options={templates} selected={templateFilter} onChange={setTemplateFilter} />
+          )}
+          {features.length > 0 && (
+            <MultiSelectDropdown label="Фичи" options={features} selected={featureFilter} onChange={setFeatureFilter} />
+          )}
         </div>
       )}
 
