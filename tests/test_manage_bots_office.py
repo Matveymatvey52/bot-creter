@@ -1,5 +1,6 @@
 """Creator-bot "🏢 Офисы" UI (handlers/manage_bots.py's office:/officeconnect:/
-officelink:/officeunlink: callbacks), per docs/OFFICES_DESIGN.md §9.
+officetarget:/officetype:/officeconfirm:/officedolink:/officeunlink:/
+officedigestguide callbacks), per docs/OFFICES_DESIGN.md §9, §12.
 
 Same conventions as tests/test_manage_bots_features.py: real bots.db rows via
 create_bot_record_with_admins, _is_owner patched per test class, MagicMock
@@ -65,12 +66,28 @@ class OfficePanelEmptyStateTests(_OfficeUiTestBase):
         self.assertIn("Пока нет связей", text)
 
 
-class OfficeConnectListsOtherBotsTests(_OfficeUiTestBase):
+class OfficeConnectPicksSourceTests(_OfficeUiTestBase):
     owner_id = 525202
 
-    async def test_connect_screen_lists_other_bots_not_self(self):
+    async def test_connect_screen_offers_all_bots_as_source(self):
         callback = _make_callback(self.owner_id, f"officeconnect:{self.bot_a}")
         await manage_bots.cb_office_connect_start(callback)
+
+        callback.message.edit_text.assert_awaited_once()
+        _, kwargs = callback.message.edit_text.call_args
+        button_texts = [
+            btn.text for row in kwargs["reply_markup"].inline_keyboard for btn in row
+        ]
+        self.assertIn("office_ui_bot_a", button_texts)
+        self.assertIn("office_ui_bot_b", button_texts)
+
+
+class OfficeTargetPicksTargetTests(_OfficeUiTestBase):
+    owner_id = 525206
+
+    async def test_target_screen_lists_other_bots_not_source(self):
+        callback = _make_callback(self.owner_id, f"officetarget:{self.bot_a}")
+        await manage_bots.cb_office_pick_target(callback)
 
         callback.message.edit_text.assert_awaited_once()
         _, kwargs = callback.message.edit_text.call_args
@@ -81,12 +98,38 @@ class OfficeConnectListsOtherBotsTests(_OfficeUiTestBase):
         self.assertNotIn("office_ui_bot_a", button_texts)
 
 
-class OfficeLinkCreatesLinkTests(_OfficeUiTestBase):
+class OfficeTypeAutoConfirmsWithOneEventTypeTests(_OfficeUiTestBase):
+    owner_id = 525207
+
+    async def test_officetype_skips_straight_to_confirm_screen(self):
+        callback = _make_callback(self.owner_id, f"officetype:{self.bot_a}:{self.bot_b}")
+        await manage_bots.cb_office_pick_type(callback)
+
+        callback.message.edit_text.assert_awaited_once()
+        text = callback.message.edit_text.call_args.args[0]
+        self.assertIn("Что произойдёт", text)
+        self.assertIn("office_ui_bot_a", text)
+        self.assertIn("office_ui_bot_b", text)
+        self.assertIn("новый заказ", text)
+        self.assertIn("не должны состоять в одной группе", text)
+
+    async def test_officetype_rejects_self_link(self):
+        callback = _make_callback(self.owner_id, f"officetype:{self.bot_a}:{self.bot_a}")
+        await manage_bots.cb_office_pick_type(callback)
+
+        callback.message.answer.assert_awaited_once()
+        text = callback.message.answer.call_args.args[0]
+        self.assertIn("нельзя", text.lower())
+
+
+class OfficeDoLinkCreatesLinkTests(_OfficeUiTestBase):
     owner_id = 525203
 
-    async def test_officelink_creates_link_visible_in_db(self):
-        callback = _make_callback(self.owner_id, f"officelink:{self.bot_a}:{self.bot_b}")
-        await manage_bots.cb_office_link(callback)
+    async def test_officedolink_creates_link_visible_in_db(self):
+        callback = _make_callback(
+            self.owner_id, f"officedolink:{self.bot_a}:{self.bot_b}:order.created"
+        )
+        await manage_bots.cb_office_do_link(callback)
 
         links = await get_office_links_for_bot(self.bot_a)
         self.assertEqual(links, [{
@@ -97,23 +140,70 @@ class OfficeLinkCreatesLinkTests(_OfficeUiTestBase):
         self.assertIn("office_ui_bot_a", text)
         self.assertIn("office_ui_bot_b", text)
 
-    async def test_officelink_rejects_self_link(self):
-        callback = _make_callback(self.owner_id, f"officelink:{self.bot_a}:{self.bot_a}")
-        await manage_bots.cb_office_link(callback)
+    async def test_officedolink_success_screen_offers_digest_button(self):
+        callback = _make_callback(
+            self.owner_id, f"officedolink:{self.bot_a}:{self.bot_b}:order.created"
+        )
+        await manage_bots.cb_office_do_link(callback)
+
+        _, kwargs = callback.message.edit_text.call_args
+        button_texts = [
+            btn.text for row in kwargs["reply_markup"].inline_keyboard for btn in row
+        ]
+        self.assertTrue(any("Telegram-группе" in t for t in button_texts))
+
+    async def test_officedolink_rejects_self_link(self):
+        callback = _make_callback(
+            self.owner_id, f"officedolink:{self.bot_a}:{self.bot_a}:order.created"
+        )
+        await manage_bots.cb_office_do_link(callback)
 
         self.assertEqual(await get_office_links_for_bot(self.bot_a), [])
         callback.message.answer.assert_awaited_once()
         text = callback.message.answer.call_args.args[0]
         self.assertIn("нельзя", text.lower())
 
-    async def test_officelink_is_idempotent_via_add_office_link(self):
-        callback1 = _make_callback(self.owner_id, f"officelink:{self.bot_a}:{self.bot_b}")
-        await manage_bots.cb_office_link(callback1)
-        callback2 = _make_callback(self.owner_id, f"officelink:{self.bot_a}:{self.bot_b}")
-        await manage_bots.cb_office_link(callback2)
+    async def test_officedolink_rejects_unknown_event_type(self):
+        callback = _make_callback(
+            self.owner_id, f"officedolink:{self.bot_a}:{self.bot_b}:not.a.real.type"
+        )
+        await manage_bots.cb_office_do_link(callback)
+
+        self.assertEqual(await get_office_links_for_bot(self.bot_a), [])
+        callback.message.answer.assert_awaited_once()
+
+    async def test_officedolink_is_idempotent_via_add_office_link(self):
+        callback1 = _make_callback(
+            self.owner_id, f"officedolink:{self.bot_a}:{self.bot_b}:order.created"
+        )
+        await manage_bots.cb_office_do_link(callback1)
+        callback2 = _make_callback(
+            self.owner_id, f"officedolink:{self.bot_a}:{self.bot_b}:order.created"
+        )
+        await manage_bots.cb_office_do_link(callback2)
 
         links = await get_office_links_for_bot(self.bot_a)
         self.assertEqual(len(links), 1)
+
+
+class OfficeDigestGuideTests(_OfficeUiTestBase):
+    owner_id = 525208
+
+    async def test_digest_guide_shows_group_instructions(self):
+        callback = _make_callback(self.owner_id, "officedigestguide")
+        await manage_bots.cb_office_digest_guide(callback)
+
+        callback.message.answer.assert_awaited_once()
+        text = callback.message.answer.call_args.args[0]
+        self.assertIn("Создай новую Telegram-группу", text)
+        self.assertIn("Creator-бота", text)
+
+    async def test_non_owner_cannot_see_digest_guide(self):
+        NON_OWNER_ID = 999999
+        callback = _make_callback(NON_OWNER_ID, "officedigestguide")
+        await manage_bots.cb_office_digest_guide(callback)
+
+        callback.message.answer.assert_not_awaited()
 
 
 class OfficeUnlinkRemovesLinkTests(_OfficeUiTestBase):
@@ -158,8 +248,10 @@ class OfficeUiDeniesNonOwnerTests(_OfficeUiTestBase):
 
     async def test_non_owner_cannot_create_link(self):
         NON_OWNER_ID = 999999
-        callback = _make_callback(NON_OWNER_ID, f"officelink:{self.bot_a}:{self.bot_b}")
-        await manage_bots.cb_office_link(callback)
+        callback = _make_callback(
+            NON_OWNER_ID, f"officedolink:{self.bot_a}:{self.bot_b}:order.created"
+        )
+        await manage_bots.cb_office_do_link(callback)
 
         self.assertEqual(await get_office_links_for_bot(self.bot_a), [])
 
