@@ -8,6 +8,8 @@ import logging
 import os
 import re
 import tempfile
+import time
+import uuid
 from pathlib import Path
 
 from aiogram import Bot, F, Router
@@ -48,6 +50,7 @@ from db.database import (
     update_bot_status,
     update_bot_username,
 )
+from features import ai_dialog
 from features.office_events import _EVENT_TYPES, EVENT_TYPE_LABELS
 from features.sheets import get_service_account_email, verify_access
 from handlers.admin_manager import _can_manage_bot, _is_owner
@@ -100,6 +103,10 @@ class PaymentConnectFlow(StatesGroup):
     waiting_for_token = State()
     waiting_for_shop_id = State()
     waiting_for_secret_key = State()
+
+
+class AiDialogStates(StatesGroup):
+    chatting = State()
 
 router = Router()
 
@@ -187,6 +194,15 @@ def _delete_custom_feature_file(bot_id: int) -> None:
 def _bot_keyboard(bot_id: int) -> InlineKeyboardMarkup:
     running = is_running(bot_id)
     rows = []
+    # Deliberately the very first row, alone, with its own distinct wording
+    # (not another "🧩"/"🔧" icon among the grid below) — this is the new
+    # free-form voice/text entry point (features/ai_dialog.py) into the SAME
+    # actions the rest of this keyboard exposes as separate buttons, so it
+    # needs to visually read as "a different kind of control", not just one
+    # more row in the list.
+    rows.append([
+        InlineKeyboardButton(text="✨🎙️ Хочу наговорить/написать что изменить", callback_data=f"aidialog:{bot_id}"),
+    ])
     if running:
         rows.append([
             InlineKeyboardButton(text="🔴 Остановить", callback_data=f"stop:{bot_id}"),
@@ -1752,6 +1768,41 @@ async def cb_payment_check_status(callback: CallbackQuery):
     await callback.message.answer(_format_shop_info(info), parse_mode="HTML")
 
 
+async def _perform_start(bot_id: int, b: dict) -> tuple[bool, str]:
+    """Core "start this bot" action shared by cb_start (button) and the AI
+    dialog's start_bot tool (features/ai_dialog.py) — single source of truth
+    so neither path can drift from the other. Returns (success,
+    human-readable outcome) instead of raising, so both callers can render
+    it their own way (edited card vs. chat reply)."""
+    if is_running(bot_id):
+        return True, "Уже запущен."
+    try:
+        pid = await start_bot(bot_id, b["file_path"], b["token"], extra_env=_make_extra_env(b))
+        await update_bot_status(bot_id, "running", pid)
+        return True, "Бот запущен."
+    except Exception:
+        await update_bot_status(bot_id, "error")
+        return False, "Бот не смог запуститься — в сгенерированном коде ошибка."
+
+
+async def _perform_stop(bot_id: int) -> tuple[bool, str]:
+    await stop_bot(bot_id)
+    await update_bot_status(bot_id, "stopped")
+    return True, "Бот остановлен."
+
+
+async def _perform_restart(bot_id: int, b: dict) -> tuple[bool, str]:
+    await stop_bot(bot_id)
+    try:
+        pid = await start_bot(bot_id, b["file_path"], b["token"], extra_env=_make_extra_env(b))
+        await update_bot_status(bot_id, "running", pid)
+        return True, "Бот перезапущен."
+    except Exception as e:
+        logger.error(f"Failed to restart bot {bot_id}: {e}")
+        await update_bot_status(bot_id, "error")
+        return False, "Бот не смог перезапуститься — в коде ошибка."
+
+
 @router.callback_query(F.data.startswith("start:"))
 async def cb_start(callback: CallbackQuery):
     bot_id = int(callback.data.split(":")[1])
@@ -1765,14 +1816,8 @@ async def cb_start(callback: CallbackQuery):
         if not b:
             await callback.message.answer("Бот не найден.")
             return
-        if is_running(bot_id):
-            await callback.message.answer("Уже запущен.")
-            return
-        try:
-            pid = await start_bot(bot_id, b["file_path"], b["token"], extra_env=_make_extra_env(b))
-            await update_bot_status(bot_id, "running", pid)
-        except Exception as e:
-            await update_bot_status(bot_id, "error")
+        ok, _msg = await _perform_start(bot_id, b)
+        if not ok:
             await _edit_or_resend(
                 callback,
                 "❌ Бот не смог запуститься — в сгенерированном коде ошибка.\n\n"
@@ -1798,8 +1843,7 @@ async def cb_stop(callback: CallbackQuery):
     if not b:
         await callback.message.answer("Бот не найден.")
         return
-    await stop_bot(bot_id)
-    await update_bot_status(bot_id, "stopped")
+    await _perform_stop(bot_id)
     b["username"] = await _ensure_username(b)
     await _edit_or_resend(
         callback, _bot_text(b), parse_mode="HTML", reply_markup=_bot_keyboard(bot_id)
@@ -1819,13 +1863,8 @@ async def cb_restart(callback: CallbackQuery):
         if not b:
             await callback.message.answer("Бот не найден.")
             return
-        await stop_bot(bot_id)
-        try:
-            pid = await start_bot(bot_id, b["file_path"], b["token"], extra_env=_make_extra_env(b))
-            await update_bot_status(bot_id, "running", pid)
-        except Exception as e:
-            logger.error(f"Failed to restart bot {bot_id}: {e}")
-            await update_bot_status(bot_id, "error")
+        ok, _msg = await _perform_restart(bot_id, b)
+        if not ok:
             await _edit_or_resend(
                 callback,
                 "❌ Бот не смог перезапуститься — в коде ошибка.\n\n"
@@ -2017,6 +2056,54 @@ async def cb_recreate(callback: CallbackQuery):
 
 # ── auto-diagnose ─────────────────────────────────────────────────────────────
 
+class _AutofixAnalyzeError(Exception):
+    """Raised by _perform_autofix when the Claude analysis call itself fails
+    (timeout/exception) — distinct from a successful fix whose resulting
+    code just fails to restart, since callers offer different follow-ups
+    for the two (retry-analysis vs delete-bot)."""
+
+
+async def _perform_autofix(bot_id: int, b: dict) -> tuple[bool, str]:
+    """Core auto-diagnose action shared by cb_auto_diagnose (button) and the
+    AI dialog's run_autofix tool (features/ai_dialog.py). Raises
+    _AutofixAnalyzeError if the Claude call itself fails; otherwise returns
+    (success, human-readable outcome) for the restart-after-fix step, same
+    shape as _perform_start/_perform_restart above."""
+    current_code = Path(b["file_path"]).read_text(encoding="utf-8")
+    error_log = get_bot_logs(bot_id) or ""
+
+    if error_log:
+        bug_description = f"Bot crashed with the following error:\n{error_log}"
+    else:
+        bug_description = (
+            "The bot is not working correctly but no crash log is available. "
+            "Analyze the code carefully, find potential bugs (wrong imports, missing asyncio.run(main()), "
+            "incorrect aiogram 3.x patterns, missing error handling) and fix them."
+        )
+
+    try:
+        fixed_code = await asyncio.wait_for(
+            fix_bot_code(current_code, bug_description), timeout=240.0
+        )
+    except Exception:
+        raise _AutofixAnalyzeError()
+
+    await stop_bot(bot_id)
+    # Same re-append as cb_recreate above — fix_bot_code() is also a
+    # whole-file LLM rewrite that can drop the appended office-hook wiring.
+    fixed_code = append_from_scratch_registry_wiring(fixed_code)
+    Path(b["file_path"]).write_text(fixed_code, encoding="utf-8")
+    asyncio.create_task(push_bot_to_github(b["name"], fixed_code))
+
+    try:
+        pid = await start_bot(bot_id, b["file_path"], b["token"], extra_env=_make_extra_env(b))
+        await update_bot_status(bot_id, "running", pid)
+        return True, f"«{b['name']}» исправлен и перезапущен!"
+    except Exception as e:
+        await update_bot_status(bot_id, "error")
+        return False, f"Код исправлен, но бот снова не запустился: {str(e)[-300:]}"
+
+
 @router.callback_query(F.data.startswith("autofix:"))
 async def cb_auto_diagnose(callback: CallbackQuery):
     bot_id = int(callback.data.split(":")[1])
@@ -2031,18 +2118,7 @@ async def cb_auto_diagnose(callback: CallbackQuery):
             await callback.message.edit_text("❌ Файл бота не найден — попробуй Перегенерировать.")
             return
 
-        current_code = Path(b["file_path"]).read_text(encoding="utf-8")
         error_log = get_bot_logs(bot_id) or ""
-
-        if error_log:
-            bug_description = f"Bot crashed with the following error:\n{error_log}"
-        else:
-            bug_description = (
-                "The bot is not working correctly but no crash log is available. "
-                "Analyze the code carefully, find potential bugs (wrong imports, missing asyncio.run(main()), "
-                "incorrect aiogram 3.x patterns, missing error handling) and fix them."
-            )
-
         await callback.message.edit_text(
             f"🔍 Диагностирую <b>{b['name']}</b>...\n\n"
             + (f"<code>{html.escape(error_log[-300:])}</code>" if error_log else "Логов нет — анализирую код."),
@@ -2050,10 +2126,8 @@ async def cb_auto_diagnose(callback: CallbackQuery):
         )
 
         try:
-            fixed_code = await asyncio.wait_for(
-                fix_bot_code(current_code, bug_description), timeout=240.0
-            )
-        except Exception:
+            ok, msg = await _perform_autofix(bot_id, b)
+        except _AutofixAnalyzeError:
             await callback.message.edit_text(
                 "⚠️ Не удалось проанализировать код. Попробуй ещё раз.",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
@@ -2063,25 +2137,13 @@ async def cb_auto_diagnose(callback: CallbackQuery):
             )
             return
 
-        await stop_bot(bot_id)
-        # Same re-append as cb_recreate above — fix_bot_code() is also a
-        # whole-file LLM rewrite that can drop the appended office-hook wiring.
-        fixed_code = append_from_scratch_registry_wiring(fixed_code)
-        Path(b["file_path"]).write_text(fixed_code, encoding="utf-8")
-        asyncio.create_task(push_bot_to_github(b["name"], fixed_code))
-
-        try:
-            pid = await start_bot(bot_id, b["file_path"], b["token"], extra_env=_make_extra_env(b))
-            await update_bot_status(bot_id, "running", pid)
+        if ok:
             await callback.message.edit_text(
-                f"✅ <b>{b['name']}</b> исправлен и перезапущен!",
-                parse_mode="HTML",
-                reply_markup=_bot_keyboard(bot_id),
+                f"✅ {msg}", parse_mode="HTML", reply_markup=_bot_keyboard(bot_id)
             )
-        except Exception as e:
-            await update_bot_status(bot_id, "error")
+        else:
             await callback.message.edit_text(
-                f"⚠️ Код исправлен, но бот снова не запустился:\n<code>{html.escape(str(e)[-300:])}</code>",
+                f"⚠️ {html.escape(msg)}",
                 parse_mode="HTML",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
                     InlineKeyboardButton(text="🔍 Диагностировать снова", callback_data=f"autofix:{bot_id}"),
@@ -2232,3 +2294,288 @@ async def msg_fix_unsupported(message: Message):
         "Не понял — отправь текст или голосовое с описанием бага.",
         reply_markup=cancel_keyboard(),
     )
+
+
+# ── AI dialog (voice/text free-form, docs/AI_DIALOG design) ────────────────
+#
+# The "✨🎙️ Хочу наговорить/написать что изменить" entry point on the detail
+# panel (_bot_keyboard above). Same tool-use shape as features/group_task.py
+# — Claude (Sonnet) gets a small set of tool schemas (features/ai_dialog.py's
+# TOOLS), a tool call is turned into a preview + ✅/❌ confirmation and NEVER
+# executed straight from the model's response, and the actual execution goes
+# through the SAME _perform_start/_perform_stop/_perform_restart/
+# _perform_autofix/get_bot_logs helpers the ordinary buttons use — no
+# separate implementation of what each action does. Unlike group_task.py,
+# this runs in the owner's own 1:1 chat with the Creator bot (not a shared
+# group), so authorization is the existing per-bot _bot_or_deny check plus
+# aiogram's own per-user FSM scoping — no separate owner-recheck dance is
+# needed the way group_task.py needs one for a multi-user group chat.
+
+_AI_DIALOG_MODEL = "claude-sonnet-5"
+_AI_DIALOG_CONTEXT_TURNS = 6
+# Same rationale as features/group_task.py's _PENDING_TTL_SECONDS — a stale
+# confirm tap after the bot's real state has since changed (e.g. someone
+# already restarted it from the button) should not silently re-fire.
+_AI_DIALOG_PENDING_TTL_SECONDS = 300
+_AI_DIALOG_EXIT_WORDS = {"выйти", "стоп", "exit", "cancel", "отмена"}
+
+
+def _ai_dialog_keyboard(bot_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="◀ Выйти из диалога", callback_data=f"aidialogexit:{bot_id}"),
+    ]])
+
+
+def _ai_dialog_confirm_keyboard(token: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"aidok:{token}"),
+        InlineKeyboardButton(text="❌ Отменить", callback_data=f"aidno:{token}"),
+    ]])
+
+
+@router.callback_query(F.data.startswith("aidialog:"))
+async def cb_aidialog(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    bot_id = int(callback.data.split(":")[1])
+    b = await _bot_or_deny(callback.from_user.id, bot_id)
+    if not b:
+        await callback.message.answer("Бот не найден.")
+        return
+    await state.set_state(AiDialogStates.chatting)
+    await state.update_data(ai_dialog_bot_id=bot_id, ai_dialog_history=[], ai_dialog_pending=None)
+    await callback.message.answer(
+        f"🎙️ Диалог с ботом <b>{b['name']}</b>\n\n"
+        "Опиши голосовым или текстом, что хочешь сделать с этим ботом — например "
+        "«поставь на паузу», «перезапусти», «почему он не отвечает».\n\n"
+        "Для действий, кроме показа логов, я спрошу подтверждение перед выполнением.",
+        parse_mode="HTML",
+        reply_markup=_ai_dialog_keyboard(bot_id),
+    )
+
+
+@router.callback_query(F.data.startswith("aidialogexit:"))
+async def cb_aidialog_exit(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.clear()
+    bot_id = int(callback.data.split(":")[1])
+    b = await _bot_or_deny(callback.from_user.id, bot_id)
+    if not b:
+        await callback.message.answer("Бот не найден.")
+        return
+    b["username"] = await _ensure_username(b)
+    await callback.message.answer(_bot_text(b), parse_mode="HTML", reply_markup=_bot_keyboard(bot_id))
+
+
+async def _ai_dialog_execute_tool(tool_name: str, bot_id: int, b: dict) -> str:
+    """Executes a confirmed (or read-only) tool call through the SAME
+    _perform_*/get_bot_logs helpers the detail panel's own buttons use —
+    never reimplements what an action does. Returns the human-readable
+    outcome shown to the owner; never raises."""
+    if tool_name == "stop_bot":
+        _ok, msg = await _perform_stop(bot_id)
+        return msg
+    if tool_name == "start_bot":
+        _ok, msg = await _perform_start(bot_id, b)
+        return msg
+    if tool_name == "restart_bot":
+        _ok, msg = await _perform_restart(bot_id, b)
+        return msg
+    if tool_name == "run_autofix":
+        try:
+            _ok, msg = await _perform_autofix(bot_id, b)
+            return msg
+        except _AutofixAnalyzeError:
+            return "Не удалось проанализировать код. Попробуй ещё раз через «🔍 Авто-диагностика»."
+    if tool_name == "show_logs":
+        logs = get_bot_logs(bot_id) or "Логов нет (бот не запускался в этой сессии)."
+        if len(logs) > 3500:
+            logs = "...\n" + logs[-3500:]
+        return logs
+    return f"Неизвестное действие {tool_name!r}."
+
+
+async def _ai_dialog_call_claude(bot_id: int, b: dict, history: list[tuple[str, str]]):
+    from anthropic import AsyncAnthropic
+    from config import ANTHROPIC_API_KEY
+
+    template_id = (
+        infer_template_id(b["file_path"]) if b.get("file_path") else None
+    ) or "general"
+    status = "запущен" if is_running(bot_id) else "остановлен"
+    system_prompt = ai_dialog.SYSTEM_PROMPT_TEMPLATE.format(
+        name=b["name"], template_id=template_id, status=status
+    )
+    client = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+    return await client.messages.create(
+        model=_AI_DIALOG_MODEL,
+        max_tokens=500,
+        system=system_prompt,
+        messages=[{"role": role, "content": content} for role, content in history],
+        tools=ai_dialog.TOOLS,
+    )
+
+
+async def _handle_ai_dialog_text(message: Message, state: FSMContext, text: str) -> None:
+    text = text.strip()
+    if not text:
+        return
+    if text.lower() in _AI_DIALOG_EXIT_WORDS:
+        data = await state.get_data()
+        bot_id = data.get("ai_dialog_bot_id")
+        await state.clear()
+        if bot_id is not None:
+            b = await _bot_or_deny(message.from_user.id, bot_id)
+            if b:
+                b["username"] = await _ensure_username(b)
+                await message.answer(_bot_text(b), parse_mode="HTML", reply_markup=_bot_keyboard(bot_id))
+                return
+        await message.answer("Диалог завершён.")
+        return
+
+    data = await state.get_data()
+    bot_id = data.get("ai_dialog_bot_id")
+    if bot_id is None:
+        await state.clear()
+        return
+    b = await _bot_or_deny(message.from_user.id, bot_id)
+    if not b:
+        await state.clear()
+        await message.answer("Бот не найден.")
+        return
+
+    history: list[tuple[str, str]] = list(data.get("ai_dialog_history") or [])
+    history.append(("user", text))
+    del history[:-_AI_DIALOG_CONTEXT_TURNS]
+
+    try:
+        response = await _ai_dialog_call_claude(bot_id, b, history)
+    except Exception:
+        logger.exception(f"ai_dialog: Claude call failed — bot_id={bot_id}")
+        await message.answer("⚠️ Не удалось обработать запрос, попробуй ещё раз.")
+        return
+
+    text_block = next((blk for blk in response.content if blk.type == "text"), None)
+    tool_block = next((blk for blk in response.content if blk.type == "tool_use"), None)
+
+    if tool_block is not None and tool_block.name in ai_dialog.READONLY_TOOLS:
+        outcome = await _ai_dialog_execute_tool(tool_block.name, bot_id, b)
+        preview = ai_dialog.describe_tool_call(tool_block.name, b["name"])
+        history.append(("assistant", f"[{preview}]"))
+        del history[:-_AI_DIALOG_CONTEXT_TURNS]
+        await state.update_data(ai_dialog_history=history)
+        await message.answer(f"{preview}\n\n{outcome}", reply_markup=_ai_dialog_keyboard(bot_id))
+        return
+
+    if tool_block is not None:
+        token = uuid.uuid4().hex[:12]
+        preview = ai_dialog.describe_tool_call(tool_block.name, b["name"])
+        history.append(("assistant", f"[Предложил действие: {preview}]"))
+        del history[:-_AI_DIALOG_CONTEXT_TURNS]
+        await state.update_data(
+            ai_dialog_history=history,
+            ai_dialog_pending={
+                "token": token,
+                "tool_name": tool_block.name,
+                "created_at": time.monotonic(),
+            },
+        )
+        await message.answer(
+            f"{preview}\n\nПодтвердить выполнение?",
+            reply_markup=_ai_dialog_confirm_keyboard(token),
+        )
+        return
+
+    reply_text = text_block.text if text_block is not None else ""
+    if not reply_text:
+        reply_text = "..."
+    history.append(("assistant", reply_text))
+    del history[:-_AI_DIALOG_CONTEXT_TURNS]
+    await state.update_data(ai_dialog_history=history)
+    await message.answer(reply_text, reply_markup=_ai_dialog_keyboard(bot_id))
+
+
+@router.message(AiDialogStates.chatting, F.voice)
+async def msg_ai_dialog_voice(message: Message, state: FSMContext, bot: Bot):
+    text = await _recognize_voice_fix(message, bot)
+    if text:
+        await _handle_ai_dialog_text(message, state, text)
+
+
+@router.message(AiDialogStates.chatting, F.text, ~F.text.startswith("/"))
+async def msg_ai_dialog_text(message: Message, state: FSMContext, bot: Bot):
+    await _handle_ai_dialog_text(message, state, message.text)
+
+
+@router.message(AiDialogStates.chatting)
+async def msg_ai_dialog_unsupported(message: Message):
+    await message.answer("Не понял — отправь текст или голосовое с описанием того, что хочешь сделать.")
+
+
+@router.callback_query(F.data.startswith("aidok:"))
+async def cb_aidialog_confirm(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    bot_id = data.get("ai_dialog_bot_id")
+    pending = data.get("ai_dialog_pending")
+    token = callback.data.split(":", 1)[1] if callback.data else ""
+
+    if bot_id is None or not pending or pending.get("token") != token:
+        await callback.answer("Действие уже выполнено, отменено или устарело.", show_alert=True)
+        return
+
+    # Claim (clear) the pending entry BEFORE any await below — same
+    # TOCTOU-avoidance reason as features/group_task.py's cb_grouptask_confirm:
+    # a double-tap must not be able to execute a non-idempotent action twice.
+    await state.update_data(ai_dialog_pending=None)
+
+    b = await _bot_or_deny(callback.from_user.id, bot_id)
+    if not b:
+        await callback.answer()
+        await callback.message.answer("Бот не найден.")
+        return
+
+    if time.monotonic() - pending["created_at"] > _AI_DIALOG_PENDING_TTL_SECONDS:
+        await callback.answer("Действие устарело — повтори запрос заново.", show_alert=True)
+        try:
+            await callback.message.edit_text("⏳ Действие устарело и было отменено автоматически.")
+        except Exception:
+            pass
+        return
+
+    if bot_id in _busy_bots:
+        await callback.answer(_BUSY_TEXT, show_alert=True)
+        return
+
+    await callback.answer()
+    _busy_bots.add(bot_id)
+    try:
+        outcome = await _ai_dialog_execute_tool(pending["tool_name"], bot_id, b)
+    finally:
+        _busy_bots.discard(bot_id)
+
+    history: list[tuple[str, str]] = list(data.get("ai_dialog_history") or [])
+    history.append(("user", f"[Владелец подтвердил действие. Результат: {outcome}]"))
+    del history[:-_AI_DIALOG_CONTEXT_TURNS]
+    await state.update_data(ai_dialog_history=history)
+
+    try:
+        await callback.message.edit_text(f"✅ {outcome}")
+    except Exception:
+        await callback.message.answer(f"✅ {outcome}")
+    await callback.message.answer("Что ещё сделать?", reply_markup=_ai_dialog_keyboard(bot_id))
+
+
+@router.callback_query(F.data.startswith("aidno:"))
+async def cb_aidialog_cancel(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    pending = data.get("ai_dialog_pending")
+    token = callback.data.split(":", 1)[1] if callback.data else ""
+    bot_id = data.get("ai_dialog_bot_id")
+    if pending and pending.get("token") == token:
+        await state.update_data(ai_dialog_pending=None)
+    await callback.answer("Отменено.")
+    try:
+        await callback.message.edit_text("❌ Отменено.")
+    except Exception:
+        pass
+    if bot_id is not None:
+        await callback.message.answer("Что ещё сделать?", reply_markup=_ai_dialog_keyboard(bot_id))
