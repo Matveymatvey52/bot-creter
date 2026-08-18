@@ -14,12 +14,15 @@ from __future__ import annotations
 
 import asyncio
 import os
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from aiogram import Bot
 from aiohttp.test_utils import TestClient, TestServer
 
+import db.database as db_module
 from db.database import (
     create_bot_record_with_admins,
     delete_bot,
@@ -53,10 +56,17 @@ class RegistryLiveUpdateTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self._bot_call_patcher = patch.object(Bot, "__call__", new=AsyncMock(return_value=MagicMock()))
         self._bot_call_patcher.start()
+        self._tmp_dir = tempfile.TemporaryDirectory()
+        self._db_path_patcher = patch.object(
+            db_module, "DB_PATH", Path(self._tmp_dir.name) / "test_registry_reload.db"
+        )
+        self._db_path_patcher.start()
         await init_db()
 
     async def asyncTearDown(self):
         self._bot_call_patcher.stop()
+        self._db_path_patcher.stop()
+        self._tmp_dir.cleanup()
 
     async def test_add_or_replace_makes_a_new_bot_start_routing(self):
         # /webhook/* is fail-closed on an unset WEBHOOK_SECRET (see

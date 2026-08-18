@@ -29,9 +29,9 @@ import aiosqlite
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
 
+import db.database as db_module
 import features.office_events as office_events
 from db.database import (
-    DB_PATH,
     create_bot_record_with_admins,
     delete_bot,
     get_bot_payment_provider,
@@ -303,6 +303,12 @@ class ProviderTokenIsolationTests(unittest.IsolatedAsyncioTestCase):
     at rest the same way bots.token is."""
 
     async def asyncSetUp(self):
+        self._tmp_dir = tempfile.TemporaryDirectory()
+        self._db_path_patcher = patch.object(
+            db_module, "DB_PATH", Path(self._tmp_dir.name) / "test_payments_provider_isolation.db"
+        )
+        self._db_path_patcher.start()
+        await db_module.init_db()
         self.bot_a_id = await create_bot_record_with_admins(
             name="payments_isolation_bot_a", description="test", token=FAKE_TOKEN,
             file_path="templates/inventory.py", admin_ids=["111"],
@@ -317,6 +323,8 @@ class ProviderTokenIsolationTests(unittest.IsolatedAsyncioTestCase):
         # db/database.py) — no separate cleanup needed here.
         await delete_bot(self.bot_a_id)
         await delete_bot(self.bot_b_id)
+        self._db_path_patcher.stop()
+        self._tmp_dir.cleanup()
 
     async def test_provider_token_isolated_between_bots(self):
         await set_bot_payment_provider(self.bot_a_id, "provider-token-for-a")
@@ -335,7 +343,7 @@ class ProviderTokenIsolationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_stored_token_is_encrypted_at_rest(self):
         await set_bot_payment_provider(self.bot_a_id, "provider-token-for-a")
-        conn = sqlite3.connect(str(DB_PATH))
+        conn = sqlite3.connect(str(db_module.DB_PATH))
         raw = conn.execute(
             "SELECT provider_token FROM bot_payment_providers WHERE bot_id=?", (self.bot_a_id,)
         ).fetchone()[0]
@@ -348,7 +356,7 @@ class ProviderTokenIsolationTests(unittest.IsolatedAsyncioTestCase):
         # asyncTearDown will call delete_bot again on an already-gone row —
         # harmless (DELETE ... WHERE matches nothing) — so create a throwaway
         # id-free check here instead of relying on teardown for the assertion.
-        conn = sqlite3.connect(str(DB_PATH))
+        conn = sqlite3.connect(str(db_module.DB_PATH))
         row = conn.execute(
             "SELECT 1 FROM bot_payment_providers WHERE bot_id=?", (self.bot_a_id,)
         ).fetchone()
@@ -360,6 +368,12 @@ class CreateInvoiceTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self._bot_call_patcher = patch.object(Bot, "__call__", new=AsyncMock(return_value=MagicMock()))
         self._bot_call_patcher.start()
+        self._tmp_dir = tempfile.TemporaryDirectory()
+        self._db_path_patcher = patch.object(
+            db_module, "DB_PATH", Path(self._tmp_dir.name) / "test_payments_create_invoice.db"
+        )
+        self._db_path_patcher.start()
+        await db_module.init_db()
         self.bot = Bot(token=FAKE_TOKEN)
         self.bot_id = await create_bot_record_with_admins(
             name="payments_invoice_bot", description="test", token=FAKE_TOKEN,
@@ -369,6 +383,8 @@ class CreateInvoiceTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         await delete_bot(self.bot_id)
         self._bot_call_patcher.stop()
+        self._db_path_patcher.stop()
+        self._tmp_dir.cleanup()
 
     async def test_create_invoice_without_configured_provider_raises(self):
         from aiogram.types import LabeledPrice
