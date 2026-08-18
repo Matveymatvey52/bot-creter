@@ -1,11 +1,13 @@
 """Shared pytest fixtures for channel_monitor tests.
 
-isolated_db patches db.database.DB_PATH to a tmp_path-backed sqlite file for
-the duration of one test, so tests exercise userbot_sessions /
-monitored_channels / channel_posts against a throwaway database instead of
-the real data/bots.db — see MEMORY.md "Backlog: test DB isolation" for why
-this matters (existing suite has some tests that hit the real DB; new tests
-in this module must not add to that list).
+isolated_db returns a tmp_path-backed sqlite file path for channel_monitor's
+tables (userbot_sessions / monitored_channels / channel_posts) — these live in
+a per-bot db_path now (docs/USERBOT_FEATURE_DESIGN.md §2 Variant A), passed
+explicitly to every db/database.py channel_monitor function, so this fixture
+just hands back a throwaway path instead of monkeypatching a module-level
+DB_PATH the way the old central-DB design needed. See MEMORY.md "Backlog:
+test DB isolation" for why isolation matters (existing suite has some tests
+that hit the real DB; new tests in this module must not add to that list).
 """
 from __future__ import annotations
 
@@ -15,10 +17,8 @@ import db.database as db_module
 
 
 @pytest.fixture
-def isolated_db(tmp_path, monkeypatch):
-    db_path = tmp_path / "test_channel_monitor.db"
-    monkeypatch.setattr(db_module, "DB_PATH", db_path)
-    return db_path
+def isolated_db(tmp_path):
+    return str(tmp_path / "test_channel_monitor.db")
 
 
 @pytest.fixture

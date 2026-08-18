@@ -132,7 +132,7 @@ class DiscoverTemplatesRegressionOnRealTemplates(unittest.TestCase):
         names = {t["name"] for t in found}
         self.assertEqual(
             names,
-            {"accountant", "booking_beauty", "booking_fitness", "booking_medical", "booking_restaurant", "boss_bot", "campaign_tracker", "car_rental", "channel_monitor", "coworking_space", "debtors", "delivery_tracker", "event_manager", "event_rsvp", "expense_tracker", "feedback_survey", "habit_tracker", "inventory", "loyalty_program", "manager_bot", "manager_secretary", "moderator", "orders_tracker", "referral_program", "rental_equipment", "repair_tracker", "sales_analytics", "shop_catalog", "staff_scheduler", "support_tickets", "tour_operator", "tourist_documents", "trip_manager", "vehicle_service"},
+            {"accountant", "booking_beauty", "booking_fitness", "booking_medical", "booking_restaurant", "boss_bot", "campaign_tracker", "car_rental", "coworking_space", "debtors", "delivery_tracker", "event_manager", "event_rsvp", "expense_tracker", "feedback_survey", "habit_tracker", "inventory", "loyalty_program", "manager_bot", "manager_secretary", "moderator", "orders_tracker", "referral_program", "rental_equipment", "repair_tracker", "sales_analytics", "shop_catalog", "staff_scheduler", "support_tickets", "tour_operator", "tourist_documents", "trip_manager", "vehicle_service"},
         )
 
     def test_tour_operator_use_for_is_parsed_despite_missing_customize_line(self):

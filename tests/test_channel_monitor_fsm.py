@@ -1,19 +1,25 @@
-"""templates/channel_monitor.py — userbot authorization FSM.
+"""features/channel_monitor.py — userbot authorization FSM.
 
 Drives the real aiogram Dispatcher/Router against fake Message/CallbackQuery
-updates, with templates.channel_monitor._make_client patched to return a fake
+updates, with features.channel_monitor._make_client patched to return a fake
 Telethon client instead of touching the real network — the dependency-
 injection seam the module docstring calls out. Bot.__call__ is patched the
-same way tests/test_moderator_isolation.py does it (FakeBotAPI), and
+same way tests/test_moderator_isolation.py does it (FakeBotAPI).
 runtime.registry._clone_router avoids aiogram's one-parent-Router restriction
 across tests, same pattern the live registry uses for multiple bots sharing
-one template module.
+one feature module. A small ConfigAndBotIdMiddleware stands in for
+runtime/registry.py's ConfigMiddleware + _attach_bot_id_middleware, the same
+convention tests/test_sellable_items_module.py uses for feature-module tests
+(the FSM's handlers now take bot_id/config as injected params, since this
+module no longer owns a standalone bot's Config/db_path the way
+templates/channel_monitor.py — now retired — used to).
 
 Covers the happy path (phone -> code -> active), the 2FA branch, and every
 Telethon error this module is required to handle explicitly (design doc §2).
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -24,10 +30,31 @@ from aiogram.methods import EditMessageText, SendMessage
 from aiogram.types import CallbackQuery, Chat, Message, Update, User
 
 from runtime.registry import _clone_router
-from templates import channel_monitor
+from features import channel_monitor
 
 FAKE_TOKEN = "222222:test-token-not-real"
 OWNER_ID = 555
+BOT_ID = 777
+
+
+@dataclass
+class FixtureConfig:
+    db_path: str
+
+
+class ConfigAndBotIdMiddleware:
+    """Stands in for runtime/registry.py's ConfigMiddleware + the bot_id
+    injection _load_and_include_features() does for every feature router —
+    see that module's _attach_bot_id_middleware()."""
+
+    def __init__(self, config: FixtureConfig, bot_id: int) -> None:
+        self.config = config
+        self.bot_id = bot_id
+
+    async def __call__(self, handler, event, data):
+        data["config"] = self.config
+        data["bot_id"] = self.bot_id
+        return await handler(event, data)
 
 
 class FakeBotAPI:
@@ -53,8 +80,9 @@ class FakeBotAPI:
         return texts[-1] if texts else None
 
 
-def _make_dispatcher() -> Dispatcher:
+def _make_dispatcher(db_path: str) -> Dispatcher:
     dp = Dispatcher(storage=MemoryStorage())
+    dp.update.outer_middleware(ConfigAndBotIdMiddleware(FixtureConfig(db_path=db_path), BOT_ID))
     dp.include_router(_clone_router(channel_monitor.router))
     return dp
 
@@ -79,7 +107,7 @@ def _callback_update(data: str, update_id: int) -> Update:
 
 
 class FakeTelethonClient:
-    """Fakes the subset of TelegramClient's async API templates/channel_monitor.py
+    """Fakes the subset of TelegramClient's async API features/channel_monitor.py
     calls: connect/disconnect, send_code_request, sign_in, session.save().
     .sign_in_side_effect returns an exception instance to raise, or None to
     succeed — lets each test script exactly one sign_in() outcome per call."""
@@ -123,9 +151,9 @@ def bot():
 @pytest.fixture(autouse=True)
 def _reset_phone_request_cooldown():
     """channel_monitor._last_phone_request_at is a module-level, per-process
-    throttle (security-review addition) — tests all use the same OWNER_ID, so
-    it must be cleared between tests or a later test's first phone entry gets
-    rejected by an earlier test's cooldown."""
+    throttle (security-review addition) — tests all use the same
+    (BOT_ID, OWNER_ID) pair, so it must be cleared between tests or a later
+    test's first phone entry gets rejected by an earlier test's cooldown."""
     channel_monitor._last_phone_request_at.clear()
     yield
     channel_monitor._last_phone_request_at.clear()
@@ -137,9 +165,9 @@ async def _feed(dp, bot, update):
 
 @pytest.mark.asyncio
 async def test_happy_path_phone_code_to_active(isolated_db, userbot_key, monkeypatch, bot, api_patch):
-    dp = _make_dispatcher()
-    from db.database import get_userbot_sessions_by_owner, init_db
-    await init_db()
+    dp = _make_dispatcher(isolated_db)
+    from db.database import get_userbot_sessions_by_bot, init_channel_monitor_tables
+    await init_channel_monitor_tables(isolated_db)
 
     client = FakeTelethonClient()
     monkeypatch.setattr(channel_monitor, "_make_client", lambda session_string="": client)
@@ -151,7 +179,7 @@ async def test_happy_path_phone_code_to_active(isolated_db, userbot_key, monkeyp
 
     assert "одключ" in api_patch.last_text()  # "Мониторинг подключён"
 
-    sessions = await get_userbot_sessions_by_owner(OWNER_ID)
+    sessions = await get_userbot_sessions_by_bot(isolated_db, BOT_ID)
     assert len(sessions) == 1
     assert sessions[0]["status"] == "active"
     assert sessions[0]["session_string"] == "encoded-session-string"
@@ -159,9 +187,9 @@ async def test_happy_path_phone_code_to_active(isolated_db, userbot_key, monkeyp
 
 @pytest.mark.asyncio
 async def test_2fa_path(isolated_db, userbot_key, monkeypatch, bot, api_patch):
-    dp = _make_dispatcher()
-    from db.database import get_userbot_sessions_by_owner, init_db
-    await init_db()
+    dp = _make_dispatcher(isolated_db)
+    from db.database import get_userbot_sessions_by_bot, init_channel_monitor_tables
+    await init_channel_monitor_tables(isolated_db)
 
     from telethon.errors import SessionPasswordNeededError
 
@@ -185,15 +213,15 @@ async def test_2fa_path(isolated_db, userbot_key, monkeypatch, bot, api_patch):
     await _feed(dp, bot, _message_update("mysecretpassword", 5))
     assert "одключ" in api_patch.last_text()
 
-    sessions = await get_userbot_sessions_by_owner(OWNER_ID)
+    sessions = await get_userbot_sessions_by_bot(isolated_db, BOT_ID)
     assert sessions[0]["status"] == "active"
 
 
 @pytest.mark.asyncio
 async def test_phone_code_invalid_stays_in_waiting_code(isolated_db, userbot_key, monkeypatch, bot, api_patch):
-    dp = _make_dispatcher()
-    from db.database import init_db
-    await init_db()
+    dp = _make_dispatcher(isolated_db)
+    from db.database import init_channel_monitor_tables
+    await init_channel_monitor_tables(isolated_db)
 
     from telethon.errors import PhoneCodeInvalidError
 
@@ -213,9 +241,9 @@ async def test_phone_code_invalid_stays_in_waiting_code(isolated_db, userbot_key
 
 @pytest.mark.asyncio
 async def test_phone_code_invalid_too_many_attempts_marks_auth_failed(isolated_db, userbot_key, monkeypatch, bot, api_patch):
-    dp = _make_dispatcher()
-    from db.database import get_userbot_sessions_by_owner, init_db
-    await init_db()
+    dp = _make_dispatcher(isolated_db)
+    from db.database import get_userbot_sessions_by_bot, init_channel_monitor_tables
+    await init_channel_monitor_tables(isolated_db)
 
     from telethon.errors import PhoneCodeInvalidError
 
@@ -232,15 +260,15 @@ async def test_phone_code_invalid_too_many_attempts_marks_auth_failed(isolated_d
     state = dp.fsm.resolve_context(bot, OWNER_ID, OWNER_ID)
     assert (await state.get_state()) is None
 
-    sessions = await get_userbot_sessions_by_owner(OWNER_ID)
+    sessions = await get_userbot_sessions_by_bot(isolated_db, BOT_ID)
     assert sessions[0]["status"] == "auth_failed"
 
 
 @pytest.mark.asyncio
 async def test_phone_code_expired_returns_to_waiting_phone(isolated_db, userbot_key, monkeypatch, bot, api_patch):
-    dp = _make_dispatcher()
-    from db.database import init_db
-    await init_db()
+    dp = _make_dispatcher(isolated_db)
+    from db.database import init_channel_monitor_tables
+    await init_channel_monitor_tables(isolated_db)
 
     from telethon.errors import PhoneCodeExpiredError
 
@@ -259,9 +287,9 @@ async def test_phone_code_expired_returns_to_waiting_phone(isolated_db, userbot_
 
 @pytest.mark.asyncio
 async def test_password_hash_invalid_stays_in_2fa_state(isolated_db, userbot_key, monkeypatch, bot, api_patch):
-    dp = _make_dispatcher()
-    from db.database import init_db
-    await init_db()
+    dp = _make_dispatcher(isolated_db)
+    from db.database import init_channel_monitor_tables
+    await init_channel_monitor_tables(isolated_db)
 
     from telethon.errors import PasswordHashInvalidError, SessionPasswordNeededError
 
@@ -289,9 +317,9 @@ async def test_password_hash_invalid_stays_in_2fa_state(isolated_db, userbot_key
 
 @pytest.mark.asyncio
 async def test_flood_wait_reports_exact_seconds_and_does_not_retry(isolated_db, userbot_key, monkeypatch, bot, api_patch):
-    dp = _make_dispatcher()
-    from db.database import init_db
-    await init_db()
+    dp = _make_dispatcher(isolated_db)
+    from db.database import init_channel_monitor_tables
+    await init_channel_monitor_tables(isolated_db)
 
     from telethon.errors import FloodWaitError
 
@@ -315,9 +343,9 @@ async def test_flood_wait_on_send_code_request(isolated_db, userbot_key, monkeyp
     """FloodWaitError can also come from send_code_request (waiting_phone
     step), not only sign_in — covered separately since it's a different call
     site in the module."""
-    dp = _make_dispatcher()
-    from db.database import init_db
-    await init_db()
+    dp = _make_dispatcher(isolated_db)
+    from db.database import init_channel_monitor_tables
+    await init_channel_monitor_tables(isolated_db)
 
     from telethon.errors import FloodWaitError
 
@@ -338,9 +366,9 @@ async def test_flood_wait_on_send_code_request(isolated_db, userbot_key, monkeyp
 
 @pytest.mark.asyncio
 async def test_phone_number_invalid_stays_in_waiting_phone(isolated_db, userbot_key, monkeypatch, bot, api_patch):
-    dp = _make_dispatcher()
-    from db.database import init_db
-    await init_db()
+    dp = _make_dispatcher(isolated_db)
+    from db.database import init_channel_monitor_tables
+    await init_channel_monitor_tables(isolated_db)
 
     from telethon.errors import PhoneNumberInvalidError
 
@@ -365,9 +393,9 @@ async def test_phone_request_cooldown_blocks_rapid_reentry(isolated_db, userbot_
     NEW phone number right away must be throttled, not allowed to trigger
     another real send_code_request immediately — prevents using this bot to
     spam Telegram login codes at arbitrary phone numbers."""
-    dp = _make_dispatcher()
-    from db.database import init_db
-    await init_db()
+    dp = _make_dispatcher(isolated_db)
+    from db.database import init_channel_monitor_tables
+    await init_channel_monitor_tables(isolated_db)
 
     client = FakeTelethonClient()
     monkeypatch.setattr(channel_monitor, "_make_client", lambda session_string="": client)
@@ -392,9 +420,9 @@ async def test_phone_request_cooldown_blocks_rapid_reentry(isolated_db, userbot_
 
 @pytest.mark.asyncio
 async def test_missing_api_credentials_fails_explicitly(isolated_db, userbot_key, monkeypatch, bot, api_patch):
-    dp = _make_dispatcher()
-    from db.database import init_db
-    await init_db()
+    dp = _make_dispatcher(isolated_db)
+    from db.database import init_channel_monitor_tables
+    await init_channel_monitor_tables(isolated_db)
 
     monkeypatch.setattr(channel_monitor, "TELEGRAM_API_ID", None)
     monkeypatch.setattr(channel_monitor, "TELEGRAM_API_HASH", None)
@@ -408,11 +436,11 @@ async def test_missing_api_credentials_fails_explicitly(isolated_db, userbot_key
 
 @pytest.mark.asyncio
 async def test_risk_screen_shown_before_phone_requested(isolated_db, userbot_key, bot, api_patch):
-    """§6 of the design doc: risk text + explicit ack button must appear
-    BEFORE any phone number is ever requested."""
-    dp = _make_dispatcher()
-    from db.database import init_db
-    await init_db()
+    """§6 of docs/USERBOT_CHANNEL_MONITOR_DESIGN.md: risk text + explicit ack
+    button must appear BEFORE any phone number is ever requested."""
+    dp = _make_dispatcher(isolated_db)
+    from db.database import init_channel_monitor_tables
+    await init_channel_monitor_tables(isolated_db)
 
     await _feed(dp, bot, _callback_update("cm_connect", 1))
 
