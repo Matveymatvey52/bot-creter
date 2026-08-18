@@ -351,11 +351,11 @@ async def _guard_action(bot_id: int, action) -> web.Response:
 
 
 async def start_bot_handler(request: web.Request) -> web.Response:
-    if not await _authenticate_owner(request):
-        return web.json_response({"error": "forbidden"}, status=403)
     bot_id = _bot_id_from_match_info(request)
     if bot_id is None:
         return web.json_response({"error": "bad bot_id"}, status=404)
+    if not await _authenticate_bot_access(request, bot_id):
+        return web.json_response({"error": "forbidden"}, status=403)
 
     async def action():
         b = await get_bot(bot_id)
@@ -376,11 +376,11 @@ async def start_bot_handler(request: web.Request) -> web.Response:
 
 
 async def stop_bot_handler(request: web.Request) -> web.Response:
-    if not await _authenticate_owner(request):
-        return web.json_response({"error": "forbidden"}, status=403)
     bot_id = _bot_id_from_match_info(request)
     if bot_id is None:
         return web.json_response({"error": "bad bot_id"}, status=404)
+    if not await _authenticate_bot_access(request, bot_id):
+        return web.json_response({"error": "forbidden"}, status=403)
     b = await get_bot(bot_id)
     if not b:
         return web.json_response({"error": "not found"}, status=404)
@@ -390,11 +390,11 @@ async def stop_bot_handler(request: web.Request) -> web.Response:
 
 
 async def restart_bot_handler(request: web.Request) -> web.Response:
-    if not await _authenticate_owner(request):
-        return web.json_response({"error": "forbidden"}, status=403)
     bot_id = _bot_id_from_match_info(request)
     if bot_id is None:
         return web.json_response({"error": "bad bot_id"}, status=404)
+    if not await _authenticate_bot_access(request, bot_id):
+        return web.json_response({"error": "forbidden"}, status=403)
 
     async def action():
         b = await get_bot(bot_id)
@@ -414,11 +414,11 @@ async def restart_bot_handler(request: web.Request) -> web.Response:
 
 
 async def delete_bot_handler(request: web.Request) -> web.Response:
-    if not await _authenticate_owner(request):
-        return web.json_response({"error": "forbidden"}, status=403)
     bot_id = _bot_id_from_match_info(request)
     if bot_id is None:
         return web.json_response({"error": "bad bot_id"}, status=404)
+    if not await _authenticate_bot_access(request, bot_id):
+        return web.json_response({"error": "forbidden"}, status=403)
 
     async def action():
         b = await get_bot(bot_id)
@@ -447,12 +447,12 @@ async def bot_logs_handler(request: web.Request) -> web.Response:
 
 
 async def recreate_bot_handler(request: web.Request) -> web.Response:
-    if not await _authenticate_owner(request):
-        return web.json_response({"error": "forbidden"}, status=403)
     bot_id = _bot_id_from_match_info(request)
     if bot_id is None:
         return web.json_response({"error": "bad bot_id"}, status=404)
-    telegram_user_id = OWNER_ID
+    telegram_user_id = await _authenticate_factory_user(request)
+    if telegram_user_id is None or not await _authenticate_bot_access(request, bot_id):
+        return web.json_response({"error": "forbidden"}, status=403)
 
     async def action():
         result = await recreate_bot_core(bot_id, telegram_user_id)
@@ -463,11 +463,11 @@ async def recreate_bot_handler(request: web.Request) -> web.Response:
 
 
 async def autofix_bot_handler(request: web.Request) -> web.Response:
-    if not await _authenticate_owner(request):
-        return web.json_response({"error": "forbidden"}, status=403)
     bot_id = _bot_id_from_match_info(request)
     if bot_id is None:
         return web.json_response({"error": "bad bot_id"}, status=404)
+    if not await _authenticate_bot_access(request, bot_id):
+        return web.json_response({"error": "forbidden"}, status=403)
 
     async def action():
         result = await autofix_bot_core(bot_id)
@@ -478,11 +478,11 @@ async def autofix_bot_handler(request: web.Request) -> web.Response:
 
 
 async def fixbug_bot_handler(request: web.Request) -> web.Response:
-    if not await _authenticate_owner(request):
-        return web.json_response({"error": "forbidden"}, status=403)
     bot_id = _bot_id_from_match_info(request)
     if bot_id is None:
         return web.json_response({"error": "bad bot_id"}, status=404)
+    if not await _authenticate_bot_access(request, bot_id):
+        return web.json_response({"error": "forbidden"}, status=403)
     try:
         payload = await request.json()
     except Exception:
@@ -621,11 +621,11 @@ async def configure_feature_handler(request: web.Request) -> web.Response:
 
 
 async def list_offices_handler(request: web.Request) -> web.Response:
-    if not await _authenticate_owner(request):
-        return web.json_response({"error": "forbidden"}, status=403)
     bot_id = _bot_id_from_match_info(request)
     if bot_id is None:
         return web.json_response({"error": "bad bot_id"}, status=404)
+    if not await _authenticate_bot_access(request, bot_id):
+        return web.json_response({"error": "forbidden"}, status=403)
     links = await get_office_links_for_bot(bot_id)
     return web.json_response({"items": links})
 
@@ -639,11 +639,11 @@ async def list_office_event_types_handler(request: web.Request) -> web.Response:
     available_event_types_for_template() — see that function's docstring for
     why this is a strict, explicit subset of the COMPATIBLE_WITH list rather
     than "every event type this template could theoretically receive"."""
-    if not await _authenticate_owner(request):
-        return web.json_response({"error": "forbidden"}, status=403)
     bot_id = _bot_id_from_match_info(request)
     if bot_id is None:
         return web.json_response({"error": "bad bot_id"}, status=404)
+    if not await _authenticate_bot_access(request, bot_id):
+        return web.json_response({"error": "forbidden"}, status=403)
     b = await get_bot(bot_id)
     if not b:
         return web.json_response({"error": "not found"}, status=404)
@@ -661,11 +661,11 @@ async def add_office_handler(request: web.Request) -> web.Response:
     template — re-validated here rather than trusted from the client, same
     "never trust the picker, re-check server-side" posture as
     configure_feature_handler's own template-compatibility re-check."""
-    if not await _authenticate_owner(request):
-        return web.json_response({"error": "forbidden"}, status=403)
     bot_id = _bot_id_from_match_info(request)
     if bot_id is None:
         return web.json_response({"error": "bad bot_id"}, status=404)
+    if not await _authenticate_bot_access(request, bot_id):
+        return web.json_response({"error": "forbidden"}, status=403)
     try:
         payload = await request.json()
     except Exception:
@@ -701,12 +701,12 @@ async def remove_office_handler(request: web.Request) -> web.Response:
     for no real benefit — defaults to _OFFICE_EVENT_TYPE for callers created
     before the event-type picker existed (the Telegram-side officeconnect
     flow still only ever creates order.created links)."""
-    if not await _authenticate_owner(request):
-        return web.json_response({"error": "forbidden"}, status=403)
     bot_id = _bot_id_from_match_info(request)
     target_raw = request.match_info.get("target_id", "")
     if bot_id is None or not target_raw.isdigit():
         return web.json_response({"error": "bad request"}, status=404)
+    if not await _authenticate_bot_access(request, bot_id):
+        return web.json_response({"error": "forbidden"}, status=403)
     event_type = request.query.get("event_type", _OFFICE_EVENT_TYPE)
     await remove_office_link(bot_id, int(target_raw), event_type)
     return web.json_response({"ok": True})
@@ -729,21 +729,21 @@ async def showcase_group_status_handler(request: web.Request) -> web.Response:
 
 
 async def list_admins_handler(request: web.Request) -> web.Response:
-    if not await _authenticate_owner(request):
-        return web.json_response({"error": "forbidden"}, status=403)
     bot_id = _bot_id_from_match_info(request)
     if bot_id is None:
         return web.json_response({"error": "bad bot_id"}, status=404)
+    if not await _authenticate_bot_access(request, bot_id):
+        return web.json_response({"error": "forbidden"}, status=403)
     admins = await get_bot_admins(bot_id)
     return web.json_response({"items": admins})
 
 
 async def add_admin_handler(request: web.Request) -> web.Response:
-    if not await _authenticate_owner(request):
-        return web.json_response({"error": "forbidden"}, status=403)
     bot_id = _bot_id_from_match_info(request)
     if bot_id is None:
         return web.json_response({"error": "bad bot_id"}, status=404)
+    if not await _authenticate_bot_access(request, bot_id):
+        return web.json_response({"error": "forbidden"}, status=403)
     b = await get_bot(bot_id)
     if not b:
         return web.json_response({"error": "not found"}, status=404)
@@ -759,12 +759,12 @@ async def add_admin_handler(request: web.Request) -> web.Response:
 
 
 async def remove_admin_handler(request: web.Request) -> web.Response:
-    if not await _authenticate_owner(request):
-        return web.json_response({"error": "forbidden"}, status=403)
     bot_id = _bot_id_from_match_info(request)
     telegram_id = request.match_info.get("telegram_id", "")
     if bot_id is None or not telegram_id:
         return web.json_response({"error": "bad request"}, status=404)
+    if not await _authenticate_bot_access(request, bot_id):
+        return web.json_response({"error": "forbidden"}, status=403)
     await remove_bot_admin(bot_id, telegram_id)
     return web.json_response({"ok": True})
 
