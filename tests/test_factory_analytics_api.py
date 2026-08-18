@@ -13,7 +13,7 @@ import os
 import tempfile
 import unittest
 from datetime import datetime, timedelta
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import aiosqlite
 from aiohttp.test_utils import TestClient, TestServer
@@ -74,6 +74,15 @@ class FactoryAnalyticsApiTests(unittest.IsolatedAsyncioTestCase):
             template_id="tour_operator",
             config={"db_path": self.bot_db_path},
         )
+        # A second, shop_catalog-templated bot — sheets/voice_intake are NOT
+        # in tour_operator's own COMPATIBLE_WITH list (see features/sheets.py,
+        # features/voice_intake.py), so the Variant D configure-dialog tests
+        # below need a template that actually offers sheets.
+        self.shop_bot_id = await create_bot_record_with_admins(
+            name="factory_analytics_shop_bot", description="test", token="3333:AAshop-fake-token-1234567890",
+            file_path="templates/shop_catalog.py", admin_ids=["1"],
+        )
+
         registry = {FACTORY_BOT_ID: entry, self.bot_id: bot_entry}
         self.app = create_app(registry)
         register_routes(self.app)
@@ -89,6 +98,7 @@ class FactoryAnalyticsApiTests(unittest.IsolatedAsyncioTestCase):
         await self.client.close()
         self._owner_patcher.stop()
         await delete_bot(self.bot_id)
+        await delete_bot(self.shop_bot_id)
 
     async def _owner_qs(self) -> str:
         with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
@@ -233,3 +243,221 @@ class FactoryAnalyticsApiTests(unittest.IsolatedAsyncioTestCase):
         no_match_item = next(i for i in body["items"] if i["summary"] == "хочу бота для учёта смен курьеров")
         self.assertIsNone(no_match_item["bot_id"])
         self.assertEqual(no_match_item["selected_templates"], [])
+
+    # ── bot_detail_handler ────────────────────────────────────────────
+    async def test_bot_detail_returns_admins_offices_and_features(self):
+        qs = await self._owner_qs()
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            resp = await self.client.get(f"/api/factory/bots/{self.bot_id}?{qs}")
+        self.assertEqual(resp.status, 200)
+        body = await resp.json()
+        self.assertEqual(body["id"], self.bot_id)
+        self.assertEqual(body["admins"], ["1"])
+        self.assertEqual(body["offices"], [])
+        names = {f["name"] for f in body["features"]}
+        # self.bot_id is a tour_operator bot — sheets/payments are NOT in
+        # tour_operator's own COMPATIBLE_WITH lists (see features/sheets.py,
+        # features/payments.py) even though asyncSetUp enables them in the
+        # DB — _feature_status_items filters by template compatibility, so
+        # neither should surface here. cashflow_ledger IS compatible with
+        # tour_operator (see features/cashflow_ledger.py) but was never
+        # enabled — it should show up in the list with state "off".
+        self.assertNotIn("sheets", names)
+        self.assertNotIn("payments", names)
+        self.assertIn("cashflow_ledger", names)
+        ledger_item = next(f for f in body["features"] if f["name"] == "cashflow_ledger")
+        self.assertEqual(ledger_item["state"], "off")
+        self.assertFalse(ledger_item["no_free_text"])
+
+    async def test_bot_detail_unknown_bot_returns_404(self):
+        qs = await self._owner_qs()
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            resp = await self.client.get(f"/api/factory/bots/999999?{qs}")
+        self.assertEqual(resp.status, 404)
+
+    async def test_bot_detail_non_owner_returns_403(self):
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            token = mint_magic_link_token(FACTORY_BOT_ID, OTHER_TELEGRAM_ID)
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            resp = await self.client.get(f"/api/factory/bots/{self.bot_id}?token={token}")
+        self.assertEqual(resp.status, 403)
+
+    # ── admins ────────────────────────────────────────────────────────
+    async def test_add_and_remove_admin(self):
+        qs = await self._owner_qs()
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            resp = await self.client.post(
+                f"/api/factory/bots/{self.bot_id}/admins?{qs}", json={"telegram_id": "424242"}
+            )
+        self.assertEqual(resp.status, 201)
+        admins = await db_module.get_bot_admins(self.bot_id)
+        self.assertIn("424242", admins)
+
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            resp = await self.client.delete(f"/api/factory/bots/{self.bot_id}/admins/424242?{qs}")
+        self.assertEqual(resp.status, 200)
+        admins = await db_module.get_bot_admins(self.bot_id)
+        self.assertNotIn("424242", admins)
+
+    async def test_add_admin_rejects_non_numeric_id(self):
+        qs = await self._owner_qs()
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            resp = await self.client.post(
+                f"/api/factory/bots/{self.bot_id}/admins?{qs}", json={"telegram_id": "not-a-number"}
+            )
+        self.assertEqual(resp.status, 400)
+
+    # ── offices ───────────────────────────────────────────────────────
+    async def test_add_and_remove_office_link(self):
+        other_bot_id = await create_bot_record_with_admins(
+            name="factory_analytics_test_other_bot", description="test", token="1111:AAother-fake-token-1234567",
+            file_path="templates/shop_catalog.py", admin_ids=["1"],
+        )
+        try:
+            qs = await self._owner_qs()
+            with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+                resp = await self.client.post(
+                    f"/api/factory/bots/{self.bot_id}/offices?{qs}", json={"target_bot_id": other_bot_id}
+                )
+            self.assertEqual(resp.status, 201)
+            links = await db_module.get_office_links_for_bot(self.bot_id)
+            self.assertEqual(len(links), 1)
+
+            with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+                resp = await self.client.delete(f"/api/factory/bots/{self.bot_id}/offices/{other_bot_id}?{qs}")
+            self.assertEqual(resp.status, 200)
+            links = await db_module.get_office_links_for_bot(self.bot_id)
+            self.assertEqual(links, [])
+        finally:
+            await delete_bot(other_bot_id)
+
+    async def test_add_office_link_rejects_self_link(self):
+        qs = await self._owner_qs()
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            resp = await self.client.post(
+                f"/api/factory/bots/{self.bot_id}/offices?{qs}", json={"target_bot_id": self.bot_id}
+            )
+        self.assertEqual(resp.status, 400)
+
+    # ── features: disable is instant, no dialog ──────────────────────
+    async def test_disable_feature_is_instant_and_clears_config(self):
+        await db_module.set_bot_feature_description(self.bot_id, "sheets", "Записываю имена клиентов")
+        qs = await self._owner_qs()
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            resp = await self.client.post(f"/api/factory/bots/{self.bot_id}/features/sheets/disable?{qs}")
+        self.assertEqual(resp.status, 200)
+        enabled = await db_module.get_bot_features(self.bot_id)
+        self.assertNotIn("sheets", enabled)
+        cfg = await db_module.get_bot_feature_config(self.bot_id, "sheets")
+        self.assertIsNone(cfg)
+
+    # ── features: Variant D configure dialog ──────────────────────────
+    async def test_configure_feature_accepted_enables_and_saves_description(self):
+        qs = await self._owner_qs()
+        with patch(
+            "runtime.factory_analytics_api.assess_feature_description",
+            AsyncMock(
+                return_value={
+                    "accepted": True,
+                    "reply": "Записываю: имя клиента, дату записи",
+                    "config_summary": "Записываю: имя клиента, дату записи",
+                }
+            ),
+        ):
+            with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+                resp = await self.client.post(
+                    f"/api/factory/bots/{self.shop_bot_id}/features/sheets/configure?{qs}",
+                    json={"message": "имя клиента и дата записи"},
+                )
+        self.assertEqual(resp.status, 200)
+        body = await resp.json()
+        self.assertEqual(body["status"], "enabled")
+        enabled = await db_module.get_bot_features(self.shop_bot_id)
+        self.assertIn("sheets", enabled)
+        cfg = await db_module.get_bot_feature_config(self.shop_bot_id, "sheets")
+        self.assertEqual(cfg["description"], "Записываю: имя клиента, дату записи")
+        self.assertEqual(cfg["thread"], [])
+
+    async def test_configure_feature_needs_clarification_does_not_enable(self):
+        qs = await self._owner_qs()
+        with patch(
+            "runtime.factory_analytics_api.assess_feature_description",
+            AsyncMock(
+                return_value={
+                    "accepted": False,
+                    "reply": "Уточни, что именно записывать?",
+                    "config_summary": None,
+                }
+            ),
+        ):
+            with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+                resp = await self.client.post(
+                    f"/api/factory/bots/{self.shop_bot_id}/features/sheets/configure?{qs}",
+                    json={"message": "что-нибудь полезное"},
+                )
+        self.assertEqual(resp.status, 200)
+        body = await resp.json()
+        self.assertEqual(body["status"], "needs_clarification")
+        self.assertEqual(body["reply"], "Уточни, что именно записывать?")
+        enabled = await db_module.get_bot_features(self.shop_bot_id)
+        self.assertNotIn("sheets", enabled)
+        cfg = await db_module.get_bot_feature_config(self.shop_bot_id, "sheets")
+        self.assertIsNone(cfg["description"])
+        self.assertEqual(len(cfg["thread"]), 2)
+
+    async def test_configure_feature_rejects_payments_and_office_events(self):
+        qs = await self._owner_qs()
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            resp = await self.client.post(
+                f"/api/factory/bots/{self.bot_id}/features/payments/configure?{qs}",
+                json={"message": "что угодно"},
+            )
+        self.assertEqual(resp.status, 400)
+
+    async def test_configure_feature_incompatible_template_returns_400(self):
+        # sheets is NOT in tour_operator's own COMPATIBLE_WITH list (see
+        # features/sheets.py) — self.bot_id is a tour_operator bot.
+        qs = await self._owner_qs()
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            resp = await self.client.post(
+                f"/api/factory/bots/{self.bot_id}/features/sheets/configure?{qs}",
+                json={"message": "что угодно"},
+            )
+        self.assertEqual(resp.status, 400)
+
+    async def test_cancel_feature_configure_clears_config(self):
+        await db_module.set_bot_feature_thread(self.bot_id, "reminders", [{"role": "owner", "text": "hi"}])
+        qs = await self._owner_qs()
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            resp = await self.client.post(f"/api/factory/bots/{self.bot_id}/features/reminders/cancel?{qs}")
+        self.assertEqual(resp.status, 200)
+        cfg = await db_module.get_bot_feature_config(self.bot_id, "reminders")
+        self.assertIsNone(cfg)
+
+    # ── lifecycle: stop/logs (no subprocess needed — bot never started) ─
+    async def test_stop_bot_updates_status(self):
+        qs = await self._owner_qs()
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            resp = await self.client.post(f"/api/factory/bots/{self.bot_id}/stop?{qs}")
+        self.assertEqual(resp.status, 200)
+        bot = await db_module.get_bot(self.bot_id)
+        self.assertEqual(bot["status"], "stopped")
+
+    async def test_bot_logs_returns_empty_string_when_never_started(self):
+        qs = await self._owner_qs()
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            resp = await self.client.get(f"/api/factory/bots/{self.bot_id}/logs?{qs}")
+        self.assertEqual(resp.status, 200)
+        body = await resp.json()
+        self.assertEqual(body["logs"], "")
+
+    async def test_delete_bot_removes_record(self):
+        deletable_id = await create_bot_record_with_admins(
+            name="factory_analytics_deletable_bot", description="test", token="2222:AAdeletable-fake-tok-123456",
+            file_path="templates/shop_catalog.py", admin_ids=["1"],
+        )
+        qs = await self._owner_qs()
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            resp = await self.client.delete(f"/api/factory/bots/{deletable_id}?{qs}")
+        self.assertEqual(resp.status, 200)
+        self.assertIsNone(await db_module.get_bot(deletable_id))

@@ -11,6 +11,7 @@ import {
 } from '../lib/factoryApi'
 import { Card, CardHeader, CardTitle, ChipRow, Chip, Badge } from '../components/Card'
 import { iconForTemplate } from '../lib/botIcons'
+import { BotDetailPanel } from './BotDetailPanel'
 
 const FALLBACK_REASON_LABELS: Record<string, string> = {
   no_template_match: 'нет подходящего шаблона',
@@ -35,9 +36,6 @@ function weeklyMetricLabel(bot: FactoryBotItem): string {
   return 'записей на этой неделе'
 }
 
-function openBotApp(botId: number) {
-  window.location.href = `/app/${botId}`
-}
 
 function FeedbackForm({ bot, onDone }: { bot: FactoryBotItem; onDone: () => void }) {
   const [rating, setRating] = useState(5)
@@ -195,12 +193,34 @@ export function FactoryDashboardScreen() {
   const [templateFilter, setTemplateFilter] = useState<string | null>(null)
   const [featureFilter, setFeatureFilter] = useState<string | null>(null)
   const [feedbackTargetId, setFeedbackTargetId] = useState<number | null>(null)
+  const [selectedBotId, setSelectedBotId] = useState<number | null>(() => {
+    const raw = new URLSearchParams(window.location.search).get('bot')
+    return raw && /^\d+$/.test(raw) ? Number(raw) : null
+  })
 
-  useEffect(() => {
+  const reload = () => {
     listFactoryBots()
       .then((data) => setItems(data.items))
       .catch((err) => setError(err instanceof ApiError ? err.message : 'Не удалось загрузить данные'))
+  }
+
+  useEffect(() => {
+    reload()
   }, [])
+
+  const openBot = (botId: number) => {
+    setSelectedBotId(botId)
+    const url = new URL(window.location.href)
+    url.searchParams.set('bot', String(botId))
+    window.history.replaceState(null, '', url.toString())
+  }
+
+  const closeBotDetail = () => {
+    setSelectedBotId(null)
+    const url = new URL(window.location.href)
+    url.searchParams.delete('bot')
+    window.history.replaceState(null, '', url.toString())
+  }
 
   const templates = useMemo(
     () => Array.from(new Set((items ?? []).map((b) => b.template).filter((t): t is string => !!t))).sort(),
@@ -220,6 +240,19 @@ export function FactoryDashboardScreen() {
   const refreshAfterFeedback = () => {
     setFeedbackTargetId(null)
     listFactoryBots().then((data) => setItems(data.items))
+  }
+
+  if (selectedBotId != null) {
+    return (
+      <div className="screen">
+        <BotDetailPanel
+          botId={selectedBotId}
+          allBots={items ?? []}
+          onBack={closeBotDetail}
+          onChanged={reload}
+        />
+      </div>
+    )
   }
 
   return (
@@ -284,7 +317,7 @@ export function FactoryDashboardScreen() {
             <button
               className="bot-card-top"
               style={{ background: 'transparent', border: 'none', padding: 0, cursor: 'pointer', textAlign: 'left' }}
-              onClick={() => openBotApp(bot.id)}
+              onClick={() => openBot(bot.id)}
             >
               <span className="bot-card-icon">{iconForTemplate(bot.template)}</span>
               <span className="bot-card-id">
@@ -306,7 +339,7 @@ export function FactoryDashboardScreen() {
             <button
               className={`bot-card-metric ${active ? '' : 'bot-card-metric-muted'}`}
               style={{ background: 'transparent', border: 'none', padding: 0, cursor: 'pointer', textAlign: 'left' }}
-              onClick={() => openBotApp(bot.id)}
+              onClick={() => openBot(bot.id)}
             >
               {active && bot.weekly_count != null && <span className="num">{bot.weekly_count}</span>}
               <span className="label">{weeklyMetricLabel(bot)}</span>
@@ -325,7 +358,7 @@ export function FactoryDashboardScreen() {
               <button
                 className="bot-card-open"
                 style={{ background: 'transparent', border: 'none', padding: 0, cursor: 'pointer' }}
-                onClick={() => openBotApp(bot.id)}
+                onClick={() => openBot(bot.id)}
               >
                 Открыть
                 <svg viewBox="0 0 16 16" width="13" height="13" fill="none">

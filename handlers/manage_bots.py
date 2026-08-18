@@ -433,6 +433,170 @@ async def disable_feature_and_reload(bot_id: int, feature_name: str) -> None:
     await _reload_registry(bot_id)
 
 
+# ── core actions shared between Telegram callbacks and the factory REST API ────
+#
+# recreate_bot_core / autofix_bot_core / apply_fix_core are the ACTUAL work
+# cb_recreate / cb_auto_diagnose / _apply_fix perform, with all
+# Telegram-message-editing stripped out — they return a plain dict describing
+# what happened instead of calling callback.message.edit_text at each step.
+# Both the Telegram callback (which renders the dict into chat messages/
+# keyboards) and runtime/factory_analytics_api.py's REST handlers (which
+# render it into a JSON response) call these, so the actual generation/
+# write-to-disk/restart sequence exists in exactly one place. Callers are
+# responsible for the _busy_bots guard — these functions assume the caller
+# already holds it, same as the Telegram callbacks currently do inline.
+
+async def recreate_bot_core(bot_id: int, creator_user_id: int) -> dict:
+    """Returns {"ok": bool, "error": str|None, "bot_name": str|None}. Mirrors
+    cb_recreate's full sequence: improve existing code or generate from
+    scratch, re-append office-hook wiring, write the file, push to GitHub,
+    persist any generated configs, restart the bot."""
+    b = await get_bot(bot_id)
+    if not b:
+        return {"ok": False, "error": "not_found", "bot_name": None}
+    if not b.get("description"):
+        return {"ok": False, "error": "no_description", "bot_name": b["name"]}
+
+    current_code = ""
+    if b.get("file_path"):
+        try:
+            current_code = Path(b["file_path"]).read_text(encoding="utf-8")
+        except Exception:
+            pass
+
+    regenerating_from_scratch = not current_code
+    task = (
+        improve_bot_code(current_code, b.get("description", ""))
+        if current_code
+        else generate_bot_code(b.get("description", ""))
+    )
+
+    miniapp_config: dict | None = None
+    office_hook_config: dict | None = None
+    voice_cashflow_config: dict | None = None
+    fallback_info: dict | None = None
+    try:
+        result = await asyncio.wait_for(task, timeout=240.0)
+        if regenerating_from_scratch:
+            code, miniapp_config, office_hook_config, voice_cashflow_config, fallback_info = result
+        else:
+            code = result
+    except Exception as e:
+        logger.error(f"recreate_bot_core: generation failed for bot_id={bot_id}: {e}")
+        return {"ok": False, "error": "generation_failed", "bot_name": b["name"]}
+
+    await stop_bot(bot_id)
+    code = append_from_scratch_registry_wiring(code)
+    bot_file = Path(b["file_path"])
+    bot_file.write_text(code, encoding="utf-8")
+    asyncio.create_task(push_bot_to_github(b["name"], code))
+
+    if office_hook_config:
+        await set_bot_office_hook_config(bot_id, office_hook_config)
+    if voice_cashflow_config:
+        await set_bot_voice_cashflow_config(bot_id, voice_cashflow_config)
+        if voice_cashflow_config.get("voice_intake"):
+            await enable_bot_feature(bot_id, "voice_intake")
+        if voice_cashflow_config.get("cashflow_ledger"):
+            await enable_bot_feature(bot_id, "cashflow_ledger")
+    if fallback_info:
+        await add_template_candidate(
+            creator_user_id=creator_user_id,
+            summary=b.get("description", ""),
+            fallback_reason=fallback_info["reason"],
+            selected_templates=fallback_info["selected_templates"],
+            bot_name=b["name"],
+            bot_id=bot_id,
+        )
+    if miniapp_config:
+        await set_bot_miniapp_config(bot_id, miniapp_config)
+        base_url = os.getenv("PUBLIC_BASE_URL", "").strip()
+        if base_url and b.get("token"):
+            try:
+                await set_miniapp_menu_button(b["token"], base_url, bot_id)
+            except Exception as e:
+                logger.error(f"recreate_bot_core: bot_id={bot_id} regenerated but Menu Button setup failed: {e}")
+
+    try:
+        pid = await start_bot(bot_id, str(bot_file), b["token"], extra_env=_make_extra_env(b))
+        await update_bot_status(bot_id, "running", pid)
+        return {"ok": True, "error": None, "bot_name": b["name"]}
+    except Exception as e:
+        await update_bot_status(bot_id, "error")
+        return {"ok": False, "error": f"start_failed:{str(e)[-300:]}", "bot_name": b["name"]}
+
+
+async def autofix_bot_core(bot_id: int) -> dict:
+    """Returns {"ok": bool, "error": str|None, "bot_name": str|None}. Mirrors
+    cb_auto_diagnose's sequence: build a bug_description from the bot's own
+    crash log (or a generic "analyze for bugs" prompt if none), run
+    fix_bot_code, re-append office-hook wiring, write, push, restart."""
+    b = await get_bot(bot_id)
+    if not b or not b.get("file_path") or not Path(b["file_path"]).exists():
+        return {"ok": False, "error": "file_missing", "bot_name": b["name"] if b else None}
+
+    current_code = Path(b["file_path"]).read_text(encoding="utf-8")
+    error_log = get_bot_logs(bot_id) or ""
+    if error_log:
+        bug_description = f"Bot crashed with the following error:\n{error_log}"
+    else:
+        bug_description = (
+            "The bot is not working correctly but no crash log is available. "
+            "Analyze the code carefully, find potential bugs (wrong imports, missing asyncio.run(main()), "
+            "incorrect aiogram 3.x patterns, missing error handling) and fix them."
+        )
+
+    try:
+        fixed_code = await asyncio.wait_for(fix_bot_code(current_code, bug_description), timeout=240.0)
+    except Exception:
+        logger.error(f"autofix_bot_core: fix_bot_code failed for bot_id={bot_id}")
+        return {"ok": False, "error": "fix_failed", "bot_name": b["name"]}
+
+    await stop_bot(bot_id)
+    fixed_code = append_from_scratch_registry_wiring(fixed_code)
+    Path(b["file_path"]).write_text(fixed_code, encoding="utf-8")
+    asyncio.create_task(push_bot_to_github(b["name"], fixed_code))
+
+    try:
+        pid = await start_bot(bot_id, b["file_path"], b["token"], extra_env=_make_extra_env(b))
+        await update_bot_status(bot_id, "running", pid)
+        return {"ok": True, "error": None, "bot_name": b["name"]}
+    except Exception as e:
+        await update_bot_status(bot_id, "error")
+        return {"ok": False, "error": f"start_failed:{str(e)[-300:]}", "bot_name": b["name"]}
+
+
+async def apply_fix_core(bot_id: int, bug_description: str) -> dict:
+    """Returns {"ok": bool, "error": str|None, "bot_name": str|None}. Mirrors
+    _apply_fix's sequence — same as autofix_bot_core but with an
+    owner-supplied bug_description instead of one derived from crash logs."""
+    b = await get_bot(bot_id)
+    if not b:
+        return {"ok": False, "error": "not_found", "bot_name": None}
+    if not b.get("file_path") or not Path(b["file_path"]).exists():
+        return {"ok": False, "error": "file_missing", "bot_name": b["name"]}
+
+    current_code = Path(b["file_path"]).read_text(encoding="utf-8")
+    try:
+        fixed_code = await asyncio.wait_for(fix_bot_code(current_code, bug_description), timeout=240.0)
+    except Exception:
+        logger.error(f"apply_fix_core: fix_bot_code failed for bot_id={bot_id}")
+        return {"ok": False, "error": "fix_failed", "bot_name": b["name"]}
+
+    await stop_bot(bot_id)
+    fixed_code = append_from_scratch_registry_wiring(fixed_code)
+    Path(b["file_path"]).write_text(fixed_code, encoding="utf-8")
+    asyncio.create_task(push_bot_to_github(b["name"], fixed_code))
+
+    try:
+        pid = await start_bot(bot_id, b["file_path"], b["token"], extra_env=_make_extra_env(b))
+        await update_bot_status(bot_id, "running", pid)
+        return {"ok": True, "error": None, "bot_name": b["name"]}
+    except Exception as e:
+        await update_bot_status(bot_id, "error")
+        return {"ok": False, "error": f"start_failed:{str(e)[-300:]}", "bot_name": b["name"]}
+
+
 async def _compatible_features(template_id: str | None, bot_id: int | None = None) -> list[dict]:
     """Features whose # COMPATIBLE_WITH: header explicitly lists this bot's
     template_id — never a blanket "all" for ordinary features (see

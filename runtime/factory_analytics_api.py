@@ -25,19 +25,56 @@ import logging
 from aiohttp import web
 
 from db.database import (
+    add_bot_admin,
     add_bot_feedback,
+    add_office_link,
+    clear_bot_feature_config,
+    delete_bot as db_delete_bot,
+    get_bot,
+    get_bot_admins,
+    get_bot_feature_config,
+    get_bot_features,
     get_bot_office_hook_config,
+    get_bot_sheets_config,
+    get_bot_yookassa_credentials,
+    get_office_links_for_bot,
     list_bots_with_stats,
     list_template_candidate_clusters_with_stats,
     list_template_candidates,
+    remove_bot_admin,
+    remove_office_link,
+    set_bot_feature_description,
+    set_bot_feature_thread,
+    update_bot_status,
 )
 from features.sales_analytics import weekly_record_count
 from handlers.admin_manager import OWNER_ID
+from handlers.manage_bots import (
+    _busy_bots,
+    _BUSY_TEXT,
+    _OFFICE_EVENT_TYPE,
+    apply_fix_core,
+    autofix_bot_core,
+    disable_feature_and_reload,
+    enable_feature_and_reload,
+    recreate_bot_core,
+)
 from runtime.miniapp_api import _authenticate
-from runtime.registry import FACTORY_BOT_ID, Registry, infer_template_id
+from runtime.registry import FACTORY_BOT_ID, Registry, discover_features, infer_template_id
 from runtime.webhook_app import REGISTRY_KEY
+from services.bot_runner import _make_extra_env, get_bot_logs, is_running, start_bot, stop_bot
+from services.claude_service import assess_feature_description
 
 logger = logging.getLogger(__name__)
+
+# Features that skip the Variant D free-text step entirely (approved design
+# — see the "Дополнение к дизайну вкладки «Фичи»" conversation): payments
+# goes straight to the existing multi-step ЮKassa wizard, which is a
+# Telegram-only flow not reproduced over REST here (the SPA tells the owner
+# to finish payments setup in Telegram); office_events has its own bot-picker
+# UI with no free text at all. Every other feature in discover_features()
+# goes through /configure.
+_NO_FREE_TEXT_FEATURES = {"payments", "office_events"}
 
 
 async def _authenticate_owner(request: web.Request) -> bool:
@@ -181,13 +218,487 @@ async def list_template_candidate_clusters_handler(request: web.Request) -> web.
     return web.json_response({"items": items})
 
 
+def _bot_id_from_match_info(request: web.Request) -> int | None:
+    raw = request.match_info.get("bot_id", "")
+    return int(raw) if raw.isdigit() else None
+
+
+async def bot_detail_handler(request: web.Request) -> web.Response:
+    """GET /api/factory/bots/{id} — everything the detail panel's "Обзор" tab
+    needs in one call: status, template, admins, office links, and per-feature
+    enabled/pending/off state (see feature_status_items below)."""
+    if not await _authenticate_owner(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    bot_id = _bot_id_from_match_info(request)
+    if bot_id is None:
+        return web.json_response({"error": "bad bot_id"}, status=404)
+    b = await get_bot(bot_id)
+    if not b:
+        return web.json_response({"error": "not found"}, status=404)
+
+    template_id = infer_template_id(b.get("file_path"))
+    admins = await get_bot_admins(bot_id)
+    offices = await get_office_links_for_bot(bot_id)
+    features = await _feature_status_items(bot_id, template_id)
+    return web.json_response(
+        {
+            "id": b["id"],
+            "name": b["name"],
+            "username": b.get("username"),
+            "display_name": b.get("display_name"),
+            "status": b.get("status"),
+            "running": is_running(bot_id),
+            "template": template_id,
+            "created_at": b.get("created_at"),
+            "admins": admins,
+            "offices": offices,
+            "features": features,
+        }
+    )
+
+
+async def _feature_status_items(bot_id: int, template_id: str | None) -> list[dict]:
+    """One entry per feature compatible with this bot's template — see
+    handlers/manage_bots.py's _compatible_features for the exact
+    compatibility rule this mirrors. state is "on" (enabled + has a config
+    row, or is payments/office_events which don't need one), "pending" (a
+    bot_feature_config row exists with no accepted description yet — the
+    owner started the configure dialog but Claude hasn't accepted an
+    answer), or "off"."""
+    compatible = [f for f in discover_features() if template_id in f["compatible_with"] or "*" in f["compatible_with"]]
+    enabled = set(await get_bot_features(bot_id))
+    items = []
+    for f in compatible:
+        name = f["name"]
+        cfg = await get_bot_feature_config(bot_id, name)
+        if name in enabled:
+            state = "on"
+        elif cfg and cfg.get("thread"):
+            state = "pending"
+        else:
+            state = "off"
+        items.append(
+            {
+                "name": name,
+                "state": state,
+                "description": cfg.get("description") if cfg else None,
+                "thread": cfg.get("thread") if cfg else [],
+                "no_free_text": name in _NO_FREE_TEXT_FEATURES,
+            }
+        )
+    return items
+
+
+async def _guard_action(bot_id: int, action) -> web.Response:
+    """Shared _busy_bots guard for the mutating single-bot endpoints below —
+    same contract as handlers/manage_bots.py's own _busy_bots checks (one
+    mutating operation per bot at a time)."""
+    if bot_id in _busy_bots:
+        return web.json_response({"error": _BUSY_TEXT}, status=409)
+    _busy_bots.add(bot_id)
+    try:
+        return await action()
+    finally:
+        _busy_bots.discard(bot_id)
+
+
+async def start_bot_handler(request: web.Request) -> web.Response:
+    if not await _authenticate_owner(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    bot_id = _bot_id_from_match_info(request)
+    if bot_id is None:
+        return web.json_response({"error": "bad bot_id"}, status=404)
+
+    async def action():
+        b = await get_bot(bot_id)
+        if not b:
+            return web.json_response({"error": "not found"}, status=404)
+        if is_running(bot_id):
+            return web.json_response({"ok": True, "already_running": True})
+        try:
+            pid = await start_bot(bot_id, b["file_path"], b["token"], extra_env=_make_extra_env(b))
+            await update_bot_status(bot_id, "running", pid)
+            return web.json_response({"ok": True})
+        except Exception as e:
+            await update_bot_status(bot_id, "error")
+            logger.error(f"start_bot_handler: bot_id={bot_id} failed: {e}")
+            return web.json_response({"error": "start_failed"}, status=500)
+
+    return await _guard_action(bot_id, action)
+
+
+async def stop_bot_handler(request: web.Request) -> web.Response:
+    if not await _authenticate_owner(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    bot_id = _bot_id_from_match_info(request)
+    if bot_id is None:
+        return web.json_response({"error": "bad bot_id"}, status=404)
+    b = await get_bot(bot_id)
+    if not b:
+        return web.json_response({"error": "not found"}, status=404)
+    await stop_bot(bot_id)
+    await update_bot_status(bot_id, "stopped")
+    return web.json_response({"ok": True})
+
+
+async def restart_bot_handler(request: web.Request) -> web.Response:
+    if not await _authenticate_owner(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    bot_id = _bot_id_from_match_info(request)
+    if bot_id is None:
+        return web.json_response({"error": "bad bot_id"}, status=404)
+
+    async def action():
+        b = await get_bot(bot_id)
+        if not b:
+            return web.json_response({"error": "not found"}, status=404)
+        await stop_bot(bot_id)
+        try:
+            pid = await start_bot(bot_id, b["file_path"], b["token"], extra_env=_make_extra_env(b))
+            await update_bot_status(bot_id, "running", pid)
+            return web.json_response({"ok": True})
+        except Exception as e:
+            await update_bot_status(bot_id, "error")
+            logger.error(f"restart_bot_handler: bot_id={bot_id} failed: {e}")
+            return web.json_response({"error": "start_failed"}, status=500)
+
+    return await _guard_action(bot_id, action)
+
+
+async def delete_bot_handler(request: web.Request) -> web.Response:
+    if not await _authenticate_owner(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    bot_id = _bot_id_from_match_info(request)
+    if bot_id is None:
+        return web.json_response({"error": "bad bot_id"}, status=404)
+
+    async def action():
+        b = await get_bot(bot_id)
+        if not b:
+            return web.json_response({"error": "not found"}, status=404)
+        await stop_bot(bot_id)
+        await db_delete_bot(bot_id)
+        return web.json_response({"ok": True})
+
+    return await _guard_action(bot_id, action)
+
+
+async def bot_logs_handler(request: web.Request) -> web.Response:
+    if not await _authenticate_owner(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    bot_id = _bot_id_from_match_info(request)
+    if bot_id is None:
+        return web.json_response({"error": "bad bot_id"}, status=404)
+    b = await get_bot(bot_id)
+    if not b:
+        return web.json_response({"error": "not found"}, status=404)
+    logs = get_bot_logs(bot_id) or ""
+    if len(logs) > 3500:
+        logs = "...\n" + logs[-3500:]
+    return web.json_response({"logs": logs})
+
+
+async def recreate_bot_handler(request: web.Request) -> web.Response:
+    if not await _authenticate_owner(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    bot_id = _bot_id_from_match_info(request)
+    if bot_id is None:
+        return web.json_response({"error": "bad bot_id"}, status=404)
+    telegram_user_id = OWNER_ID
+
+    async def action():
+        result = await recreate_bot_core(bot_id, telegram_user_id)
+        status = 200 if result["ok"] else 422
+        return web.json_response(result, status=status)
+
+    return await _guard_action(bot_id, action)
+
+
+async def autofix_bot_handler(request: web.Request) -> web.Response:
+    if not await _authenticate_owner(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    bot_id = _bot_id_from_match_info(request)
+    if bot_id is None:
+        return web.json_response({"error": "bad bot_id"}, status=404)
+
+    async def action():
+        result = await autofix_bot_core(bot_id)
+        status = 200 if result["ok"] else 422
+        return web.json_response(result, status=status)
+
+    return await _guard_action(bot_id, action)
+
+
+async def fixbug_bot_handler(request: web.Request) -> web.Response:
+    if not await _authenticate_owner(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    bot_id = _bot_id_from_match_info(request)
+    if bot_id is None:
+        return web.json_response({"error": "bad bot_id"}, status=404)
+    try:
+        payload = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON body"}, status=400)
+    description = payload.get("description") if isinstance(payload, dict) else None
+    if not isinstance(description, str) or not description.strip():
+        return web.json_response({"error": "description is required"}, status=400)
+
+    async def action():
+        result = await apply_fix_core(bot_id, description.strip())
+        status = 200 if result["ok"] else 422
+        return web.json_response(result, status=status)
+
+    return await _guard_action(bot_id, action)
+
+
+async def list_features_handler(request: web.Request) -> web.Response:
+    """GET /api/factory/bots/{id}/features — the "Фичи" tab's own list, same
+    shape as bot_detail_handler's "features" key (kept as a separate route
+    too so the tab can refresh itself without re-fetching the whole detail
+    panel)."""
+    if not await _authenticate_owner(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    bot_id = _bot_id_from_match_info(request)
+    if bot_id is None:
+        return web.json_response({"error": "bad bot_id"}, status=404)
+    b = await get_bot(bot_id)
+    if not b:
+        return web.json_response({"error": "not found"}, status=404)
+    template_id = infer_template_id(b.get("file_path"))
+    return web.json_response({"items": await _feature_status_items(bot_id, template_id)})
+
+
+async def disable_feature_handler(request: web.Request) -> web.Response:
+    """POST /api/factory/bots/{id}/features/{name}/disable — turning OFF is
+    instant, no dialog (see the approved Variant D design: "Выключение
+    (on→off) остаётся мгновенным"). Also clears any stored config/thread so
+    a later re-enable starts the configure dialog fresh rather than silently
+    reusing a stale description."""
+    if not await _authenticate_owner(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    bot_id = _bot_id_from_match_info(request)
+    feature_name = request.match_info.get("name", "")
+    if bot_id is None or not feature_name:
+        return web.json_response({"error": "bad request"}, status=404)
+    if bot_id in _busy_bots:
+        return web.json_response({"error": _BUSY_TEXT}, status=409)
+    _busy_bots.add(bot_id)
+    try:
+        await disable_feature_and_reload(bot_id, feature_name)
+        await clear_bot_feature_config(bot_id, feature_name)
+        return web.json_response({"ok": True})
+    finally:
+        _busy_bots.discard(bot_id)
+
+
+async def cancel_feature_configure_handler(request: web.Request) -> web.Response:
+    """POST /api/factory/bots/{id}/features/{name}/cancel — the configure
+    dialog's "Отмена" at any step: tumbler reverts to off, nothing is saved
+    (see the approved design's "Отмена на любом шаге")."""
+    if not await _authenticate_owner(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    bot_id = _bot_id_from_match_info(request)
+    feature_name = request.match_info.get("name", "")
+    if bot_id is None or not feature_name:
+        return web.json_response({"error": "bad request"}, status=404)
+    await clear_bot_feature_config(bot_id, feature_name)
+    return web.json_response({"ok": True})
+
+
+async def configure_feature_handler(request: web.Request) -> web.Response:
+    """POST /api/factory/bots/{id}/features/{name}/configure — body
+    {"message": str}, the owner's latest reply in the free-text configure
+    dialog (Variant D). Appends it to the stored thread, asks
+    assess_feature_description whether it's enough, and either:
+      - accepts: enables the feature, persists the accepted description,
+        clears the thread, returns {"status": "enabled", "description": ...}
+      - needs more: persists the updated thread (with Claude's follow-up
+        appended), returns {"status": "needs_clarification", "reply": ...}
+
+    payments/office_events are rejected here (see _NO_FREE_TEXT_FEATURES) —
+    the frontend must not call this route for them; payments routes the
+    owner to the Telegram ЮKassa wizard instead, office_events has its own
+    bot-picker endpoints."""
+    if not await _authenticate_owner(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    bot_id = _bot_id_from_match_info(request)
+    feature_name = request.match_info.get("name", "")
+    if bot_id is None or not feature_name:
+        return web.json_response({"error": "bad request"}, status=404)
+    if feature_name in _NO_FREE_TEXT_FEATURES:
+        return web.json_response({"error": "feature has no free-text configure step"}, status=400)
+
+    b = await get_bot(bot_id)
+    if not b:
+        return web.json_response({"error": "not found"}, status=404)
+    template_id = infer_template_id(b.get("file_path"))
+    feat = next((f for f in discover_features() if f["name"] == feature_name), None)
+    if feat is None or (template_id not in feat["compatible_with"] and "*" not in feat["compatible_with"]):
+        return web.json_response({"error": "feature not compatible with this bot"}, status=400)
+
+    try:
+        payload = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON body"}, status=400)
+    message = payload.get("message") if isinstance(payload, dict) else None
+    if not isinstance(message, str) or not message.strip():
+        return web.json_response({"error": "message is required"}, status=400)
+
+    if bot_id in _busy_bots:
+        return web.json_response({"error": _BUSY_TEXT}, status=409)
+    _busy_bots.add(bot_id)
+    try:
+        existing = await get_bot_feature_config(bot_id, feature_name)
+        thread = list(existing["thread"]) if existing else []
+        thread.append({"role": "owner", "text": message.strip()})
+
+        try:
+            result = await assess_feature_description(feature_name, template_id, thread)
+        except Exception as e:
+            logger.error(f"configure_feature_handler: assess_feature_description failed bot_id={bot_id} feature={feature_name}: {e}")
+            return web.json_response({"error": "assessment_failed"}, status=502)
+
+        if result["accepted"] and result["config_summary"]:
+            await set_bot_feature_description(bot_id, feature_name, result["config_summary"])
+            await enable_feature_and_reload(bot_id, feature_name)
+            return web.json_response(
+                {"status": "enabled", "description": result["config_summary"], "reply": result["reply"]}
+            )
+
+        thread.append({"role": "claude", "text": result["reply"]})
+        await set_bot_feature_thread(bot_id, feature_name, thread)
+        return web.json_response({"status": "needs_clarification", "reply": result["reply"], "thread": thread})
+    finally:
+        _busy_bots.discard(bot_id)
+
+
+async def list_offices_handler(request: web.Request) -> web.Response:
+    if not await _authenticate_owner(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    bot_id = _bot_id_from_match_info(request)
+    if bot_id is None:
+        return web.json_response({"error": "bad bot_id"}, status=404)
+    links = await get_office_links_for_bot(bot_id)
+    return web.json_response({"items": links})
+
+
+async def add_office_handler(request: web.Request) -> web.Response:
+    """POST /api/factory/bots/{id}/offices — body {"target_bot_id": int}.
+    This bot (source) will notify target_bot_id about order.created events —
+    same direction/event_type convention as handlers/manage_bots.py's
+    officelink callback."""
+    if not await _authenticate_owner(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    bot_id = _bot_id_from_match_info(request)
+    if bot_id is None:
+        return web.json_response({"error": "bad bot_id"}, status=404)
+    try:
+        payload = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON body"}, status=400)
+    target_bot_id = payload.get("target_bot_id") if isinstance(payload, dict) else None
+    if not isinstance(target_bot_id, int):
+        return web.json_response({"error": "target_bot_id is required"}, status=400)
+    if target_bot_id == bot_id:
+        return web.json_response({"error": "cannot link a bot to itself"}, status=400)
+    source = await get_bot(bot_id)
+    target = await get_bot(target_bot_id)
+    if not source or not target:
+        return web.json_response({"error": "not found"}, status=404)
+    await add_office_link(bot_id, target_bot_id, _OFFICE_EVENT_TYPE)
+    return web.json_response({"ok": True}, status=201)
+
+
+async def remove_office_handler(request: web.Request) -> web.Response:
+    """DELETE /api/factory/bots/{id}/offices/{target_id} — removes the
+    (bot_id, target_id, order.created) link. bot_id in the URL is always the
+    SOURCE side, matching add_office_handler above; a link where this bot is
+    the TARGET is removed from the other bot's own detail panel instead
+    (each panel only ever displays/manages links where IT is the source, same
+    posture as the mockup's single-arrow-per-row list)."""
+    if not await _authenticate_owner(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    bot_id = _bot_id_from_match_info(request)
+    target_raw = request.match_info.get("target_id", "")
+    if bot_id is None or not target_raw.isdigit():
+        return web.json_response({"error": "bad request"}, status=404)
+    await remove_office_link(bot_id, int(target_raw), _OFFICE_EVENT_TYPE)
+    return web.json_response({"ok": True})
+
+
+async def list_admins_handler(request: web.Request) -> web.Response:
+    if not await _authenticate_owner(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    bot_id = _bot_id_from_match_info(request)
+    if bot_id is None:
+        return web.json_response({"error": "bad bot_id"}, status=404)
+    admins = await get_bot_admins(bot_id)
+    return web.json_response({"items": admins})
+
+
+async def add_admin_handler(request: web.Request) -> web.Response:
+    if not await _authenticate_owner(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    bot_id = _bot_id_from_match_info(request)
+    if bot_id is None:
+        return web.json_response({"error": "bad bot_id"}, status=404)
+    b = await get_bot(bot_id)
+    if not b:
+        return web.json_response({"error": "not found"}, status=404)
+    try:
+        payload = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON body"}, status=400)
+    telegram_id = payload.get("telegram_id") if isinstance(payload, dict) else None
+    if not isinstance(telegram_id, str) or not telegram_id.strip().isdigit():
+        return web.json_response({"error": "telegram_id must be a numeric string"}, status=400)
+    await add_bot_admin(bot_id, telegram_id.strip())
+    return web.json_response({"ok": True}, status=201)
+
+
+async def remove_admin_handler(request: web.Request) -> web.Response:
+    if not await _authenticate_owner(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    bot_id = _bot_id_from_match_info(request)
+    telegram_id = request.match_info.get("telegram_id", "")
+    if bot_id is None or not telegram_id:
+        return web.json_response({"error": "bad request"}, status=404)
+    await remove_bot_admin(bot_id, telegram_id)
+    return web.json_response({"ok": True})
+
+
 def register_routes(app: web.Application) -> None:
-    """Adds owner-only analytics routes to the same Application miniapp_api's
-    register_routes() already extends (see combined_app.py's _bootstrap_app,
-    which calls both). Namespaced under /api/factory/ to stay clearly
-    distinct from /api/{bot_id}/... 's per-tenant-bot paths — a real bot_id
-    is never 'factory'."""
+    """Adds owner-only analytics + bot-management routes to the same
+    Application miniapp_api's register_routes() already extends (see
+    combined_app.py's _bootstrap_app, which calls both). Namespaced under
+    /api/factory/ to stay clearly distinct from /api/{bot_id}/... 's
+    per-tenant-bot paths — a real bot_id is never 'factory'."""
     app.router.add_get("/api/factory/bots", list_bots_handler)
     app.router.add_post("/api/factory/bots/{bot_id}/feedback", add_feedback_handler)
     app.router.add_get("/api/factory/candidates", list_template_candidates_handler)
     app.router.add_get("/api/factory/candidate-clusters", list_template_candidate_clusters_handler)
+
+    # Detail panel — level 2 of the dashboard (docs discussion: "Детальная
+    # панель бота — макет уровня 2").
+    app.router.add_get("/api/factory/bots/{bot_id}", bot_detail_handler)
+    app.router.add_post("/api/factory/bots/{bot_id}/start", start_bot_handler)
+    app.router.add_post("/api/factory/bots/{bot_id}/stop", stop_bot_handler)
+    app.router.add_post("/api/factory/bots/{bot_id}/restart", restart_bot_handler)
+    app.router.add_delete("/api/factory/bots/{bot_id}", delete_bot_handler)
+    app.router.add_get("/api/factory/bots/{bot_id}/logs", bot_logs_handler)
+    app.router.add_post("/api/factory/bots/{bot_id}/recreate", recreate_bot_handler)
+    app.router.add_post("/api/factory/bots/{bot_id}/autofix", autofix_bot_handler)
+    app.router.add_post("/api/factory/bots/{bot_id}/fixbug", fixbug_bot_handler)
+
+    app.router.add_get("/api/factory/bots/{bot_id}/features", list_features_handler)
+    app.router.add_post("/api/factory/bots/{bot_id}/features/{name}/disable", disable_feature_handler)
+    app.router.add_post("/api/factory/bots/{bot_id}/features/{name}/configure", configure_feature_handler)
+    app.router.add_post("/api/factory/bots/{bot_id}/features/{name}/cancel", cancel_feature_configure_handler)
+
+    app.router.add_get("/api/factory/bots/{bot_id}/offices", list_offices_handler)
+    app.router.add_post("/api/factory/bots/{bot_id}/offices", add_office_handler)
+    app.router.add_delete("/api/factory/bots/{bot_id}/offices/{target_id}", remove_office_handler)
+
+    app.router.add_get("/api/factory/bots/{bot_id}/admins", list_admins_handler)
+    app.router.add_post("/api/factory/bots/{bot_id}/admins", add_admin_handler)
+    app.router.add_delete("/api/factory/bots/{bot_id}/admins/{telegram_id}", remove_admin_handler)

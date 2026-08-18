@@ -214,6 +214,27 @@ async def init_db():
                 PRIMARY KEY (bot_id, feature_name)
             )
         """)
+        # bot_feature_config — Variant D's "what should this feature do"
+        # free-text description, one row per (bot_id, feature_name), separate
+        # from bot_features (which only records ON/OFF). description is the
+        # LATEST accepted text (what the owner sees under "Изменить описание");
+        # thread_json is the in-progress clarification transcript ([{role,
+        # text}, ...]) for a feature still stuck in "pending" (owner wrote
+        # something, Claude asked a follow-up, no accepted description yet) —
+        # NULL once accepted or never started. A feature reaching "enabled"
+        # always has description NOT NULL; thread_json is cleared at that
+        # point (see set_bot_feature_description below) since the transcript
+        # has no further use once the description it produced is accepted.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS bot_feature_config (
+                bot_id        INTEGER NOT NULL REFERENCES bots(id),
+                feature_name  TEXT NOT NULL,
+                description   TEXT,
+                thread_json   TEXT,
+                updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (bot_id, feature_name)
+            )
+        """)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS bot_custom_features (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -514,6 +535,7 @@ async def delete_bot(bot_id: int) -> None:
         await db.execute("DELETE FROM bot_miniapp_config WHERE bot_id = ?", (bot_id,))
         await db.execute("DELETE FROM bot_office_hook_config WHERE bot_id = ?", (bot_id,))
         await db.execute("DELETE FROM bot_voice_cashflow_config WHERE bot_id = ?", (bot_id,))
+        await db.execute("DELETE FROM bot_feature_config WHERE bot_id = ?", (bot_id,))
         await db.execute(
             "DELETE FROM bot_office_links WHERE source_bot_id = ? OR target_bot_id = ?", (bot_id, bot_id)
         )
@@ -659,6 +681,81 @@ async def disable_bot_feature(bot_id: int, feature_name: str) -> None:
         )
         await db.commit()
     logger.info(f"disable_bot_feature: feature_name={feature_name!r} disabled for bot_id={bot_id}")
+
+
+async def get_bot_feature_config(bot_id: int, feature_name: str) -> dict | None:
+    """Returns {"description": str|None, "thread": list[dict]} or None if no
+    row exists yet (feature never entered the Variant D configure flow).
+    thread is decoded from thread_json — [] if NULL/absent, never raises on
+    malformed JSON (degrades to [], same defensive posture as
+    get_bot_miniapp_config's json.loads sibling calls)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT description, thread_json FROM bot_feature_config WHERE bot_id = ? AND feature_name = ?",
+            (bot_id, feature_name),
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row is None:
+                return None
+            thread = []
+            if row[1]:
+                try:
+                    thread = json.loads(row[1])
+                except (json.JSONDecodeError, ValueError):
+                    thread = []
+            return {"description": row[0], "thread": thread}
+
+
+async def set_bot_feature_thread(bot_id: int, feature_name: str, thread: list[dict]) -> None:
+    """Persists the in-progress clarification transcript for a feature still
+    pending (owner wrote something, Claude is not yet satisfied). Does NOT
+    touch description — call set_bot_feature_description separately once
+    Claude accepts it."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO bot_feature_config (bot_id, feature_name, thread_json, updated_at)
+            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT (bot_id, feature_name) DO UPDATE SET
+                thread_json = excluded.thread_json,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (bot_id, feature_name, json.dumps(thread)),
+        )
+        await db.commit()
+
+
+async def set_bot_feature_description(bot_id: int, feature_name: str, description: str) -> None:
+    """Accepts a description (Claude judged the owner's text sufficient) —
+    clears thread_json since the transcript that produced this description
+    has no further use once accepted (see bot_feature_config's own comment
+    in init_db). Callers still need to call enable_bot_feature separately;
+    this only records WHAT the feature should do, not whether it's ON."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO bot_feature_config (bot_id, feature_name, description, thread_json, updated_at)
+            VALUES (?, ?, ?, NULL, CURRENT_TIMESTAMP)
+            ON CONFLICT (bot_id, feature_name) DO UPDATE SET
+                description = excluded.description,
+                thread_json = NULL,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (bot_id, feature_name, description),
+        )
+        await db.commit()
+    logger.info(f"set_bot_feature_description: feature_name={feature_name!r} bot_id={bot_id}")
+
+
+async def clear_bot_feature_config(bot_id: int, feature_name: str) -> None:
+    """Wipes both description and thread — called when the owner cancels the
+    configure flow (tumbler reverts to off, nothing should be remembered)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "DELETE FROM bot_feature_config WHERE bot_id = ? AND feature_name = ?",
+            (bot_id, feature_name),
+        )
+        await db.commit()
 
 
 async def set_bot_sheets_config(bot_id: int, spreadsheet_id: str, sheet_title: str | None) -> None:

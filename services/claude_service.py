@@ -900,6 +900,103 @@ async def classify_connect_feature_intent(text: str) -> dict:
     return _parse_connect_feature_intent(response.content[0].text)
 
 
+# Variant D (docs/FEATURE_CONFIGURE_DIALOG_DESIGN.md) — the factory miniapp's
+# "Фичи" tab conversational configure step. Given the running clarification
+# thread for ONE (bot, feature) pair, decides whether the owner's latest
+# message is a concrete-enough description to enable the feature, or whether
+# Claude should keep asking. Unlike classify_connect_feature_intent (a fixed
+# two-feature Telegram-side classifier), this covers every feature that
+# collects free text on the "Фичи" tab (sheets/notifications/reminders/
+# sales_analytics/voice_intake/sellable_items/cashflow_ledger — NOT payments,
+# which skips straight to the existing ЮKassa wizard, and NOT office_events,
+# which has its own bot-picker UI, no free text). feature_name is passed in
+# so the same prompt can ask a feature-appropriate follow-up instead of a
+# generic one.
+FEATURE_CONFIGURE_PROMPT_TEMPLATE = """You are helping the owner of a Telegram-bot factory (Bot-creter) configure the "{feature_name}" feature for one of their bots (template: {template_id}).
+
+{feature_context}
+
+You will receive the conversation so far (owner's messages and your own previous follow-up questions, if any). Decide:
+- If the owner's LATEST message describes what they want clearly and completely enough to actually configure the feature — accept it.
+- If it's vague, ambiguous, or missing something you'd need to know to set this up correctly — ask ONE short, specific follow-up question in Russian.
+
+Respond with ONLY a single line of valid JSON, no markdown fences, no explanation, in exactly this shape:
+{{"accepted": true or false, "reply": "<Russian text>", "config_summary": "<short Russian summary of the accepted config, or null>"}}
+
+Rules:
+- accepted=true: "reply" is a short Russian confirmation summarizing what will happen (e.g. "Записываю: имя клиента, дату записи, услугу"). "config_summary" is the same text, or a slightly more compact version — this is what gets stored and shown back to the owner later under "Изменить описание".
+- accepted=false: "reply" is your follow-up question ONLY — Russian, short (1-2 sentences), friendly, specific to what's actually missing. "config_summary" must be null.
+- Never accept a message that is empty, off-topic, or just says "да"/"ок" with no actual content behind it in the conversation.
+- Do not ask more than one question at a time even if several things are unclear — ask the single most important one first.
+- If the conversation has already gone back and forth 3+ times and the owner is clearly trying but the answers stay vague, prefer accepting with your best understanding over stalling indefinitely — summarize what you DO understand rather than blocking forever."""
+
+_FEATURE_CONFIGURE_CONTEXT: dict[str, str] = {
+    "sheets": "This feature copies new records into a Google Sheet the owner connects separately. You need to know WHAT should be written to the sheet (which records/fields).",
+    "notifications": "This feature lets the owner broadcast messages to everyone who has ever messaged the bot. You need to know what kind of messages they plan to send and roughly how often.",
+    "reminders": "This feature sends automatic reminder DMs to clients ahead of an upcoming date/appointment. You need to know what the reminder is about and how long before the event it should fire.",
+    "sales_analytics": "This feature shows business metrics inside the bot's own mini-app. Configuration here is optional — if the owner has no particular metric in mind, standard metrics (count of records, totals) are fine to accept.",
+    "voice_intake": "This feature turns voice messages into structured records. You need to know what kind of voice messages should become records (e.g. new orders, new bookings) and what info should be extracted.",
+    "sellable_items": "This feature is a configurable catalog of items the bot can sell. You need to know roughly what will be sold, or an explicit confirmation to start with an empty catalog the owner will fill in via /items.",
+    "cashflow_ledger": "This feature tracks money in/out. You need to know how the owner wants entries grouped or categorized (or that a single running total with no categories is fine).",
+}
+
+
+def _parse_feature_configure_result(raw: str) -> dict:
+    """Best-effort JSON parse — malformed output degrades to "not accepted,
+    generic follow-up" rather than raising or silently enabling a feature
+    with no real description (see FEATURE_CONFIGURE_PROMPT_TEMPLATE's own
+    "never accept ... off-topic" rule — a parse failure must fail the same
+    direction as an explicit non-acceptance, never the direction that
+    enables something unreviewed)."""
+    fallback = {
+        "accepted": False,
+        "reply": "Не понял, можешь описать подробнее?",
+        "config_summary": None,
+    }
+    try:
+        data = json.loads(_strip_code_fences(raw))
+    except (json.JSONDecodeError, ValueError):
+        return fallback
+    if not isinstance(data, dict):
+        return fallback
+    accepted = bool(data.get("accepted"))
+    reply = data.get("reply")
+    if not isinstance(reply, str) or not reply.strip():
+        return fallback
+    config_summary = data.get("config_summary")
+    if not accepted or not isinstance(config_summary, str) or not config_summary.strip():
+        config_summary = None
+    return {"accepted": accepted, "reply": reply.strip(), "config_summary": config_summary}
+
+
+async def assess_feature_description(feature_name: str, template_id: str | None, thread: list[dict]) -> dict:
+    """thread: [{"role": "owner"|"claude", "text": str}, ...], oldest first,
+    ending with the owner's latest message (the one being assessed). Returns
+    {"accepted": bool, "reply": str, "config_summary": str|None} — see
+    _parse_feature_configure_result for the exact contract. Haiku, same cost
+    tier as classify_connect_feature_intent — this is a short judgment call,
+    not code generation."""
+    feature_context = _FEATURE_CONFIGURE_CONTEXT.get(
+        feature_name, "Configure this feature based on what the owner describes."
+    )
+    system = FEATURE_CONFIGURE_PROMPT_TEMPLATE.format(
+        feature_name=feature_name,
+        template_id=template_id or "from-scratch (no template)",
+        feature_context=feature_context,
+    )
+    messages = [
+        {"role": "user" if turn["role"] == "owner" else "assistant", "content": turn["text"]}
+        for turn in thread
+    ]
+    response = await client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=300,
+        system=system,
+        messages=messages,
+    )
+    return _parse_feature_configure_result(response.content[0].text)
+
+
 # docs/TEMPLATE_CANDIDATE_CLUSTERING_DESIGN.md §3 — one incremental batch
 # classification call per pass of runtime/template_candidate_clustering.py.
 # Given the domains already known and a batch of new from-scratch summaries,
