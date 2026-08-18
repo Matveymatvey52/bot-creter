@@ -441,7 +441,14 @@ class FactoryAnalyticsApiTests(unittest.IsolatedAsyncioTestCase):
         body = await resp.json()
         by_name = {item["name"]: item for item in body["items"]}
         self.assertIn("factory_analytics_owned_bot", by_name)
-        self.assertEqual(by_name["factory_analytics_owned_bot"]["owner_telegram_id"], OTHER_TELEGRAM_ID)
+        item = by_name["factory_analytics_owned_bot"]
+        self.assertEqual(item["owner_telegram_id"], OTHER_TELEGRAM_ID)
+        # Upgraded payload (owner product-analytics design) — same richer
+        # per-bot fields as list_bots_handler.
+        for key in ("features", "edits_count", "avg_rating", "feedback_count", "archived_at", "weekly_count"):
+            self.assertIn(key, item)
+        self.assertEqual(item["features"], [])
+        self.assertEqual(item["edits_count"], 0)
 
     async def test_owner_registry_non_owner_returns_403(self):
         with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):

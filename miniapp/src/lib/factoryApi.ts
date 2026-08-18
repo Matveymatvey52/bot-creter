@@ -116,10 +116,10 @@ export function listFactoryBots(): Promise<{ items: FactoryBotItem[]; is_owner: 
 
 // OwnerRegistryItem — the separate owner-wide registry (see
 // OwnerRegistryScreen.tsx): every bot across every customer, with
-// owner_telegram_id shown explicitly. Deliberately a smaller shape than
-// FactoryBotItem (no features/edits/rating/weekly_count) — this screen is
-// about "who owns what", not per-bot analytics, which "Моя фабрика" already
-// covers.
+// owner_telegram_id shown explicitly. Now carries the same richer per-bot
+// fields as FactoryBotItem (features/edits/rating/weekly_count/archived_at)
+// — this screen graduated from a pure "who owns what" list into full
+// owner-facing product analytics, see owner_registry_handler's docstring.
 export interface OwnerRegistryItem {
   id: number
   name: string
@@ -127,8 +127,14 @@ export interface OwnerRegistryItem {
   display_name: string | null
   status: string
   created_at: string
+  archived_at: string | null
   template: string | null
   owner_telegram_id: number | null
+  features: string[]
+  edits_count: number
+  avg_rating: number | null
+  feedback_count: number
+  weekly_count: number | null
 }
 
 export function listOwnerRegistry(): Promise<{ items: OwnerRegistryItem[] }> {

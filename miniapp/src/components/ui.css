@@ -141,6 +141,41 @@
   gap: 12px;
 }
 
+/* ── "Моя фабрика" dashboard header (title row + filter row) ─────────────
+   Title got its own row once the registry button moved out (see
+   OwnerRegistryScreen's own header comment) — the filter row now sits
+   directly below with a touch of accent polish so the block reads as one
+   coherent header rather than a bare title plus a loose row of dropdowns. */
+.factory-dashboard-header {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--border-hair);
+}
+
+.factory-dashboard-header .screen-header h1 {
+  font-size: 22px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  background: linear-gradient(90deg, var(--text-primary, #fff) 0%, var(--accent-hover) 140%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+.factory-dashboard-header .filter-bar {
+  padding: 0;
+}
+
+.factory-dashboard-header .filter-dropdown-trigger {
+  border-color: var(--accent-soft);
+}
+
+.factory-dashboard-header .filter-dropdown-trigger:hover {
+  border-color: var(--accent);
+}
+
 .bottom-bar {
   position: sticky;
   bottom: 0;
@@ -474,6 +509,78 @@
 
 .filter-dropdown-item:last-child {
   border-bottom: none;
+}
+
+/* ── Owner registry: summary stat tiles + bots table ──────────────────── */
+
+.registry-stats-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+  gap: 8px;
+}
+
+.registry-stat-tile {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 10px 12px;
+  border-radius: var(--radius-lg, 12px);
+  border: 1px solid var(--border-subtle);
+  background: var(--surface-inset);
+}
+
+.registry-stat-value {
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--accent-hover);
+}
+
+.registry-stat-label {
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.registry-table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg, 12px);
+}
+
+.registry-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.registry-table th,
+.registry-table td {
+  padding: 8px 10px;
+  text-align: left;
+  border-bottom: 1px solid var(--border-hair);
+}
+
+.registry-table th {
+  color: var(--text-secondary);
+  font-weight: 600;
+  font-size: 12px;
+}
+
+.registry-table-row {
+  cursor: pointer;
+  transition: background 0.12s ease;
+}
+
+.registry-table-row:hover {
+  background: var(--accent-soft);
+}
+
+.registry-table-row:last-child td {
+  border-bottom: none;
+}
+
+.registry-table-bot-name {
+  font-weight: 600;
 }
 
 .feature-dropdown-trigger {

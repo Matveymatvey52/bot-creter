@@ -146,13 +146,6 @@ export function FactoryDashboardScreen() {
     new URLSearchParams(window.location.search).get('view') === 'registry' ? 'registry' : 'dashboard',
   )
 
-  const openRegistry = () => {
-    setView('registry')
-    const url = new URL(window.location.href)
-    url.searchParams.set('view', 'registry')
-    window.history.replaceState(null, '', url.toString())
-  }
-
   const closeRegistry = () => {
     setView('dashboard')
     const url = new URL(window.location.href)
@@ -221,28 +214,25 @@ export function FactoryDashboardScreen() {
 
   return (
     <div className="screen">
-      <div className="screen-header">
-        <h1>Моя фабрика</h1>
-        {isOwner && (
-          <button className="btn-secondary" onClick={openRegistry}>
-            👥 Реестр ботов по владельцам
-          </button>
+      <div className="factory-dashboard-header">
+        <div className="screen-header">
+          <h1>Моя фабрика</h1>
+        </div>
+
+        {(templates.length > 0 || features.length > 0) && (
+          <div className="filter-bar">
+            {templates.length > 0 && (
+              <MultiSelectDropdown label="Шаблоны" options={templates} selected={templateFilter} onChange={setTemplateFilter} />
+            )}
+            {features.length > 0 && (
+              <MultiSelectDropdown label="Фичи" options={features} selected={featureFilter} onChange={setFeatureFilter} />
+            )}
+          </div>
         )}
       </div>
 
       {error && <div className="state-message">{error}</div>}
       {!error && items === null && <div className="state-message">Загрузка…</div>}
-
-      {(templates.length > 0 || features.length > 0) && (
-        <div className="filter-bar">
-          {templates.length > 0 && (
-            <MultiSelectDropdown label="Шаблоны" options={templates} selected={templateFilter} onChange={setTemplateFilter} />
-          )}
-          {features.length > 0 && (
-            <MultiSelectDropdown label="Фичи" options={features} selected={featureFilter} onChange={setFeatureFilter} />
-          )}
-        </div>
-      )}
 
       {items !== null && filtered.length === 0 && <div className="state-message">Ничего не найдено</div>}
 
