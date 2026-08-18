@@ -10,13 +10,16 @@ tests/test_payment_connect_flow.py for that baseline.
 """
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.base import StorageKey
 from aiogram.fsm.storage.memory import MemoryStorage
 
+import db.database as db_module
 import handlers.manage_bots as manage_bots
 from db.database import (
     create_bot_record_with_admins,
@@ -75,6 +78,12 @@ class YooKassaAutoFetchTests(unittest.IsolatedAsyncioTestCase):
     owner_id = 555201
 
     async def asyncSetUp(self):
+        self._tmp_dir = tempfile.TemporaryDirectory()
+        self._db_path_patcher = patch.object(
+            db_module, "DB_PATH", Path(self._tmp_dir.name) / "test_yookassa_autofetch.db"
+        )
+        self._db_path_patcher.start()
+        await db_module.init_db()
         self.bot_id = await create_bot_record_with_admins(
             name="yk_autofetch_bot", description="test", token=FAKE_TOKEN,
             file_path="templates/inventory.py", admin_ids=[str(self.owner_id)],
@@ -86,6 +95,8 @@ class YooKassaAutoFetchTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         self._owner_patcher.stop()
         await delete_bot(self.bot_id)
+        self._db_path_patcher.stop()
+        self._tmp_dir.cleanup()
 
     async def test_valid_shop_id_advances_to_secret_key_step(self):
         message = _make_message(self.owner_id, "123456")
@@ -166,6 +177,12 @@ class YooKassaOwnerReuseTests(unittest.IsolatedAsyncioTestCase):
     owner_id = 555202
 
     async def asyncSetUp(self):
+        self._tmp_dir = tempfile.TemporaryDirectory()
+        self._db_path_patcher = patch.object(
+            db_module, "DB_PATH", Path(self._tmp_dir.name) / "test_yookassa_owner_reuse.db"
+        )
+        self._db_path_patcher.start()
+        await db_module.init_db()
         self.bot_a = await create_bot_record_with_admins(
             name="yk_owner_bot_a", description="test", token=FAKE_TOKEN,
             file_path="templates/inventory.py", admin_ids=[str(self.owner_id)],
@@ -183,6 +200,8 @@ class YooKassaOwnerReuseTests(unittest.IsolatedAsyncioTestCase):
         self._owner_patcher.stop()
         await delete_bot(self.bot_a)
         await delete_bot(self.bot_b)
+        self._db_path_patcher.stop()
+        self._tmp_dir.cleanup()
 
     async def test_reuse_button_applies_saved_credentials_without_reasking(self):
         callback = _make_callback(self.owner_id, f"payreuse:{self.bot_a}")
@@ -230,6 +249,12 @@ class YooKassaStatusCheckTests(unittest.IsolatedAsyncioTestCase):
     owner_id = 555203
 
     async def asyncSetUp(self):
+        self._tmp_dir = tempfile.TemporaryDirectory()
+        self._db_path_patcher = patch.object(
+            db_module, "DB_PATH", Path(self._tmp_dir.name) / "test_yookassa_status_check.db"
+        )
+        self._db_path_patcher.start()
+        await db_module.init_db()
         self.bot_id = await create_bot_record_with_admins(
             name="yk_status_bot", description="test", token=FAKE_TOKEN,
             file_path="templates/inventory.py", admin_ids=[str(self.owner_id)],
@@ -241,6 +266,8 @@ class YooKassaStatusCheckTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         self._owner_patcher.stop()
         await delete_bot(self.bot_id)
+        self._db_path_patcher.stop()
+        self._tmp_dir.cleanup()
 
     async def test_check_status_without_saved_credentials_prompts_to_connect_first(self):
         callback = _make_callback(self.owner_id, f"paycheck:{self.bot_id}")
@@ -286,6 +313,12 @@ class PaymentStatusPollerTests(unittest.IsolatedAsyncioTestCase):
     owner_id = 555204
 
     async def asyncSetUp(self):
+        self._tmp_dir = tempfile.TemporaryDirectory()
+        self._db_path_patcher = patch.object(
+            db_module, "DB_PATH", Path(self._tmp_dir.name) / "test_yookassa_poller.db"
+        )
+        self._db_path_patcher.start()
+        await db_module.init_db()
         self.bot_id = await create_bot_record_with_admins(
             name="yk_poller_bot", description="test", token=FAKE_TOKEN,
             file_path="templates/inventory.py", admin_ids=[str(self.owner_id)],
@@ -295,6 +328,8 @@ class PaymentStatusPollerTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self):
         await delete_bot(self.bot_id)
+        self._db_path_patcher.stop()
+        self._tmp_dir.cleanup()
 
     async def test_poll_once_updates_cache_for_credentialed_bots(self):
         from runtime.payment_status_poller import _poll_once
