@@ -65,6 +65,7 @@ from runtime.registry import (
 )
 from runtime.factory_analytics_api import register_routes as register_factory_analytics_routes
 from runtime.miniapp_api import register_routes as register_miniapp_routes
+from runtime.owner_report_api import register_routes as register_owner_report_routes
 from runtime.template_candidate_clustering import template_candidate_clustering_loop
 from runtime.webhook_app import create_app
 
@@ -216,6 +217,7 @@ async def _bootstrap_app() -> web.Application:
     # its own port. See docs/MINIAPP_DESIGN.md §2.2.
     register_miniapp_routes(app)
     register_factory_analytics_routes(app)
+    register_owner_report_routes(app)
 
     # aiohttp's own on_startup/on_cleanup hooks, not a bare asyncio.create_task
     # here in _bootstrap_app() — _bootstrap_app() runs to completion BEFORE

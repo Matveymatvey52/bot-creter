@@ -146,21 +146,6 @@ export function addFactoryFeedback(
   })
 }
 
-export interface TemplateCandidateItem {
-  id: number
-  bot_id: number | null
-  bot_name: string | null
-  summary: string
-  fallback_reason: string
-  selected_templates: string[]
-  bot_type: string | null
-  created_at: string
-}
-
-export function listTemplateCandidates(): Promise<{ items: TemplateCandidateItem[] }> {
-  return request('/candidates')
-}
-
 // ── Bot detail panel (level 2) — docs discussion "Детальная панель бота" ────
 
 export interface FeatureThreadTurn {
@@ -306,16 +291,3 @@ export function removeAdmin(botId: number, telegramId: string): Promise<{ ok: tr
   return request(`/bots/${botId}/admins/${telegramId}`, { method: 'DELETE' })
 }
 
-export interface TemplateCandidateClusterItem {
-  id: number
-  label: string
-  description: string | null
-  count: number
-  first_seen: string
-  last_seen: string
-  examples: string[]
-}
-
-export function listTemplateCandidateClusters(): Promise<{ items: TemplateCandidateClusterItem[] }> {
-  return request('/candidate-clusters')
-}

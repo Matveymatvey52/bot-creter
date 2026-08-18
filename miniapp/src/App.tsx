@@ -8,6 +8,7 @@ import { DetailScreen } from './screens/DetailScreen'
 import { CreateFormScreen } from './screens/CreateFormScreen'
 import { FactoryDashboardScreen } from './screens/FactoryDashboardScreen'
 import { AnalyticsScreen } from './screens/AnalyticsScreen'
+import { OwnerReportScreen } from './screens/OwnerReportScreen'
 
 // bot_id=0 is the reserved FACTORY_BOT_ID (runtime/registry.py) — the
 // factory's own /app command opens /app/0, which has no per-bot
@@ -16,6 +17,16 @@ import { AnalyticsScreen } from './screens/AnalyticsScreen'
 // generic per-bot resource list/detail/create routes below.
 function isFactoryBotPath(): boolean {
   return /\/app\/0(\/|$)/.test(window.location.pathname)
+}
+
+// /owner-report is a THIRD, fully separate app (Stage 2 of the
+// multitenancy rollout, runtime/owner_report_api.py) — a system-owner-only
+// cross-owner report, its own top-level route, not a tab inside either the
+// per-bot customer app or the owner's own /app/0 "Моя фабрика" dashboard.
+// Not linked from either of those apps' navigation on purpose (see that
+// module's docstring).
+function isOwnerReportPath(): boolean {
+  return /^\/owner-report(\/|$)/.test(window.location.pathname)
 }
 
 type Route =
@@ -32,6 +43,10 @@ export default function App() {
     webApp?.ready()
     webApp?.expand()
   }, [])
+
+  if (isOwnerReportPath()) {
+    return <OwnerReportScreen />
+  }
 
   if (isFactoryBotPath()) {
     return <FactoryDashboardScreen />
