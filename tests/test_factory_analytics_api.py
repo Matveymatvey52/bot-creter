@@ -470,6 +470,32 @@ class FactoryAnalyticsApiTests(unittest.IsolatedAsyncioTestCase):
             resp = await self.client.get(f"/api/factory/showcase-group?token={token}")
         self.assertEqual(resp.status, 403)
 
+    # ── owner_registry_handler ────────────────────────────────────────
+    async def test_owner_registry_shows_owner_per_bot(self):
+        await db_module.create_bot_record_with_admins(
+            name="factory_analytics_owned_bot", description="test", token="4444:AAowned-fake-token-1234567890",
+            file_path="templates/shop_catalog.py", admin_ids=["1"], owner_telegram_id=OTHER_TELEGRAM_ID,
+        )
+        qs = await self._owner_qs()
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            resp = await self.client.get(f"/api/factory/owner-registry?{qs}")
+        self.assertEqual(resp.status, 200)
+        body = await resp.json()
+        by_name = {item["name"]: item for item in body["items"]}
+        self.assertIn("factory_analytics_owned_bot", by_name)
+        self.assertEqual(by_name["factory_analytics_owned_bot"]["owner_telegram_id"], OTHER_TELEGRAM_ID)
+
+    async def test_owner_registry_non_owner_returns_403(self):
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            token = mint_magic_link_token(FACTORY_BOT_ID, OTHER_TELEGRAM_ID)
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            resp = await self.client.get(f"/api/factory/owner-registry?token={token}")
+        self.assertEqual(resp.status, 403)
+
+    async def test_owner_registry_no_credentials_returns_403(self):
+        resp = await self.client.get("/api/factory/owner-registry")
+        self.assertEqual(resp.status, 403)
+
     # ── features: disable is instant, no dialog ──────────────────────
     async def test_disable_feature_is_instant_and_clears_config(self):
         await db_module.set_bot_feature_description(self.bot_id, "sheets", "Записываю имена клиентов")

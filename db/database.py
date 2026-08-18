@@ -1377,7 +1377,7 @@ async def list_bots_with_stats(owner_telegram_id: int | None = None) -> list[dic
         async with db.execute(f"""
             SELECT
                 b.id, b.name, b.username, b.display_name, b.status,
-                b.created_at, b.archived_at, b.file_path,
+                b.created_at, b.archived_at, b.file_path, b.owner_telegram_id,
                 COALESCE(f.features, '') AS features,
                 COALESCE(c.edits_count, 0) AS edits_count,
                 r.avg_rating, r.feedback_count

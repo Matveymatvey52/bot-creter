@@ -170,6 +170,35 @@ async def list_bots_handler(request: web.Request) -> web.Response:
     return web.json_response({"items": items, "is_owner": is_owner})
 
 
+async def owner_registry_handler(request: web.Request) -> web.Response:
+    """GET /api/factory/owner-registry — the system OWNER's separate,
+    owner-only view of every bot across EVERY customer, with each bot's
+    owner_telegram_id shown explicitly. Deliberately a different endpoint
+    (and a different miniapp screen — see miniapp/src/screens/
+    OwnerRegistryScreen.tsx) from list_bots_handler's "Моя фабрика": that one
+    already returns every bot to the owner too, but its payload/UI never
+    surfaces WHICH customer owns which bot (see MEMORY.md's multitenancy
+    design note) — this endpoint exists specifically to make that visible,
+    not to duplicate the dashboard."""
+    if not await _authenticate_owner(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    rows = await list_bots_with_stats(owner_telegram_id=None)
+    items = [
+        {
+            "id": row["id"],
+            "name": row["name"],
+            "username": row["username"],
+            "display_name": row["display_name"],
+            "status": row["status"],
+            "created_at": row["created_at"],
+            "template": infer_template_id(row["file_path"]),
+            "owner_telegram_id": row["owner_telegram_id"],
+        }
+        for row in rows
+    ]
+    return web.json_response({"items": items})
+
+
 async def _weekly_count_for_bot(registry: Registry, bot_id: int) -> int | None:
     """Records this bot's own data got in the last 7 days, for the dashboard
     card's headline metric — see features/sales_analytics.weekly_record_count.
@@ -779,6 +808,7 @@ def register_routes(app: web.Application) -> None:
     per-tenant-bot paths — a real bot_id is never 'factory'."""
     app.router.add_get("/api/factory/session", refresh_session_handler)
     app.router.add_get("/api/factory/bots", list_bots_handler)
+    app.router.add_get("/api/factory/owner-registry", owner_registry_handler)
     app.router.add_post("/api/factory/bots/{bot_id}/feedback", add_feedback_handler)
     app.router.add_get("/api/factory/candidates", list_template_candidates_handler)
     app.router.add_get("/api/factory/candidate-clusters", list_template_candidate_clusters_handler)
