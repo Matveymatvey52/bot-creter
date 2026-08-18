@@ -129,7 +129,13 @@ export function FeedbackForm({ bot, onDone }: { bot: FactoryBotItem; onDone: () 
 
 export function FactoryDashboardScreen() {
   const [items, setItems] = useState<FactoryBotItem[] | null>(null)
-  const [isOwner, setIsOwner] = useState(false)
+  // is_owner itself has no reader left in this component — the two sections
+  // that used to gate on it (template-candidate clusters/candidates) moved
+  // to OwnerReportScreen.tsx (multitenancy stage 2), and this screen's own
+  // "Реестр" button was removed (see task: header redesign). Kept as a
+  // discarded setter rather than dropped entirely since listFactoryBots()
+  // still returns is_owner and a future section here may want it again.
+  const [, setIsOwner] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [templateFilter, setTemplateFilter] = useState<Set<string>>(new Set())
   const [featureFilter, setFeatureFilter] = useState<Set<string>>(new Set())
