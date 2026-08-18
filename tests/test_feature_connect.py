@@ -17,6 +17,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.base import StorageKey
 from aiogram.fsm.storage.memory import MemoryStorage
 
+import handlers.admin_manager as admin_manager
 import handlers.feature_connect as feature_connect
 import handlers.general as general
 import handlers.manage_bots as manage_bots
@@ -420,12 +421,19 @@ class ConfirmEquivalentToButtonToggleTests(unittest.IsolatedAsyncioTestCase):
         self._owner_patcher_mb.start()
         self._owner_patcher_fc = patch.object(feature_connect, "_is_owner", lambda uid: uid == self.owner_id)
         self._owner_patcher_fc.start()
+        # cb_toggle_feature now goes through _can_manage_bot (Stage 1
+        # per-bot ownership), which closes over admin_manager's OWN
+        # _is_owner — patch that too, consistent with the manage_bots test
+        # files.
+        self._owner_patcher_admin = patch.object(admin_manager, "_is_owner", lambda uid: uid == self.owner_id)
+        self._owner_patcher_admin.start()
         self._fake_registry = MagicMock()
         self._fake_registry.reload_one = AsyncMock()
         manage_bots.set_registry(self._fake_registry)
 
     async def asyncTearDown(self):
         manage_bots.set_registry(None)
+        self._owner_patcher_admin.stop()
         self._owner_patcher_fc.stop()
         self._owner_patcher_mb.stop()
         await delete_bot(self.bot_id_button)

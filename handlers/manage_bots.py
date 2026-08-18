@@ -50,7 +50,7 @@ from db.database import (
 )
 from features.office_events import _EVENT_TYPES, EVENT_TYPE_LABELS
 from features.sheets import get_service_account_email, verify_access
-from handlers.admin_manager import _is_owner
+from handlers.admin_manager import _can_manage_bot, _is_owner
 from handlers.create_bot import cancel_keyboard
 from runtime.registry import _CUSTOM_FEATURES_DIR, discover_features, infer_template_id, invalidate_custom_feature_cache
 from runtime.registry_holder import RegistryHandle
@@ -112,6 +112,29 @@ async def _deny_message(message: Message) -> None:
 
 async def _deny_callback(callback: CallbackQuery) -> None:
     await callback.answer(_DENY_TEXT, show_alert=True)
+
+
+def _visible_bots(user_id: int, bots: list[dict]) -> list[dict]:
+    """Filters an enumerate-all-bots list down to what user_id may see —
+    every bot for the owner, only their own bot(s) for a customer (Stage 1
+    multitenancy: never let a customer discover another customer's bot
+    through a picker, even read-only)."""
+    if _is_owner(user_id):
+        return bots
+    return [b for b in bots if _can_manage_bot(user_id, b)]
+
+
+async def _bot_or_deny(user_id: int, bot_id: int) -> dict | None:
+    """Fetches bot_id and checks per-bot authorization — returns the bot row
+    if user_id may manage it, else None (caller decides not-found vs
+    forbidden messaging; most callers show a generic "Бот не найден."
+    either way, matching this module's existing not-found messaging so a
+    customer probing another owner's bot_id learns nothing beyond "not
+    found")."""
+    b = await get_bot(bot_id)
+    if not b or not _can_manage_bot(user_id, b):
+        return None
+    return b
 
 
 async def _edit_or_resend(callback: CallbackQuery, text: str, **kwargs) -> None:
@@ -228,10 +251,7 @@ async def _send_list(send_fn, bots: list[dict]) -> None:
 
 @router.message(Command("list"))
 async def cmd_list(message: Message):
-    if not _is_owner(message.from_user.id):
-        await _deny_message(message)
-        return
-    bots = await get_all_bots()
+    bots = _visible_bots(message.from_user.id, await get_all_bots())
     if not bots:
         await message.answer("Ботов пока нет. Создай первого командой /create")
         return
@@ -242,10 +262,7 @@ async def cmd_list(message: Message):
 
 @router.message(Command("stop"))
 async def cmd_stop(message: Message):
-    if not _is_owner(message.from_user.id):
-        await _deny_message(message)
-        return
-    bots = await get_all_bots()
+    bots = _visible_bots(message.from_user.id, await get_all_bots())
     running = [b for b in bots if is_running(b["id"])]
     if not running:
         await message.answer("Нет запущенных ботов.")
@@ -263,10 +280,7 @@ async def cmd_stop(message: Message):
 
 @router.message(Command("run"))
 async def cmd_run(message: Message):
-    if not _is_owner(message.from_user.id):
-        await _deny_message(message)
-        return
-    bots = await get_all_bots()
+    bots = _visible_bots(message.from_user.id, await get_all_bots())
     stopped = [b for b in bots if not is_running(b["id"])]
     if not stopped:
         await message.answer("Все боты уже запущены.")
@@ -284,6 +298,9 @@ async def cmd_run(message: Message):
 
 @router.message(Command("logs"))
 async def cmd_logs(message: Message):
+    # Logs stay owner-only, matching runtime/factory_analytics_api.py's
+    # bot_logs_handler (crash logs can contain internals a customer
+    # shouldn't need to debug their own bot through raw stack traces).
     if not _is_owner(message.from_user.id):
         await _deny_message(message)
         return
@@ -325,16 +342,13 @@ async def _send_logs(send_fn, b: dict) -> None:
 
 @router.callback_query(F.data == "list")
 async def cb_list(callback: CallbackQuery):
-    if not _is_owner(callback.from_user.id):
-        await _deny_callback(callback)
-        return
     await callback.answer()
     chat_id = callback.message.chat.id
     try:
         await callback.message.delete()
     except Exception:
         pass
-    bots = await get_all_bots()
+    bots = _visible_bots(callback.from_user.id, await get_all_bots())
     if not bots:
         await callback.bot.send_message(chat_id, "Ботов пока нет. Создай первого командой /create")
         return
@@ -350,9 +364,6 @@ async def cb_list(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("info:"))
 async def cb_info(callback: CallbackQuery):
-    if not _is_owner(callback.from_user.id):
-        await _deny_callback(callback)
-        return
     await callback.answer()
     chat_id = callback.message.chat.id
     try:
@@ -360,7 +371,7 @@ async def cb_info(callback: CallbackQuery):
     except Exception:
         pass
     bot_id = int(callback.data.split(":")[1])
-    b = await get_bot(bot_id)
+    b = await _bot_or_deny(callback.from_user.id, bot_id)
     if not b:
         await callback.bot.send_message(chat_id, "Бот не найден.")
         return
@@ -640,12 +651,9 @@ async def _compatible_features(template_id: str | None, bot_id: int | None = Non
 
 @router.callback_query(F.data.startswith("features:"))
 async def cb_features_list(callback: CallbackQuery):
-    if not _is_owner(callback.from_user.id):
-        await _deny_callback(callback)
-        return
     await callback.answer()
     bot_id = int(callback.data.split(":")[1])
-    b = await get_bot(bot_id)
+    b = await _bot_or_deny(callback.from_user.id, bot_id)
     if not b:
         await callback.message.answer("Бот не найден.")
         return
@@ -667,9 +675,6 @@ async def cb_features_list(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("togglefeature:"))
 async def cb_toggle_feature(callback: CallbackQuery):
-    if not _is_owner(callback.from_user.id):
-        await _deny_callback(callback)
-        return
     _, bot_id_str, feature_name = callback.data.split(":", 2)
     bot_id = int(bot_id_str)
     if bot_id in _busy_bots:
@@ -677,7 +682,7 @@ async def cb_toggle_feature(callback: CallbackQuery):
         return
     _busy_bots.add(bot_id)
     try:
-        b = await get_bot(bot_id)
+        b = await _bot_or_deny(callback.from_user.id, bot_id)
         if not b:
             await callback.answer("Бот не найден.", show_alert=True)
             return
@@ -783,12 +788,9 @@ async def _office_panel_text_and_keyboard(bot_id: int) -> tuple[str, InlineKeybo
 
 @router.callback_query(F.data.startswith("office:"))
 async def cb_office_panel(callback: CallbackQuery):
-    if not _is_owner(callback.from_user.id):
-        await _deny_callback(callback)
-        return
     await callback.answer()
     bot_id = int(callback.data.split(":")[1])
-    b = await get_bot(bot_id)
+    b = await _bot_or_deny(callback.from_user.id, bot_id)
     if not b:
         await callback.message.answer("Бот не найден.")
         return
@@ -803,16 +805,17 @@ async def cb_office_connect_start(callback: CallbackQuery):
     are offered; picking any of them (not just "this" bot) matches the
     "выбор бота-источника" step from the design brief rather than assuming
     the panel's own bot is always the source."""
-    if not _is_owner(callback.from_user.id):
-        await _deny_callback(callback)
-        return
     await callback.answer()
     bot_id = int(callback.data.split(":")[1])
-    b = await get_bot(bot_id)
+    b = await _bot_or_deny(callback.from_user.id, bot_id)
     if not b:
         await callback.message.answer("Бот не найден.")
         return
-    all_bots = await get_all_bots()
+    # Only bots this user can manage are offered as the SOURCE — a customer
+    # must never see (or be able to pick) another customer's bot here, even
+    # though db.database.add_office_link would reject a cross-owner link
+    # server-side anyway; the picker shouldn't expose the option at all.
+    all_bots = _visible_bots(callback.from_user.id, await get_all_bots())
     if len(all_bots) < 2:
         await _edit_or_resend(
             callback,
@@ -834,16 +837,17 @@ async def cb_office_connect_start(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("officetarget:"))
 async def cb_office_pick_target(callback: CallbackQuery):
     """Step 2: pick the TARGET (subscriber) bot, excluding the source."""
-    if not _is_owner(callback.from_user.id):
-        await _deny_callback(callback)
-        return
     await callback.answer()
     source_id = int(callback.data.split(":")[1])
-    source_bot = await get_bot(source_id)
+    source_bot = await _bot_or_deny(callback.from_user.id, source_id)
     if not source_bot:
         await callback.message.answer("Бот не найден.")
         return
-    other_bots = [ob for ob in await get_all_bots() if ob["id"] != source_id]
+    # Same "only what this user can manage" restriction as step 1 — a
+    # customer's target picker never lists another customer's bot.
+    other_bots = [
+        ob for ob in _visible_bots(callback.from_user.id, await get_all_bots()) if ob["id"] != source_id
+    ]
     if not other_bots:
         await _edit_or_resend(
             callback,
@@ -873,16 +877,13 @@ async def cb_office_pick_type(callback: CallbackQuery):
     auto-skipped straight into the confirmation screen so the owner isn't
     shown a one-item picker for no reason; it starts prompting for real the
     day a second event_type is added to _EVENT_TYPES."""
-    if not _is_owner(callback.from_user.id):
-        await _deny_callback(callback)
-        return
     await callback.answer()
     _, source_id_str, target_id_str = callback.data.split(":")
     source_id, target_id = int(source_id_str), int(target_id_str)
     if source_id == target_id:
         await callback.message.answer("⚠️ Нельзя объединить бота с самим собой.")
         return
-    source_bot = await get_bot(source_id)
+    source_bot = await _bot_or_deny(callback.from_user.id, source_id)
     target_bot = await get_bot(target_id)
     if not source_bot or not target_bot:
         await callback.message.answer("Бот не найден.")
@@ -935,14 +936,16 @@ async def _render_office_confirm(callback: CallbackQuery, source_id: int, target
 
 @router.callback_query(F.data.startswith("officeconfirm:"))
 async def cb_office_confirm(callback: CallbackQuery):
-    if not _is_owner(callback.from_user.id):
-        await _deny_callback(callback)
-        return
     await callback.answer()
     # maxsplit=3: event_type is the only free-form-looking segment — bounded
     # the same way officeunlink already is, see that handler's comment.
     _, source_id_str, target_id_str, event_type = callback.data.split(":", 3)
-    await _render_office_confirm(callback, int(source_id_str), int(target_id_str), event_type)
+    source_id = int(source_id_str)
+    source_bot = await _bot_or_deny(callback.from_user.id, source_id)
+    if not source_bot:
+        await callback.message.answer("Бот не найден.")
+        return
+    await _render_office_confirm(callback, source_id, int(target_id_str), event_type)
 
 
 @router.callback_query(F.data.startswith("officedolink:"))
@@ -951,9 +954,6 @@ async def cb_office_do_link(callback: CallbackQuery):
     happen" screen — kept as its own step (not fused into officeconfirm)
     so re-rendering the confirmation screen (e.g. via officeconfirm: from a
     Back navigation) never itself has a side effect."""
-    if not _is_owner(callback.from_user.id):
-        await _deny_callback(callback)
-        return
     await callback.answer()
     _, source_id_str, target_id_str, event_type = callback.data.split(":", 3)
     source_id, target_id = int(source_id_str), int(target_id_str)
@@ -966,7 +966,7 @@ async def cb_office_do_link(callback: CallbackQuery):
     if source_id == target_id:
         await callback.message.answer("⚠️ Нельзя объединить бота с самим собой.")
         return
-    source_bot = await get_bot(source_id)
+    source_bot = await _bot_or_deny(callback.from_user.id, source_id)
     target_bot = await get_bot(target_id)
     if not source_bot or not target_bot:
         await callback.message.answer("Бот не найден.")
@@ -974,7 +974,10 @@ async def cb_office_do_link(callback: CallbackQuery):
     if event_type not in _EVENT_TYPES:
         await callback.message.answer("⚠️ Неизвестный тип события.")
         return
-    await add_office_link(source_id, target_id, event_type)
+    linked = await add_office_link(source_id, target_id, event_type)
+    if not linked:
+        await callback.message.answer("⚠️ Нельзя связать ботов разных владельцев.")
+        return
     label = EVENT_TYPE_LABELS.get(event_type, event_type)
     text, keyboard_panel = await _office_panel_text_and_keyboard(source_id)
     success_rows = list(keyboard_panel.inline_keyboard)
@@ -1010,9 +1013,6 @@ async def cb_office_digest_guide(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("officeunlink:"))
 async def cb_office_unlink(callback: CallbackQuery):
-    if not _is_owner(callback.from_user.id):
-        await _deny_callback(callback)
-        return
     # maxsplit=4: event_type is the only free-form-looking segment here, but
     # _EVENT_TYPES (features/office_events.py) is a closed, developer-owned
     # set with no ':' in any current key — still, an unbounded split() would
@@ -1022,7 +1022,7 @@ async def cb_office_unlink(callback: CallbackQuery):
     _, source_id_str, target_id_str, event_type, panel_bot_id_str = callback.data.split(":", 4)
     source_id, target_id, panel_bot_id = int(source_id_str), int(target_id_str), int(panel_bot_id_str)
     await callback.answer()
-    panel_bot = await get_bot(panel_bot_id)
+    panel_bot = await _bot_or_deny(callback.from_user.id, panel_bot_id)
     if not panel_bot:
         await callback.message.answer("Бот не найден.")
         return
@@ -1076,12 +1076,9 @@ async def _group_task_panel_text_and_keyboard(bot_id: int, bot_row: dict) -> tup
 
 @router.callback_query(F.data.startswith("grouptask:"))
 async def cb_group_task_panel(callback: CallbackQuery):
-    if not _is_owner(callback.from_user.id):
-        await _deny_callback(callback)
-        return
     await callback.answer()
     bot_id = int(callback.data.split(":")[1])
-    bot_row = await get_bot(bot_id)
+    bot_row = await _bot_or_deny(callback.from_user.id, bot_id)
     if not bot_row:
         await callback.message.answer("Бот не найден.")
         return
@@ -1099,12 +1096,9 @@ async def cb_group_task_panel(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("grouptaskdisconnect:"))
 async def cb_group_task_disconnect(callback: CallbackQuery):
-    if not _is_owner(callback.from_user.id):
-        await _deny_callback(callback)
-        return
     await callback.answer()
     bot_id = int(callback.data.split(":")[1])
-    bot_row = await get_bot(bot_id)
+    bot_row = await _bot_or_deny(callback.from_user.id, bot_id)
     if not bot_row:
         await callback.message.answer("Бот не найден.")
         return
@@ -1190,32 +1184,33 @@ async def begin_sheets_connect(bot_id: int, state: FSMContext, present) -> bool:
 
 @router.callback_query(F.data.startswith("sheetsconnect:"))
 async def cb_sheets_connect_start(callback: CallbackQuery, state: FSMContext):
-    if not _is_owner(callback.from_user.id):
-        await _deny_callback(callback)
-        return
     await callback.answer()
     bot_id = int(callback.data.split(":")[1])
+    if not await _bot_or_deny(callback.from_user.id, bot_id):
+        await callback.message.answer("Бот не найден.")
+        return
     await begin_sheets_connect(bot_id, state, functools.partial(_edit_or_resend, callback))
 
 
 @router.callback_query(F.data.startswith("sheetscancel:"))
 async def cb_sheets_connect_cancel(callback: CallbackQuery, state: FSMContext):
-    if not _is_owner(callback.from_user.id):
-        await _deny_callback(callback)
-        return
     await callback.answer()
     bot_id = int(callback.data.split(":")[1])
+    if not await _bot_or_deny(callback.from_user.id, bot_id):
+        await callback.message.answer("Бот не найден.")
+        return
     await state.clear()
     await _back_to_features_panel(bot_id, callback.message)
 
 
 @router.message(SheetsConnectFlow.waiting_for_link, F.text, ~F.text.startswith("/"))
 async def msg_sheets_connect_link(message: Message, state: FSMContext):
-    if not _is_owner(message.from_user.id):
-        return
     data = await state.get_data()
     bot_id = data.get("bot_id")
     if bot_id is None:
+        await state.clear()
+        return
+    if not await _bot_or_deny(message.from_user.id, bot_id):
         await state.clear()
         return
     spreadsheet_id = _parse_spreadsheet_id(message.text)
@@ -1263,8 +1258,10 @@ async def msg_sheets_connect_link(message: Message, state: FSMContext):
 
 @router.message(SheetsConnectFlow.waiting_for_link)
 async def msg_sheets_connect_invalid(message: Message) -> None:
-    if not _is_owner(message.from_user.id):
-        return
+    # No bot_id available here (only reached on a non-text message, so no
+    # FSM data lookup is possible) — access was already checked when this
+    # FSM state was entered (cb_sheets_connect_start above), so this is just
+    # the format-reminder fallback for whoever is already mid-flow.
     await message.answer("Пришли ссылку на Google Таблицу текстом, либо нажми ❌ Отмена.")
 
 
@@ -1370,12 +1367,9 @@ async def _show_payment_step(callback: CallbackQuery, bot_id: int, step: int) ->
 
 @router.callback_query(F.data.startswith("paystart:"))
 async def cb_payment_connect_start(callback: CallbackQuery, state: FSMContext):
-    if not _is_owner(callback.from_user.id):
-        await _deny_callback(callback)
-        return
     await callback.answer()
     bot_id = int(callback.data.split(":")[1])
-    if not await get_bot(bot_id):
+    if not await _bot_or_deny(callback.from_user.id, bot_id):
         await callback.message.answer("Бот не найден.")
         return
     # Set from the very first screen (not just at the final text-collecting
@@ -1390,9 +1384,6 @@ async def cb_payment_connect_start(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("paystep:"))
 async def cb_payment_connect_step(callback: CallbackQuery, state: FSMContext):
-    if not _is_owner(callback.from_user.id):
-        await _deny_callback(callback)
-        return
     await callback.answer()
     _, bot_id_str, step_str = callback.data.split(":", 2)
     bot_id, step = int(bot_id_str), int(step_str)
@@ -1401,7 +1392,7 @@ async def cb_payment_connect_step(callback: CallbackQuery, state: FSMContext):
         # surviving a future step-range change) — ignore rather than crash on
         # a dict lookup or route through invalid FSM data.
         return
-    if not await get_bot(bot_id):
+    if not await _bot_or_deny(callback.from_user.id, bot_id):
         await state.clear()
         await callback.message.answer("Бот не найден.")
         return
@@ -1416,22 +1407,23 @@ async def cb_payment_connect_step(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("paycancel:"))
 async def cb_payment_connect_cancel(callback: CallbackQuery, state: FSMContext):
-    if not _is_owner(callback.from_user.id):
-        await _deny_callback(callback)
-        return
     await callback.answer()
     bot_id = int(callback.data.split(":")[1])
+    if not await _bot_or_deny(callback.from_user.id, bot_id):
+        await callback.message.answer("Бот не найден.")
+        return
     await state.clear()
     await _back_to_features_panel(bot_id, callback.message)
 
 
 @router.message(PaymentConnectFlow.waiting_for_token, F.text, ~F.text.startswith("/"))
 async def msg_payment_connect_token(message: Message, state: FSMContext):
-    if not _is_owner(message.from_user.id):
-        return
     data = await state.get_data()
     bot_id = data.get("bot_id")
     if bot_id is None:
+        await state.clear()
+        return
+    if not await _bot_or_deny(message.from_user.id, bot_id):
         await state.clear()
         return
     token = message.text.strip()
@@ -1491,8 +1483,8 @@ async def msg_payment_connect_token(message: Message, state: FSMContext):
 
 @router.message(PaymentConnectFlow.waiting_for_token)
 async def msg_payment_connect_invalid(message: Message) -> None:
-    if not _is_owner(message.from_user.id):
-        return
+    # No FSM state read here (non-text messages carry no bot_id lookup worth
+    # doing) — access was already checked when this state was entered.
     await message.answer("Пришли токен от @YooKassaBot текстом, либо нажми ❌ Отмена.")
 
 
@@ -1503,22 +1495,22 @@ async def msg_payment_connect_invalid(message: Message) -> None:
 
 @router.callback_query(F.data.startswith("payskip:"))
 async def cb_payment_details_skip(callback: CallbackQuery, state: FSMContext):
-    if not _is_owner(callback.from_user.id):
-        await _deny_callback(callback)
-        return
     await callback.answer()
     bot_id = int(callback.data.split(":")[1])
+    if not await _bot_or_deny(callback.from_user.id, bot_id):
+        await callback.message.answer("Бот не найден.")
+        return
     await state.clear()
     await _back_to_features_panel(bot_id, callback.message)
 
 
 @router.callback_query(F.data.startswith("payownnew:"))
 async def cb_payment_details_own_new(callback: CallbackQuery, state: FSMContext):
-    if not _is_owner(callback.from_user.id):
-        await _deny_callback(callback)
-        return
     await callback.answer()
     bot_id = int(callback.data.split(":")[1])
+    if not await _bot_or_deny(callback.from_user.id, bot_id):
+        await callback.message.answer("Бот не найден.")
+        return
     await state.set_state(PaymentConnectFlow.waiting_for_shop_id)
     await state.update_data(bot_id=bot_id)
     await callback.message.answer(
@@ -1530,15 +1522,12 @@ async def cb_payment_details_own_new(callback: CallbackQuery, state: FSMContext)
 
 @router.callback_query(F.data.startswith("payreuse:"))
 async def cb_payment_details_reuse(callback: CallbackQuery, state: FSMContext):
-    if not _is_owner(callback.from_user.id):
-        await _deny_callback(callback)
-        return
     await callback.answer()
     bot_id = int(callback.data.split(":")[1])
     if bot_id not in _busy_bots:
         _busy_bots.add(bot_id)
         try:
-            if not await get_bot(bot_id):
+            if not await _bot_or_deny(callback.from_user.id, bot_id):
                 await state.clear()
                 await callback.message.answer("Бот не найден.")
                 return
@@ -1558,11 +1547,12 @@ async def cb_payment_details_reuse(callback: CallbackQuery, state: FSMContext):
 
 @router.message(PaymentConnectFlow.waiting_for_shop_id, F.text, ~F.text.startswith("/"))
 async def msg_payment_shop_id(message: Message, state: FSMContext):
-    if not _is_owner(message.from_user.id):
-        return
     data = await state.get_data()
     bot_id = data.get("bot_id")
     if bot_id is None:
+        await state.clear()
+        return
+    if not await _bot_or_deny(message.from_user.id, bot_id):
         await state.clear()
         return
     shop_id = message.text.strip()
@@ -1580,19 +1570,18 @@ async def msg_payment_shop_id(message: Message, state: FSMContext):
 
 @router.message(PaymentConnectFlow.waiting_for_shop_id)
 async def msg_payment_shop_id_invalid(message: Message) -> None:
-    if not _is_owner(message.from_user.id):
-        return
     await message.answer("Пришли shopId текстом (число), либо нажми ❌ Отмена.")
 
 
 @router.message(PaymentConnectFlow.waiting_for_secret_key, F.text, ~F.text.startswith("/"))
 async def msg_payment_secret_key(message: Message, state: FSMContext):
-    if not _is_owner(message.from_user.id):
-        return
     data = await state.get_data()
     bot_id = data.get("bot_id")
     shop_id = data.get("shop_id")
     if bot_id is None or shop_id is None:
+        await state.clear()
+        return
+    if not await _bot_or_deny(message.from_user.id, bot_id):
         await state.clear()
         return
     secret_key = message.text.strip()
@@ -1614,8 +1603,6 @@ async def msg_payment_secret_key(message: Message, state: FSMContext):
 
 @router.message(PaymentConnectFlow.waiting_for_secret_key)
 async def msg_payment_secret_key_invalid(message: Message) -> None:
-    if not _is_owner(message.from_user.id):
-        return
     await message.answer("Пришли secret key текстом, либо нажми ❌ Отмена.")
 
 
@@ -1692,22 +1679,16 @@ async def _offer_multi_bot_connect(present: Message, bot_id: int) -> None:
 
 @router.callback_query(F.data.startswith("paymultiskip:"))
 async def cb_payment_multi_skip(callback: CallbackQuery):
-    if not _is_owner(callback.from_user.id):
-        await _deny_callback(callback)
-        return
     await callback.answer()
     await callback.message.edit_reply_markup(reply_markup=None)
 
 
 @router.callback_query(F.data.startswith("paymulti:"))
 async def cb_payment_multi_connect(callback: CallbackQuery):
-    if not _is_owner(callback.from_user.id):
-        await _deny_callback(callback)
-        return
     await callback.answer()
     _, _source_bot_id_str, target_bot_id_str = callback.data.split(":", 2)
     target_bot_id = int(target_bot_id_str)
-    target_bot = await get_bot(target_bot_id)
+    target_bot = await _bot_or_deny(callback.from_user.id, target_bot_id)
     if not target_bot:
         await callback.message.answer("Бот не найден.")
         return
@@ -1745,11 +1726,11 @@ def _format_status_line(cache: dict | None) -> str:
 async def cb_payment_check_status(callback: CallbackQuery):
     """'Проверить статус' button — re-runs GET /me on demand using the bot's saved
     shop_id/secret_key and reports whether the shop is ready to accept payments."""
-    if not _is_owner(callback.from_user.id):
-        await _deny_callback(callback)
-        return
     await callback.answer()
     bot_id = int(callback.data.split(":")[1])
+    if not await _bot_or_deny(callback.from_user.id, bot_id):
+        await callback.message.answer("Бот не найден.")
+        return
     creds = await get_bot_yookassa_credentials(bot_id)
     if not creds:
         await callback.message.answer(
@@ -1773,9 +1754,6 @@ async def cb_payment_check_status(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("start:"))
 async def cb_start(callback: CallbackQuery):
-    if not _is_owner(callback.from_user.id):
-        await _deny_callback(callback)
-        return
     bot_id = int(callback.data.split(":")[1])
     if bot_id in _busy_bots:
         await callback.answer(_BUSY_TEXT, show_alert=True)
@@ -1783,7 +1761,7 @@ async def cb_start(callback: CallbackQuery):
     _busy_bots.add(bot_id)
     await callback.answer()
     try:
-        b = await get_bot(bot_id)
+        b = await _bot_or_deny(callback.from_user.id, bot_id)
         if not b:
             await callback.message.answer("Бот не найден.")
             return
@@ -1814,12 +1792,9 @@ async def cb_start(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("stop:"))
 async def cb_stop(callback: CallbackQuery):
-    if not _is_owner(callback.from_user.id):
-        await _deny_callback(callback)
-        return
     await callback.answer()
     bot_id = int(callback.data.split(":")[1])
-    b = await get_bot(bot_id)
+    b = await _bot_or_deny(callback.from_user.id, bot_id)
     if not b:
         await callback.message.answer("Бот не найден.")
         return
@@ -1833,9 +1808,6 @@ async def cb_stop(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("restart:"))
 async def cb_restart(callback: CallbackQuery):
-    if not _is_owner(callback.from_user.id):
-        await _deny_callback(callback)
-        return
     bot_id = int(callback.data.split(":")[1])
     if bot_id in _busy_bots:
         await callback.answer(_BUSY_TEXT, show_alert=True)
@@ -1843,7 +1815,7 @@ async def cb_restart(callback: CallbackQuery):
     _busy_bots.add(bot_id)
     await callback.answer()
     try:
-        b = await get_bot(bot_id)
+        b = await _bot_or_deny(callback.from_user.id, bot_id)
         if not b:
             await callback.message.answer("Бот не найден.")
             return
@@ -1873,6 +1845,7 @@ async def cb_restart(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("logs:"))
 async def cb_logs(callback: CallbackQuery):
+    # Logs stay owner-only — see cmd_logs's comment above.
     if not _is_owner(callback.from_user.id):
         await _deny_callback(callback)
         return
@@ -1892,9 +1865,6 @@ async def cb_logs(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("delete:"))
 async def cb_delete(callback: CallbackQuery):
-    if not _is_owner(callback.from_user.id):
-        await _deny_callback(callback)
-        return
     bot_id = int(callback.data.split(":")[1])
     # Was previously the only mutating handler in this file with no
     # _busy_bots check at all — a bot could be deleted mid-generation or
@@ -1905,7 +1875,7 @@ async def cb_delete(callback: CallbackQuery):
         await callback.answer(_BUSY_TEXT, show_alert=True)
         return
     await callback.answer()
-    b = await get_bot(bot_id)
+    b = await _bot_or_deny(callback.from_user.id, bot_id)
     if not b:
         await callback.message.answer("Бот не найден.")
         return
@@ -1927,9 +1897,6 @@ async def cb_delete(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("recreate:"))
 async def cb_recreate(callback: CallbackQuery):
-    if not _is_owner(callback.from_user.id):
-        await _deny_callback(callback)
-        return
     bot_id = int(callback.data.split(":")[1])
     if bot_id in _busy_bots:
         await callback.answer(_BUSY_TEXT, show_alert=True)
@@ -1937,7 +1904,7 @@ async def cb_recreate(callback: CallbackQuery):
     _busy_bots.add(bot_id)
     await callback.answer()
     try:
-        b = await get_bot(bot_id)
+        b = await _bot_or_deny(callback.from_user.id, bot_id)
         if not b:
             await callback.message.edit_text("Бот не найден.")
             return
@@ -2052,9 +2019,6 @@ async def cb_recreate(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("autofix:"))
 async def cb_auto_diagnose(callback: CallbackQuery):
-    if not _is_owner(callback.from_user.id):
-        await _deny_callback(callback)
-        return
     bot_id = int(callback.data.split(":")[1])
     if bot_id in _busy_bots:
         await callback.answer(_BUSY_TEXT, show_alert=True)
@@ -2062,7 +2026,7 @@ async def cb_auto_diagnose(callback: CallbackQuery):
     _busy_bots.add(bot_id)
     await callback.answer()
     try:
-        b = await get_bot(bot_id)
+        b = await _bot_or_deny(callback.from_user.id, bot_id)
         if not b or not b.get("file_path") or not Path(b["file_path"]).exists():
             await callback.message.edit_text("❌ Файл бота не найден — попробуй Перегенерировать.")
             return
@@ -2132,12 +2096,9 @@ async def cb_auto_diagnose(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("fixbug:"))
 async def cb_fix_bug(callback: CallbackQuery, state: FSMContext):
-    if not _is_owner(callback.from_user.id):
-        await _deny_callback(callback)
-        return
     await callback.answer()
     bot_id = int(callback.data.split(":")[1])
-    b = await get_bot(bot_id)
+    b = await _bot_or_deny(callback.from_user.id, bot_id)
     if not b or not b.get("file_path") or not Path(b["file_path"]).exists():
         await callback.message.edit_text("❌ Файл бота не найден — попробуй Перегенерировать.")
         return
@@ -2192,7 +2153,7 @@ async def _apply_fix(message: Message, state: FSMContext, bug_description: str, 
         return
     _busy_bots.add(bot_id)
     try:
-        b = await get_bot(bot_id)
+        b = await _bot_or_deny(message.from_user.id, bot_id)
         if not b:
             await message.answer("Бот не найден.")
             return
@@ -2253,9 +2214,8 @@ async def _apply_fix(message: Message, state: FSMContext, bug_description: str, 
 
 @router.message(FixBotStates.describing_bug, F.voice)
 async def msg_fix_voice(message: Message, state: FSMContext, bot: Bot):
-    if not _is_owner(message.from_user.id):
-        await _deny_message(message)
-        return
+    # Access already checked when this FSM state was entered (cb_fix_bug) and
+    # re-checked inside _apply_fix before anything is written.
     text = await _recognize_voice_fix(message, bot)
     if text:
         await _apply_fix(message, state, text, bot)
@@ -2263,17 +2223,11 @@ async def msg_fix_voice(message: Message, state: FSMContext, bot: Bot):
 
 @router.message(FixBotStates.describing_bug, F.text, ~F.text.startswith("/"))
 async def msg_fix_text(message: Message, state: FSMContext, bot: Bot):
-    if not _is_owner(message.from_user.id):
-        await _deny_message(message)
-        return
     await _apply_fix(message, state, message.text, bot)
 
 
 @router.message(FixBotStates.describing_bug)
 async def msg_fix_unsupported(message: Message):
-    if not _is_owner(message.from_user.id):
-        await _deny_message(message)
-        return
     await message.answer(
         "Не понял — отправь текст или голосовое с описанием бага.",
         reply_markup=cancel_keyboard(),

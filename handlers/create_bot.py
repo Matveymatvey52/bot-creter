@@ -555,10 +555,24 @@ async def _generate_and_show_button(message: Message, state: FSMContext) -> None
     )
 
 
+def _first_user_message(conversation: list[dict]) -> str | None:
+    """The original free-text request that kicked off this /create flow —
+    the FIRST role="user" entry in the gathering conversation (see
+    _process_gathering_text), before any Claude clarification turned it into
+    bot_summary/description. None if the conversation is empty/malformed
+    (shouldn't happen post-gathering, but defensive)."""
+    for turn in conversation:
+        if isinstance(turn, dict) and turn.get("role") == "user":
+            content = turn.get("content")
+            return content if isinstance(content, str) else None
+    return None
+
+
 async def _run_generation(chat_id: int, user_id: int, bot: Bot, state: FSMContext) -> None:
     data = await state.get_data()
     summary: str = data.get("bot_summary", "")
     bot_name: str = data.get("bot_name", "my_bot")
+    creation_prompt = _first_user_message(data.get("conversation", []))
 
     if not summary:
         await bot.send_message(
@@ -622,6 +636,7 @@ async def _run_generation(chat_id: int, user_id: int, bot: Bot, state: FSMContex
         "code": code,
         "name": bot_name,
         "summary": summary,
+        "creation_prompt": creation_prompt,
         "display_name": data.get("display_name", ""),
         "miniapp_config": miniapp_config,
         "office_hook_config": office_hook_config,
@@ -734,6 +749,7 @@ async def auto_launch_managed_bot(managed_data: dict, bot: Bot, storage=None) ->
     bot_name: str = pending["name"]
     bot_code: str = pending["code"]
     bot_summary: str = pending["summary"]
+    creation_prompt: str | None = pending.get("creation_prompt")
     display_name: str = pending.get("display_name", "")
     miniapp_config: dict | None = pending.get("miniapp_config")
     office_hook_config: dict | None = pending.get("office_hook_config")
@@ -762,6 +778,7 @@ async def auto_launch_managed_bot(managed_data: dict, bot: Bot, storage=None) ->
         admin_ids=admin_ids,
         username=real_username,
         owner_telegram_id=creator_user_id,
+        creation_prompt=creation_prompt,
     )
 
     if miniapp_config:
@@ -820,6 +837,7 @@ async def handle_token(message: Message, state: FSMContext, bot: Bot):
     bot_code: str = data["bot_code"]
     bot_name: str = data["bot_name"]
     bot_summary: str = data.get("bot_summary", "")
+    creation_prompt = _first_user_message(data.get("conversation", []))
     display_name: str = data.get("display_name", "")
     miniapp_config: dict | None = data.get("miniapp_config")
     office_hook_config: dict | None = data.get("office_hook_config")
@@ -854,6 +872,7 @@ async def handle_token(message: Message, state: FSMContext, bot: Bot):
         admin_ids=admin_ids,
         username=real_username,
         owner_telegram_id=message.from_user.id,
+        creation_prompt=creation_prompt,
     )
 
     if miniapp_config:

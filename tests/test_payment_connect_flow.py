@@ -19,6 +19,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.base import StorageKey
 from aiogram.fsm.storage.memory import MemoryStorage
 
+import handlers.admin_manager as admin_manager
 import handlers.manage_bots as manage_bots
 from db.database import create_bot_record_with_admins, delete_bot, get_bot_payment_provider
 
@@ -62,8 +63,14 @@ class PaymentConnectStartTests(unittest.IsolatedAsyncioTestCase):
         )
         self._owner_patcher = patch.object(manage_bots, "_is_owner", lambda uid: uid == self.owner_id)
         self._owner_patcher.start()
+        # payment-connect handlers now go through _can_manage_bot (Stage 1
+        # per-bot ownership), which closes over admin_manager's OWN
+        # _is_owner — patch both consistently.
+        self._admin_owner_patcher = patch.object(admin_manager, "_is_owner", lambda uid: uid == self.owner_id)
+        self._admin_owner_patcher.start()
 
     async def asyncTearDown(self):
+        self._admin_owner_patcher.stop()
         self._owner_patcher.stop()
         await delete_bot(self.bot_id)
 
@@ -100,8 +107,14 @@ class PaymentConnectStepNavigationTests(unittest.IsolatedAsyncioTestCase):
         )
         self._owner_patcher = patch.object(manage_bots, "_is_owner", lambda uid: uid == self.owner_id)
         self._owner_patcher.start()
+        # payment-connect handlers now go through _can_manage_bot (Stage 1
+        # per-bot ownership), which closes over admin_manager's OWN
+        # _is_owner — patch both consistently.
+        self._admin_owner_patcher = patch.object(admin_manager, "_is_owner", lambda uid: uid == self.owner_id)
+        self._admin_owner_patcher.start()
 
     async def asyncTearDown(self):
+        self._admin_owner_patcher.stop()
         self._owner_patcher.stop()
         await delete_bot(self.bot_id)
 
@@ -172,8 +185,14 @@ class PaymentConnectTokenTests(unittest.IsolatedAsyncioTestCase):
         )
         self._owner_patcher = patch.object(manage_bots, "_is_owner", lambda uid: uid == self.owner_id)
         self._owner_patcher.start()
+        # payment-connect handlers now go through _can_manage_bot (Stage 1
+        # per-bot ownership), which closes over admin_manager's OWN
+        # _is_owner — patch both consistently.
+        self._admin_owner_patcher = patch.object(admin_manager, "_is_owner", lambda uid: uid == self.owner_id)
+        self._admin_owner_patcher.start()
 
     async def asyncTearDown(self):
+        self._admin_owner_patcher.stop()
         self._owner_patcher.stop()
         await delete_bot(self.bot_id)
 
@@ -254,11 +273,17 @@ class PaymentStepScreenshotTests(unittest.IsolatedAsyncioTestCase):
         )
         self._owner_patcher = patch.object(manage_bots, "_is_owner", lambda uid: uid == self.owner_id)
         self._owner_patcher.start()
+        # payment-connect handlers now go through _can_manage_bot (Stage 1
+        # per-bot ownership), which closes over admin_manager's OWN
+        # _is_owner — patch both consistently.
+        self._admin_owner_patcher = patch.object(admin_manager, "_is_owner", lambda uid: uid == self.owner_id)
+        self._admin_owner_patcher.start()
         self._tmpdir = tempfile.TemporaryDirectory()
         self._placeholder_path = Path(self._tmpdir.name) / "step2_placeholder.png"
         self._placeholder_path.write_bytes(b"\x89PNG\r\n\x1a\n")  # minimal PNG magic bytes, not a real image
 
     async def asyncTearDown(self):
+        self._admin_owner_patcher.stop()
         self._owner_patcher.stop()
         self._tmpdir.cleanup()
         await delete_bot(self.bot_id)

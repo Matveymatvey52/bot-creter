@@ -20,6 +20,7 @@ from aiogram.fsm.storage.base import StorageKey
 from aiogram.fsm.storage.memory import MemoryStorage
 
 import db.database as db_module
+import handlers.admin_manager as admin_manager
 import handlers.manage_bots as manage_bots
 from db.database import (
     create_bot_record_with_admins,
@@ -91,8 +92,14 @@ class YooKassaAutoFetchTests(unittest.IsolatedAsyncioTestCase):
         await set_bot_payment_provider(self.bot_id, VALID_PROVIDER_TOKEN)
         self._owner_patcher = patch.object(manage_bots, "_is_owner", lambda uid: uid == self.owner_id)
         self._owner_patcher.start()
+        # yookassa-onboarding handlers now go through _can_manage_bot
+        # (Stage 1 per-bot ownership), which closes over admin_manager's OWN
+        # _is_owner — patch both consistently.
+        self._admin_owner_patcher = patch.object(admin_manager, "_is_owner", lambda uid: uid == self.owner_id)
+        self._admin_owner_patcher.start()
 
     async def asyncTearDown(self):
+        self._admin_owner_patcher.stop()
         self._owner_patcher.stop()
         await delete_bot(self.bot_id)
         self._db_path_patcher.stop()
@@ -195,8 +202,14 @@ class YooKassaOwnerReuseTests(unittest.IsolatedAsyncioTestCase):
         await set_owner_payment_credentials(self.owner_id, "999", "live_ownersecret")
         self._owner_patcher = patch.object(manage_bots, "_is_owner", lambda uid: uid == self.owner_id)
         self._owner_patcher.start()
+        # yookassa-onboarding handlers now go through _can_manage_bot
+        # (Stage 1 per-bot ownership), which closes over admin_manager's OWN
+        # _is_owner — patch both consistently.
+        self._admin_owner_patcher = patch.object(admin_manager, "_is_owner", lambda uid: uid == self.owner_id)
+        self._admin_owner_patcher.start()
 
     async def asyncTearDown(self):
+        self._admin_owner_patcher.stop()
         self._owner_patcher.stop()
         await delete_bot(self.bot_a)
         await delete_bot(self.bot_b)
@@ -262,8 +275,14 @@ class YooKassaStatusCheckTests(unittest.IsolatedAsyncioTestCase):
         await set_bot_payment_provider(self.bot_id, VALID_PROVIDER_TOKEN)
         self._owner_patcher = patch.object(manage_bots, "_is_owner", lambda uid: uid == self.owner_id)
         self._owner_patcher.start()
+        # yookassa-onboarding handlers now go through _can_manage_bot
+        # (Stage 1 per-bot ownership), which closes over admin_manager's OWN
+        # _is_owner — patch both consistently.
+        self._admin_owner_patcher = patch.object(admin_manager, "_is_owner", lambda uid: uid == self.owner_id)
+        self._admin_owner_patcher.start()
 
     async def asyncTearDown(self):
+        self._admin_owner_patcher.stop()
         self._owner_patcher.stop()
         await delete_bot(self.bot_id)
         self._db_path_patcher.stop()

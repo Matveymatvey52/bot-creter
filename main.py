@@ -10,7 +10,7 @@ from aiogram.types import ChatMemberUpdated, InlineKeyboardButton, InlineKeyboar
 
 from config import BOT_TOKEN
 from db.database import get_all_bots, init_db, set_bot_group, set_office_digest_group, update_bot_status
-from handlers.admin_manager import OWNER_ID, _is_owner, router as admin_router
+from handlers.admin_manager import OWNER_ID, _can_manage_bot, _is_owner, router as admin_router
 from handlers.create_bot import auto_launch_managed_bot, router as create_router, set_bot_id, set_manager_username
 from handlers.custom_features import router as custom_features_router
 from handlers.feature_connect import router as feature_connect_router
@@ -67,7 +67,11 @@ def build_group_router() -> Router:
         user_id = update.from_user.id
         group_id = str(chat.id)
         group_name = chat.title or str(chat.id)
-        bots = await get_all_bots()
+        all_bots = await get_all_bots()
+        # Per-bot ownership (Stage 1 multitenancy): the owner is offered every
+        # bot, a customer only the bot(s) they created — never someone else's
+        # bot, even just to LIST it in this picker.
+        bots = all_bots if _is_owner(user_id) else [b for b in all_bots if _can_manage_bot(user_id, b)]
         if not bots:
             await bot.send_message(
                 user_id,
@@ -102,24 +106,42 @@ def build_group_router() -> Router:
 
     @group_router.callback_query(lambda c: c.data and c.data.startswith("setgroup:"))
     async def cb_set_group(callback):
-        if not _is_owner(callback.from_user.id):
-            await callback.answer("⛔ Доступно только владельцу.", show_alert=True)
-            return
-        await callback.answer()
+        user_id = callback.from_user.id
         parts = callback.data.split(":")
         bot_target = parts[1]
         group_id = ":".join(parts[2:])
         if bot_target == "officedigest":
-            await set_office_digest_group(group_id)
+            # System-wide showcase feature — stays owner-only (see design
+            # brief: not opened up to customers in Stage 1).
+            if not _is_owner(user_id):
+                await callback.answer("⛔ Доступно только владельцу.", show_alert=True)
+                return
+            await callback.answer()
+            # user_id here, not the module-level OWNER_ID constant: _is_owner
+            # already confirmed user_id is the system owner, and using the
+            # live value avoids any staleness from OWNER_ID being bound at
+            # import time (relevant for tests that monkeypatch
+            # admin_manager.OWNER_ID after main's own import already ran).
+            await set_office_digest_group(user_id, group_id)
             await callback.message.edit_text(
                 "🏢 Эта группа теперь витрина связей офисов — сюда будет приходить сводка по office_event."
             )
             return
         bots = await get_all_bots()
         if bot_target == "all":
-            targets = bots
+            # "all" resolves to "every bot this user can manage" — the owner
+            # gets literally all bots, a customer only their own.
+            targets = bots if _is_owner(user_id) else [b for b in bots if _can_manage_bot(user_id, b)]
         else:
             targets = [b for b in bots if str(b["id"]) == bot_target]
+            if targets and not _can_manage_bot(user_id, targets[0]):
+                await callback.answer("⛔ Этот бот тебе не принадлежит.", show_alert=True)
+                return
+        if not targets:
+            await callback.answer()
+            await callback.message.edit_text("Нет доступных ботов для настройки этой группы.")
+            return
+        await callback.answer()
         from services.bot_runner import start_bot, stop_bot, is_running
         for b in targets:
             await set_bot_group(b["id"], group_id)

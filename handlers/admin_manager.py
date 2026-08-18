@@ -41,6 +41,18 @@ def _is_owner(user_id: int) -> bool:
     return OWNER_ID != 0 and user_id == OWNER_ID
 
 
+def _can_manage_bot(user_id: int, bot_row: dict) -> bool:
+    """Per-bot authorization gate for the Telegram bot's own UI (Stage 1 of
+    the multitenancy rollout). The system owner can manage every bot; a
+    customer can manage only the bot(s) they created
+    (bots.owner_telegram_id == user_id, set at creation time in
+    handlers/create_bot.py). Mirrors the same "owner-equivalent" semantics
+    runtime/factory_analytics_api.py's _authenticate_bot_access() already
+    applies to the miniapp REST API — this is the Telegram-bot-side
+    counterpart of that check."""
+    return _is_owner(user_id) or bot_row.get("owner_telegram_id") == user_id
+
+
 def _bots_keyboard(bots: list[dict], action: str) -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton(
         text=f"🤖 {b['name']}",

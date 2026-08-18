@@ -186,13 +186,20 @@ async def _mirror_to_digest_group(registry, source_bot_id: int, event_type: str)
     from runtime.registry import FACTORY_BOT_ID
 
     try:
-        chat_id = await get_office_digest_group()
+        source_bot = await get_bot(source_bot_id)
+        # Per-owner showcase group (Stage 1 multitenancy) — mirror only to
+        # the group bound by THIS bot's own owner, never another owner's
+        # group. A source bot with no owner_telegram_id on file (shouldn't
+        # happen post-backfill, but defensive) has nothing to mirror to.
+        owner_telegram_id = source_bot.get("owner_telegram_id") if source_bot else None
+        if owner_telegram_id is None:
+            return
+        chat_id = await get_office_digest_group(owner_telegram_id)
         if not chat_id:
             return
         factory_entry = registry.get(FACTORY_BOT_ID)
         if factory_entry is None:
             return
-        source_bot = await get_bot(source_bot_id)
         # source_bot["name"] is owner/LLM-controlled free text (see
         # handlers/create_bot.py's naming flow) — escaped before
         # interpolation, same convention every other user/LLM-text-derived

@@ -685,7 +685,9 @@ async def add_office_handler(request: web.Request) -> web.Response:
     source_template = infer_template_id(source.get("file_path"))
     if event_type not in available_event_types_for_template(source_template):
         return web.json_response({"error": "event_type not available for this bot's template"}, status=400)
-    await add_office_link(bot_id, target_bot_id, event_type)
+    linked = await add_office_link(bot_id, target_bot_id, event_type)
+    if not linked:
+        return web.json_response({"error": "cannot link bots owned by different customers"}, status=403)
     return web.json_response({"ok": True}, status=201)
 
 
@@ -724,7 +726,7 @@ async def showcase_group_status_handler(request: web.Request) -> web.Response:
     build_group_router()), both converging on this one table."""
     if not await _authenticate_owner(request):
         return web.json_response({"error": "forbidden"}, status=403)
-    chat_id = await get_office_digest_group()
+    chat_id = await get_office_digest_group(OWNER_ID)
     return web.json_response({"connected": chat_id is not None})
 
 

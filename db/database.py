@@ -161,7 +161,18 @@ async def init_db():
                 PRIMARY KEY (bot_id, telegram_id)
             )
         """)
-        for col in ("display_name TEXT", "group_chat_id TEXT", "archived_at TIMESTAMP", "owner_telegram_id INTEGER"):
+        for col in (
+            "display_name TEXT",
+            "group_chat_id TEXT",
+            "archived_at TIMESTAMP",
+            "owner_telegram_id INTEGER",
+            # creation_prompt — the original free-text request the bot was
+            # created from (see handlers/create_bot.py), stored for future
+            # reference/reporting stages of the multitenancy rollout. NULL
+            # for bots created before this column existed, or wherever the
+            # call site had no prompt text on hand.
+            "creation_prompt TEXT",
+        ):
             try:
                 await db.execute(f"ALTER TABLE bots ADD COLUMN {col}")
             except aiosqlite.OperationalError:
@@ -283,24 +294,59 @@ async def init_db():
                 PRIMARY KEY (source_bot_id, target_bot_id, event_type)
             )
         """)
-        # office_digest_group — the Telegram group the OWNER has opted to bind
-        # as a read-only showcase/mirror of office_events activity (see
-        # docs/OFFICES_DESIGN.md §12 "витрина"). Deliberately a single row
-        # (id fixed at 1, upserted), not one row per bot: the digest is
-        # emitted by the Creator/factory bot itself, not by any tenant bot,
-        # and there is only ever one such group for the whole factory
-        # instance — unlike bots.group_chat_id, which is a PER-BOT fallback
-        # destination for that bot's own moderator-style notifications and is
-        # semantically unrelated to this. Read via get_office_digest_group()/
-        # set via set_office_digest_group() below — the miniapp's
-        # showcase_group_status_handler (runtime/factory_analytics_api.py)
-        # and the Telegram-side "🔔 Использовать как витрину" button (main.py)
-        # both bind through this same pair, one canonical table.
+        # office_digest_group — the Telegram group a factory OWNER (system
+        # owner OR a customer who owns their own bots) has opted to bind as a
+        # read-only showcase/mirror of office_events activity (see
+        # docs/OFFICES_DESIGN.md §12 "витрина"). Was a single fixed row
+        # (id=1) when the whole factory had exactly one possible "owner";
+        # Stage 1 of the multitenancy rollout makes this per-owner
+        # (owner_telegram_id PRIMARY KEY) so each customer can bind their own
+        # showcase group without clobbering anyone else's — unlike
+        # bots.group_chat_id, which is a PER-BOT fallback destination for
+        # that bot's own moderator-style notifications and is semantically
+        # unrelated to this. Read via get_office_digest_group(owner_telegram_id)/
+        # set via set_office_digest_group(owner_telegram_id, chat_id) below —
+        # the miniapp's showcase_group_status_handler
+        # (runtime/factory_analytics_api.py) and the Telegram-side
+        # "🔔 Использовать как витрину" button (main.py) both bind through
+        # this same pair, one canonical table.
+        async with db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='office_digest_group'"
+        ) as cursor:
+            _odg_exists = await cursor.fetchone()
+        if _odg_exists:
+            async with db.execute("PRAGMA table_info(office_digest_group)") as cursor:
+                _odg_cols = {row[1] for row in await cursor.fetchall()}
+            if "owner_telegram_id" not in _odg_cols:
+                # Old single-row (id=1) schema — migrate in place: rename,
+                # recreate with the new PK, backfill the old row to OWNER_ID
+                # (the only person who could have bound it under the old
+                # schema), drop the renamed original. SQLite can't ALTER a
+                # PRIMARY KEY directly, hence the rename/recreate/copy dance
+                # (same pattern already used for bots.owner_telegram_id's
+                # backfill above, just at the table level instead of a
+                # column).
+                await db.execute("ALTER TABLE office_digest_group RENAME TO office_digest_group_old")
+                await db.execute("""
+                    CREATE TABLE office_digest_group (
+                        owner_telegram_id INTEGER PRIMARY KEY,
+                        chat_id           TEXT NOT NULL,
+                        bound_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                owner_id_raw = os.getenv("OWNER_ID", "")
+                if owner_id_raw.isdigit():
+                    await db.execute(
+                        "INSERT INTO office_digest_group (owner_telegram_id, chat_id, bound_at) "
+                        "SELECT ?, chat_id, bound_at FROM office_digest_group_old LIMIT 1",
+                        (int(owner_id_raw),),
+                    )
+                await db.execute("DROP TABLE office_digest_group_old")
         await db.execute("""
             CREATE TABLE IF NOT EXISTS office_digest_group (
-                id         INTEGER PRIMARY KEY CHECK (id = 1),
-                chat_id    TEXT NOT NULL,
-                bound_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                owner_telegram_id INTEGER PRIMARY KEY,
+                chat_id           TEXT NOT NULL,
+                bound_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
         # mini-app config (see docs/MINIAPP_DESIGN.md §6) — one row per bot,
@@ -486,16 +532,21 @@ async def create_bot_record_with_admins(
     admin_ids: list[str],
     username: str | None = None,
     owner_telegram_id: int | None = None,
+    creation_prompt: str | None = None,
 ) -> int:
     """Insert the bot record and its initial admins as one atomic transaction —
     a crash between the two would otherwise leave a bot with no admin at all.
     owner_telegram_id is the customer/creator this bot belongs to for the
     factory dashboard's per-owner filtering (runtime/factory_analytics_api.py) —
-    None only for legacy call sites that haven't been updated yet."""
+    None only for legacy call sites that haven't been updated yet.
+    creation_prompt is the original free-text request the bot was generated
+    from (handlers/create_bot.py) — None when no such text was available at
+    the call site (e.g. flows that don't collect one)."""
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
-            "INSERT INTO bots (name, username, description, token, file_path, status, owner_telegram_id) VALUES (?, ?, ?, ?, ?, 'stopped', ?)",
-            (name, username, description, _encrypt_token(token), file_path, owner_telegram_id),
+            "INSERT INTO bots (name, username, description, token, file_path, status, owner_telegram_id, creation_prompt) "
+            "VALUES (?, ?, ?, ?, ?, 'stopped', ?, ?)",
+            (name, username, description, _encrypt_token(token), file_path, owner_telegram_id, creation_prompt),
         )
         bot_id = cursor.lastrowid
         for telegram_id in admin_ids:
@@ -936,12 +987,44 @@ async def get_bot_features(bot_id: int) -> list[str]:
             return [row[0] for row in rows]
 
 
-async def add_office_link(source_bot_id: int, target_bot_id: int, event_type: str) -> None:
+async def add_office_link(source_bot_id: int, target_bot_id: int, event_type: str) -> bool:
     """Subscribes target_bot_id to event_type published by source_bot_id — see
     docs/OFFICES_DESIGN.md §3. INSERT OR IGNORE: re-subscribing to an already
     existing (source, target, event_type) triple is a no-op, not an error —
-    same idempotency the PRIMARY KEY already gives bot_features."""
+    same idempotency the PRIMARY KEY already gives bot_features.
+
+    Stage 1 multitenancy guard: a link is only created when the two bots are
+    "owner-equivalent" — same owner_telegram_id, or either one is owned by
+    the system OWNER_ID (same semantics as handlers/admin_manager.py's
+    _is_owner/_can_manage_bot: the system owner can always bridge bots,
+    customers can only link their own bots to each other). Returns False
+    (no-op, nothing written) when the two bots belong to different customers
+    and neither is the system owner; True otherwise (link created or already
+    existed). Callers (handlers/manage_bots.py's cb_office_do_link,
+    runtime/factory_analytics_api.py's add_office_handler) must check this
+    return value and report the rejection rather than silently claiming
+    success."""
+    owner_id_raw = os.getenv("OWNER_ID", "")
+    system_owner_id = int(owner_id_raw) if owner_id_raw.isdigit() else None
     async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT id, owner_telegram_id FROM bots WHERE id IN (?, ?)",
+            (source_bot_id, target_bot_id),
+        ) as cursor:
+            owners = {row["id"]: row["owner_telegram_id"] for row in await cursor.fetchall()}
+        source_owner = owners.get(source_bot_id)
+        target_owner = owners.get(target_bot_id)
+        # source_owner == target_owner covers both "same customer" and the
+        # legacy/test case where neither bot has owner_telegram_id set yet
+        # (both None) — in production every bot gets one at creation time or
+        # via init_db()'s backfill, so None-vs-None in practice only shows up
+        # for bots created directly in tests without passing one.
+        is_owner_equivalent = source_owner == target_owner or (
+            system_owner_id is not None and system_owner_id in (source_owner, target_owner)
+        )
+        if not is_owner_equivalent:
+            return False
         await db.execute(
             """
             INSERT OR IGNORE INTO bot_office_links (source_bot_id, target_bot_id, event_type)
@@ -950,6 +1033,7 @@ async def add_office_link(source_bot_id: int, target_bot_id: int, event_type: st
             (source_bot_id, target_bot_id, event_type),
         )
         await db.commit()
+    return True
 
 
 async def remove_office_link(source_bot_id: int, target_bot_id: int, event_type: str) -> None:
@@ -983,26 +1067,30 @@ async def get_office_links_for_bot(bot_id: int) -> list[dict]:
             return [dict(row) for row in rows]
 
 
-async def set_office_digest_group(chat_id: str) -> None:
-    """Upserts the single office-digest showcase group — see
+async def set_office_digest_group(owner_telegram_id: int, chat_id: str) -> None:
+    """Upserts this owner's office-digest showcase group — see
     office_digest_group's CREATE TABLE comment above for why this is
-    deliberately one row, not per-bot."""
+    per-owner (Stage 1 multitenancy) rather than one row for the whole
+    factory."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             """
-            INSERT INTO office_digest_group (id, chat_id) VALUES (1, ?)
-            ON CONFLICT(id) DO UPDATE SET chat_id = excluded.chat_id, bound_at = CURRENT_TIMESTAMP
+            INSERT INTO office_digest_group (owner_telegram_id, chat_id) VALUES (?, ?)
+            ON CONFLICT(owner_telegram_id) DO UPDATE SET chat_id = excluded.chat_id, bound_at = CURRENT_TIMESTAMP
             """,
-            (chat_id,),
+            (owner_telegram_id, chat_id),
         )
         await db.commit()
 
 
-async def get_office_digest_group() -> str | None:
-    """The bound showcase group's chat_id, or None if the owner never bound
-    one — see features/office_events.py's publish_event(), the only reader."""
+async def get_office_digest_group(owner_telegram_id: int) -> str | None:
+    """This owner's bound showcase group's chat_id, or None if they never
+    bound one — see features/office_events.py's publish_event(), the only
+    reader."""
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT chat_id FROM office_digest_group WHERE id = 1") as cursor:
+        async with db.execute(
+            "SELECT chat_id FROM office_digest_group WHERE owner_telegram_id = ?", (owner_telegram_id,)
+        ) as cursor:
             row = await cursor.fetchone()
             return row[0] if row else None
 

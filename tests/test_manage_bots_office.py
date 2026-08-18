@@ -11,6 +11,7 @@ from __future__ import annotations
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import handlers.admin_manager as admin_manager
 import handlers.manage_bots as manage_bots
 from db.database import (
     add_office_link,
@@ -38,16 +39,25 @@ class _OfficeUiTestBase(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self._owner_patcher = patch.object(manage_bots, "_is_owner", lambda uid: uid == self.owner_id)
         self._owner_patcher.start()
+        # Most office handlers now go through _can_manage_bot (Stage 1
+        # per-bot ownership), which closes over admin_manager's OWN
+        # _is_owner — patch both consistently, same as
+        # tests/test_manage_bots_features.py.
+        self._admin_owner_patcher = patch.object(admin_manager, "_is_owner", lambda uid: uid == self.owner_id)
+        self._admin_owner_patcher.start()
         self.bot_a = await create_bot_record_with_admins(
             name="office_ui_bot_a", description="test", token=FAKE_TOKEN,
             file_path="templates/tour_operator.py", admin_ids=[str(self.owner_id)],
+            owner_telegram_id=self.owner_id,
         )
         self.bot_b = await create_bot_record_with_admins(
             name="office_ui_bot_b", description="test", token=FAKE_TOKEN,
             file_path="templates/event_rsvp.py", admin_ids=[str(self.owner_id)],
+            owner_telegram_id=self.owner_id,
         )
 
     async def asyncTearDown(self):
+        self._admin_owner_patcher.stop()
         self._owner_patcher.stop()
         await delete_bot(self.bot_a)
         await delete_bot(self.bot_b)

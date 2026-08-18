@@ -444,7 +444,7 @@ class FactoryAnalyticsApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(body["connected"])
 
     async def test_showcase_group_status_connected_after_set(self):
-        await db_module.set_office_digest_group("-100987654321")
+        await db_module.set_office_digest_group(OWNER_TELEGRAM_ID, "-100987654321")
         try:
             qs = await self._owner_qs()
             with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
@@ -458,7 +458,9 @@ class FactoryAnalyticsApiTests(unittest.IsolatedAsyncioTestCase):
             # cleanup goes through the raw connection directly rather than
             # inventing a delete function this feature has no real use for.
             async with aiosqlite.connect(db_module.DB_PATH) as db:
-                await db.execute("DELETE FROM office_digest_group WHERE id = 1")
+                await db.execute(
+                    "DELETE FROM office_digest_group WHERE owner_telegram_id = ?", (OWNER_TELEGRAM_ID,)
+                )
                 await db.commit()
 
     async def test_showcase_group_status_non_owner_returns_403(self):

@@ -18,6 +18,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import features
 import templates
 
+import handlers.admin_manager as admin_manager
 import handlers.manage_bots as manage_bots
 import runtime.registry as reg
 from db.database import create_bot_record_with_admins, delete_bot, get_bot_features
@@ -75,8 +76,15 @@ class _FeatureToggleTestBase(unittest.IsolatedAsyncioTestCase):
 
         self._owner_patcher = patch.object(manage_bots, "_is_owner", lambda uid: uid == self.owner_id)
         self._owner_patcher.start()
+        # cb_toggle_feature now goes through _can_manage_bot (Stage 1
+        # per-bot ownership), which closes over admin_manager's OWN
+        # _is_owner — patching manage_bots._is_owner alone no longer covers
+        # it, so both must be patched consistently.
+        self._admin_owner_patcher = patch.object(admin_manager, "_is_owner", lambda uid: uid == self.owner_id)
+        self._admin_owner_patcher.start()
 
     async def asyncTearDown(self):
+        self._admin_owner_patcher.stop()
         self._owner_patcher.stop()
         self._features_dir_patcher.stop()
         await delete_bot(self.bot_id)

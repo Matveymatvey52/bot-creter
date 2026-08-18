@@ -159,7 +159,7 @@ async def test_publish_event_skips_digest_mirror_when_no_group_bound(monkeypatch
 async def test_publish_event_mirrors_to_bound_digest_group(monkeypatch):
     monkeypatch.setattr(office_events, "get_office_subscribers", AsyncMock(return_value=[]))
     monkeypatch.setattr(database, "get_office_digest_group", AsyncMock(return_value="-100999"))
-    monkeypatch.setattr(office_events, "get_bot", AsyncMock(return_value={"id": 1, "name": "SourceBot"}))
+    monkeypatch.setattr(office_events, "get_bot", AsyncMock(return_value={"id": 1, "name": "SourceBot", "owner_telegram_id": 42}))
     factory_entry = SimpleNamespace(bot=AsyncMock())
     office_events.set_registry(FakeRegistry({0: factory_entry}))
 
@@ -181,7 +181,7 @@ async def test_publish_event_digest_mirror_escapes_bot_name_html_metacharacters(
     monkeypatch.setattr(office_events, "get_office_subscribers", AsyncMock(return_value=[]))
     monkeypatch.setattr(database, "get_office_digest_group", AsyncMock(return_value="-100999"))
     monkeypatch.setattr(
-        office_events, "get_bot", AsyncMock(return_value={"id": 1, "name": "<b>Рома</b> & Co"})
+        office_events, "get_bot", AsyncMock(return_value={"id": 1, "name": "<b>Рома</b> & Co", "owner_telegram_id": 42})
     )
     factory_entry = SimpleNamespace(bot=AsyncMock())
     office_events.set_registry(FakeRegistry({0: factory_entry}))

@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+import handlers.admin_manager as admin_manager
 import handlers.manage_bots as manage_bots
 from db.database import create_bot_record_with_admins, get_bot_features, get_group_task_config, init_db, set_group_task_config
 
@@ -40,6 +41,10 @@ async def _make_bot_row(username: str = "group_task_ui_bot") -> int:
 @pytest.fixture(autouse=True)
 def _owner(monkeypatch):
     monkeypatch.setattr(manage_bots, "_is_owner", lambda uid: uid == OWNER_ID)
+    # cb_group_task_panel/cb_group_task_disconnect now go through
+    # _can_manage_bot (Stage 1 per-bot ownership), which closes over
+    # admin_manager's OWN _is_owner — patch both consistently.
+    monkeypatch.setattr(admin_manager, "_is_owner", lambda uid: uid == OWNER_ID)
 
 
 @pytest.mark.asyncio
