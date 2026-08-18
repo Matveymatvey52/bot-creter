@@ -21,8 +21,52 @@ export class ApiError extends Error {
   }
 }
 
+// The magic-link token minted by mint_magic_link_token() (runtime/
+// miniapp_api.py) is deliberately short-lived (MAGIC_LINK_TTL_SECONDS = 15
+// min) — a "click the link now" flow, not a durable session. That module's
+// own docstring says the SPA is expected to exchange it for a longer-lived
+// session on first load; until this, that exchange never happened, so the
+// dashboard's OWN bot list (fetched once on mount) kept showing already-
+// loaded data while every later click — bot detail, candidates, clusters —
+// started failing with 403 the moment the 15-minute window closed. We now
+// persist the token in sessionStorage (survives the SPA's own client-side
+// navigation, gone when the tab closes — same "don't outlive this visit"
+// posture as the original link) and proactively refresh it well inside the
+// TTL via /api/factory/session, so a session that's still open keeps working.
+const TOKEN_STORAGE_KEY = 'factory_dashboard_token'
+const REFRESH_INTERVAL_MS = 5 * 60 * 1000 // 5 min — comfortably under the 15 min TTL
+
 function getMagicLinkToken(): string | null {
-  return new URLSearchParams(window.location.search).get('token')
+  const fromUrl = new URLSearchParams(window.location.search).get('token')
+  if (fromUrl) {
+    sessionStorage.setItem(TOKEN_STORAGE_KEY, fromUrl)
+    return fromUrl
+  }
+  return sessionStorage.getItem(TOKEN_STORAGE_KEY)
+}
+
+function setStoredToken(token: string): void {
+  sessionStorage.setItem(TOKEN_STORAGE_KEY, token)
+}
+
+let refreshTimer: ReturnType<typeof setInterval> | null = null
+
+function ensureRefreshLoop(): void {
+  if (refreshTimer !== null || getInitData()) {
+    // No refresh needed inside Telegram: initData carries no expiry here
+    // (see miniapp_api.py's _verify_telegram_init_data) and is re-issued
+    // fresh each time Telegram opens the WebApp.
+    return
+  }
+  refreshTimer = setInterval(() => {
+    if (!getMagicLinkToken()) return
+    request<{ token: string }>('/session')
+      .then((data) => setStoredToken(data.token))
+      .catch(() => {
+        // A failed refresh means the token already lapsed or auth is gone —
+        // nothing to do here, the next real request will surface the error.
+      })
+  }, REFRESH_INTERVAL_MS)
 }
 
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
@@ -40,6 +84,7 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
       url = `${url}${separator}token=${encodeURIComponent(token)}`
     }
   }
+  ensureRefreshLoop()
 
   const response = await fetch(url, { ...options, headers })
   if (!response.ok) {

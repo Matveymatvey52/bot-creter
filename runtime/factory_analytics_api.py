@@ -61,7 +61,7 @@ from handlers.manage_bots import (
     enable_feature_and_reload,
     recreate_bot_core,
 )
-from runtime.miniapp_api import _authenticate
+from runtime.miniapp_api import _authenticate, mint_magic_link_token
 from runtime.registry import FACTORY_BOT_ID, Registry, discover_features, infer_template_id
 from runtime.webhook_app import REGISTRY_KEY
 from services.bot_runner import _make_extra_env, get_bot_logs, is_running, start_bot, stop_bot
@@ -92,6 +92,26 @@ async def _authenticate_owner(request: web.Request) -> bool:
         return False
     telegram_user_id = await _authenticate(request, FACTORY_BOT_ID, factory_entry.bot.token)
     return telegram_user_id == OWNER_ID
+
+
+async def refresh_session_handler(request: web.Request) -> web.Response:
+    """GET /api/factory/session — mints a fresh, full-TTL magic-link token for
+    the owner, scoped to FACTORY_BOT_ID. mint_magic_link_token()'s docstring
+    on MAGIC_LINK_TTL_SECONDS (15 min) always meant a dashboard session was
+    expected to renew itself rather than keep replaying the one token from
+    the original /start link — that renewal was never wired up, so an owner
+    who kept the dashboard open past 15 minutes (or came back to it later
+    without re-opening from Telegram) got "forbidden" on every subsequent
+    click even though the very first load had worked. The SPA (factoryApi.ts)
+    now calls this on a timer well inside the TTL and swaps in the returned
+    token, so a still-valid session keeps itself alive instead of expiring
+    mid-use. Requires an already-valid credential (current token or Telegram
+    initData) — this refreshes a live session, it doesn't mint one from
+    nothing."""
+    if not await _authenticate_owner(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    token = mint_magic_link_token(FACTORY_BOT_ID, OWNER_ID)
+    return web.json_response({"token": token})
 
 
 async def list_bots_handler(request: web.Request) -> web.Response:
@@ -729,6 +749,7 @@ def register_routes(app: web.Application) -> None:
     combined_app.py's _bootstrap_app, which calls both). Namespaced under
     /api/factory/ to stay clearly distinct from /api/{bot_id}/... 's
     per-tenant-bot paths — a real bot_id is never 'factory'."""
+    app.router.add_get("/api/factory/session", refresh_session_handler)
     app.router.add_get("/api/factory/bots", list_bots_handler)
     app.router.add_post("/api/factory/bots/{bot_id}/feedback", add_feedback_handler)
     app.router.add_get("/api/factory/candidates", list_template_candidates_handler)

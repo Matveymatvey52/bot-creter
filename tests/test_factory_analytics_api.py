@@ -124,6 +124,34 @@ class FactoryAnalyticsApiTests(unittest.IsolatedAsyncioTestCase):
                 resp = await self.client.get(f"/api/factory/bots?{qs}")
         self.assertEqual(resp.status, 403)
 
+    # ── refresh_session_handler ───────────────────────────────────────
+    async def test_session_refresh_returns_new_valid_token(self):
+        qs = await self._owner_qs()
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            resp = await self.client.get(f"/api/factory/session?{qs}")
+        self.assertEqual(resp.status, 200)
+        body = await resp.json()
+        new_token = body["token"]
+        self.assertTrue(new_token)
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            resp2 = await self.client.get(f"/api/factory/bots?token={new_token}")
+        self.assertEqual(resp2.status, 200)
+
+    async def test_session_refresh_non_owner_returns_403(self):
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            token = mint_magic_link_token(FACTORY_BOT_ID, OTHER_TELEGRAM_ID)
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            resp = await self.client.get(f"/api/factory/session?token={token}")
+        self.assertEqual(resp.status, 403)
+
+    async def test_session_refresh_expired_token_returns_403(self):
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            with patch("runtime.miniapp_api.MAGIC_LINK_TTL_SECONDS", -1):
+                token = mint_magic_link_token(FACTORY_BOT_ID, OWNER_TELEGRAM_ID)
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            resp = await self.client.get(f"/api/factory/session?token={token}")
+        self.assertEqual(resp.status, 403)
+
     # ── list_bots_handler ─────────────────────────────────────────────
     async def test_owner_sees_bot_list_with_aggregated_stats(self):
         qs = await self._owner_qs()
