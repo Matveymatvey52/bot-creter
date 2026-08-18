@@ -9,7 +9,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import ChatMemberUpdated, InlineKeyboardButton, InlineKeyboardMarkup, Update
 
 from config import BOT_TOKEN
-from db.database import get_all_bots, init_db, set_bot_group, update_bot_status
+from db.database import get_all_bots, init_db, set_bot_group, set_factory_showcase_group, update_bot_status
 from handlers.admin_manager import OWNER_ID, router as admin_router
 from handlers.create_bot import auto_launch_managed_bot, router as create_router, set_bot_id, set_manager_username
 from handlers.custom_features import router as custom_features_router
@@ -80,6 +80,13 @@ def build_group_router() -> Router:
             callback_data=f"setgroup:{b['id']}:{group_id}",
         )] for b in bots]
         rows.append([InlineKeyboardButton(text="✅ Всем ботам", callback_data=f"setgroup:all:{group_id}")])
+        # Office-showcase option (approved design, docs discussion "Офисы —
+        # доработка"): this group can ALSO become the read-only mirror for
+        # office_events digests — orthogonal to the per-bot task-channel
+        # buttons above, so it's offered as an extra row, not instead of them.
+        rows.append([InlineKeyboardButton(
+            text="🔔 Использовать как витрину офисных событий", callback_data=f"showcase:{group_id}"
+        )])
         await bot.send_message(
             user_id,
             f"Я добавлен в группу <b>«{group_name}»</b>.\n\nДля каких ботов настроить эту группу?",
@@ -114,6 +121,27 @@ def build_group_router() -> Router:
         names = ", ".join(b["name"] for b in targets)
         await callback.message.edit_text(
             f"✅ Группа настроена для: <b>{names}</b>\n\nТеперь сделай этих ботов администраторами группы — тогда они смогут видеть все сообщения и отвечать на имя.",
+            parse_mode="HTML",
+        )
+
+    @group_router.callback_query(lambda c: c.data and c.data.startswith("showcase:"))
+    async def cb_set_showcase_group(callback):
+        await callback.answer()
+        group_id = callback.data.split(":", 1)[1]
+        await set_factory_showcase_group(int(group_id))
+        # Read-only by design (see docs discussion "Офисы — доработка", §5):
+        # this group only ever RECEIVES digest messages from the Creator
+        # bot's own publish_event() hook (features/office_events.py's
+        # _post_showcase_digest) — no reply-parsing handler is wired here,
+        # unlike build_group_router's per-bot task channel above. Client
+        # bots are never added to it; office_events/bot_office_links stays
+        # the only real transport between bots.
+        await callback.message.edit_text(
+            "🔔 <b>Витрина офисных событий подключена</b>\n\n"
+            "Эта группа теперь read-only: я буду присылать сюда короткую сводку "
+            "каждый раз, когда один бот уведомляет другого через связку «Офисы». "
+            "Отвечать здесь мне не нужно — витрина не участвует в самой доставке "
+            "событий, боты между собой всё равно связаны напрямую через сервер.",
             parse_mode="HTML",
         )
 

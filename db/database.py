@@ -274,6 +274,26 @@ async def init_db():
                 PRIMARY KEY (source_bot_id, target_bot_id, event_type)
             )
         """)
+        # factory_office_showcase — a SINGLE optional Telegram group the
+        # CREATOR bot itself (not any tenant bot) posts a read-only digest
+        # line to whenever an office event is delivered through
+        # bot_office_links. Explicitly NOT a transport: office_events.py's
+        # publish_event()/bot_office_links remains the only delivery path
+        # between bots — this group is a mirror the owner can glance at,
+        # never a participant (client bots are never added to it). Singleton
+        # (id fixed at 1, upserted) since the owner has exactly one factory
+        # instance and one optional showcase group, same shape as
+        # owner_payment_credentials' single-row-per-owner pattern but even
+        # simpler (no owner_user_id column — there's only ever one owner in
+        # this codebase's current scope, same assumption OWNER_ID itself makes).
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS factory_office_showcase (
+                id         INTEGER PRIMARY KEY CHECK (id = 1),
+                chat_id    INTEGER NOT NULL,
+                enabled    INTEGER NOT NULL DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         # mini-app config (see docs/MINIAPP_DESIGN.md §6) — one row per bot,
         # JSON blob (same shape as templates/tour_operator.py's miniapp_config
         # dict: {"resources": [...]}). Stored in the factory DB, not inline in
@@ -999,6 +1019,45 @@ async def get_office_subscribers(source_bot_id: int, event_type: str) -> list[in
         ) as cursor:
             rows = await cursor.fetchall()
             return [row[0] for row in rows]
+
+
+async def get_factory_showcase_group() -> dict | None:
+    """The single optional Telegram group the CREATOR bot posts office-event
+    digests to (see factory_office_showcase's own comment in init_db). None
+    if never configured. enabled lets the owner keep the binding on record
+    while pausing the digest without losing chat_id (same on/off-without-
+    forgetting shape as bot_group_task_config's own enabled column)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT chat_id, enabled FROM factory_office_showcase WHERE id = 1"
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row is None:
+                return None
+            return {"chat_id": row[0], "enabled": bool(row[1])}
+
+
+async def set_factory_showcase_group(chat_id: int) -> None:
+    """Binds (or re-binds) the factory's showcase group — called once the
+    owner confirms "Использовать эту группу как витрину" after adding the
+    Creator bot to a new group (see main.py's build_group_router())."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO factory_office_showcase (id, chat_id, enabled)
+            VALUES (1, ?, 1)
+            ON CONFLICT (id) DO UPDATE SET chat_id = excluded.chat_id, enabled = 1
+            """,
+            (chat_id,),
+        )
+        await db.commit()
+    logger.info(f"set_factory_showcase_group: chat_id={chat_id}")
+
+
+async def clear_factory_showcase_group() -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM factory_office_showcase WHERE id = 1")
+        await db.commit()
 
 
 async def get_group_task_config(bot_id: int) -> dict | None:

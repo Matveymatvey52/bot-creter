@@ -199,15 +199,30 @@ export function listOffices(botId: number): Promise<{ items: OfficeLink[] }> {
   return request(`/bots/${botId}/offices`)
 }
 
-export function addOffice(botId: number, targetBotId: number): Promise<{ ok: true }> {
+export interface OfficeEventTypeOption {
+  event_type: string
+  label: string
+}
+
+export function listOfficeEventTypes(botId: number): Promise<{ items: OfficeEventTypeOption[] }> {
+  return request(`/bots/${botId}/offices/event-types`)
+}
+
+export function addOffice(botId: number, targetBotId: number, eventType: string): Promise<{ ok: true }> {
   return request(`/bots/${botId}/offices`, {
     method: 'POST',
-    body: JSON.stringify({ target_bot_id: targetBotId }),
+    body: JSON.stringify({ target_bot_id: targetBotId, event_type: eventType }),
   })
 }
 
-export function removeOffice(botId: number, targetBotId: number): Promise<{ ok: true }> {
-  return request(`/bots/${botId}/offices/${targetBotId}`, { method: 'DELETE' })
+export function removeOffice(botId: number, targetBotId: number, eventType: string): Promise<{ ok: true }> {
+  return request(`/bots/${botId}/offices/${targetBotId}?event_type=${encodeURIComponent(eventType)}`, {
+    method: 'DELETE',
+  })
+}
+
+export function getShowcaseGroupStatus(): Promise<{ connected: boolean }> {
+  return request('/showcase-group')
 }
 
 export function listAdmins(botId: number): Promise<{ items: string[] }> {

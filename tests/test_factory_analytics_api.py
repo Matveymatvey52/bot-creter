@@ -309,6 +309,11 @@ class FactoryAnalyticsApiTests(unittest.IsolatedAsyncioTestCase):
 
     # ── offices ───────────────────────────────────────────────────────
     async def test_add_and_remove_office_link(self):
+        # self.bot_id is a tour_operator bot — tour_operator publishes NO
+        # event type (not in features/payments.py's own COMPATIBLE_WITH list,
+        # and not boss_bot — see features/office_events.py's
+        # _EVENT_TYPE_PUBLISHER_TEMPLATES), so this link uses self.shop_bot_id
+        # (shop_catalog, which IS compatible with payments) as the source.
         other_bot_id = await create_bot_record_with_admins(
             name="factory_analytics_test_other_bot", description="test", token="1111:AAother-fake-token-1234567",
             file_path="templates/shop_catalog.py", admin_ids=["1"],
@@ -317,16 +322,21 @@ class FactoryAnalyticsApiTests(unittest.IsolatedAsyncioTestCase):
             qs = await self._owner_qs()
             with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
                 resp = await self.client.post(
-                    f"/api/factory/bots/{self.bot_id}/offices?{qs}", json={"target_bot_id": other_bot_id}
+                    f"/api/factory/bots/{self.shop_bot_id}/offices?{qs}",
+                    json={"target_bot_id": other_bot_id, "event_type": "order.created"},
                 )
             self.assertEqual(resp.status, 201)
-            links = await db_module.get_office_links_for_bot(self.bot_id)
+            links = await db_module.get_office_links_for_bot(self.shop_bot_id)
             self.assertEqual(len(links), 1)
+            self.assertEqual(links[0]["event_type"], "order.created")
 
             with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
-                resp = await self.client.delete(f"/api/factory/bots/{self.bot_id}/offices/{other_bot_id}?{qs}")
+                resp = await self.client.delete(
+                    f"/api/factory/bots/{self.shop_bot_id}/offices/{other_bot_id}"
+                    f"?event_type=order.created&{qs}"
+                )
             self.assertEqual(resp.status, 200)
-            links = await db_module.get_office_links_for_bot(self.bot_id)
+            links = await db_module.get_office_links_for_bot(self.shop_bot_id)
             self.assertEqual(links, [])
         finally:
             await delete_bot(other_bot_id)
@@ -338,6 +348,77 @@ class FactoryAnalyticsApiTests(unittest.IsolatedAsyncioTestCase):
                 f"/api/factory/bots/{self.bot_id}/offices?{qs}", json={"target_bot_id": self.bot_id}
             )
         self.assertEqual(resp.status, 400)
+
+    async def test_add_office_link_rejects_event_type_not_available_for_source_template(self):
+        # self.bot_id is tour_operator — publishes NO event type (not
+        # payments-compatible, not boss_bot). Must be rejected even though
+        # order.created is a real, registered event type in general.
+        other_bot_id = await create_bot_record_with_admins(
+            name="factory_analytics_reject_target_bot", description="test",
+            token="4444:AAreject-fake-token-1234567890", file_path="templates/shop_catalog.py", admin_ids=["1"],
+        )
+        try:
+            qs = await self._owner_qs()
+            with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+                resp = await self.client.post(
+                    f"/api/factory/bots/{self.bot_id}/offices?{qs}",
+                    json={"target_bot_id": other_bot_id, "event_type": "order.created"},
+                )
+            self.assertEqual(resp.status, 400)
+        finally:
+            await delete_bot(other_bot_id)
+
+    # ── list_office_event_types_handler ────────────────────────────────
+    async def test_office_event_types_for_shop_catalog_bot(self):
+        qs = await self._owner_qs()
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            resp = await self.client.get(f"/api/factory/bots/{self.shop_bot_id}/offices/event-types?{qs}")
+        self.assertEqual(resp.status, 200)
+        body = await resp.json()
+        self.assertEqual(body["items"], [{"event_type": "order.created", "label": "Новый заказ"}])
+
+    async def test_office_event_types_empty_for_tour_operator_bot(self):
+        qs = await self._owner_qs()
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            resp = await self.client.get(f"/api/factory/bots/{self.bot_id}/offices/event-types?{qs}")
+        self.assertEqual(resp.status, 200)
+        body = await resp.json()
+        self.assertEqual(body["items"], [])
+
+    async def test_office_event_types_non_owner_returns_403(self):
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            token = mint_magic_link_token(FACTORY_BOT_ID, OTHER_TELEGRAM_ID)
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            resp = await self.client.get(f"/api/factory/bots/{self.shop_bot_id}/offices/event-types?token={token}")
+        self.assertEqual(resp.status, 403)
+
+    # ── showcase_group_status_handler ────────────────────────────────
+    async def test_showcase_group_status_disconnected_by_default(self):
+        qs = await self._owner_qs()
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            resp = await self.client.get(f"/api/factory/showcase-group?{qs}")
+        self.assertEqual(resp.status, 200)
+        body = await resp.json()
+        self.assertFalse(body["connected"])
+
+    async def test_showcase_group_status_connected_after_set(self):
+        await db_module.set_factory_showcase_group(-100987654321)
+        try:
+            qs = await self._owner_qs()
+            with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+                resp = await self.client.get(f"/api/factory/showcase-group?{qs}")
+            self.assertEqual(resp.status, 200)
+            body = await resp.json()
+            self.assertTrue(body["connected"])
+        finally:
+            await db_module.clear_factory_showcase_group()
+
+    async def test_showcase_group_status_non_owner_returns_403(self):
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            token = mint_magic_link_token(FACTORY_BOT_ID, OTHER_TELEGRAM_ID)
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            resp = await self.client.get(f"/api/factory/showcase-group?token={token}")
+        self.assertEqual(resp.status, 403)
 
     # ── features: disable is instant, no dialog ──────────────────────
     async def test_disable_feature_is_instant_and_clears_config(self):

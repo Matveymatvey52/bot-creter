@@ -29,6 +29,7 @@ features/sheets.py's write_row()/read_data().
 """
 from __future__ import annotations
 
+import html
 import logging
 import re
 import time
@@ -82,6 +83,66 @@ _EVENT_TYPES: dict[str, type] = {
     "order.created": OrderCreatedEvent,
     "task.assigned": TaskAssignedEvent,
 }
+
+# Which template_ids actually PUBLISH each event_type — a strict subset of
+# COMPATIBLE_WITH above (which only gates who can RECEIVE/subscribe). Used by
+# the office-link wizard (runtime/factory_analytics_api.py's
+# list_office_event_types_handler) to offer only event types the chosen
+# SOURCE bot can realistically emit, instead of the full _EVENT_TYPES set —
+# e.g. offering "task.assigned" for a shop_catalog bot would create a link
+# that will simply never fire. Deliberately explicit (not derived from
+# scanning templates/*.py for publish_event() calls at runtime) for the same
+# "no silent widening" reason _EVENT_TYPES itself is a closed dict: a new
+# publisher call site must be a deliberate addition here, not an automatic
+# side effect of adding a publish_event() call somewhere.
+#
+# order.created's publisher set is None (not a fixed set) because its only
+# publisher, features/payments.py's on_successful_payment, fires for EVERY
+# template payments is compatible with — that list already lives in
+# payments.py's own "# COMPATIBLE_WITH:" header (parsed by
+# runtime/registry.py's discover_features(), the same mechanism every other
+# feature's compatibility list goes through) rather than a second hand-kept
+# copy here that could drift from it.
+_EVENT_TYPE_PUBLISHER_TEMPLATES: dict[str, set[str] | None] = {
+    "order.created": None,
+    "task.assigned": {"boss_bot"},
+}
+
+_EVENT_TYPE_LABELS: dict[str, str] = {
+    "order.created": "Новый заказ",
+    "task.assigned": "Задача назначена",
+}
+
+
+def available_event_types_for_template(template_id: str | None) -> list[str]:
+    """Event types `template_id` can plausibly PUBLISH as a source bot — see
+    _EVENT_TYPE_PUBLISHER_TEMPLATES. order.created's availability is derived
+    from features/payments.py's own COMPATIBLE_WITH header via
+    runtime/registry.py's discover_features(), its only current publisher.
+    A from-scratch bot (template_id=None) can never publish anything through
+    this closed-dataclass mechanism, so it always gets an empty list. Local
+    import of discover_features to avoid a runtime.registry <-> this module
+    import cycle at module load time (registry.py imports feature modules
+    dynamically, not the reverse, but this keeps the dependency one-way at
+    parse time too)."""
+    if template_id is None:
+        return []
+    from runtime.registry import discover_features
+
+    payments_compatible: set[str] = set()
+    for feature in discover_features():
+        if feature["name"] == "payments":
+            payments_compatible = set(feature["compatible_with"])
+            break
+
+    available = []
+    for event_type, publishers in _EVENT_TYPE_PUBLISHER_TEMPLATES.items():
+        if publishers is None:
+            if event_type == "order.created" and template_id in payments_compatible:
+                available.append(event_type)
+        elif template_id in publishers:
+            available.append(event_type)
+    return available
 
 
 @dataclass(frozen=True)
@@ -162,7 +223,61 @@ async def publish_event(source_bot_id: int, event_type: str, payload: object) ->
                 f"publish_event: delivery to target_bot_id={target_bot_id} raised — "
                 f"event_type={event_type!r} source_bot_id={source_bot_id}, skipped"
             )
+
+    await _post_showcase_digest(registry, source_bot_id, event_type, subscriber_ids, delivered)
     return delivered
+
+
+async def _post_showcase_digest(
+    registry, source_bot_id: int, event_type: str, subscriber_ids: list[int], delivered: int
+) -> None:
+    """Best-effort, read-only mirror of this event into the optional
+    showcase group (see db/database.py's factory_office_showcase and its own
+    comment in init_db) — NOT part of the transport: delivery to real
+    subscribers above already happened regardless of whether this succeeds.
+    Sent by the FACTORY bot itself (never a tenant bot — client bots are
+    never added to this group, per the approved design), so this looks the
+    group up via FACTORY_BOT_ID in the same live registry publish_event()
+    already has in hand, no separate registry lookup path needed. Any
+    failure here (group not configured, factory bot not in registry, Telegram
+    API error, bot kicked from the group) is swallowed — a broken showcase
+    mirror must never affect real event delivery, same posture as each
+    subscriber's own isolated try/except above."""
+    try:
+        from db.database import get_factory_showcase_group, get_bot
+
+        showcase = await get_factory_showcase_group()
+        if showcase is None or not showcase["enabled"]:
+            return
+
+        from runtime.registry import FACTORY_BOT_ID
+
+        factory_entry = registry.get(FACTORY_BOT_ID)
+        if factory_entry is None:
+            return
+
+        source_bot = await get_bot(source_bot_id)
+        # source_bot["name"] is owner/LLM-controlled free text (see
+        # handlers/create_bot.py's naming flow) — escaped before interpolation
+        # into this parse_mode="HTML" message, same convention every other
+        # HTML-formatted message built from user/LLM text in this codebase
+        # already follows (e.g. features/sellable_items.py, templates/
+        # channel_monitor.py) so a stray '<'/'&' in a bot's name can't break
+        # or mangle the Telegram API call.
+        raw_name = source_bot["name"] if source_bot else f"#{source_bot_id}"
+        source_name = html.escape(raw_name)
+        label = _EVENT_TYPE_LABELS.get(event_type, event_type)
+        text = (
+            f"🔔 <b>{source_name}</b> → {label}\n"
+            f"Доставлено ботам-подписчикам: {delivered}/{len(subscriber_ids)}"
+        )
+        await factory_entry.bot.send_message(showcase["chat_id"], text, parse_mode="HTML")
+    except Exception:
+        logger.warning(
+            f"_post_showcase_digest: failed to post digest — event_type={event_type!r} "
+            f"source_bot_id={source_bot_id} (non-fatal, real delivery already completed)",
+            exc_info=True,
+        )
 
 
 def register_office_event_hook(config: dict[str, Any], hook) -> None:

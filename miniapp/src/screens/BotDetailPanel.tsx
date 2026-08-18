@@ -14,6 +14,8 @@ import {
   cancelFeatureConfigure,
   addOffice,
   removeOffice,
+  listOfficeEventTypes,
+  getShowcaseGroupStatus,
   addAdmin,
   removeAdmin,
   ApiError,
@@ -500,6 +502,17 @@ function FeatureConfigureSubpanel({
   )
 }
 
+const EVENT_TYPE_LABELS: Record<string, string> = {
+  'order.created': 'Новый заказ',
+  'task.assigned': 'Задача назначена',
+}
+
+function eventTypeLabel(eventType: string): string {
+  return EVENT_TYPE_LABELS[eventType] || eventType
+}
+
+type WizardStep = 'source' | 'target' | 'event_type' | 'confirm' | 'success'
+
 function OfficesTab({
   botId,
   offices,
@@ -511,10 +524,9 @@ function OfficesTab({
   allBots: FactoryBotItem[]
   onChanged: () => void
 }) {
-  const [picking, setPicking] = useState(false)
+  const [wizardOpen, setWizardOpen] = useState(false)
   const nameById = (id: number) =>
     allBots.find((b) => b.id === id)?.display_name || allBots.find((b) => b.id === id)?.name || `#${id}`
-  const others = allBots.filter((b) => b.id !== botId)
 
   return (
     <div>
@@ -527,48 +539,243 @@ function OfficesTab({
         const isSource = link.source_bot_id === botId
         const otherId = isSource ? link.target_bot_id : link.source_bot_id
         return (
-          <div className="office-link-row" key={`${link.source_bot_id}-${link.target_bot_id}-${link.event_type}`}>
+          <div
+            className="office-link-row"
+            key={`${link.source_bot_id}-${link.target_bot_id}-${link.event_type}`}
+          >
             <span>
-              <span className="office-arrow">{isSource ? '📤' : '📥'}</span> {isSource ? '→' : '←'} {nameById(otherId)}
+              <span className="office-arrow">{isSource ? '📤' : '📥'}</span> {isSource ? '→' : '←'}{' '}
+              {nameById(otherId)}
+              <span className="feature-desc"> · {eventTypeLabel(link.event_type)}</span>
             </span>
             {isSource && (
-              <button className="remove-x" onClick={() => removeOffice(botId, link.target_bot_id).then(onChanged)}>
+              <button
+                className="remove-x"
+                onClick={() => removeOffice(botId, link.target_bot_id, link.event_type).then(onChanged)}
+              >
                 ✕
               </button>
             )}
           </div>
         )
       })}
-      {picking ? (
-        <div className="feature-subpanel">
-          {others.length === 0 ? (
-            <div>Других ботов пока нет.</div>
-          ) : (
-            others.map((b) => (
+      {wizardOpen ? (
+        <OfficeLinkWizard
+          defaultSourceId={botId}
+          allBots={allBots}
+          onDone={() => {
+            setWizardOpen(false)
+            onChanged()
+          }}
+          onCancel={() => setWizardOpen(false)}
+        />
+      ) : (
+        <button className="add-fab" onClick={() => setWizardOpen(true)}>
+          ➕ Связать ботов
+        </button>
+      )}
+    </div>
+  )
+}
+
+function OfficeLinkWizard({
+  defaultSourceId,
+  allBots,
+  onDone,
+  onCancel,
+}: {
+  defaultSourceId: number
+  allBots: FactoryBotItem[]
+  onDone: () => void
+  onCancel: () => void
+}) {
+  const [step, setStep] = useState<WizardStep>('source')
+  const [sourceId, setSourceId] = useState<number | null>(defaultSourceId)
+  const [targetId, setTargetId] = useState<number | null>(null)
+  const [eventTypes, setEventTypes] = useState<{ event_type: string; label: string }[] | null>(null)
+  const [eventType, setEventType] = useState<string | null>(null)
+  const [submitting, setSubmitting] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [showcaseOffered, setShowcaseOffered] = useState<boolean | null>(null)
+
+  const botName = (id: number | null) => {
+    if (id == null) return ''
+    const b = allBots.find((x) => x.id === id)
+    return b ? b.display_name || b.name : `#${id}`
+  }
+
+  const loadEventTypes = (srcId: number) => {
+    setEventTypes(null)
+    setError(null)
+    listOfficeEventTypes(srcId)
+      .then((r) => setEventTypes(r.items))
+      .catch((err) => setError(err instanceof ApiError ? err.message : 'Не удалось загрузить типы событий'))
+  }
+
+  const confirm = () => {
+    if (sourceId == null || targetId == null || !eventType) return
+    setSubmitting(true)
+    setError(null)
+    addOffice(sourceId, targetId, eventType)
+      .then(() => {
+        getShowcaseGroupStatus()
+          .then((r) => setShowcaseOffered(!r.connected))
+          .catch(() => setShowcaseOffered(true))
+        setStep('success')
+      })
+      .catch((err) => setError(err instanceof ApiError ? err.message : 'Не удалось создать связь'))
+      .finally(() => setSubmitting(false))
+  }
+
+  if (step === 'success') {
+    return (
+      <div className="feature-subpanel">
+        <div>
+          ✅ «{botName(sourceId)}» теперь автоматически уведомляет «{botName(targetId)}» о событии «
+          {eventType ? eventTypeLabel(eventType) : ''}».
+        </div>
+        {showcaseOffered && <ShowcaseGroupGuide onDismiss={() => setShowcaseOffered(false)} />}
+        <div className="row">
+          <button className="mini-btn" onClick={onDone}>
+            Готово
+          </button>
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="feature-subpanel">
+      {error && <div>{error}</div>}
+
+      {step === 'source' && (
+        <>
+          <div style={{ fontWeight: 600, color: 'var(--text-primary)' }}>Шаг 1 из 3 — какой бот источник?</div>
+          {allBots.map((b) => (
+            <button
+              key={b.id}
+              className="mini-btn"
+              style={{ marginBottom: 6, width: '100%' }}
+              onClick={() => {
+                setSourceId(b.id)
+                setTargetId(null)
+                setEventType(null)
+                loadEventTypes(b.id)
+                setStep('target')
+              }}
+            >
+              {b.display_name || b.name}
+            </button>
+          ))}
+          <div className="row">
+            <button className="mini-btn danger" onClick={onCancel}>
+              Отмена
+            </button>
+          </div>
+        </>
+      )}
+
+      {step === 'target' && sourceId != null && (
+        <>
+          <div style={{ fontWeight: 600, color: 'var(--text-primary)' }}>
+            Шаг 2 из 3 — кого уведомлять от «{botName(sourceId)}»?
+          </div>
+          {allBots.filter((b) => b.id !== sourceId).length === 0 && <div>Других ботов пока нет.</div>}
+          {allBots
+            .filter((b) => b.id !== sourceId)
+            .map((b) => (
               <button
                 key={b.id}
                 className="mini-btn"
                 style={{ marginBottom: 6, width: '100%' }}
-                onClick={() =>
-                  addOffice(botId, b.id).then(() => {
-                    setPicking(false)
-                    onChanged()
-                  })
-                }
+                onClick={() => {
+                  setTargetId(b.id)
+                  setStep('event_type')
+                }}
               >
                 {b.display_name || b.name}
               </button>
-            ))
-          )}
-          <button className="mini-btn danger" onClick={() => setPicking(false)}>
-            Отмена
-          </button>
-        </div>
-      ) : (
-        <button className="add-fab" onClick={() => setPicking(true)}>
-          + Подключить к другому боту
-        </button>
+            ))}
+          <div className="row">
+            <button className="mini-btn danger" onClick={() => setStep('source')}>
+              Назад
+            </button>
+          </div>
+        </>
       )}
+
+      {step === 'event_type' && (
+        <>
+          <div style={{ fontWeight: 600, color: 'var(--text-primary)' }}>Шаг 3 из 3 — какое событие?</div>
+          {eventTypes === null && <div>Загрузка…</div>}
+          {eventTypes !== null && eventTypes.length === 0 && (
+            <div>«{botName(sourceId)}» не поддерживает ни одного типа события для связи.</div>
+          )}
+          {eventTypes?.map((et) => (
+            <button
+              key={et.event_type}
+              className="mini-btn"
+              style={{ marginBottom: 6, width: '100%' }}
+              onClick={() => {
+                setEventType(et.event_type)
+                setStep('confirm')
+              }}
+            >
+              {et.label}
+            </button>
+          ))}
+          <div className="row">
+            <button className="mini-btn danger" onClick={() => setStep('target')}>
+              Назад
+            </button>
+          </div>
+        </>
+      )}
+
+      {step === 'confirm' && eventType && (
+        <>
+          <div style={{ fontWeight: 600, color: 'var(--text-primary)' }}>Что произойдёт</div>
+          <div>
+            Бот «{botName(sourceId)}» будет автоматически уведомлять бота «{botName(targetId)}» о событии «
+            {eventTypeLabel(eventType)}». Это работает через сервер — боты не должны состоять в одной группе
+            Telegram. Задержка — доли секунды.
+          </div>
+          <div className="row">
+            <button className="mini-btn" disabled={submitting} onClick={confirm}>
+              Подтвердить
+            </button>
+            <button className="mini-btn danger" onClick={() => setStep('event_type')}>
+              Назад
+            </button>
+          </div>
+        </>
+      )}
+    </div>
+  )
+}
+
+function ShowcaseGroupGuide({ onDismiss }: { onDismiss: () => void }) {
+  return (
+    <div style={{ marginTop: 4, paddingTop: 8, borderTop: '1px solid var(--border-hair, #333)' }}>
+      <div style={{ fontWeight: 600, color: 'var(--text-primary)', marginBottom: 4 }}>
+        🔔 Показать в Telegram-группе
+      </div>
+      <div className="feature-desc">
+        1) Создайте новую Telegram-группу
+        <br />
+        2) Добавьте туда Creator-бота
+        <br />
+        3) Готово — он будет присылать сюда сводку по связанным событиям
+        <br />
+        <br />
+        Клиентские боты в группу добавлять не нужно — они не участвуют в доставке событий, только Creator
+        показывает read-only сводку.
+      </div>
+      <div className="row">
+        <button className="mini-btn danger" onClick={onDismiss}>
+          Скрыть
+        </button>
+      </div>
     </div>
   )
 }

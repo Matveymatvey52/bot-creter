@@ -132,3 +132,162 @@ async def test_publish_event_never_raises_for_subscriber_hook_exception(monkeypa
     # Must not propagate — a broken subscriber must never interrupt the publisher.
     delivered = await publish_event(1, "order.created", OrderCreatedEvent(1, 100, "RUB", 999))
     assert delivered == 0
+
+
+# ── showcase-group digest (docs discussion "Офисы — доработка" §5) ───────────
+# The Telegram showcase group is explicitly NOT the transport — every test
+# above already proves delivery to real subscribers works with no showcase
+# group configured at all (db.database.get_factory_showcase_group is not
+# monkeypatched there, so the real function runs against no DB row / whatever
+# table state exists, and _post_showcase_digest's own try/except swallows any
+# failure). These tests isolate _post_showcase_digest's own behavior instead.
+
+from runtime.registry import FACTORY_BOT_ID
+
+
+def _factory_entry_with_bot(bot):
+    return SimpleNamespace(bot=bot)
+
+
+@pytest.mark.asyncio
+async def test_publish_event_posts_digest_to_showcase_group_when_configured(monkeypatch):
+    monkeypatch.setattr(office_events, "get_office_subscribers", AsyncMock(return_value=[2]))
+    monkeypatch.setattr(
+        "db.database.get_factory_showcase_group",
+        AsyncMock(return_value={"chat_id": -100123, "enabled": True}),
+    )
+    monkeypatch.setattr(
+        "db.database.get_bot", AsyncMock(return_value={"id": 1, "name": "Магазин Ромы"})
+    )
+    factory_bot = SimpleNamespace(send_message=AsyncMock())
+    office_events.set_registry(
+        FakeRegistry({2: _entry_with_hook(AsyncMock()), FACTORY_BOT_ID: _factory_entry_with_bot(factory_bot)})
+    )
+
+    await publish_event(1, "order.created", OrderCreatedEvent(1, 100, "RUB", 999))
+
+    factory_bot.send_message.assert_awaited_once()
+    (chat_id, text), kwargs = factory_bot.send_message.call_args
+    assert chat_id == -100123
+    assert "Магазин Ромы" in text
+    assert kwargs.get("parse_mode") == "HTML"
+
+
+@pytest.mark.asyncio
+async def test_publish_event_digest_escapes_bot_name_html_metacharacters(monkeypatch):
+    """A bot name is owner/LLM-controlled free text — must be HTML-escaped
+    before interpolation into this parse_mode='HTML' message, or a stray
+    '<'/'&' would make Telegram reject the send (see the fix's own comment
+    in features/office_events.py's _post_showcase_digest)."""
+    monkeypatch.setattr(office_events, "get_office_subscribers", AsyncMock(return_value=[2]))
+    monkeypatch.setattr(
+        "db.database.get_factory_showcase_group",
+        AsyncMock(return_value={"chat_id": -100123, "enabled": True}),
+    )
+    monkeypatch.setattr(
+        "db.database.get_bot", AsyncMock(return_value={"id": 1, "name": "<b>Рома</b> & Co"})
+    )
+    factory_bot = SimpleNamespace(send_message=AsyncMock())
+    office_events.set_registry(
+        FakeRegistry({2: _entry_with_hook(AsyncMock()), FACTORY_BOT_ID: _factory_entry_with_bot(factory_bot)})
+    )
+
+    await publish_event(1, "order.created", OrderCreatedEvent(1, 100, "RUB", 999))
+
+    factory_bot.send_message.assert_awaited_once()
+    (_, text), _ = factory_bot.send_message.call_args
+    assert "<b>Рома</b> & Co" not in text
+    assert "&lt;b&gt;Рома&lt;/b&gt; &amp; Co" in text
+
+
+@pytest.mark.asyncio
+async def test_publish_event_skips_digest_when_showcase_not_configured(monkeypatch):
+    monkeypatch.setattr(office_events, "get_office_subscribers", AsyncMock(return_value=[2]))
+    monkeypatch.setattr("db.database.get_factory_showcase_group", AsyncMock(return_value=None))
+    factory_bot = SimpleNamespace(send_message=AsyncMock())
+    office_events.set_registry(
+        FakeRegistry({2: _entry_with_hook(AsyncMock()), FACTORY_BOT_ID: _factory_entry_with_bot(factory_bot)})
+    )
+
+    await publish_event(1, "order.created", OrderCreatedEvent(1, 100, "RUB", 999))
+
+    factory_bot.send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_publish_event_skips_digest_when_showcase_disabled(monkeypatch):
+    monkeypatch.setattr(office_events, "get_office_subscribers", AsyncMock(return_value=[2]))
+    monkeypatch.setattr(
+        "db.database.get_factory_showcase_group",
+        AsyncMock(return_value={"chat_id": -100123, "enabled": False}),
+    )
+    factory_bot = SimpleNamespace(send_message=AsyncMock())
+    office_events.set_registry(
+        FakeRegistry({2: _entry_with_hook(AsyncMock()), FACTORY_BOT_ID: _factory_entry_with_bot(factory_bot)})
+    )
+
+    await publish_event(1, "order.created", OrderCreatedEvent(1, 100, "RUB", 999))
+
+    factory_bot.send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_publish_event_digest_failure_does_not_affect_real_delivery(monkeypatch):
+    """A broken showcase mirror (Telegram error, bot kicked, etc.) must never
+    affect real subscriber delivery — same isolation contract as a failing
+    subscriber hook (test_one_failing_subscriber_does_not_block_others)."""
+    monkeypatch.setattr(office_events, "get_office_subscribers", AsyncMock(return_value=[2]))
+    monkeypatch.setattr(
+        "db.database.get_factory_showcase_group",
+        AsyncMock(return_value={"chat_id": -100123, "enabled": True}),
+    )
+    monkeypatch.setattr("db.database.get_bot", AsyncMock(return_value={"id": 1, "name": "Магазин Ромы"}))
+    factory_bot = SimpleNamespace(send_message=AsyncMock(side_effect=RuntimeError("kicked from group")))
+    real_hook = AsyncMock()
+    office_events.set_registry(
+        FakeRegistry({2: _entry_with_hook(real_hook), FACTORY_BOT_ID: _factory_entry_with_bot(factory_bot)})
+    )
+
+    delivered = await publish_event(1, "order.created", OrderCreatedEvent(1, 100, "RUB", 999))
+
+    assert delivered == 1
+    real_hook.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_publish_event_skips_digest_when_factory_bot_not_in_registry(monkeypatch):
+    monkeypatch.setattr(office_events, "get_office_subscribers", AsyncMock(return_value=[2]))
+    monkeypatch.setattr(
+        "db.database.get_factory_showcase_group",
+        AsyncMock(return_value={"chat_id": -100123, "enabled": True}),
+    )
+    # FACTORY_BOT_ID deliberately absent from the registry.
+    office_events.set_registry(FakeRegistry({2: _entry_with_hook(AsyncMock())}))
+
+    # Must not raise even though the factory bot instance is unavailable.
+    delivered = await publish_event(1, "order.created", OrderCreatedEvent(1, 100, "RUB", 999))
+    assert delivered == 1
+
+
+# ── available_event_types_for_template ────────────────────────────────────
+from features.office_events import available_event_types_for_template
+
+
+def test_available_event_types_none_for_from_scratch_bot():
+    assert available_event_types_for_template(None) == []
+
+
+def test_available_event_types_order_created_for_payments_compatible_template():
+    # shop_catalog IS in features/payments.py's own COMPATIBLE_WITH header.
+    assert available_event_types_for_template("shop_catalog") == ["order.created"]
+
+
+def test_available_event_types_task_assigned_for_boss_bot():
+    assert available_event_types_for_template("boss_bot") == ["task.assigned"]
+
+
+def test_available_event_types_empty_for_template_with_no_publisher():
+    # tour_operator is compatible with office_events (can RECEIVE events) but
+    # is not in payments' COMPATIBLE_WITH list and is not boss_bot, so it
+    # publishes nothing.
+    assert available_event_types_for_template("tour_operator") == []

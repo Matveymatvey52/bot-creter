@@ -12,12 +12,15 @@ import pytest
 
 from db.database import (
     add_office_link,
+    clear_factory_showcase_group,
     create_bot_record_with_admins,
     delete_bot,
+    get_factory_showcase_group,
     get_office_links_for_bot,
     get_office_subscribers,
     init_db,
     remove_office_link,
+    set_factory_showcase_group,
 )
 
 FAKE_TOKEN = "123456:test-token-not-real"
@@ -135,3 +138,36 @@ async def test_get_office_links_for_bot_excludes_unrelated_links(isolated_db):
     a, b, c = await _make_bots(3)
     await add_office_link(a, b, "order.created")
     assert await get_office_links_for_bot(c) == []
+
+
+# ── factory_office_showcase — the optional Telegram digest mirror ──────────
+
+@pytest.mark.asyncio
+async def test_showcase_group_unset_by_default(isolated_db):
+    await init_db()
+    assert await get_factory_showcase_group() is None
+
+
+@pytest.mark.asyncio
+async def test_set_and_get_showcase_group(isolated_db):
+    await init_db()
+    await set_factory_showcase_group(-100123456789)
+    assert await get_factory_showcase_group() == {"chat_id": -100123456789, "enabled": True}
+
+
+@pytest.mark.asyncio
+async def test_set_showcase_group_is_a_singleton_upsert(isolated_db):
+    """Binding a NEW group replaces the old one — there is exactly one
+    factory-wide showcase group at a time, not a growing list."""
+    await init_db()
+    await set_factory_showcase_group(-1)
+    await set_factory_showcase_group(-2)
+    assert await get_factory_showcase_group() == {"chat_id": -2, "enabled": True}
+
+
+@pytest.mark.asyncio
+async def test_clear_showcase_group(isolated_db):
+    await init_db()
+    await set_factory_showcase_group(-100123456789)
+    await clear_factory_showcase_group()
+    assert await get_factory_showcase_group() is None
