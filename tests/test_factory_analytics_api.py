@@ -283,6 +283,39 @@ class FactoryAnalyticsApiTests(unittest.IsolatedAsyncioTestCase):
             resp = await self.client.get(f"/api/factory/bots/{self.bot_id}?token={token}")
         self.assertEqual(resp.status, 403)
 
+    async def test_bot_detail_tenant_owner_cannot_access_other_tenants_bot(self):
+        """Owner A (a tenant, not the factory OWNER_ID) must not be able to
+        read owner B's bot via bot_id — per-bot ownership, not just
+        owner-vs-non-owner. Both bots belong to real tenants (owner_telegram_id
+        set), neither is OWNER_TELEGRAM_ID/OTHER_TELEGRAM_ID's own bot."""
+        THIRD_TELEGRAM_ID = 777
+        bot_a_id = await create_bot_record_with_admins(
+            name="factory_analytics_tenant_a_bot", description="test",
+            token="6666:AAtenantA-fake-token-1234567890",
+            file_path="templates/shop_catalog.py", admin_ids=["1"],
+            owner_telegram_id=OTHER_TELEGRAM_ID,
+        )
+        bot_b_id = await create_bot_record_with_admins(
+            name="factory_analytics_tenant_b_bot", description="test",
+            token="7777:AAtenantB-fake-token-1234567890",
+            file_path="templates/shop_catalog.py", admin_ids=["1"],
+            owner_telegram_id=THIRD_TELEGRAM_ID,
+        )
+        try:
+            with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+                token_a = mint_magic_link_token(FACTORY_BOT_ID, OTHER_TELEGRAM_ID)
+            with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+                resp = await self.client.get(f"/api/factory/bots/{bot_b_id}?token={token_a}")
+            self.assertEqual(resp.status, 403)
+
+            # sanity: owner A CAN access their own bot A with the same token
+            with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+                resp_own = await self.client.get(f"/api/factory/bots/{bot_a_id}?token={token_a}")
+            self.assertEqual(resp_own.status, 200)
+        finally:
+            await delete_bot(bot_a_id)
+            await delete_bot(bot_b_id)
+
     # ── admins ────────────────────────────────────────────────────────
     async def test_add_and_remove_admin(self):
         qs = await self._owner_qs()
