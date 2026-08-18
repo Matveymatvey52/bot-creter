@@ -15,7 +15,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from config import ASSEMBLYAI_API_KEY
 from db.database import (
@@ -32,8 +32,10 @@ from db.database import (
     get_bot_sheets_config,
     get_bot_yookassa_credentials,
     get_bot_yookassa_status_cache,
+    get_group_task_config,
     get_office_links_for_bot,
     get_owner_payment_credentials,
+    delete_group_task_config,
     remove_office_link,
     set_bot_miniapp_config,
     set_bot_office_hook_config,
@@ -190,6 +192,7 @@ def _bot_keyboard(bot_id: int) -> InlineKeyboardMarkup:
     ])
     rows.append([
         InlineKeyboardButton(text="🏢 Офисы", callback_data=f"office:{bot_id}"),
+        InlineKeyboardButton(text="💬 Рабочая группа", callback_data=f"grouptask:{bot_id}"),
     ])
     rows.append([
         InlineKeyboardButton(text="◀ К списку", callback_data="list"),
@@ -866,6 +869,88 @@ async def cb_office_unlink(callback: CallbackQuery):
     await _edit_or_resend(callback, text, parse_mode="HTML", reply_markup=keyboard)
 
 
+# ── "Рабочая группа" (docs/GROUP_TASK_CHANNEL_DESIGN.md §5) ─────────────────
+# Unlike office:/officeconnect: above, connection is NOT confirmed through a
+# button tap here — features/group_task.py's own router auto-captures
+# group_chat_id from the first mention/reply update it sees in a group with
+# no existing bot_group_task_config row. This panel is read-only status +
+# the setup guide + a disconnect action; enable_feature_and_reload() below
+# is the only WRITE this panel itself performs (turning the feature on, the
+# same action "🧩 Фичи" would do, so the owner doesn't have to visit that
+# screen first just to reach this one).
+
+
+async def _group_task_panel_text_and_keyboard(bot_id: int, bot_row: dict) -> tuple[str, InlineKeyboardMarkup]:
+    username = bot_row.get("username") or "bot"
+    config = await get_group_task_config(bot_id)
+    if config and config["enabled"]:
+        text = (
+            f"💬 <b>Рабочая группа для {html.escape(bot_row['name'])}</b>\n\n"
+            "Подключено. Пиши боту задачи в группе, упоминая "
+            f"@{html.escape(username)} или отвечая на его сообщения."
+        )
+        rows = [[InlineKeyboardButton(text="🔌 Отключить", callback_data=f"grouptaskdisconnect:{bot_id}")]]
+    else:
+        text = (
+            f"💬 <b>Рабочая группа для {html.escape(bot_row['name'])}</b>\n\n"
+            "Подключи бота к своей Telegram-группе — сможешь писать ему задачи "
+            f"прямо там (<code>@{html.escape(username)} сделай то-то</code> или "
+            "ответом на его сообщение), и он будет отвечать в группе. Отвечает "
+            "только тебе (владельцу), другие участники группы бота не получат ответа.\n\n"
+            "<b>Как подключить:</b>\n"
+            "1. Создай новую Telegram-группу (или используй существующую).\n"
+            f"2. Добавь туда бота @{html.escape(username)}.\n"
+            f"3. Зайди в BotFather → выбери @{html.escape(username)} → "
+            "<b>Bot Settings</b> → <b>Group Privacy</b> → <b>Turn off</b>. "
+            "Без этого шага бот не увидит твои сообщения в группе, даже если "
+            "упомянуть его по имени.\n"
+            "4. Напиши в группе что угодно, упомянув бота — фабрика подхватит "
+            "группу автоматически."
+        )
+        rows = []
+    rows.append([InlineKeyboardButton(text="◀ Назад", callback_data=f"info:{bot_id}")])
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data.startswith("grouptask:"))
+async def cb_group_task_panel(callback: CallbackQuery):
+    if not _is_owner(callback.from_user.id):
+        await _deny_callback(callback)
+        return
+    await callback.answer()
+    bot_id = int(callback.data.split(":")[1])
+    bot_row = await get_bot(bot_id)
+    if not bot_row:
+        await callback.message.answer("Бот не найден.")
+        return
+    # The feature must be enabled for features/group_task.py's router to ever
+    # run for this bot — same enable_feature_and_reload() the "🧩 Фичи" toggle
+    # uses, so opening this panel is enough to turn the channel on without a
+    # separate trip through the Features screen first. A no-op (INSERT OR
+    # IGNORE under the hood) if already enabled.
+    enabled_features = await get_bot_features(bot_id)
+    if "group_task" not in enabled_features:
+        await enable_feature_and_reload(bot_id, "group_task")
+    text, keyboard = await _group_task_panel_text_and_keyboard(bot_id, bot_row)
+    await _edit_or_resend(callback, text, parse_mode="HTML", reply_markup=keyboard)
+
+
+@router.callback_query(F.data.startswith("grouptaskdisconnect:"))
+async def cb_group_task_disconnect(callback: CallbackQuery):
+    if not _is_owner(callback.from_user.id):
+        await _deny_callback(callback)
+        return
+    await callback.answer()
+    bot_id = int(callback.data.split(":")[1])
+    bot_row = await get_bot(bot_id)
+    if not bot_row:
+        await callback.message.answer("Бот не найден.")
+        return
+    await delete_group_task_config(bot_id)
+    text, keyboard = await _group_task_panel_text_and_keyboard(bot_id, bot_row)
+    await _edit_or_resend(callback, text, parse_mode="HTML", reply_markup=keyboard)
+
+
 def _parse_spreadsheet_id(text: str) -> str | None:
     text = text.strip()
     m = _SPREADSHEET_ID_RE.search(text)
@@ -1032,28 +1117,46 @@ async def msg_sheets_connect_invalid(message: Message) -> None:
 
 _PROVIDER_TOKEN_RE = re.compile(r"^\d+:(TEST|LIVE):.{1,256}$")
 
+# Checklist format ("☐ сделай → скопируй") instead of prose — cuts cognitive
+# load on each step down to the concrete action plus the concrete thing to
+# carry into the next screen. Not real Telegram checkboxes (messages don't
+# support those) — plain characters used purely as a visual marker.
 _PAYMENT_STEP_1_TEXT = (
     "💳 <b>Подключение оплаты (Telegram Payments)</b>\n\n"
     "Шаг 1 из 4 — Регистрация у платёжного провайдера\n\n"
-    "Если у тебя ещё нет магазина в ЮKassa — зарегистрируй его по кнопке ниже. "
-    "Понадобятся данные ИП/самозанятости/юрлица — это требование платёжного "
-    "законодательства, тут это не обойти."
+    "☐ Если у тебя ещё нет магазина в ЮKassa — зарегистрируй его по кнопке ниже\n"
+    "☐ Понадобятся данные ИП/самозанятости/юрлица — это требование платёжного "
+    "законодательства, тут это не обойти"
 )
 _PAYMENT_STEP_2_TEXT = (
     "💳 Шаг 2 из 4 — Открой BotFather\n\n"
-    "В открывшемся чате отправь:\n"
-    "<code>/mybots</code> → выбери своего бота → <b>Bot Settings</b> → <b>Payments</b>."
+    "☐ Перейди в чат BotFather по кнопке ниже\n"
+    "☐ Отправь туда: <code>/mybots</code>\n"
+    "☐ Выбери своего бота → <b>Bot Settings</b> → <b>Payments</b>"
 )
 _PAYMENT_STEP_3_TEXT = (
     "💳 Шаг 3 из 4 — Выбери провайдера в списке\n\n"
-    "В списке провайдеров выбери <b>YooKassa</b> — BotFather откроет чат с "
-    "@YooKassaBot. Войди там в свой аккаунт ЮKassa и подтверди — он пришлёт "
-    "тебе токен вида <code>381764678:TEST:...</code> или <code>381764678:LIVE:...</code>."
+    "☐ В списке провайдеров выбери <b>YooKassa</b>\n"
+    "☐ BotFather откроет чат с @YooKassaBot — войди там в свой аккаунт ЮKassa\n"
+    "☐ Подтверди — @YooKassaBot пришлёт токен вида "
+    "<code>381764678:TEST:...</code> или <code>381764678:LIVE:...</code>"
 )
 _PAYMENT_STEP_4_TEXT = (
     "💳 Шаг 4 из 4 — Вставь токен сюда\n\n"
-    "Скопируй токен, который прислал @YooKassaBot, и пришли его сюда сообщением."
+    "→ Скопируй токен, который прислал @YooKassaBot, и пришли его сюда сообщением"
 )
+
+# Static screenshots of the corresponding BotFather/@YooKassaBot screen, one per
+# step. Prepared and dropped in by the project owner separately (BotFather's UI
+# isn't ours to snapshot automatically); step 1 has no BotFather screen yet, so
+# it stays text-only. A missing/placeholder file degrades to plain text — a
+# stale or absent screenshot must never block the wizard, since the caption
+# always carries the instruction independent of the image.
+_PAYMENT_STEP_SCREENSHOTS = {
+    2: Path(__file__).resolve().parent.parent / "assets" / "payment_guide" / "step2_botfather_payments.png",
+    3: Path(__file__).resolve().parent.parent / "assets" / "payment_guide" / "step3_choose_provider.png",
+    4: Path(__file__).resolve().parent.parent / "assets" / "payment_guide" / "step4_token_message.png",
+}
 
 
 def _payment_step_keyboard(bot_id: int, step: int) -> InlineKeyboardMarkup:
@@ -1081,6 +1184,28 @@ _PAYMENT_STEP_TEXTS = {
 }
 
 
+async def _show_payment_step(callback: CallbackQuery, bot_id: int, step: int) -> None:
+    """Renders one wizard step: photo+caption when a screenshot asset exists for
+    this step, otherwise the plain-text card exactly as before. Telegram can't
+    turn a text message into a photo message (or back) via edit_text/edit_media,
+    so a step with a screenshot always deletes the old card and resends fresh —
+    the small navigation flicker is an acceptable trade for never crashing on a
+    missing/placeholder asset."""
+    text = _PAYMENT_STEP_TEXTS[step]
+    markup = _payment_step_keyboard(bot_id, step)
+    screenshot = _PAYMENT_STEP_SCREENSHOTS.get(step)
+    if screenshot is not None and screenshot.exists():
+        try:
+            await callback.message.delete()
+        except TelegramBadRequest:
+            pass  # already gone / too old to delete for the bot — resend anyway
+        await callback.message.answer_photo(
+            FSInputFile(str(screenshot)), caption=text, parse_mode="HTML", reply_markup=markup,
+        )
+        return
+    await _edit_or_resend(callback, text, parse_mode="HTML", reply_markup=markup)
+
+
 @router.callback_query(F.data.startswith("paystart:"))
 async def cb_payment_connect_start(callback: CallbackQuery, state: FSMContext):
     if not _is_owner(callback.from_user.id):
@@ -1098,12 +1223,7 @@ async def cb_payment_connect_start(callback: CallbackQuery, state: FSMContext):
     # clobber this wizard's stashed bot_id.
     await state.set_state(PaymentConnectFlow.browsing_step)
     await state.update_data(bot_id=bot_id)
-    await _edit_or_resend(
-        callback,
-        _PAYMENT_STEP_1_TEXT,
-        parse_mode="HTML",
-        reply_markup=_payment_step_keyboard(bot_id, 1),
-    )
+    await _show_payment_step(callback, bot_id, 1)
 
 
 @router.callback_query(F.data.startswith("paystep:"))
@@ -1129,12 +1249,7 @@ async def cb_payment_connect_step(callback: CallbackQuery, state: FSMContext):
     else:
         await state.set_state(PaymentConnectFlow.browsing_step)
     await state.update_data(bot_id=bot_id)
-    await _edit_or_resend(
-        callback,
-        _PAYMENT_STEP_TEXTS[step],
-        parse_mode="HTML",
-        reply_markup=_payment_step_keyboard(bot_id, step),
-    )
+    await _show_payment_step(callback, bot_id, step)
 
 
 @router.callback_query(F.data.startswith("paycancel:"))
@@ -1635,6 +1750,9 @@ async def cb_delete(callback: CallbackQuery):
     name = b["name"]
     await stop_bot(bot_id)
     await delete_bot(bot_id)
+    from features.group_task import invalidate_group_task_state
+
+    invalidate_group_task_state(bot_id)
     _delete_custom_feature_file(bot_id)
     await callback.message.edit_text(
         f"✅ Бот <b>{name}</b> удалён.\n\nСоздай нового: /create",
