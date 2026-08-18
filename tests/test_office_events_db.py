@@ -135,3 +135,7 @@ async def test_get_office_links_for_bot_excludes_unrelated_links(isolated_db):
     a, b, c = await _make_bots(3)
     await add_office_link(a, b, "order.created")
     assert await get_office_links_for_bot(c) == []
+
+
+# The optional office-events digest-group showcase (office_digest_group) is
+# covered separately in tests/test_office_digest_group_db.py.

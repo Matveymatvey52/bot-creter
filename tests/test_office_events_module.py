@@ -173,6 +173,28 @@ async def test_publish_event_mirrors_to_bound_digest_group(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_publish_event_digest_mirror_escapes_bot_name_html_metacharacters(monkeypatch):
+    """A bot name is owner/LLM-controlled free text — must be HTML-escaped
+    before interpolation, even though this message currently has no
+    parse_mode set (defense-in-depth, see the escaping fix's own comment in
+    features/office_events.py's _mirror_to_digest_group)."""
+    monkeypatch.setattr(office_events, "get_office_subscribers", AsyncMock(return_value=[]))
+    monkeypatch.setattr(database, "get_office_digest_group", AsyncMock(return_value="-100999"))
+    monkeypatch.setattr(
+        office_events, "get_bot", AsyncMock(return_value={"id": 1, "name": "<b>Рома</b> & Co"})
+    )
+    factory_entry = SimpleNamespace(bot=AsyncMock())
+    office_events.set_registry(FakeRegistry({0: factory_entry}))
+
+    await publish_event(1, "order.created", OrderCreatedEvent(1, 100, "RUB", 999))
+
+    factory_entry.bot.send_message.assert_awaited_once()
+    (_, text), _ = factory_entry.bot.send_message.call_args
+    assert "<b>Рома</b> & Co" not in text
+    assert "&lt;b&gt;Рома&lt;/b&gt; &amp; Co" in text
+
+
+@pytest.mark.asyncio
 async def test_publish_event_digest_mirror_failure_does_not_block_delivery(monkeypatch):
     monkeypatch.setattr(office_events, "get_office_subscribers", AsyncMock(return_value=[2]))
     monkeypatch.setattr(
@@ -196,3 +218,27 @@ async def test_publish_event_skips_digest_mirror_when_factory_bot_not_live(monke
     # Must not raise even though the factory bot isn't in the live registry.
     delivered = await publish_event(1, "order.created", OrderCreatedEvent(1, 100, "RUB", 999))
     assert delivered == 0
+
+
+# ── available_event_types_for_template ────────────────────────────────────
+from features.office_events import available_event_types_for_template
+
+
+def test_available_event_types_none_for_from_scratch_bot():
+    assert available_event_types_for_template(None) == []
+
+
+def test_available_event_types_order_created_for_payments_compatible_template():
+    # shop_catalog IS in features/payments.py's own COMPATIBLE_WITH header.
+    assert available_event_types_for_template("shop_catalog") == ["order.created"]
+
+
+def test_available_event_types_task_assigned_for_boss_bot():
+    assert available_event_types_for_template("boss_bot") == ["task.assigned"]
+
+
+def test_available_event_types_empty_for_template_with_no_publisher():
+    # tour_operator is compatible with office_events (can RECEIVE events) but
+    # is not in payments' COMPATIBLE_WITH list and is not boss_bot, so it
+    # publishes nothing.
+    assert available_event_types_for_template("tour_operator") == []

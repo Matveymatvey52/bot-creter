@@ -282,7 +282,11 @@ async def init_db():
         # and there is only ever one such group for the whole factory
         # instance — unlike bots.group_chat_id, which is a PER-BOT fallback
         # destination for that bot's own moderator-style notifications and is
-        # semantically unrelated to this.
+        # semantically unrelated to this. Read via get_office_digest_group()/
+        # set via set_office_digest_group() below — the miniapp's
+        # showcase_group_status_handler (runtime/factory_analytics_api.py)
+        # and the Telegram-side "🔔 Использовать как витрину" button (main.py)
+        # both bind through this same pair, one canonical table.
         await db.execute("""
             CREATE TABLE IF NOT EXISTS office_digest_group (
                 id         INTEGER PRIMARY KEY CHECK (id = 1),

@@ -37,6 +37,7 @@ from db.database import (
     get_bot_office_hook_config,
     get_bot_sheets_config,
     get_bot_yookassa_credentials,
+    get_office_digest_group,
     get_office_links_for_bot,
     list_bots_with_stats,
     list_template_candidate_clusters_with_stats,
@@ -47,6 +48,7 @@ from db.database import (
     set_bot_feature_thread,
     update_bot_status,
 )
+from features.office_events import EVENT_TYPE_LABELS, available_event_types_for_template
 from features.sales_analytics import weekly_record_count
 from handlers.admin_manager import OWNER_ID
 from handlers.manage_bots import (
@@ -582,11 +584,37 @@ async def list_offices_handler(request: web.Request) -> web.Response:
     return web.json_response({"items": links})
 
 
+async def list_office_event_types_handler(request: web.Request) -> web.Response:
+    """GET /api/factory/bots/{id}/offices/event-types — event types THIS bot
+    (as a prospective SOURCE) can plausibly publish, for the office-link
+    wizard's event-type picker (approved design step 2: "выбор типа события
+    из списка, который поддерживает бот-источник"). Derived from the bot's
+    own template_id via features/office_events.py's
+    available_event_types_for_template() — see that function's docstring for
+    why this is a strict, explicit subset of the COMPATIBLE_WITH list rather
+    than "every event type this template could theoretically receive"."""
+    if not await _authenticate_owner(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    bot_id = _bot_id_from_match_info(request)
+    if bot_id is None:
+        return web.json_response({"error": "bad bot_id"}, status=404)
+    b = await get_bot(bot_id)
+    if not b:
+        return web.json_response({"error": "not found"}, status=404)
+    template_id = infer_template_id(b.get("file_path"))
+    event_types = available_event_types_for_template(template_id)
+    items = [{"event_type": et, "label": EVENT_TYPE_LABELS.get(et, et)} for et in event_types]
+    return web.json_response({"items": items})
+
+
 async def add_office_handler(request: web.Request) -> web.Response:
-    """POST /api/factory/bots/{id}/offices — body {"target_bot_id": int}.
-    This bot (source) will notify target_bot_id about order.created events —
-    same direction/event_type convention as handlers/manage_bots.py's
-    officelink callback."""
+    """POST /api/factory/bots/{id}/offices — body {"target_bot_id": int,
+    "event_type": str}. This bot (source) will notify target_bot_id about
+    event_type events. event_type must be one of the types
+    list_office_event_types_handler would offer for this bot's own
+    template — re-validated here rather than trusted from the client, same
+    "never trust the picker, re-check server-side" posture as
+    configure_feature_handler's own template-compatibility re-check."""
     if not await _authenticate_owner(request):
         return web.json_response({"error": "forbidden"}, status=403)
     bot_id = _bot_id_from_match_info(request)
@@ -597,33 +625,61 @@ async def add_office_handler(request: web.Request) -> web.Response:
     except Exception:
         return web.json_response({"error": "invalid JSON body"}, status=400)
     target_bot_id = payload.get("target_bot_id") if isinstance(payload, dict) else None
+    event_type = payload.get("event_type") if isinstance(payload, dict) else None
     if not isinstance(target_bot_id, int):
         return web.json_response({"error": "target_bot_id is required"}, status=400)
+    if not isinstance(event_type, str) or not event_type:
+        return web.json_response({"error": "event_type is required"}, status=400)
     if target_bot_id == bot_id:
         return web.json_response({"error": "cannot link a bot to itself"}, status=400)
     source = await get_bot(bot_id)
     target = await get_bot(target_bot_id)
     if not source or not target:
         return web.json_response({"error": "not found"}, status=404)
-    await add_office_link(bot_id, target_bot_id, _OFFICE_EVENT_TYPE)
+    source_template = infer_template_id(source.get("file_path"))
+    if event_type not in available_event_types_for_template(source_template):
+        return web.json_response({"error": "event_type not available for this bot's template"}, status=400)
+    await add_office_link(bot_id, target_bot_id, event_type)
     return web.json_response({"ok": True}, status=201)
 
 
 async def remove_office_handler(request: web.Request) -> web.Response:
-    """DELETE /api/factory/bots/{id}/offices/{target_id} — removes the
-    (bot_id, target_id, order.created) link. bot_id in the URL is always the
-    SOURCE side, matching add_office_handler above; a link where this bot is
-    the TARGET is removed from the other bot's own detail panel instead
-    (each panel only ever displays/manages links where IT is the source, same
-    posture as the mockup's single-arrow-per-row list)."""
+    """DELETE /api/factory/bots/{id}/offices/{target_id}?event_type=...
+    — removes the (bot_id, target_id, event_type) link. bot_id in the URL is
+    always the SOURCE side, matching add_office_handler above; a link where
+    this bot is the TARGET is removed from the other bot's own detail panel
+    instead (each panel only ever displays/manages links where IT is the
+    source, same posture as the mockup's single-arrow-per-row list).
+    event_type is a query param (not a path segment) since it can contain a
+    '.' (e.g. "order.created") that would otherwise need URL-segment escaping
+    for no real benefit — defaults to _OFFICE_EVENT_TYPE for callers created
+    before the event-type picker existed (the Telegram-side officeconnect
+    flow still only ever creates order.created links)."""
     if not await _authenticate_owner(request):
         return web.json_response({"error": "forbidden"}, status=403)
     bot_id = _bot_id_from_match_info(request)
     target_raw = request.match_info.get("target_id", "")
     if bot_id is None or not target_raw.isdigit():
         return web.json_response({"error": "bad request"}, status=404)
-    await remove_office_link(bot_id, int(target_raw), _OFFICE_EVENT_TYPE)
+    event_type = request.query.get("event_type", _OFFICE_EVENT_TYPE)
+    await remove_office_link(bot_id, int(target_raw), event_type)
     return web.json_response({"ok": True})
+
+
+async def showcase_group_status_handler(request: web.Request) -> web.Response:
+    """GET /api/factory/showcase-group — whether the optional office-events
+    digest group (db/database.py's office_digest_group, docs/OFFICES_DESIGN.md
+    §12 "витрина") is bound. No chat_id/title in the response — the SPA
+    never needs to render it, only whether the guide/success screen should
+    show "connected" state. Bound either from the miniapp's own success
+    screen (not yet wired to write this table — see BotDetailPanel.tsx's
+    ShowcaseGroupGuide, currently a read-only guide) or from the
+    Telegram-side "🏢 Как витрина связей офисов" button (main.py's
+    build_group_router()), both converging on this one table."""
+    if not await _authenticate_owner(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    chat_id = await get_office_digest_group()
+    return web.json_response({"connected": chat_id is not None})
 
 
 async def list_admins_handler(request: web.Request) -> web.Response:
@@ -696,8 +752,10 @@ def register_routes(app: web.Application) -> None:
     app.router.add_post("/api/factory/bots/{bot_id}/features/{name}/cancel", cancel_feature_configure_handler)
 
     app.router.add_get("/api/factory/bots/{bot_id}/offices", list_offices_handler)
+    app.router.add_get("/api/factory/bots/{bot_id}/offices/event-types", list_office_event_types_handler)
     app.router.add_post("/api/factory/bots/{bot_id}/offices", add_office_handler)
     app.router.add_delete("/api/factory/bots/{bot_id}/offices/{target_id}", remove_office_handler)
+    app.router.add_get("/api/factory/showcase-group", showcase_group_status_handler)
 
     app.router.add_get("/api/factory/bots/{bot_id}/admins", list_admins_handler)
     app.router.add_post("/api/factory/bots/{bot_id}/admins", add_admin_handler)

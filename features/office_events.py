@@ -29,6 +29,7 @@ features/sheets.py's write_row()/read_data().
 """
 from __future__ import annotations
 
+import html
 import logging
 import re
 import time
@@ -83,16 +84,75 @@ _EVENT_TYPES: dict[str, type] = {
     "task.assigned": TaskAssignedEvent,
 }
 
-# Human-readable labels for the picker/confirmation screens in
-# handlers/manage_bots.py's "🏢 Офисы" flow — kept alongside _EVENT_TYPES so
-# a new event_type can't be added there without a caller-facing label. Falls
-# back to the raw event_type string if a key is somehow missing (see
+# Human-readable labels for the picker/confirmation screens in both
+# handlers/manage_bots.py's "🏢 Офисы" Telegram flow AND the miniapp's
+# office-link wizard (runtime/factory_analytics_api.py's
+# list_office_event_types_handler) — kept alongside _EVENT_TYPES so a new
+# event_type can't be added there without a caller-facing label. Falls back
+# to the raw event_type string if a key is somehow missing (see
 # EVENT_TYPE_LABELS.get usage) rather than raising in a UI render path.
 EVENT_TYPE_LABELS: dict[str, str] = {
     "order.created": "новый заказ",
     "task.assigned": "новая задача",
 }
 
+# Which template_ids actually PUBLISH each event_type — a strict subset of
+# COMPATIBLE_WITH above (which only gates who can RECEIVE/subscribe). Used by
+# the miniapp office-link wizard (runtime/factory_analytics_api.py's
+# list_office_event_types_handler) to offer only event types the chosen
+# SOURCE bot can realistically emit, instead of the full _EVENT_TYPES set —
+# e.g. offering "task.assigned" for a shop_catalog bot would create a link
+# that will simply never fire. The Telegram-side wizard (handlers/
+# manage_bots.py's cb_office_pick_type) still offers every _EVENT_TYPES key
+# unfiltered — this is an additional, stricter check layered on top for the
+# miniapp surface, not a replacement for that flow. Deliberately explicit
+# (not derived from scanning templates/*.py for publish_event() calls at
+# runtime) for the same "no silent widening" reason _EVENT_TYPES itself is a
+# closed dict: a new publisher call site must be a deliberate addition here,
+# not an automatic side effect of adding a publish_event() call somewhere.
+#
+# order.created's publisher set is None (not a fixed set) because its only
+# publisher, features/payments.py's on_successful_payment, fires for EVERY
+# template payments is compatible with — that list already lives in
+# payments.py's own "# COMPATIBLE_WITH:" header (parsed by
+# runtime/registry.py's discover_features(), the same mechanism every other
+# feature's compatibility list goes through) rather than a second hand-kept
+# copy here that could drift from it.
+_EVENT_TYPE_PUBLISHER_TEMPLATES: dict[str, set[str] | None] = {
+    "order.created": None,
+    "task.assigned": {"boss_bot"},
+}
+
+
+def available_event_types_for_template(template_id: str | None) -> list[str]:
+    """Event types `template_id` can plausibly PUBLISH as a source bot — see
+    _EVENT_TYPE_PUBLISHER_TEMPLATES. order.created's availability is derived
+    from features/payments.py's own COMPATIBLE_WITH header via
+    runtime/registry.py's discover_features(), its only current publisher.
+    A from-scratch bot (template_id=None) can never publish anything through
+    this closed-dataclass mechanism, so it always gets an empty list. Local
+    import of discover_features to avoid a runtime.registry <-> this module
+    import cycle at module load time (registry.py imports feature modules
+    dynamically, not the reverse, but this keeps the dependency one-way at
+    parse time too)."""
+    if template_id is None:
+        return []
+    from runtime.registry import discover_features
+
+    payments_compatible: set[str] = set()
+    for feature in discover_features():
+        if feature["name"] == "payments":
+            payments_compatible = set(feature["compatible_with"])
+            break
+
+    available = []
+    for event_type, publishers in _EVENT_TYPE_PUBLISHER_TEMPLATES.items():
+        if publishers is None:
+            if event_type == "order.created" and template_id in payments_compatible:
+                available.append(event_type)
+        elif template_id in publishers:
+            available.append(event_type)
+    return available
 
 @dataclass(frozen=True)
 class OfficeEvent:
@@ -133,7 +193,18 @@ async def _mirror_to_digest_group(registry, source_bot_id: int, event_type: str)
         if factory_entry is None:
             return
         source_bot = await get_bot(source_bot_id)
-        source_name = source_bot["name"] if source_bot else str(source_bot_id)
+        # source_bot["name"] is owner/LLM-controlled free text (see
+        # handlers/create_bot.py's naming flow) — escaped before
+        # interpolation, same convention every other user/LLM-text-derived
+        # message in this codebase follows (e.g. features/sellable_items.py,
+        # templates/channel_monitor.py). This message has no parse_mode set
+        # (plain text), so escaping here is defense-in-depth against a
+        # future caller adding parse_mode="HTML" rather than a fix for a
+        # live rendering bug — plain-text send_message doesn't interpret
+        # '<'/'&' at all, but keeping the escape means switching to HTML
+        # formatting later can't silently reintroduce injection.
+        raw_name = source_bot["name"] if source_bot else str(source_bot_id)
+        source_name = html.escape(raw_name)
         label = EVENT_TYPE_LABELS.get(event_type, event_type)
         text = f"🏢 «{source_name}»: {label}"
         await factory_entry.bot.send_message(chat_id, text)
@@ -211,6 +282,7 @@ async def publish_event(source_bot_id: int, event_type: str, payload: object) ->
                 f"publish_event: delivery to target_bot_id={target_bot_id} raised — "
                 f"event_type={event_type!r} source_bot_id={source_bot_id}, skipped"
             )
+
     return delivered
 
 
