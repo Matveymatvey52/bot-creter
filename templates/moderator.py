@@ -46,6 +46,16 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 router = Router()
 
+# Per-chat locks guarding _replace_panel's read-delete-send-write sequence —
+# see _replace_panel's docstring. A fast double-tap on a panel button (or two
+# updates landing in the same getUpdates batch) could otherwise both read the
+# same stale panel_msg_id, both send a new panel message, and the later
+# state.update_data() win — leaking the other message (never tracked, never
+# deleted on the next navigation). Module-level dict is fine here: it only
+# ever grows by one entry per DISTINCT private chat the bot has ever shown a
+# panel in, and Lock objects are tiny.
+_panel_locks: dict[int, asyncio.Lock] = {}
+
 # Same link-detection regex as the generic per-bot MODERATOR_EXTRA prompt in
 # services/claude_service.py — kept consistent so a Claude-generated custom
 # moderator bot and this fixed template flag the same things.
@@ -144,7 +154,14 @@ class ConfigMiddleware(BaseMiddleware):
         return await handler(event, data)
 
 
-# ── admin helpers (admins_file — bot owner's admins, used for /modlog) ───────
+# ── admin helpers (bot_admins table — bot owner's admins, used for /modlog) ──
+# Storage used to be a JSON admins_file with a plain read-modify-write (no
+# locking), which meant two admins changing the set at the same time could
+# silently clobber each other's change. Replaced with the bot_admins SQLite
+# table below, using the same BEGIN IMMEDIATE locking as _apply_escalation
+# and _claim_dm_fallback_slot elsewhere in this file. _load_admins (JSON) is
+# kept ONLY for _migrate_admins_file_to_db's one-time import — every runtime
+# read/write goes through the async helpers below instead.
 
 def _load_admins(admins_file: Path) -> set:
     try:
@@ -152,19 +169,79 @@ def _load_admins(admins_file: Path) -> set:
     except Exception:
         return set()
 
-def _save_admins(admins_file: Path, ids: set) -> None:
-    # Review-found: the admin-panel button flow added 3 more write sites on
-    # top of the pre-existing 2 (raw /addadmin, /removeadmin) — a crash mid
-    # write (process kill, disk full) on a plain write_text() truncates the
-    # file first, so a following read sees invalid JSON and _load_admins
-    # silently returns an EMPTY set. Combined with cmd_start's "first
-    # /start-er becomes the bot's admin" bootstrap, that would hand admin
-    # access to whoever happens to message the bot next. Write to a sibling
-    # temp file and atomically replace instead — a crash mid-write leaves the
-    # ORIGINAL file untouched.
-    tmp_path = admins_file.with_suffix(admins_file.suffix + ".tmp")
-    tmp_path.write_text(json.dumps({"ids": list(ids)}, ensure_ascii=False))
-    tmp_path.replace(admins_file)
+
+async def _list_bot_admins(db_path: str) -> set:
+    async with aiosqlite.connect(db_path) as db:
+        rows = await (await db.execute("SELECT id FROM bot_admins")).fetchall()
+    return {r[0] for r in rows}
+
+
+async def _is_bot_admin_db(db_path: str, user_id: int) -> bool:
+    async with aiosqlite.connect(db_path) as db:
+        row = await (await db.execute(
+            "SELECT 1 FROM bot_admins WHERE id=?", (str(user_id),)
+        )).fetchone()
+    return row is not None
+
+
+async def _add_bot_admin(db_path: str, admin_id: str) -> None:
+    async with aiosqlite.connect(db_path, timeout=10) as db:
+        await db.execute("INSERT OR IGNORE INTO bot_admins (id) VALUES (?)", (admin_id,))
+        await db.commit()
+
+
+async def _replace_bot_admins(db_path: str, ids: set) -> None:
+    """Replaces the whole bot_admins set — same replace-not-merge semantics
+    as the old JSON _save_admins. Not used by any runtime handler (they all
+    go through _add_bot_admin/_remove_bot_admin, which change one id at a
+    time); exists for test fixtures that need to seed/overwrite the full
+    admin set in one call."""
+    async with aiosqlite.connect(db_path, timeout=10) as db:
+        await db.execute("DELETE FROM bot_admins")
+        if ids:
+            await db.executemany("INSERT INTO bot_admins (id) VALUES (?)", [(i,) for i in ids])
+        await db.commit()
+
+
+async def _remove_bot_admin(db_path: str, admin_id: str) -> str:
+    """Atomically removes admin_id from bot_admins, refusing to remove the
+    last remaining admin — same BEGIN IMMEDIATE pattern as
+    _claim_dm_fallback_slot, closing the race the old in-memory
+    `len(ids) <= 1` check couldn't: two admins concurrently removing two
+    DIFFERENT other admins, each reading a stale count that still included
+    the other's target, could previously both proceed and empty the set.
+    Returns "removed", "not_found", or "last_admin"."""
+    async with aiosqlite.connect(db_path, timeout=10) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        row = await (await db.execute("SELECT 1 FROM bot_admins WHERE id=?", (admin_id,))).fetchone()
+        if row is None:
+            await db.commit()
+            return "not_found"
+        count = (await (await db.execute("SELECT COUNT(*) FROM bot_admins")).fetchone())[0]
+        if count <= 1:
+            await db.commit()
+            return "last_admin"
+        await db.execute("DELETE FROM bot_admins WHERE id=?", (admin_id,))
+        await db.commit()
+        return "removed"
+
+
+async def _claim_first_bot_admin(db_path: str, user_id: str) -> bool:
+    """Atomically bootstraps user_id as the bot's first admin iff bot_admins
+    is currently empty — same BEGIN IMMEDIATE pattern as the rest of this
+    section, closing a TOCTOU the old cmd_start had: two people /start-ing
+    the fresh bot at nearly the same moment could both see an empty admin
+    set and both get told "you're the admin", even though only one of them
+    should have been. Returns True iff THIS call won the bootstrap."""
+    async with aiosqlite.connect(db_path, timeout=10) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        count = (await (await db.execute("SELECT COUNT(*) FROM bot_admins")).fetchone())[0]
+        if count > 0:
+            await db.commit()
+            return False
+        await db.execute("INSERT INTO bot_admins (id) VALUES (?)", (user_id,))
+        await db.commit()
+        return True
 
 
 async def _is_group_admin(bot: Bot, chat_id: int, user_id: int) -> bool:
@@ -246,6 +323,59 @@ async def init_db(db_path: str):
                 sent_at TEXT DEFAULT (datetime('now','localtime'))
             )
         """)
+        # Bot-admin IDs (who may use /addadmin, the "👥 Админы" panel, /modlog).
+        # Replaces the old admins_file JSON store — a plain read-modify-write
+        # over a file has no cross-call locking, so two admins adding/removing
+        # different IDs at the same time could silently clobber each other's
+        # change (whichever _save_admins finished last won). SQLite's
+        # BEGIN IMMEDIATE (see _add_bot_admin/_remove_bot_admin) closes that
+        # race the same way _apply_escalation and _claim_dm_fallback_slot
+        # already do elsewhere in this file.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS bot_admins (
+                id TEXT PRIMARY KEY
+            )
+        """)
+        await db.commit()
+    await _migrate_admins_file_to_db(db_path)
+
+
+def _admins_file_for_db_path(db_path: str) -> Path:
+    """Derives the legacy admins_file path from db_path — both are built from
+    the same stem by _paths_for/config_from_bot_row ("{name}_data.db" /
+    "admins_{name}.json", or "bot_{id}_data.db" / "admins_{id}.json"), so the
+    "_data" suffix is the only part that differs. init_db only receives
+    db_path (see runtime/registry.py's generic `module.init_db(config.db_path)`
+    call, shared by every template), so migration has to work from that alone
+    rather than taking a ModeratorConfig."""
+    stem = Path(db_path).stem
+    if stem.endswith("_data"):
+        stem = stem[: -len("_data")]
+    return Path(db_path).with_name(f"admins_{stem}.json")
+
+
+async def _migrate_admins_file_to_db(db_path: str) -> None:
+    """One-time import of the legacy admins_file JSON store into bot_admins —
+    runs on every startup but is a no-op once the table is non-empty, so it's
+    safe to call unconditionally. The JSON file is left on disk untouched
+    (not deleted) as a backup; bot_admins is the only store read/written from
+    here on."""
+    admins_file = _admins_file_for_db_path(db_path)
+    if not admins_file.exists():
+        return
+    async with aiosqlite.connect(db_path, timeout=10) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        row = await (await db.execute("SELECT 1 FROM bot_admins LIMIT 1")).fetchone()
+        if row is not None:
+            await db.commit()
+            return
+        ids = _load_admins(admins_file)
+        if ids:
+            await db.executemany(
+                "INSERT OR IGNORE INTO bot_admins (id) VALUES (?)",
+                [(i,) for i in ids],
+            )
+            logger.info(f"_migrate_admins_file_to_db: imported {len(ids)} admin id(s) from {admins_file}")
         await db.commit()
 
 
@@ -548,7 +678,7 @@ async def _moderate_safely(bot: Bot, config: ModeratorConfig, chat_id: int, acti
         # would let the exception escape moderate_message() unhandled, silently
         # dropping the violation from warnings/moderation_log with no DM either.
         logger.error(f"_moderate_safely: action={action} chat_id={chat_id} failed: {e}")
-        for admin_id in _load_admins(config.admins_file):
+        for admin_id in await _list_bot_admins(config.db_path):
             try:
                 await bot.send_message(
                     int(admin_id),
@@ -1132,7 +1262,7 @@ def kb_start_menu() -> InlineKeyboardMarkup:
 async def _replace_panel(
     bot: Bot, state: FSMContext, chat_id: int, text: str,
     reply_markup: InlineKeyboardMarkup | None = None, parse_mode: str | None = None,
-) -> None:
+) -> bool:
     """Private-chat panel navigation: delete the previously shown panel
     message (if any) and send a new one, tracking its id for next time — same
     delete-old/show-new mechanic as templates/tour_operator.py's cb_section
@@ -1149,27 +1279,39 @@ async def _replace_panel(
     would also wipe `panel_msg_id` and make the delete-old step below a no-op
     (review-found: every flow-completion path originally did `state.clear()`
     THEN called this function, so `prev_id` below was always None and the
-    prompt/pick-list message from the step just finished was never deleted)."""
-    data = await state.get_data()
-    prev_id = data.get("panel_msg_id")
-    if prev_id:
+    prompt/pick-list message from the step just finished was never deleted).
+
+    Returns True iff the new panel message was actually sent. Callers that
+    are STARTING a flow off the back of this call (setting an FSM state that
+    expects a reply to a prompt this function was supposed to show) must
+    check this — review-found: previously always returned None either way,
+    so cb_addadmin_start/cb_removeadmin_start etc. would set FSM state to
+    expect a reply even when the prompt itself silently failed to send,
+    leaving the user's next ordinary message misinterpreted as a flow answer
+    with no prompt ever shown."""
+    lock = _panel_locks.setdefault(chat_id, asyncio.Lock())
+    async with lock:
+        data = await state.get_data()
+        prev_id = data.get("panel_msg_id")
+        if prev_id:
+            try:
+                await bot.delete_message(chat_id, prev_id)
+            except Exception as e:
+                # Expected in the common case (already 48h+ old, or the user
+                # deleted it themselves) — debug level, but logged instead of a
+                # bare pass so a genuinely unexpected failure isn't invisible.
+                logger.debug(f"_replace_panel: failed to delete old panel {prev_id} in chat {chat_id}: {e}")
+        # Review-found: unlike every other Telegram call in this file, this send
+        # had no try/except — an unbounded admin ID (see _admins_list_text) or a
+        # blocked/deactivated user would raise here unhandled, on EVERY future
+        # panel render, for every admin, until fixed by hand.
         try:
-            await bot.delete_message(chat_id, prev_id)
+            msg = await bot.send_message(chat_id, text, parse_mode=parse_mode, reply_markup=reply_markup)
         except Exception as e:
-            # Expected in the common case (already 48h+ old, or the user
-            # deleted it themselves) — debug level, but logged instead of a
-            # bare pass so a genuinely unexpected failure isn't invisible.
-            logger.debug(f"_replace_panel: failed to delete old panel {prev_id} in chat {chat_id}: {e}")
-    # Review-found: unlike every other Telegram call in this file, this send
-    # had no try/except — an unbounded admin ID (see _admins_list_text) or a
-    # blocked/deactivated user would raise here unhandled, on EVERY future
-    # panel render, for every admin, until fixed by hand.
-    try:
-        msg = await bot.send_message(chat_id, text, parse_mode=parse_mode, reply_markup=reply_markup)
-    except Exception as e:
-        logger.warning(f"_replace_panel: failed to send panel to chat {chat_id}: {e}")
-        return
-    await state.update_data(panel_msg_id=msg.message_id)
+            logger.warning(f"_replace_panel: failed to send panel to chat {chat_id}: {e}")
+            return False
+        await state.update_data(panel_msg_id=msg.message_id)
+        return True
 
 
 async def _clear_flow_keep_panel(state: FSMContext) -> None:
@@ -1184,8 +1326,8 @@ async def _clear_flow_keep_panel(state: FSMContext) -> None:
         await state.update_data(panel_msg_id=panel_msg_id)
 
 
-def _is_bot_admin(user_id: int, config: ModeratorConfig) -> bool:
-    return str(user_id) in _load_admins(config.admins_file)
+async def _is_bot_admin(user_id: int, config: ModeratorConfig) -> bool:
+    return await _is_bot_admin_db(config.db_path, user_id)
 
 
 # AdminPanelFlow reuses FLOW_TIMEOUT_SECONDS/_flow_expired (defined above,
@@ -1260,7 +1402,7 @@ async def _admins_list_text(config: ModeratorConfig) -> str:
     # its numbered buttons from sorted(_load_admins(...)) — the displayed
     # list and the button order could silently disagree. Sort both the same
     # way so "admin #2 in the list" always means the same id as "button #2".
-    ids = sorted(_load_admins(config.admins_file))
+    ids = sorted(await _list_bot_admins(config.db_path))
     if not ids:
         return "👥 Пусто"
     return _join_bounded(["👥 <b>Администраторы бота:</b>\n"] + [f"• <code>{_esc(i)}</code>" for i in ids])
@@ -1291,10 +1433,7 @@ async def cmd_start(message: Message, state: FSMContext, config: ModeratorConfig
     # otherwise the user's very next plain-text message gets silently
     # captured as an admin ID for a flow they believed they'd left.
     await state.clear()
-    admins = _load_admins(config.admins_file)
-    first_time_admin = not admins
-    if first_time_admin:
-        _save_admins(config.admins_file, {str(message.from_user.id)})
+    first_time_admin = await _claim_first_bot_admin(config.db_path, str(message.from_user.id))
     if config.welcome_image.exists():
         await message.answer_photo(
             FSInputFile(str(config.welcome_image)), caption=WELCOME_TEXT, parse_mode="HTML",
@@ -1689,7 +1828,7 @@ async def cb_admins(cb: CallbackQuery, bot: Bot, state: FSMContext, config: Mode
     if chat_id is None:
         await cb.answer(); return
     await cb.answer()
-    if not _is_bot_admin(cb.from_user.id, config):
+    if not await _is_bot_admin(cb.from_user.id, config):
         await cb.message.answer("⛔ Нет доступа"); return
     await _clear_flow_keep_panel(state)
     await _replace_panel(
@@ -1703,39 +1842,39 @@ async def cb_modlog(cb: CallbackQuery, bot: Bot, state: FSMContext, config: Mode
     if chat_id is None:
         await cb.answer(); return
     await cb.answer()
-    if not _is_bot_admin(cb.from_user.id, config):
+    if not await _is_bot_admin(cb.from_user.id, config):
         await cb.message.answer("⛔ Нет доступа"); return
     await _clear_flow_keep_panel(state)
     await _replace_panel(bot, state, chat_id, await _modlog_text(config), parse_mode="HTML")
 
 @router.message(Command("modlog"), F.chat.type == "private")
 async def cmd_modlog(msg: Message, config: ModeratorConfig):
-    if not _is_bot_admin(msg.from_user.id, config):
+    if not await _is_bot_admin(msg.from_user.id, config):
         await msg.answer("⛔ Нет доступа"); return
     await msg.answer(await _modlog_text(config), parse_mode="HTML")
 
 @router.message(Command("addadmin"))
 async def cmd_addadmin(msg: Message, config: ModeratorConfig):
-    if not _is_bot_admin(msg.from_user.id, config): await msg.answer("⛔ Нет доступа"); return
+    if not await _is_bot_admin(msg.from_user.id, config): await msg.answer("⛔ Нет доступа"); return
     parts = msg.text.split()
     if len(parts) < 2 or not _valid_admin_id(parts[1]): await msg.answer("Использование: /addadmin <id>"); return
-    ids = _load_admins(config.admins_file); ids.add(parts[1]); _save_admins(config.admins_file, ids)
+    await _add_bot_admin(config.db_path, parts[1])
     logger.info(f"cmd_addadmin: {parts[1]} added as bot admin by {msg.from_user.id}")
     await msg.answer(f"✅ <code>{parts[1]}</code> добавлен.", parse_mode="HTML")
 
 @router.message(Command("removeadmin"))
 async def cmd_removeadmin(msg: Message, config: ModeratorConfig):
-    if not _is_bot_admin(msg.from_user.id, config): await msg.answer("⛔ Нет доступа"); return
+    if not await _is_bot_admin(msg.from_user.id, config): await msg.answer("⛔ Нет доступа"); return
     parts = msg.text.split()
     if len(parts) < 2: await msg.answer("Использование: /removeadmin <id>"); return
-    ids = _load_admins(config.admins_file)
     # Review-found: removing the last remaining bot admin hands the role to
     # whoever happens to message /start next (cmd_start's bootstrap) — refuse
-    # rather than silently emptying admins_file.
-    if parts[1] in ids and len(ids) <= 1:
+    # rather than silently emptying the admin set. _remove_bot_admin enforces
+    # this atomically now, closing a race the old in-memory count check couldn't.
+    result = await _remove_bot_admin(config.db_path, parts[1])
+    if result == "last_admin":
         await msg.answer("⚠️ Нельзя удалить единственного администратора."); return
-    ids.discard(parts[1]); _save_admins(config.admins_file, ids)
-    logger.info(f"cmd_removeadmin: {parts[1]} removed as bot admin by {msg.from_user.id}")
+    logger.info(f"cmd_removeadmin: {parts[1]} removed as bot admin by {msg.from_user.id} (result={result})")
     # Review-found: unlike cmd_addadmin (validates isdigit() before this point),
     # this echoed the raw argument straight into a parse_mode="HTML" <code>
     # block — arbitrary text containing '<'/'&' would break the HTML the
@@ -1745,7 +1884,7 @@ async def cmd_removeadmin(msg: Message, config: ModeratorConfig):
 
 @router.message(Command("admins"))
 async def cmd_admins(msg: Message, config: ModeratorConfig):
-    if not _is_bot_admin(msg.from_user.id, config): await msg.answer("⛔ Нет доступа"); return
+    if not await _is_bot_admin(msg.from_user.id, config): await msg.answer("⛔ Нет доступа"); return
     await msg.answer(await _admins_list_text(config), parse_mode="HTML")
 
 
@@ -1764,13 +1903,18 @@ async def cb_addadmin_start(cb: CallbackQuery, bot: Bot, state: FSMContext, conf
     if chat_id is None:
         await cb.answer(); return
     await cb.answer()
-    if not _is_bot_admin(cb.from_user.id, config):
+    if not await _is_bot_admin(cb.from_user.id, config):
         await cb.message.answer("⛔ Нет доступа"); return
-    await _replace_panel(
+    sent = await _replace_panel(
         bot, state, chat_id,
         "Пришлите Telegram ID пользователя, которого нужно сделать администратором:",
         reply_markup=kb_private_cancel(),
     )
+    if not sent:
+        # Prompt never reached the user — don't arm a state that expects a
+        # reply to a message they never saw (see _replace_panel's docstring).
+        await cb.message.answer("⚠️ Не удалось открыть панель, попробуйте ещё раз.")
+        return
     await state.update_data(started_at=time.time())
     await state.set_state(AdminPanelFlow.add_admin)
 
@@ -1780,13 +1924,13 @@ async def adminpanel_add_admin(msg: Message, bot: Bot, state: FSMContext, config
     if _flow_expired(data):
         await _clear_flow_keep_panel(state)
         await msg.answer("⏳ Время ожидания истекло — начните заново кнопкой «👥 Админы»."); return
-    if not _is_bot_admin(msg.from_user.id, config):
+    if not await _is_bot_admin(msg.from_user.id, config):
         await _clear_flow_keep_panel(state)
         await msg.answer("⛔ Нет доступа"); return
     text = msg.text.strip()
     if not _valid_admin_id(text):
         await msg.answer("Пришлите числовой Telegram ID."); return
-    ids = _load_admins(config.admins_file); ids.add(text); _save_admins(config.admins_file, ids)
+    await _add_bot_admin(config.db_path, text)
     logger.info(f"adminpanel_add_admin: {text} added as bot admin by {msg.from_user.id}")
     await _clear_flow_keep_panel(state)
     await msg.answer(f"✅ <code>{_esc(text)}</code> добавлен.", parse_mode="HTML")
@@ -1802,15 +1946,19 @@ async def cb_removeadmin_start(cb: CallbackQuery, bot: Bot, state: FSMContext, c
     if chat_id is None:
         await cb.answer(); return
     await cb.answer()
-    if not _is_bot_admin(cb.from_user.id, config):
+    if not await _is_bot_admin(cb.from_user.id, config):
         await cb.message.answer("⛔ Нет доступа"); return
-    ids = sorted(_load_admins(config.admins_file))
+    ids = sorted(await _list_bot_admins(config.db_path))
     if not ids:
         await _replace_panel(bot, state, chat_id, "Список администраторов пуст.")
         return
     # Review-found: same last-admin guard as cmd_removeadmin — block the
     # no-op-but-dangerous case upfront instead of offering a picker that
-    # would empty admins_file on the very next tap.
+    # would empty admins_file on the very next tap. Note this is a UX
+    # shortcut, not the enforcement point — _remove_bot_admin re-checks
+    # atomically at actual removal time (cb_removeadmin_pick/
+    # adminpanel_remove_admin_text below), so a race between this check and
+    # the tap can't actually empty the set.
     if len(ids) == 1:
         await _replace_panel(
             bot, state, chat_id,
@@ -1820,17 +1968,23 @@ async def cb_removeadmin_start(cb: CallbackQuery, bot: Bot, state: FSMContext, c
         )
         return
     if len(ids) <= MAX_ADMIN_REMOVE_BUTTONS:
-        await _replace_panel(
+        sent = await _replace_panel(
             bot, state, chat_id, "Выберите администратора для удаления:",
             reply_markup=kb_remove_admins(ids),
         )
+        if not sent:
+            await cb.message.answer("⚠️ Не удалось открыть панель, попробуйте ещё раз.")
+            return
         await state.update_data(remove_admin_ids=ids, started_at=time.time())
         await state.set_state(AdminPanelFlow.remove_admin_pick)
     else:
-        await _replace_panel(
+        sent = await _replace_panel(
             bot, state, chat_id, "Админов много — пришлите ID для удаления текстом:",
             reply_markup=kb_private_cancel(),
         )
+        if not sent:
+            await cb.message.answer("⚠️ Не удалось открыть панель, попробуйте ещё раз.")
+            return
         await state.update_data(started_at=time.time())
         await state.set_state(AdminPanelFlow.remove_admin_text)
 
@@ -1840,7 +1994,7 @@ async def cb_removeadmin_pick(cb: CallbackQuery, bot: Bot, state: FSMContext, co
     if chat_id is None:
         await cb.answer(); return
     await cb.answer()
-    if not _is_bot_admin(cb.from_user.id, config):
+    if not await _is_bot_admin(cb.from_user.id, config):
         await _clear_flow_keep_panel(state)
         await cb.message.answer("⛔ Нет доступа"); return
     data = await state.get_data()
@@ -1859,12 +2013,15 @@ async def cb_removeadmin_pick(cb: CallbackQuery, bot: Bot, state: FSMContext, co
         await _replace_panel(bot, state, chat_id, "Список устарел — откройте заново кнопкой «👥 Админы».")
         return
     target = ids[idx]
-    admins = _load_admins(config.admins_file)
     # Review-found: unconditionally reporting "✅ Убрано" even if the target
     # had ALREADY been removed (stale snapshot vs. a concurrent change) was a
     # false-success message — mirror the group panel's cb_removeword_pick,
     # which checks this honestly instead of assuming the snapshot still holds.
-    if target not in admins:
+    # _remove_bot_admin does both the not-found and last-admin checks
+    # atomically against the current DB state, not the stale `ids` snapshot
+    # this picker's buttons were built from.
+    result = await _remove_bot_admin(config.db_path, target)
+    if result == "not_found":
         await _clear_flow_keep_panel(state)
         await cb.message.answer(f"«{_esc(target)}» уже не администратор.", parse_mode="HTML")
         await _replace_panel(
@@ -1872,15 +2029,13 @@ async def cb_removeadmin_pick(cb: CallbackQuery, bot: Bot, state: FSMContext, co
             reply_markup=kb_admins_panel(), parse_mode="HTML",
         )
         return
-    if len(admins) <= 1:
+    if result == "last_admin":
         await _clear_flow_keep_panel(state)
         await _replace_panel(
             bot, state, chat_id, "⚠️ Нельзя удалить единственного администратора.",
             reply_markup=kb_admins_panel(), parse_mode="HTML",
         )
         return
-    admins.discard(target)
-    _save_admins(config.admins_file, admins)
     logger.info(f"cb_removeadmin_pick: {target} removed as bot admin by {cb.from_user.id}")
     await _clear_flow_keep_panel(state)
     await cb.message.answer(f"✅ <code>{_esc(target)}</code> удалён.", parse_mode="HTML")
@@ -1902,14 +2057,14 @@ async def adminpanel_remove_admin_text(msg: Message, bot: Bot, state: FSMContext
     if _flow_expired(data):
         await _clear_flow_keep_panel(state)
         await msg.answer("⏳ Время ожидания истекло — начните заново кнопкой «👥 Админы»."); return
-    if not _is_bot_admin(msg.from_user.id, config):
+    if not await _is_bot_admin(msg.from_user.id, config):
         await _clear_flow_keep_panel(state)
         await msg.answer("⛔ Нет доступа"); return
     target = msg.text.strip()
-    admins = _load_admins(config.admins_file)
-    if target not in admins:
+    result = await _remove_bot_admin(config.db_path, target)
+    if result == "not_found":
         await msg.answer(f"«{_esc(target)}» не найден среди администраторов.", parse_mode="HTML"); return
-    if len(admins) <= 1:
+    if result == "last_admin":
         await _clear_flow_keep_panel(state)
         await msg.answer("⚠️ Нельзя удалить единственного администратора.")
         await _replace_panel(
@@ -1917,8 +2072,6 @@ async def adminpanel_remove_admin_text(msg: Message, bot: Bot, state: FSMContext
             reply_markup=kb_admins_panel(), parse_mode="HTML",
         )
         return
-    admins.discard(target)
-    _save_admins(config.admins_file, admins)
     logger.info(f"adminpanel_remove_admin_text: {target} removed as bot admin by {msg.from_user.id}")
     await _clear_flow_keep_panel(state)
     await msg.answer(f"✅ <code>{_esc(target)}</code> удалён.", parse_mode="HTML")
@@ -1934,7 +2087,7 @@ async def cb_admin_cancel(cb: CallbackQuery, bot: Bot, state: FSMContext, config
     if chat_id is None:
         await cb.answer(); return
     await cb.answer()
-    is_admin = _is_bot_admin(cb.from_user.id, config)
+    is_admin = await _is_bot_admin(cb.from_user.id, config)
     await _clear_flow_keep_panel(state)
     await cb.message.answer("Отменено.")
     if is_admin:
@@ -1967,7 +2120,7 @@ async def cmd_private_cancel(msg: Message, bot: Bot, state: FSMContext, config: 
         else:
             await _clear_flow_keep_panel(state)
         return
-    is_admin = _is_bot_admin(msg.from_user.id, config)
+    is_admin = await _is_bot_admin(msg.from_user.id, config)
     await _clear_flow_keep_panel(state)
     await msg.answer("Отменено.")
     if is_admin:
@@ -1975,6 +2128,25 @@ async def cmd_private_cancel(msg: Message, bot: Bot, state: FSMContext, config: 
             bot, state, msg.chat.id, await _admins_list_text(config),
             reply_markup=kb_admins_panel(), parse_mode="HTML",
         )
+
+
+# ── private: orphaned-flow catch-all ──────────────────────────────────────────
+# Review-found: MemoryStorage has no persistence — a process restart (Railway
+# redeploy) wipes every in-flight FSM state instantly. Before this handler, a
+# user mid-flow (e.g. having just been shown "Пришлите Telegram ID...") whose
+# next message arrived after a restart matched NO AdminPanelFlow/ModPanelFlow
+# state handler at all (state is gone) and fell through with total silence —
+# the FLOW_TIMEOUT_SECONDS/_flow_expired mechanism only covers a user going
+# quiet, not the bot itself losing its memory of the conversation. Registered
+# last (aiogram tries handlers in registration order within a router) so it
+# only ever fires when nothing more specific — including every StateFilter
+# above — matched first.
+@router.message(F.chat.type == "private", F.text, ~F.text.startswith("/"))
+async def private_orphaned_message_catchall(msg: Message) -> None:
+    await msg.answer(
+        "⏳ Сессия сброшена (перезапуск бота) — начните заново кнопкой «👥 Админы» "
+        "или «⚙️ Настроить группу», либо командой /start."
+    )
 
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────

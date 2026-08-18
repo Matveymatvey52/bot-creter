@@ -865,7 +865,7 @@ class ModeratorRightsMechanism3_RuntimeFailureTests(unittest.IsolatedAsyncioTest
             {"bot_id": 708, "name": "mod_rights3", "display_name": None, "group_chat_id": None}, self.data_dir
         )
         await moderator.init_db(self.config.db_path)
-        moderator._save_admins(self.config.admins_file, {str(self.OWNER_ADMIN_ID)})
+        await moderator._replace_bot_admins(self.config.db_path, {str(self.OWNER_ADMIN_ID)})
         self.bot, self.dp = _build_bot_dispatcher(self.config)
 
     async def asyncTearDown(self):
@@ -1039,7 +1039,7 @@ class ModeratorAdminsPanelButtonTests(unittest.IsolatedAsyncioTestCase):
             {"bot_id": 712, "name": "mod_admins_panel", "display_name": None, "group_chat_id": None}, self.data_dir
         )
         await moderator.init_db(self.config.db_path)
-        moderator._save_admins(self.config.admins_file, {str(self.OWNER_ID)})
+        await moderator._replace_bot_admins(self.config.db_path, {str(self.OWNER_ID)})
         self.bot, self.dp = _build_bot_dispatcher(self.config)
 
     async def asyncTearDown(self):
@@ -1062,7 +1062,7 @@ class ModeratorAdminsPanelButtonTests(unittest.IsolatedAsyncioTestCase):
         numbered removal buttons could silently disagree on order. Both must
         now agree on sorted() order."""
         ids = {"9", "700", "80", str(self.OTHER_ADMIN_ID)}
-        moderator._save_admins(self.config.admins_file, {str(self.OWNER_ID)} | ids)
+        await moderator._replace_bot_admins(self.config.db_path, {str(self.OWNER_ID)} | ids)
         text = await moderator._admins_list_text(self.config)
         listed_order = [line.split("<code>")[1].split("</code>")[0] for line in text.splitlines() if "<code>" in line]
         self.assertEqual(listed_order, sorted({str(self.OWNER_ID)} | ids))
@@ -1072,7 +1072,7 @@ class ModeratorAdminsPanelButtonTests(unittest.IsolatedAsyncioTestCase):
         await self.dp.feed_webhook_update(self.bot, _private_callback_update(uid, self.OWNER_ID, "mod_addadmin")); uid += 1
         await self.dp.feed_webhook_update(self.bot, _private_text_update(uid, self.OWNER_ID, str(self.OTHER_ADMIN_ID))); uid += 1
 
-        ids = moderator._load_admins(self.config.admins_file)
+        ids = await moderator._list_bot_admins(self.config.db_path)
         self.assertIn(str(self.OTHER_ADMIN_ID), ids)
         self.assertTrue(any("добавлен" in t for t in self.fake_api.sent_texts(self.OWNER_ID)))
 
@@ -1080,21 +1080,21 @@ class ModeratorAdminsPanelButtonTests(unittest.IsolatedAsyncioTestCase):
         uid = 1
         await self.dp.feed_webhook_update(self.bot, _private_callback_update(uid, self.OWNER_ID, "mod_addadmin")); uid += 1
         await self.dp.feed_webhook_update(self.bot, _private_text_update(uid, self.OWNER_ID, "not-an-id")); uid += 1
-        ids = moderator._load_admins(self.config.admins_file)
+        ids = await moderator._list_bot_admins(self.config.db_path)
         self.assertNotIn("not-an-id", ids)
 
     async def test_non_admin_cannot_open_addadmin(self):
         non_admin = 999
         await self.dp.feed_webhook_update(self.bot, _private_callback_update(1, non_admin, "mod_addadmin"))
-        ids_before = moderator._load_admins(self.config.admins_file)
+        ids_before = await moderator._list_bot_admins(self.config.db_path)
         # The prompt was never shown, so a follow-up ID-looking message must
         # not be captured by the flow either.
         await self.dp.feed_webhook_update(self.bot, _private_text_update(2, non_admin, "12345"))
-        self.assertEqual(moderator._load_admins(self.config.admins_file), ids_before)
+        self.assertEqual(await moderator._list_bot_admins(self.config.db_path), ids_before)
         self.assertTrue(any("Нет доступа" in t for t in self.fake_api.sent_texts(non_admin)))
 
     async def test_remove_admin_flow_via_pick_buttons(self):
-        moderator._save_admins(self.config.admins_file, {str(self.OWNER_ID), str(self.OTHER_ADMIN_ID)})
+        await moderator._replace_bot_admins(self.config.db_path, {str(self.OWNER_ID), str(self.OTHER_ADMIN_ID)})
         uid = 1
         await self.dp.feed_webhook_update(self.bot, _private_callback_update(uid, self.OWNER_ID, "mod_removeadmin")); uid += 1
         sends = [c for c in self.fake_api.calls if isinstance(c, SendMessage)]
@@ -1105,26 +1105,26 @@ class ModeratorAdminsPanelButtonTests(unittest.IsolatedAsyncioTestCase):
         )
         await self.dp.feed_webhook_update(self.bot, _private_callback_update(uid, self.OWNER_ID, target_data)); uid += 1
 
-        ids = moderator._load_admins(self.config.admins_file)
+        ids = await moderator._list_bot_admins(self.config.db_path)
         self.assertNotIn(str(self.OTHER_ADMIN_ID), ids)
         self.assertIn(str(self.OWNER_ID), ids)
 
     async def test_remove_admin_falls_back_to_text_when_too_many_admins(self):
         many_ids = {str(self.OWNER_ID)} | {str(1000 + i) for i in range(moderator.MAX_ADMIN_REMOVE_BUTTONS + 1)}
-        moderator._save_admins(self.config.admins_file, many_ids)
+        await moderator._replace_bot_admins(self.config.db_path, many_ids)
         uid = 1
         await self.dp.feed_webhook_update(self.bot, _private_callback_update(uid, self.OWNER_ID, "mod_removeadmin")); uid += 1
         await self.dp.feed_webhook_update(self.bot, _private_text_update(uid, self.OWNER_ID, "1000")); uid += 1
-        ids = moderator._load_admins(self.config.admins_file)
+        ids = await moderator._list_bot_admins(self.config.db_path)
         self.assertNotIn("1000", ids)
 
     async def test_stray_text_while_picking_admin_gets_a_reply_not_silence(self):
-        moderator._save_admins(self.config.admins_file, {str(self.OWNER_ID), str(self.OTHER_ADMIN_ID)})
+        await moderator._replace_bot_admins(self.config.db_path, {str(self.OWNER_ID), str(self.OTHER_ADMIN_ID)})
         uid = 1
         await self.dp.feed_webhook_update(self.bot, _private_callback_update(uid, self.OWNER_ID, "mod_removeadmin")); uid += 1
         await self.dp.feed_webhook_update(self.bot, _private_text_update(uid, self.OWNER_ID, str(self.OTHER_ADMIN_ID))); uid += 1
         self.assertTrue(any("кнопкой" in t for t in self.fake_api.sent_texts(self.OWNER_ID)))
-        ids = moderator._load_admins(self.config.admins_file)
+        ids = await moderator._list_bot_admins(self.config.db_path)
         self.assertIn(str(self.OTHER_ADMIN_ID), ids, "typed text must not be accepted as a removal in the pick-button state")
 
     async def test_cancel_returns_to_admins_panel(self):
@@ -1133,7 +1133,7 @@ class ModeratorAdminsPanelButtonTests(unittest.IsolatedAsyncioTestCase):
         await self.dp.feed_webhook_update(self.bot, _private_callback_update(uid, self.OWNER_ID, "mod_admin_cancel")); uid += 1
         # The cancelled prompt must not still be listening for an ID.
         await self.dp.feed_webhook_update(self.bot, _private_text_update(uid, self.OWNER_ID, str(self.OTHER_ADMIN_ID))); uid += 1
-        ids = moderator._load_admins(self.config.admins_file)
+        ids = await moderator._list_bot_admins(self.config.db_path)
         self.assertNotIn(str(self.OTHER_ADMIN_ID), ids)
         # The admins panel (with its add/remove buttons) must be reshown after cancel.
         panel_sends = [
@@ -1164,7 +1164,7 @@ class ModeratorAdminsPanelButtonTests(unittest.IsolatedAsyncioTestCase):
         await self.dp.feed_webhook_update(self.bot, _private_callback_update(uid, self.OWNER_ID, "mod_addadmin")); uid += 1
         await self.dp.feed_webhook_update(self.bot, _private_callback_update(uid, self.OWNER_ID, "mod_modlog")); uid += 1
         await self.dp.feed_webhook_update(self.bot, _private_text_update(uid, self.OWNER_ID, "5551234")); uid += 1
-        ids = moderator._load_admins(self.config.admins_file)
+        ids = await moderator._list_bot_admins(self.config.db_path)
         self.assertNotIn("5551234", ids, "an unrelated number after navigating away was captured as a new admin")
 
     async def test_successful_add_admin_deletes_the_prompt_message(self):
@@ -1179,7 +1179,7 @@ class ModeratorAdminsPanelButtonTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(prompt_id, self.fake_api.deleted_message_ids(self.OWNER_ID))
 
     async def test_successful_remove_admin_pick_deletes_the_pick_list_message(self):
-        moderator._save_admins(self.config.admins_file, {str(self.OWNER_ID), str(self.OTHER_ADMIN_ID)})
+        await moderator._replace_bot_admins(self.config.db_path, {str(self.OWNER_ID), str(self.OTHER_ADMIN_ID)})
         uid = 1
         await self.dp.feed_webhook_update(self.bot, _private_callback_update(uid, self.OWNER_ID, "mod_removeadmin")); uid += 1
         pick_list_id = self.fake_api.last_sent_message_id(self.OWNER_ID)
@@ -1196,7 +1196,7 @@ class ModeratorAdminsPanelButtonTests(unittest.IsolatedAsyncioTestCase):
         await self.dp.feed_webhook_update(self.bot, _private_callback_update(uid, self.OWNER_ID, "mod_removeadmin")); uid += 1
         sends = [c for c in self.fake_api.calls if isinstance(c, SendMessage)]
         self.assertTrue(any("единственный администратор" in s.text for s in sends))
-        ids = moderator._load_admins(self.config.admins_file)
+        ids = await moderator._list_bot_admins(self.config.db_path)
         self.assertEqual(ids, {str(self.OWNER_ID)})
 
     async def test_cannot_remove_last_admin_via_text_fallback(self):
@@ -1207,18 +1207,18 @@ class ModeratorAdminsPanelButtonTests(unittest.IsolatedAsyncioTestCase):
         the handler's own re-check must refuse rather than trust the
         snapshot from when the flow started."""
         many_ids = {str(self.OWNER_ID)} | {str(1000 + i) for i in range(moderator.MAX_ADMIN_REMOVE_BUTTONS + 1)}
-        moderator._save_admins(self.config.admins_file, many_ids)
+        await moderator._replace_bot_admins(self.config.db_path, many_ids)
         uid = 1
         await self.dp.feed_webhook_update(self.bot, _private_callback_update(uid, self.OWNER_ID, "mod_removeadmin")); uid += 1
         # Simulate everyone else being removed concurrently, via another path.
-        moderator._save_admins(self.config.admins_file, {str(self.OWNER_ID)})
+        await moderator._replace_bot_admins(self.config.db_path, {str(self.OWNER_ID)})
         await self.dp.feed_webhook_update(self.bot, _private_text_update(uid, self.OWNER_ID, str(self.OWNER_ID))); uid += 1
-        ids = moderator._load_admins(self.config.admins_file)
+        ids = await moderator._list_bot_admins(self.config.db_path)
         self.assertEqual(ids, {str(self.OWNER_ID)})
         self.assertTrue(any("единственного администратора" in t for t in self.fake_api.sent_texts(self.OWNER_ID)))
 
     async def test_removeadmin_pick_reports_honestly_if_already_removed(self):
-        moderator._save_admins(self.config.admins_file, {str(self.OWNER_ID), str(self.OTHER_ADMIN_ID)})
+        await moderator._replace_bot_admins(self.config.db_path, {str(self.OWNER_ID), str(self.OTHER_ADMIN_ID)})
         uid = 1
         await self.dp.feed_webhook_update(self.bot, _private_callback_update(uid, self.OWNER_ID, "mod_removeadmin")); uid += 1
         sends = [c for c in self.fake_api.calls if isinstance(c, SendMessage)]
@@ -1227,7 +1227,7 @@ class ModeratorAdminsPanelButtonTests(unittest.IsolatedAsyncioTestCase):
             if b.text == str(self.OTHER_ADMIN_ID)
         )
         # Removed by another path (raw command) between the snapshot and the button press.
-        moderator._save_admins(self.config.admins_file, {str(self.OWNER_ID)})
+        await moderator._replace_bot_admins(self.config.db_path, {str(self.OWNER_ID)})
         await self.dp.feed_webhook_update(self.bot, _private_callback_update(uid, self.OWNER_ID, target_data)); uid += 1
         self.assertTrue(any("уже не администратор" in t for t in self.fake_api.sent_texts(self.OWNER_ID)))
 
@@ -1238,7 +1238,7 @@ class ModeratorAdminsPanelButtonTests(unittest.IsolatedAsyncioTestCase):
         uid = 1
         await self.dp.feed_webhook_update(self.bot, _private_callback_update(uid, self.OWNER_ID, "mod_addadmin")); uid += 1
         await self.dp.feed_webhook_update(self.bot, _private_text_update(uid, self.OWNER_ID, "1" * 50)); uid += 1
-        ids = moderator._load_admins(self.config.admins_file)
+        ids = await moderator._list_bot_admins(self.config.db_path)
         self.assertNotIn("1" * 50, ids)
 
     async def test_add_admin_rejects_unicode_lookalike_digits(self):
@@ -1248,7 +1248,7 @@ class ModeratorAdminsPanelButtonTests(unittest.IsolatedAsyncioTestCase):
         uid = 1
         await self.dp.feed_webhook_update(self.bot, _private_callback_update(uid, self.OWNER_ID, "mod_addadmin")); uid += 1
         await self.dp.feed_webhook_update(self.bot, _private_text_update(uid, self.OWNER_ID, "１２３")); uid += 1
-        ids = moderator._load_admins(self.config.admins_file)
+        ids = await moderator._list_bot_admins(self.config.db_path)
         self.assertNotIn("１２３", ids)
 
     async def test_add_admin_rejects_zero_and_leading_zeros(self):
@@ -1262,7 +1262,7 @@ class ModeratorAdminsPanelButtonTests(unittest.IsolatedAsyncioTestCase):
             uid = 1
             await self.dp.feed_webhook_update(self.bot, _private_callback_update(uid, self.OWNER_ID, "mod_addadmin")); uid += 1
             await self.dp.feed_webhook_update(self.bot, _private_text_update(uid, self.OWNER_ID, phantom_id)); uid += 1
-            ids = moderator._load_admins(self.config.admins_file)
+            ids = await moderator._list_bot_admins(self.config.db_path)
             self.assertNotIn(phantom_id, ids, f"{phantom_id!r} must not be accepted as an admin id")
             self.assertTrue(
                 any("числовой" in t for t in self.fake_api.sent_texts(self.OWNER_ID)),
@@ -1275,7 +1275,7 @@ class ModeratorAdminsPanelButtonTests(unittest.IsolatedAsyncioTestCase):
         with patch("templates.moderator.time") as fake_time:
             fake_time.time.return_value = time.time() + moderator.FLOW_TIMEOUT_SECONDS + 1
             await self.dp.feed_webhook_update(self.bot, _private_text_update(uid, self.OWNER_ID, str(self.OTHER_ADMIN_ID))); uid += 1
-        ids = moderator._load_admins(self.config.admins_file)
+        ids = await moderator._list_bot_admins(self.config.db_path)
         self.assertNotIn(str(self.OTHER_ADMIN_ID), ids)
         self.assertTrue(any("Время ожидания истекло" in t for t in self.fake_api.sent_texts(self.OWNER_ID)))
 

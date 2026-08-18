@@ -88,7 +88,16 @@ class RemoveAdminEscapingTests(unittest.IsolatedAsyncioTestCase):
             {"bot_id": 1, "name": f"{template_name}_esc_test", "display_name": None, "group_chat_id": None},
             self.data_dir,
         )
-        module._save_admins(config.admins_file, {str(ADMIN_ID)})
+        if template_name == "moderator":
+            # moderator.py moved bot-admin storage from the shared
+            # admins_file/_save_admins JSON pattern to a SQLite bot_admins
+            # table (see backlog_moderator_admin_panel_concurrency) — seed
+            # through init_db + _add_bot_admin instead of the other
+            # templates' still-file-based _save_admins.
+            await module.init_db(config.db_path)
+            await module._add_bot_admin(config.db_path, str(ADMIN_ID))
+        else:
+            module._save_admins(config.admins_file, {str(ADMIN_ID)})
 
         bot = Bot(token=FAKE_TOKEN)
         dp = Dispatcher(storage=MemoryStorage())
