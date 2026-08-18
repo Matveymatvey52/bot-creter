@@ -504,11 +504,11 @@ async def list_features_handler(request: web.Request) -> web.Response:
     shape as bot_detail_handler's "features" key (kept as a separate route
     too so the tab can refresh itself without re-fetching the whole detail
     panel)."""
-    if not await _authenticate_owner(request):
-        return web.json_response({"error": "forbidden"}, status=403)
     bot_id = _bot_id_from_match_info(request)
     if bot_id is None:
         return web.json_response({"error": "bad bot_id"}, status=404)
+    if not await _authenticate_bot_access(request, bot_id):
+        return web.json_response({"error": "forbidden"}, status=403)
     b = await get_bot(bot_id)
     if not b:
         return web.json_response({"error": "not found"}, status=404)
@@ -522,12 +522,12 @@ async def disable_feature_handler(request: web.Request) -> web.Response:
     (on→off) остаётся мгновенным"). Also clears any stored config/thread so
     a later re-enable starts the configure dialog fresh rather than silently
     reusing a stale description."""
-    if not await _authenticate_owner(request):
-        return web.json_response({"error": "forbidden"}, status=403)
     bot_id = _bot_id_from_match_info(request)
     feature_name = request.match_info.get("name", "")
     if bot_id is None or not feature_name:
         return web.json_response({"error": "bad request"}, status=404)
+    if not await _authenticate_bot_access(request, bot_id):
+        return web.json_response({"error": "forbidden"}, status=403)
     if bot_id in _busy_bots:
         return web.json_response({"error": _BUSY_TEXT}, status=409)
     _busy_bots.add(bot_id)
@@ -543,12 +543,12 @@ async def cancel_feature_configure_handler(request: web.Request) -> web.Response
     """POST /api/factory/bots/{id}/features/{name}/cancel — the configure
     dialog's "Отмена" at any step: tumbler reverts to off, nothing is saved
     (see the approved design's "Отмена на любом шаге")."""
-    if not await _authenticate_owner(request):
-        return web.json_response({"error": "forbidden"}, status=403)
     bot_id = _bot_id_from_match_info(request)
     feature_name = request.match_info.get("name", "")
     if bot_id is None or not feature_name:
         return web.json_response({"error": "bad request"}, status=404)
+    if not await _authenticate_bot_access(request, bot_id):
+        return web.json_response({"error": "forbidden"}, status=403)
     await clear_bot_feature_config(bot_id, feature_name)
     return web.json_response({"ok": True})
 
@@ -567,12 +567,12 @@ async def configure_feature_handler(request: web.Request) -> web.Response:
     the frontend must not call this route for them; payments routes the
     owner to the Telegram ЮKassa wizard instead, office_events has its own
     bot-picker endpoints."""
-    if not await _authenticate_owner(request):
-        return web.json_response({"error": "forbidden"}, status=403)
     bot_id = _bot_id_from_match_info(request)
     feature_name = request.match_info.get("name", "")
     if bot_id is None or not feature_name:
         return web.json_response({"error": "bad request"}, status=404)
+    if not await _authenticate_bot_access(request, bot_id):
+        return web.json_response({"error": "forbidden"}, status=403)
     if feature_name in _NO_FREE_TEXT_FEATURES:
         return web.json_response({"error": "feature has no free-text configure step"}, status=400)
 
