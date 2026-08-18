@@ -40,8 +40,6 @@ from db.database import (
     get_office_digest_group,
     get_office_links_for_bot,
     list_bots_with_stats,
-    list_template_candidate_clusters_with_stats,
-    list_template_candidates,
     remove_bot_admin,
     remove_office_link,
     set_bot_feature_description,
@@ -211,59 +209,6 @@ async def add_feedback_handler(request: web.Request) -> web.Response:
 
     await add_bot_feedback(int(bot_id_raw), rating, comment)
     return web.json_response({"ok": True}, status=201)
-
-
-async def list_template_candidates_handler(request: web.Request) -> web.Response:
-    """"Кандидаты на новый шаблон" section (docs/TEMPLATE_CANDIDATE_LOGGING_DESIGN.md)
-    — raw rows, most recent first, no server-side clustering (MVP decision:
-    let the owner read the actual requirement text). creator_user_id is
-    deliberately excluded from the response, same posture as list_bots_handler
-    excluding `token` — an internal Telegram user id the dashboard UI has no
-    use for."""
-    if not await _authenticate_owner(request):
-        return web.json_response({"error": "forbidden"}, status=403)
-
-    rows = await list_template_candidates()
-    items = [
-        {
-            "id": row["id"],
-            "bot_id": row["bot_id"],
-            "bot_name": row["bot_name"],
-            "summary": row["summary"],
-            "fallback_reason": row["fallback_reason"],
-            "selected_templates": row["selected_templates"],
-            "bot_type": row["bot_type"],
-            "created_at": row["created_at"],
-        }
-        for row in rows
-    ]
-    return web.json_response({"items": items})
-
-
-async def list_template_candidate_clusters_handler(request: web.Request) -> web.Response:
-    """"Топ незакрытых паттернов" section
-    (docs/TEMPLATE_CANDIDATE_CLUSTERING_DESIGN.md §4) — clusters an
-    incremental background pass (runtime/template_candidate_clustering.py)
-    has already assigned candidates to, largest first. Candidates not yet
-    picked up by a pass (cluster_id IS NULL) are excluded here on purpose —
-    they still show up in list_template_candidates_handler's raw feed above."""
-    if not await _authenticate_owner(request):
-        return web.json_response({"error": "forbidden"}, status=403)
-
-    rows = await list_template_candidate_clusters_with_stats()
-    items = [
-        {
-            "id": row["id"],
-            "label": row["label"],
-            "description": row["description"],
-            "count": row["count"],
-            "first_seen": row["first_seen"],
-            "last_seen": row["last_seen"],
-            "examples": row["examples"],
-        }
-        for row in rows
-    ]
-    return web.json_response({"items": items})
 
 
 def _bot_id_from_match_info(request: web.Request) -> int | None:
@@ -780,8 +725,6 @@ def register_routes(app: web.Application) -> None:
     app.router.add_get("/api/factory/session", refresh_session_handler)
     app.router.add_get("/api/factory/bots", list_bots_handler)
     app.router.add_post("/api/factory/bots/{bot_id}/feedback", add_feedback_handler)
-    app.router.add_get("/api/factory/candidates", list_template_candidates_handler)
-    app.router.add_get("/api/factory/candidate-clusters", list_template_candidate_clusters_handler)
 
     # Detail panel — level 2 of the dashboard (docs discussion: "Детальная
     # панель бота — макет уровня 2").

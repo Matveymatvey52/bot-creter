@@ -482,6 +482,24 @@ async def serve_app_shell(request: web.Request) -> web.Response:
     return web.FileResponse(index_path)
 
 
+async def serve_owner_report_shell(request: web.Request) -> web.Response:
+    """Serves the SPA's index.html for /owner-report — the Stage 2 system-
+    owner-only cross-owner report (runtime/owner_report_api.py), a THIRD app
+    distinct from both the per-bot customer app (/app/{bot_id}) and the
+    owner's own "Моя фабрика" dashboard (/app/0). Same "serve the shell
+    unconditionally, let the SPA's own API calls enforce auth" posture as
+    serve_app_shell's FACTORY_BOT_ID special case above — App.tsx's routing
+    branches on window.location.pathname client-side, and every
+    /api/owner-report/* route is independently OWNER_ID-gated server-side
+    regardless of whether this shell was ever reached."""
+    index_path = _MINIAPP_DIST_DIR / "index.html"
+    if not index_path.exists():
+        return web.json_response(
+            {"error": "mini-app build not found — run `npm run build` in miniapp/"}, status=503
+        )
+    return web.FileResponse(index_path)
+
+
 def _register_static_routes(app: web.Application) -> None:
     """Registers the built SPA's JS/CSS/favicon files under the FIXED prefix
     /app-assets/, kept OUT of the /app/{bot_id}/* namespace on purpose:
@@ -529,4 +547,5 @@ def register_routes(app: web.Application) -> None:
     app.router.add_get("/api/{bot_id}/{resource}/{item_id}", get_resource_handler)
     app.router.add_post("/api/{bot_id}/{resource}", create_resource_handler)
     app.router.add_get("/app/{bot_id}", serve_app_shell)
+    app.router.add_get("/owner-report", serve_owner_report_shell)
     _register_static_routes(app)

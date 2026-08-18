@@ -1401,6 +1401,92 @@ async def list_bots_with_stats(owner_telegram_id: int | None = None) -> list[dic
             return [dict(row) for row in rows]
 
 
+async def list_bots_for_owner_report(owner_telegram_id: int | None = None) -> list[dict]:
+    """One row per bot for the Stage 2 owner-only cross-owner report (see
+    runtime/owner_report_api.py) — a superset of list_bots_with_stats()
+    aimed at the SYSTEM OWNER (not a per-customer view): adds
+    owner_telegram_id (so the report can group/filter by owner),
+    creation_prompt, and whether a payments provider row exists
+    (bot_payment_providers), on top of the same features/edits_count/
+    avg_rating/feedback_count aggregation list_bots_with_stats() already
+    does. Kept as a SEPARATE query rather than widening
+    list_bots_with_stats() itself — that function is also used by the
+    per-customer factory dashboard, which has no business seeing another
+    customer's owner_telegram_id or creation_prompt.
+
+    template/from-scratch resolution and file-size-based data-volume are
+    deliberately NOT done here — file_path -> template_id needs
+    runtime.registry.infer_template_id (a db/ -> runtime/ import this module
+    avoids everywhere else, same reasoning as list_bots_with_stats' own
+    docstring), and data volume needs the LIVE registry's resolved db_path,
+    which only runtime/owner_report_api.py has access to."""
+    where_clause = "WHERE b.owner_telegram_id = ?" if owner_telegram_id is not None else ""
+    params = (owner_telegram_id,) if owner_telegram_id is not None else ()
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(f"""
+            SELECT
+                b.id, b.name, b.username, b.display_name, b.status,
+                b.created_at, b.archived_at, b.file_path,
+                b.owner_telegram_id, b.creation_prompt,
+                COALESCE(f.features, '') AS features,
+                COALESCE(c.edits_count, 0) AS edits_count,
+                c.last_edit_at,
+                r.avg_rating, r.feedback_count, r.last_feedback_at,
+                CASE WHEN p.bot_id IS NOT NULL THEN 1 ELSE 0 END AS payments_connected
+            FROM bots b
+            LEFT JOIN (
+                SELECT bot_id, GROUP_CONCAT(feature_name, ',') AS features
+                FROM bot_features GROUP BY bot_id
+            ) f ON f.bot_id = b.id
+            LEFT JOIN (
+                SELECT bot_id, COUNT(*) AS edits_count, MAX(applied_at) AS last_edit_at
+                FROM bot_custom_features GROUP BY bot_id
+            ) c ON c.bot_id = b.id
+            LEFT JOIN (
+                SELECT bot_id, AVG(rating) AS avg_rating, COUNT(*) AS feedback_count, MAX(created_at) AS last_feedback_at
+                FROM bot_feedback GROUP BY bot_id
+            ) r ON r.bot_id = b.id
+            LEFT JOIN bot_payment_providers p ON p.bot_id = b.id
+            {where_clause}
+            ORDER BY b.created_at DESC
+        """, params) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
+
+async def list_feedback_activity(owner_telegram_id: int | None = None, bot_id: int | None = None) -> list[dict]:
+    """bot_feedback rows joined with the owning bot's name/owner, for the
+    owner-only cross-owner activity feed's "feedback" source (see
+    runtime/owner_report_api.py). One of three sources merged into that
+    feed's single timeline — the other two (office_notes, payments) live in
+    each bot's OWN per-bot sqlite file, not this central DB, so they can't be
+    joined in SQL here and are read separately by the API layer via the live
+    Registry."""
+    clauses = []
+    params: list = []
+    if owner_telegram_id is not None:
+        clauses.append("b.owner_telegram_id = ?")
+        params.append(owner_telegram_id)
+    if bot_id is not None:
+        clauses.append("bf.bot_id = ?")
+        params.append(bot_id)
+    where_clause = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(f"""
+            SELECT bf.id, bf.bot_id, b.name AS bot_name, b.owner_telegram_id,
+                   bf.rating, bf.comment, bf.created_at
+            FROM bot_feedback bf
+            JOIN bots b ON b.id = bf.bot_id
+            {where_clause}
+            ORDER BY bf.created_at DESC
+            LIMIT 500
+        """, params) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
+
 async def update_bot_status(bot_id: int, status: str, pid: int | None = None):
     async with aiosqlite.connect(DB_PATH) as db:
         if pid is not None:
