@@ -37,7 +37,7 @@ from db.database import (
     get_bot_office_hook_config,
     get_bot_sheets_config,
     get_bot_yookassa_credentials,
-    get_factory_showcase_group,
+    get_office_digest_group,
     get_office_links_for_bot,
     list_bots_with_stats,
     list_template_candidate_clusters_with_stats,
@@ -48,7 +48,7 @@ from db.database import (
     set_bot_feature_thread,
     update_bot_status,
 )
-from features.office_events import _EVENT_TYPE_LABELS, available_event_types_for_template
+from features.office_events import EVENT_TYPE_LABELS, available_event_types_for_template
 from features.sales_analytics import weekly_record_count
 from handlers.admin_manager import OWNER_ID
 from handlers.manage_bots import (
@@ -603,7 +603,7 @@ async def list_office_event_types_handler(request: web.Request) -> web.Response:
         return web.json_response({"error": "not found"}, status=404)
     template_id = infer_template_id(b.get("file_path"))
     event_types = available_event_types_for_template(template_id)
-    items = [{"event_type": et, "label": _EVENT_TYPE_LABELS.get(et, et)} for et in event_types]
+    items = [{"event_type": et, "label": EVENT_TYPE_LABELS.get(et, et)} for et in event_types]
     return web.json_response({"items": items})
 
 
@@ -668,13 +668,18 @@ async def remove_office_handler(request: web.Request) -> web.Response:
 
 async def showcase_group_status_handler(request: web.Request) -> web.Response:
     """GET /api/factory/showcase-group — whether the optional office-events
-    showcase group (docs discussion "Офисы — доработка" §5) is configured.
-    No chat_id/title in the response — the SPA never needs to render it,
-    only whether the guide/success screen should show "connected" state."""
+    digest group (db/database.py's office_digest_group, docs/OFFICES_DESIGN.md
+    §12 "витрина") is bound. No chat_id/title in the response — the SPA
+    never needs to render it, only whether the guide/success screen should
+    show "connected" state. Bound either from the miniapp's own success
+    screen (not yet wired to write this table — see BotDetailPanel.tsx's
+    ShowcaseGroupGuide, currently a read-only guide) or from the
+    Telegram-side "🏢 Как витрина связей офисов" button (main.py's
+    build_group_router()), both converging on this one table."""
     if not await _authenticate_owner(request):
         return web.json_response({"error": "forbidden"}, status=403)
-    showcase = await get_factory_showcase_group()
-    return web.json_response({"connected": showcase is not None and showcase["enabled"]})
+    chat_id = await get_office_digest_group()
+    return web.json_response({"connected": chat_id is not None})
 
 
 async def list_admins_handler(request: web.Request) -> web.Response:

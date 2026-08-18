@@ -375,7 +375,7 @@ class FactoryAnalyticsApiTests(unittest.IsolatedAsyncioTestCase):
             resp = await self.client.get(f"/api/factory/bots/{self.shop_bot_id}/offices/event-types?{qs}")
         self.assertEqual(resp.status, 200)
         body = await resp.json()
-        self.assertEqual(body["items"], [{"event_type": "order.created", "label": "Новый заказ"}])
+        self.assertEqual(body["items"], [{"event_type": "order.created", "label": "новый заказ"}])
 
     async def test_office_event_types_empty_for_tour_operator_bot(self):
         qs = await self._owner_qs()
@@ -402,7 +402,7 @@ class FactoryAnalyticsApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(body["connected"])
 
     async def test_showcase_group_status_connected_after_set(self):
-        await db_module.set_factory_showcase_group(-100987654321)
+        await db_module.set_office_digest_group("-100987654321")
         try:
             qs = await self._owner_qs()
             with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
@@ -411,7 +411,13 @@ class FactoryAnalyticsApiTests(unittest.IsolatedAsyncioTestCase):
             body = await resp.json()
             self.assertTrue(body["connected"])
         finally:
-            await db_module.clear_factory_showcase_group()
+            # No clear_office_digest_group() exists (see db/database.py) —
+            # this table's own contract is "bind/rebind", never "unbind", so
+            # cleanup goes through the raw connection directly rather than
+            # inventing a delete function this feature has no real use for.
+            async with aiosqlite.connect(db_module.DB_PATH) as db:
+                await db.execute("DELETE FROM office_digest_group WHERE id = 1")
+                await db.commit()
 
     async def test_showcase_group_status_non_owner_returns_403(self):
         with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):

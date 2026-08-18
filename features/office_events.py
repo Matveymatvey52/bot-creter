@@ -36,7 +36,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from db.database import get_office_subscribers
+from db.database import get_bot, get_office_subscribers
 from runtime.registry_holder import RegistryHandle
 
 logger = logging.getLogger(__name__)
@@ -84,17 +84,32 @@ _EVENT_TYPES: dict[str, type] = {
     "task.assigned": TaskAssignedEvent,
 }
 
+# Human-readable labels for the picker/confirmation screens in both
+# handlers/manage_bots.py's "🏢 Офисы" Telegram flow AND the miniapp's
+# office-link wizard (runtime/factory_analytics_api.py's
+# list_office_event_types_handler) — kept alongside _EVENT_TYPES so a new
+# event_type can't be added there without a caller-facing label. Falls back
+# to the raw event_type string if a key is somehow missing (see
+# EVENT_TYPE_LABELS.get usage) rather than raising in a UI render path.
+EVENT_TYPE_LABELS: dict[str, str] = {
+    "order.created": "новый заказ",
+    "task.assigned": "новая задача",
+}
+
 # Which template_ids actually PUBLISH each event_type — a strict subset of
 # COMPATIBLE_WITH above (which only gates who can RECEIVE/subscribe). Used by
-# the office-link wizard (runtime/factory_analytics_api.py's
+# the miniapp office-link wizard (runtime/factory_analytics_api.py's
 # list_office_event_types_handler) to offer only event types the chosen
 # SOURCE bot can realistically emit, instead of the full _EVENT_TYPES set —
 # e.g. offering "task.assigned" for a shop_catalog bot would create a link
-# that will simply never fire. Deliberately explicit (not derived from
-# scanning templates/*.py for publish_event() calls at runtime) for the same
-# "no silent widening" reason _EVENT_TYPES itself is a closed dict: a new
-# publisher call site must be a deliberate addition here, not an automatic
-# side effect of adding a publish_event() call somewhere.
+# that will simply never fire. The Telegram-side wizard (handlers/
+# manage_bots.py's cb_office_pick_type) still offers every _EVENT_TYPES key
+# unfiltered — this is an additional, stricter check layered on top for the
+# miniapp surface, not a replacement for that flow. Deliberately explicit
+# (not derived from scanning templates/*.py for publish_event() calls at
+# runtime) for the same "no silent widening" reason _EVENT_TYPES itself is a
+# closed dict: a new publisher call site must be a deliberate addition here,
+# not an automatic side effect of adding a publish_event() call somewhere.
 #
 # order.created's publisher set is None (not a fixed set) because its only
 # publisher, features/payments.py's on_successful_payment, fires for EVERY
@@ -106,11 +121,6 @@ _EVENT_TYPES: dict[str, type] = {
 _EVENT_TYPE_PUBLISHER_TEMPLATES: dict[str, set[str] | None] = {
     "order.created": None,
     "task.assigned": {"boss_bot"},
-}
-
-_EVENT_TYPE_LABELS: dict[str, str] = {
-    "order.created": "Новый заказ",
-    "task.assigned": "Задача назначена",
 }
 
 
@@ -144,7 +154,6 @@ def available_event_types_for_template(template_id: str | None) -> list[str]:
             available.append(event_type)
     return available
 
-
 @dataclass(frozen=True)
 class OfficeEvent:
     """What a subscriber's on_office_event() hook actually receives — wraps
@@ -157,6 +166,54 @@ class OfficeEvent:
     event_type: str
     source_bot_id: int
     payload: Any = field(default=None)
+
+
+async def _mirror_to_digest_group(registry, source_bot_id: int, event_type: str) -> None:
+    """Best-effort, read-only mirror of ONE line per office_event into the
+    owner's bound showcase group (db.database.get_office_digest_group), if
+    any — see docs/OFFICES_DESIGN.md §12. Sent via the FACTORY bot, never a
+    tenant bot: the group is a Creator-bot-owned "витрина", not a chat any
+    client bot participates in (client bots are never added to it — see the
+    design doc's "клиентские боты в группу не добавляются").
+
+    Deliberately isolated from the real delivery loop in publish_event(): a
+    digest-group failure (group deleted, factory bot kicked, no group bound
+    at all) must never affect actual subscriber delivery, so this is called
+    unconditionally before the subscriber loop and swallows every exception
+    itself, same isolation contract as every other office_events failure
+    mode in this module."""
+    from db.database import get_office_digest_group
+    from runtime.registry import FACTORY_BOT_ID
+
+    try:
+        chat_id = await get_office_digest_group()
+        if not chat_id:
+            return
+        factory_entry = registry.get(FACTORY_BOT_ID)
+        if factory_entry is None:
+            return
+        source_bot = await get_bot(source_bot_id)
+        # source_bot["name"] is owner/LLM-controlled free text (see
+        # handlers/create_bot.py's naming flow) — escaped before
+        # interpolation, same convention every other user/LLM-text-derived
+        # message in this codebase follows (e.g. features/sellable_items.py,
+        # templates/channel_monitor.py). This message has no parse_mode set
+        # (plain text), so escaping here is defense-in-depth against a
+        # future caller adding parse_mode="HTML" rather than a fix for a
+        # live rendering bug — plain-text send_message doesn't interpret
+        # '<'/'&' at all, but keeping the escape means switching to HTML
+        # formatting later can't silently reintroduce injection.
+        raw_name = source_bot["name"] if source_bot else str(source_bot_id)
+        source_name = html.escape(raw_name)
+        label = EVENT_TYPE_LABELS.get(event_type, event_type)
+        text = f"🏢 «{source_name}»: {label}"
+        await factory_entry.bot.send_message(chat_id, text)
+    except Exception:
+        logger.warning(
+            f"_mirror_to_digest_group: failed to mirror event_type={event_type!r} "
+            f"source_bot_id={source_bot_id} to digest group",
+            exc_info=True,
+        )
 
 
 async def publish_event(source_bot_id: int, event_type: str, payload: object) -> int:
@@ -194,6 +251,8 @@ async def publish_event(source_bot_id: int, event_type: str, payload: object) ->
         )
         return 0
 
+    await _mirror_to_digest_group(registry, source_bot_id, event_type)
+
     subscriber_ids = await get_office_subscribers(source_bot_id, event_type)
     if not subscriber_ids:
         return 0
@@ -224,60 +283,7 @@ async def publish_event(source_bot_id: int, event_type: str, payload: object) ->
                 f"event_type={event_type!r} source_bot_id={source_bot_id}, skipped"
             )
 
-    await _post_showcase_digest(registry, source_bot_id, event_type, subscriber_ids, delivered)
     return delivered
-
-
-async def _post_showcase_digest(
-    registry, source_bot_id: int, event_type: str, subscriber_ids: list[int], delivered: int
-) -> None:
-    """Best-effort, read-only mirror of this event into the optional
-    showcase group (see db/database.py's factory_office_showcase and its own
-    comment in init_db) — NOT part of the transport: delivery to real
-    subscribers above already happened regardless of whether this succeeds.
-    Sent by the FACTORY bot itself (never a tenant bot — client bots are
-    never added to this group, per the approved design), so this looks the
-    group up via FACTORY_BOT_ID in the same live registry publish_event()
-    already has in hand, no separate registry lookup path needed. Any
-    failure here (group not configured, factory bot not in registry, Telegram
-    API error, bot kicked from the group) is swallowed — a broken showcase
-    mirror must never affect real event delivery, same posture as each
-    subscriber's own isolated try/except above."""
-    try:
-        from db.database import get_factory_showcase_group, get_bot
-
-        showcase = await get_factory_showcase_group()
-        if showcase is None or not showcase["enabled"]:
-            return
-
-        from runtime.registry import FACTORY_BOT_ID
-
-        factory_entry = registry.get(FACTORY_BOT_ID)
-        if factory_entry is None:
-            return
-
-        source_bot = await get_bot(source_bot_id)
-        # source_bot["name"] is owner/LLM-controlled free text (see
-        # handlers/create_bot.py's naming flow) — escaped before interpolation
-        # into this parse_mode="HTML" message, same convention every other
-        # HTML-formatted message built from user/LLM text in this codebase
-        # already follows (e.g. features/sellable_items.py, templates/
-        # channel_monitor.py) so a stray '<'/'&' in a bot's name can't break
-        # or mangle the Telegram API call.
-        raw_name = source_bot["name"] if source_bot else f"#{source_bot_id}"
-        source_name = html.escape(raw_name)
-        label = _EVENT_TYPE_LABELS.get(event_type, event_type)
-        text = (
-            f"🔔 <b>{source_name}</b> → {label}\n"
-            f"Доставлено ботам-подписчикам: {delivered}/{len(subscriber_ids)}"
-        )
-        await factory_entry.bot.send_message(showcase["chat_id"], text, parse_mode="HTML")
-    except Exception:
-        logger.warning(
-            f"_post_showcase_digest: failed to post digest — event_type={event_type!r} "
-            f"source_bot_id={source_bot_id} (non-fatal, real delivery already completed)",
-            exc_info=True,
-        )
 
 
 def register_office_event_hook(config: dict[str, Any], hook) -> None:

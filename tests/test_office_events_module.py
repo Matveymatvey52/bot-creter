@@ -134,139 +134,90 @@ async def test_publish_event_never_raises_for_subscriber_hook_exception(monkeypa
     assert delivered == 0
 
 
-# ── showcase-group digest (docs discussion "Офисы — доработка" §5) ───────────
-# The Telegram showcase group is explicitly NOT the transport — every test
-# above already proves delivery to real subscribers works with no showcase
-# group configured at all (db.database.get_factory_showcase_group is not
-# monkeypatched there, so the real function runs against no DB row / whatever
-# table state exists, and _post_showcase_digest's own try/except swallows any
-# failure). These tests isolate _post_showcase_digest's own behavior instead.
+# ── digest-group mirroring (docs/OFFICES_DESIGN.md §12) ─────────────────────
+# _mirror_to_digest_group does its own imports of db.database.get_office_
+# digest_group and runtime.registry.FACTORY_BOT_ID inside the function body
+# (see that function's own docstring for why), so these tests monkeypatch
+# db.database directly rather than office_events' own module namespace.
 
-from runtime.registry import FACTORY_BOT_ID
-
-
-def _factory_entry_with_bot(bot):
-    return SimpleNamespace(bot=bot)
+import db.database as database  # noqa: E402
 
 
 @pytest.mark.asyncio
-async def test_publish_event_posts_digest_to_showcase_group_when_configured(monkeypatch):
-    monkeypatch.setattr(office_events, "get_office_subscribers", AsyncMock(return_value=[2]))
-    monkeypatch.setattr(
-        "db.database.get_factory_showcase_group",
-        AsyncMock(return_value={"chat_id": -100123, "enabled": True}),
-    )
-    monkeypatch.setattr(
-        "db.database.get_bot", AsyncMock(return_value={"id": 1, "name": "Магазин Ромы"})
-    )
-    factory_bot = SimpleNamespace(send_message=AsyncMock())
-    office_events.set_registry(
-        FakeRegistry({2: _entry_with_hook(AsyncMock()), FACTORY_BOT_ID: _factory_entry_with_bot(factory_bot)})
-    )
+async def test_publish_event_skips_digest_mirror_when_no_group_bound(monkeypatch):
+    monkeypatch.setattr(office_events, "get_office_subscribers", AsyncMock(return_value=[]))
+    monkeypatch.setattr(database, "get_office_digest_group", AsyncMock(return_value=None))
+    factory_entry = SimpleNamespace(bot=AsyncMock())
+    office_events.set_registry(FakeRegistry({0: factory_entry}))
 
     await publish_event(1, "order.created", OrderCreatedEvent(1, 100, "RUB", 999))
 
-    factory_bot.send_message.assert_awaited_once()
-    (chat_id, text), kwargs = factory_bot.send_message.call_args
-    assert chat_id == -100123
-    assert "Магазин Ромы" in text
-    assert kwargs.get("parse_mode") == "HTML"
+    factory_entry.bot.send_message.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_publish_event_digest_escapes_bot_name_html_metacharacters(monkeypatch):
+async def test_publish_event_mirrors_to_bound_digest_group(monkeypatch):
+    monkeypatch.setattr(office_events, "get_office_subscribers", AsyncMock(return_value=[]))
+    monkeypatch.setattr(database, "get_office_digest_group", AsyncMock(return_value="-100999"))
+    monkeypatch.setattr(office_events, "get_bot", AsyncMock(return_value={"id": 1, "name": "SourceBot"}))
+    factory_entry = SimpleNamespace(bot=AsyncMock())
+    office_events.set_registry(FakeRegistry({0: factory_entry}))
+
+    await publish_event(1, "order.created", OrderCreatedEvent(1, 100, "RUB", 999))
+
+    factory_entry.bot.send_message.assert_awaited_once()
+    (chat_id, text), _ = factory_entry.bot.send_message.call_args
+    assert chat_id == "-100999"
+    assert "SourceBot" in text
+    assert "новый заказ" in text
+
+
+@pytest.mark.asyncio
+async def test_publish_event_digest_mirror_escapes_bot_name_html_metacharacters(monkeypatch):
     """A bot name is owner/LLM-controlled free text — must be HTML-escaped
-    before interpolation into this parse_mode='HTML' message, or a stray
-    '<'/'&' would make Telegram reject the send (see the fix's own comment
-    in features/office_events.py's _post_showcase_digest)."""
-    monkeypatch.setattr(office_events, "get_office_subscribers", AsyncMock(return_value=[2]))
+    before interpolation, even though this message currently has no
+    parse_mode set (defense-in-depth, see the escaping fix's own comment in
+    features/office_events.py's _mirror_to_digest_group)."""
+    monkeypatch.setattr(office_events, "get_office_subscribers", AsyncMock(return_value=[]))
+    monkeypatch.setattr(database, "get_office_digest_group", AsyncMock(return_value="-100999"))
     monkeypatch.setattr(
-        "db.database.get_factory_showcase_group",
-        AsyncMock(return_value={"chat_id": -100123, "enabled": True}),
+        office_events, "get_bot", AsyncMock(return_value={"id": 1, "name": "<b>Рома</b> & Co"})
     )
-    monkeypatch.setattr(
-        "db.database.get_bot", AsyncMock(return_value={"id": 1, "name": "<b>Рома</b> & Co"})
-    )
-    factory_bot = SimpleNamespace(send_message=AsyncMock())
-    office_events.set_registry(
-        FakeRegistry({2: _entry_with_hook(AsyncMock()), FACTORY_BOT_ID: _factory_entry_with_bot(factory_bot)})
-    )
+    factory_entry = SimpleNamespace(bot=AsyncMock())
+    office_events.set_registry(FakeRegistry({0: factory_entry}))
 
     await publish_event(1, "order.created", OrderCreatedEvent(1, 100, "RUB", 999))
 
-    factory_bot.send_message.assert_awaited_once()
-    (_, text), _ = factory_bot.send_message.call_args
+    factory_entry.bot.send_message.assert_awaited_once()
+    (_, text), _ = factory_entry.bot.send_message.call_args
     assert "<b>Рома</b> & Co" not in text
     assert "&lt;b&gt;Рома&lt;/b&gt; &amp; Co" in text
 
 
 @pytest.mark.asyncio
-async def test_publish_event_skips_digest_when_showcase_not_configured(monkeypatch):
-    monkeypatch.setattr(office_events, "get_office_subscribers", AsyncMock(return_value=[2]))
-    monkeypatch.setattr("db.database.get_factory_showcase_group", AsyncMock(return_value=None))
-    factory_bot = SimpleNamespace(send_message=AsyncMock())
-    office_events.set_registry(
-        FakeRegistry({2: _entry_with_hook(AsyncMock()), FACTORY_BOT_ID: _factory_entry_with_bot(factory_bot)})
-    )
-
-    await publish_event(1, "order.created", OrderCreatedEvent(1, 100, "RUB", 999))
-
-    factory_bot.send_message.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_publish_event_skips_digest_when_showcase_disabled(monkeypatch):
+async def test_publish_event_digest_mirror_failure_does_not_block_delivery(monkeypatch):
     monkeypatch.setattr(office_events, "get_office_subscribers", AsyncMock(return_value=[2]))
     monkeypatch.setattr(
-        "db.database.get_factory_showcase_group",
-        AsyncMock(return_value={"chat_id": -100123, "enabled": False}),
+        database, "get_office_digest_group", AsyncMock(side_effect=RuntimeError("db down"))
     )
-    factory_bot = SimpleNamespace(send_message=AsyncMock())
-    office_events.set_registry(
-        FakeRegistry({2: _entry_with_hook(AsyncMock()), FACTORY_BOT_ID: _factory_entry_with_bot(factory_bot)})
-    )
-
-    await publish_event(1, "order.created", OrderCreatedEvent(1, 100, "RUB", 999))
-
-    factory_bot.send_message.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_publish_event_digest_failure_does_not_affect_real_delivery(monkeypatch):
-    """A broken showcase mirror (Telegram error, bot kicked, etc.) must never
-    affect real subscriber delivery — same isolation contract as a failing
-    subscriber hook (test_one_failing_subscriber_does_not_block_others)."""
-    monkeypatch.setattr(office_events, "get_office_subscribers", AsyncMock(return_value=[2]))
-    monkeypatch.setattr(
-        "db.database.get_factory_showcase_group",
-        AsyncMock(return_value={"chat_id": -100123, "enabled": True}),
-    )
-    monkeypatch.setattr("db.database.get_bot", AsyncMock(return_value={"id": 1, "name": "Магазин Ромы"}))
-    factory_bot = SimpleNamespace(send_message=AsyncMock(side_effect=RuntimeError("kicked from group")))
-    real_hook = AsyncMock()
-    office_events.set_registry(
-        FakeRegistry({2: _entry_with_hook(real_hook), FACTORY_BOT_ID: _factory_entry_with_bot(factory_bot)})
-    )
+    hook = AsyncMock()
+    office_events.set_registry(FakeRegistry({2: _entry_with_hook(hook)}))
 
     delivered = await publish_event(1, "order.created", OrderCreatedEvent(1, 100, "RUB", 999))
 
     assert delivered == 1
-    real_hook.assert_awaited_once()
+    hook.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-async def test_publish_event_skips_digest_when_factory_bot_not_in_registry(monkeypatch):
-    monkeypatch.setattr(office_events, "get_office_subscribers", AsyncMock(return_value=[2]))
-    monkeypatch.setattr(
-        "db.database.get_factory_showcase_group",
-        AsyncMock(return_value={"chat_id": -100123, "enabled": True}),
-    )
-    # FACTORY_BOT_ID deliberately absent from the registry.
-    office_events.set_registry(FakeRegistry({2: _entry_with_hook(AsyncMock())}))
+async def test_publish_event_skips_digest_mirror_when_factory_bot_not_live(monkeypatch):
+    monkeypatch.setattr(office_events, "get_office_subscribers", AsyncMock(return_value=[]))
+    monkeypatch.setattr(database, "get_office_digest_group", AsyncMock(return_value="-100999"))
+    office_events.set_registry(FakeRegistry({}))  # factory bot (id 0) not registered
 
-    # Must not raise even though the factory bot instance is unavailable.
+    # Must not raise even though the factory bot isn't in the live registry.
     delivered = await publish_event(1, "order.created", OrderCreatedEvent(1, 100, "RUB", 999))
-    assert delivered == 1
+    assert delivered == 0
 
 
 # ── available_event_types_for_template ────────────────────────────────────
