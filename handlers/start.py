@@ -54,13 +54,15 @@ def _start_keyboard(telegram_user_id: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="➕ Создать бота", callback_data="start_create")],
         [InlineKeyboardButton(text="📋 Мои боты", callback_data="list")],
     ]
-    if _OWNER_ID != 0 and telegram_user_id == _OWNER_ID:
-        dashboard_url = _dashboard_url(telegram_user_id)
-        if dashboard_url is not None:
-            rows.append([InlineKeyboardButton(
-                text="📊 Панель управления",
-                web_app=WebAppInfo(url=dashboard_url),
-            )])
+    # The dashboard itself is role-based (see runtime/factory_analytics_api.py's
+    # is_owner) — every user gets this button, not just OWNER_ID. The owner
+    # sees the full "Моя фабрика" view (all bots, templates, candidates);
+    # everyone else sees only their own bots. Label differs only so the
+    # owner keeps recognizing their existing entry point.
+    dashboard_url = _dashboard_url(telegram_user_id)
+    if dashboard_url is not None:
+        label = "📊 Панель управления" if (_OWNER_ID != 0 and telegram_user_id == _OWNER_ID) else "🏭 Моя фабрика"
+        rows.append([InlineKeyboardButton(text=label, web_app=WebAppInfo(url=dashboard_url))])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 

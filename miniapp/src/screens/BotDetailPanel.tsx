@@ -24,6 +24,7 @@ import {
   type FactoryBotItem,
 } from '../lib/factoryApi'
 import { iconForTemplate } from '../lib/botIcons'
+import { FeedbackForm } from './FactoryDashboardScreen'
 
 type Tab = 'overview' | 'features' | 'offices' | 'admins' | 'maintenance'
 
@@ -242,7 +243,14 @@ export function BotDetailPanel({
         )}
         {tab === 'admins' && <AdminsTab botId={botId} admins={detail.admins} onChanged={load} />}
         {tab === 'maintenance' && (
-          <MaintenanceTab botId={botId} busy={busy} setBusy={setBusy} setActionError={setActionError} onChanged={load} />
+          <MaintenanceTab
+            botId={botId}
+            bot={allBots.find((b) => b.id === botId) ?? null}
+            busy={busy}
+            setBusy={setBusy}
+            setActionError={setActionError}
+            onChanged={load}
+          />
         )}
       </div>
     </div>
@@ -324,38 +332,61 @@ function FeaturesTab({
   onChanged: () => void
 }) {
   const [openFeature, setOpenFeature] = useState<string | null>(null)
+  const [dropdownOpen, setDropdownOpen] = useState(false)
 
   if (features.length === 0) {
     return <div className="state-message">Для этого бота пока нет доступных фич.</div>
   }
 
+  const enabledCount = features.filter((f) => f.state === 'on').length
+
+  const toggleFeature = (f: FeatureStatusItem) => {
+    if (f.state === 'on') {
+      disableFeature(botId, f.name).then(onChanged)
+    } else if (f.name === 'office_events') {
+      // office_events has its own bot-picker UI (the "Офисы" tab) — no
+      // free-text configure step, so the checkbox here just points the
+      // owner there instead of opening a chat the backend would reject
+      // with 400 (see _NO_FREE_TEXT_FEATURES in factory_analytics_api.py).
+      window.alert('Настраивается на вкладке «Офисы» — выбери, какой бот уведомлять.')
+    } else {
+      setOpenFeature(openFeature === f.name ? null : f.name)
+    }
+  }
+
   return (
     <div>
+      <div className="feature-dropdown">
+        <button className="feature-dropdown-trigger" onClick={() => setDropdownOpen(!dropdownOpen)}>
+          <span>Функции ({enabledCount} из {features.length} включено)</span>
+          <span>{dropdownOpen ? '▲' : '▼'}</span>
+        </button>
+        {dropdownOpen && (
+          <div className="feature-dropdown-list">
+            {features.map((f) => (
+              <label key={f.name} className="feature-dropdown-item">
+                <input
+                  type="checkbox"
+                  checked={f.state === 'on'}
+                  ref={(el) => {
+                    if (el) el.indeterminate = f.state === 'pending'
+                  }}
+                  onChange={() => toggleFeature(f)}
+                />
+                <span>{featureLabel(f.name)}</span>
+              </label>
+            ))}
+          </div>
+        )}
+      </div>
+
       {features.map((f) => (
         <div key={f.name}>
-          <div className="feature-row">
-            <div>
-              <div className="feature-name">{featureLabel(f.name)}</div>
-              {f.description && f.state === 'on' && <div className="feature-desc">«{f.description}»</div>}
+          {f.description && f.state === 'on' && (
+            <div className="feature-desc" style={{ marginTop: 4 }}>
+              {featureLabel(f.name)}: «{f.description}»
             </div>
-            <button
-              className={`switch ${f.state === 'on' ? 'on' : f.state === 'pending' ? 'pending' : ''}`}
-              onClick={() => {
-                if (f.state === 'on') {
-                  disableFeature(botId, f.name).then(onChanged)
-                } else if (f.name === 'office_events') {
-                  // office_events has its own bot-picker UI (the "Офисы" tab)
-                  // — no free-text configure step, so the tumbler here just
-                  // points the owner there instead of opening a chat that
-                  // the backend would reject with 400 (see
-                  // _NO_FREE_TEXT_FEATURES in factory_analytics_api.py).
-                  window.alert('Настраивается на вкладке «Офисы» — выбери, какой бот уведомлять.')
-                } else {
-                  setOpenFeature(openFeature === f.name ? null : f.name)
-                }
-              }}
-            />
-          </div>
+          )}
           {openFeature === f.name && f.state !== 'on' && f.name !== 'office_events' && (
             <FeatureConfigureSubpanel
               botId={botId}
@@ -847,12 +878,14 @@ function AdminsTab({ botId, admins, onChanged }: { botId: number; admins: string
 
 function MaintenanceTab({
   botId,
+  bot,
   busy,
   setBusy,
   setActionError,
   onChanged,
 }: {
   botId: number
+  bot: FactoryBotItem | null
   busy: boolean
   setBusy: (b: boolean) => void
   setActionError: (e: string | null) => void
@@ -860,6 +893,7 @@ function MaintenanceTab({
 }) {
   const [fixDescribing, setFixDescribing] = useState(false)
   const [bugText, setBugText] = useState('')
+  const [rating, setRating] = useState(false)
 
   const run = async (fn: () => Promise<{ ok: boolean; error: string | null }>) => {
     setBusy(true)
@@ -928,6 +962,18 @@ function MaintenanceTab({
           <div className="maint-sub">немного улучшим код</div>
         </div>
       </button>
+      {bot &&
+        (rating ? (
+          <FeedbackForm bot={bot} onDone={() => { setRating(false); onChanged() }} />
+        ) : (
+          <button className="maint-btn" disabled={busy} onClick={() => setRating(true)}>
+            <span className="ic">⭐</span>
+            <div>
+              <div>Оценить</div>
+              <div className="maint-sub">оставить оценку и комментарий</div>
+            </div>
+          </button>
+        ))}
     </div>
   )
 }

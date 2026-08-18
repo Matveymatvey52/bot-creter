@@ -86,12 +86,36 @@ async def _authenticate_owner(request: web.Request) -> bool:
     returns False, same posture as admin_manager.py's _is_owner()."""
     if OWNER_ID == 0:
         return False
+    telegram_user_id = await _authenticate_factory_user(request)
+    return telegram_user_id == OWNER_ID
+
+
+async def _authenticate_factory_user(request: web.Request) -> int | None:
+    """Same credential check as _authenticate_owner (Telegram initData or
+    magic-link token scoped to FACTORY_BOT_ID), but without the OWNER_ID
+    restriction — any authenticated Telegram user is accepted. Used by
+    routes the customer-facing view of the shared dashboard also hits (see
+    docs decision: one codebase, role-based rendering, not owner-gated
+    routes for everything)."""
     registry: Registry = request.app[REGISTRY_KEY]
     factory_entry = registry.get(FACTORY_BOT_ID)
     if factory_entry is None:
+        return None
+    return await _authenticate(request, FACTORY_BOT_ID, factory_entry.bot.token)
+
+
+async def _authenticate_bot_access(request: web.Request, bot_id: int) -> bool:
+    """True iff the request is an authenticated OWNER_ID, or an authenticated
+    customer who owns this specific bot_id (bots.owner_telegram_id). Used by
+    routes the customer view of the shared dashboard needs for their OWN
+    bots only (bot detail, feedback) — everything else stays owner-only."""
+    telegram_user_id = await _authenticate_factory_user(request)
+    if telegram_user_id is None:
         return False
-    telegram_user_id = await _authenticate(request, FACTORY_BOT_ID, factory_entry.bot.token)
-    return telegram_user_id == OWNER_ID
+    if telegram_user_id == OWNER_ID:
+        return True
+    bot_row = await get_bot(bot_id)
+    return bot_row is not None and bot_row.get("owner_telegram_id") == telegram_user_id
 
 
 async def refresh_session_handler(request: web.Request) -> web.Response:
@@ -108,18 +132,21 @@ async def refresh_session_handler(request: web.Request) -> web.Response:
     mid-use. Requires an already-valid credential (current token or Telegram
     initData) — this refreshes a live session, it doesn't mint one from
     nothing."""
-    if not await _authenticate_owner(request):
+    telegram_user_id = await _authenticate_factory_user(request)
+    if telegram_user_id is None:
         return web.json_response({"error": "forbidden"}, status=403)
-    token = mint_magic_link_token(FACTORY_BOT_ID, OWNER_ID)
-    return web.json_response({"token": token})
+    token = mint_magic_link_token(FACTORY_BOT_ID, telegram_user_id)
+    return web.json_response({"token": token, "is_owner": telegram_user_id == OWNER_ID})
 
 
 async def list_bots_handler(request: web.Request) -> web.Response:
-    if not await _authenticate_owner(request):
+    telegram_user_id = await _authenticate_factory_user(request)
+    if telegram_user_id is None:
         return web.json_response({"error": "forbidden"}, status=403)
+    is_owner = telegram_user_id == OWNER_ID
 
     registry: Registry = request.app[REGISTRY_KEY]
-    rows = await list_bots_with_stats()
+    rows = await list_bots_with_stats(owner_telegram_id=None if is_owner else telegram_user_id)
     items = []
     for row in rows:
         features = [f for f in row["features"].split(",") if f]
@@ -140,7 +167,7 @@ async def list_bots_handler(request: web.Request) -> web.Response:
                 "weekly_count": await _weekly_count_for_bot(registry, row["id"]),
             }
         )
-    return web.json_response({"items": items})
+    return web.json_response({"items": items, "is_owner": is_owner})
 
 
 async def _weekly_count_for_bot(registry: Registry, bot_id: int) -> int | None:
@@ -162,12 +189,11 @@ async def _weekly_count_for_bot(registry: Registry, bot_id: int) -> int | None:
 
 
 async def add_feedback_handler(request: web.Request) -> web.Response:
-    if not await _authenticate_owner(request):
-        return web.json_response({"error": "forbidden"}, status=403)
-
     bot_id_raw = request.match_info.get("bot_id", "")
     if not bot_id_raw.isdigit():
         return web.json_response({"error": "bad bot_id"}, status=404)
+    if not await _authenticate_bot_access(request, int(bot_id_raw)):
+        return web.json_response({"error": "forbidden"}, status=403)
 
     try:
         payload = await request.json()
@@ -249,11 +275,11 @@ async def bot_detail_handler(request: web.Request) -> web.Response:
     """GET /api/factory/bots/{id} — everything the detail panel's "Обзор" tab
     needs in one call: status, template, admins, office links, and per-feature
     enabled/pending/off state (see feature_status_items below)."""
-    if not await _authenticate_owner(request):
-        return web.json_response({"error": "forbidden"}, status=403)
     bot_id = _bot_id_from_match_info(request)
     if bot_id is None:
         return web.json_response({"error": "bad bot_id"}, status=404)
+    if not await _authenticate_bot_access(request, bot_id):
+        return web.json_response({"error": "forbidden"}, status=403)
     b = await get_bot(bot_id)
     if not b:
         return web.json_response({"error": "not found"}, status=404)

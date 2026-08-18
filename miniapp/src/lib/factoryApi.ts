@@ -110,7 +110,7 @@ export interface FactoryBotItem {
   weekly_count: number | null
 }
 
-export function listFactoryBots(): Promise<{ items: FactoryBotItem[] }> {
+export function listFactoryBots(): Promise<{ items: FactoryBotItem[]; is_owner: boolean }> {
   return request('/bots')
 }
 

@@ -161,11 +161,20 @@ async def init_db():
                 PRIMARY KEY (bot_id, telegram_id)
             )
         """)
-        for col in ("display_name TEXT", "group_chat_id TEXT", "archived_at TIMESTAMP"):
+        for col in ("display_name TEXT", "group_chat_id TEXT", "archived_at TIMESTAMP", "owner_telegram_id INTEGER"):
             try:
                 await db.execute(f"ALTER TABLE bots ADD COLUMN {col}")
             except aiosqlite.OperationalError:
                 pass
+        # One-time backfill: bots created before owner_telegram_id existed
+        # belong to OWNER_ID (the only person who could create bots at the
+        # time) — see handlers/create_bot.py's owner-vs-customer split.
+        owner_id_raw = os.getenv("OWNER_ID", "")
+        if owner_id_raw.isdigit():
+            await db.execute(
+                "UPDATE bots SET owner_telegram_id = ? WHERE owner_telegram_id IS NULL",
+                (int(owner_id_raw),),
+            )
         await db.execute("""
             CREATE TABLE IF NOT EXISTS bot_payment_providers (
                 bot_id         INTEGER PRIMARY KEY REFERENCES bots(id),
@@ -476,13 +485,17 @@ async def create_bot_record_with_admins(
     file_path: str,
     admin_ids: list[str],
     username: str | None = None,
+    owner_telegram_id: int | None = None,
 ) -> int:
     """Insert the bot record and its initial admins as one atomic transaction —
-    a crash between the two would otherwise leave a bot with no admin at all."""
+    a crash between the two would otherwise leave a bot with no admin at all.
+    owner_telegram_id is the customer/creator this bot belongs to for the
+    factory dashboard's per-owner filtering (runtime/factory_analytics_api.py) —
+    None only for legacy call sites that haven't been updated yet."""
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
-            "INSERT INTO bots (name, username, description, token, file_path, status) VALUES (?, ?, ?, ?, ?, 'stopped')",
-            (name, username, description, _encrypt_token(token), file_path),
+            "INSERT INTO bots (name, username, description, token, file_path, status, owner_telegram_id) VALUES (?, ?, ?, ?, ?, 'stopped', ?)",
+            (name, username, description, _encrypt_token(token), file_path, owner_telegram_id),
         )
         bot_id = cursor.lastrowid
         for telegram_id in admin_ids:
@@ -1255,7 +1268,7 @@ async def list_template_candidate_clusters_with_stats(limit_examples: int = 3) -
         return cluster_rows
 
 
-async def list_bots_with_stats() -> list[dict]:
+async def list_bots_with_stats(owner_telegram_id: int | None = None) -> list[dict]:
     """One row per bot for the factory analytics dashboard (see
     docs/FACTORY_ANALYTICS_DESIGN.md): created_at/status/archived_at straight
     off `bots`, plus aggregate counts joined in. Deliberately excludes
@@ -1264,10 +1277,16 @@ async def list_bots_with_stats() -> list[dict]:
     derived from it separately via runtime.registry.infer_template_id, kept
     out of the DB layer to avoid a db/database.py -> runtime/registry.py
     import). Feature list comes back as a comma-joined string (SQLite has no
-    array type); callers split on ',' and filter empties."""
+    array type); callers split on ',' and filter empties.
+
+    owner_telegram_id, when given, restricts the result to bots owned by
+    that customer (runtime/factory_analytics_api.py's non-owner path) —
+    None (the owner path) returns every bot, unchanged behavior."""
+    where_clause = "WHERE b.owner_telegram_id = ?" if owner_telegram_id is not None else ""
+    params = (owner_telegram_id,) if owner_telegram_id is not None else ()
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        async with db.execute("""
+        async with db.execute(f"""
             SELECT
                 b.id, b.name, b.username, b.display_name, b.status,
                 b.created_at, b.archived_at, b.file_path,
@@ -1287,8 +1306,9 @@ async def list_bots_with_stats() -> list[dict]:
                 SELECT bot_id, AVG(rating) AS avg_rating, COUNT(*) AS feedback_count
                 FROM bot_feedback GROUP BY bot_id
             ) r ON r.bot_id = b.id
+            {where_clause}
             ORDER BY b.created_at DESC
-        """) as cursor:
+        """, params) as cursor:
             rows = await cursor.fetchall()
             return [dict(row) for row in rows]
 

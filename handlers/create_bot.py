@@ -761,6 +761,7 @@ async def auto_launch_managed_bot(managed_data: dict, bot: Bot, storage=None) ->
         file_path=str(bot_file),
         admin_ids=admin_ids,
         username=real_username,
+        owner_telegram_id=creator_user_id,
     )
 
     if miniapp_config:
@@ -852,6 +853,7 @@ async def handle_token(message: Message, state: FSMContext, bot: Bot):
         file_path=str(bot_file),
         admin_ids=admin_ids,
         username=real_username,
+        owner_telegram_id=message.from_user.id,
     )
 
     if miniapp_config:

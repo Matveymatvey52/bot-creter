@@ -37,7 +37,7 @@ function weeklyMetricLabel(bot: FactoryBotItem): string {
 }
 
 
-function FeedbackForm({ bot, onDone }: { bot: FactoryBotItem; onDone: () => void }) {
+export function FeedbackForm({ bot, onDone }: { bot: FactoryBotItem; onDone: () => void }) {
   const [rating, setRating] = useState(5)
   const [comment, setComment] = useState('')
   const [submitting, setSubmitting] = useState(false)
@@ -189,10 +189,10 @@ function TemplateCandidatesSection() {
 
 export function FactoryDashboardScreen() {
   const [items, setItems] = useState<FactoryBotItem[] | null>(null)
+  const [isOwner, setIsOwner] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [templateFilter, setTemplateFilter] = useState<string | null>(null)
   const [featureFilter, setFeatureFilter] = useState<string | null>(null)
-  const [feedbackTargetId, setFeedbackTargetId] = useState<number | null>(null)
   const [selectedBotId, setSelectedBotId] = useState<number | null>(() => {
     const raw = new URLSearchParams(window.location.search).get('bot')
     return raw && /^\d+$/.test(raw) ? Number(raw) : null
@@ -200,7 +200,10 @@ export function FactoryDashboardScreen() {
 
   const reload = () => {
     listFactoryBots()
-      .then((data) => setItems(data.items))
+      .then((data) => {
+        setItems(data.items)
+        setIsOwner(data.is_owner)
+      })
       .catch((err) => setError(err instanceof ApiError ? err.message : 'Не удалось загрузить данные'))
   }
 
@@ -237,11 +240,6 @@ export function FactoryDashboardScreen() {
       (!featureFilter || b.features.includes(featureFilter)),
   )
 
-  const refreshAfterFeedback = () => {
-    setFeedbackTargetId(null)
-    listFactoryBots().then((data) => setItems(data.items))
-  }
-
   if (selectedBotId != null) {
     return (
       <div className="screen">
@@ -258,13 +256,13 @@ export function FactoryDashboardScreen() {
   return (
     <div className="screen">
       <div className="screen-header">
-        <h1>Аналитика фабрики</h1>
+        <h1>Моя фабрика</h1>
       </div>
 
       {error && <div className="state-message">{error}</div>}
       {!error && items === null && <div className="state-message">Загрузка…</div>}
 
-      {templates.length > 0 && (
+      {isOwner && templates.length > 0 && (
         <div className="chip-row" style={{ padding: '0 0 8px' }}>
           <button
             className="chip"
@@ -286,7 +284,7 @@ export function FactoryDashboardScreen() {
         </div>
       )}
 
-      {features.length > 0 && (
+      {isOwner && features.length > 0 && (
         <div className="chip-row" style={{ padding: '0 0 8px' }}>
           <button
             className="chip"
@@ -366,20 +364,12 @@ export function FactoryDashboardScreen() {
                 </svg>
               </button>
             </div>
-
-            {feedbackTargetId === bot.id ? (
-              <FeedbackForm bot={bot} onDone={refreshAfterFeedback} />
-            ) : (
-              <button className="btn-secondary" onClick={() => setFeedbackTargetId(bot.id)}>
-                Оценить
-              </button>
-            )}
           </div>
         )
       })}
 
-      <TemplateCandidateClustersSection />
-      <TemplateCandidatesSection />
+      {isOwner && <TemplateCandidateClustersSection />}
+      {isOwner && <TemplateCandidatesSection />}
     </div>
   )
 }

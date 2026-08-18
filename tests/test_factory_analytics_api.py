@@ -106,23 +106,35 @@ class FactoryAnalyticsApiTests(unittest.IsolatedAsyncioTestCase):
         return f"token={token}"
 
     # ── auth ──────────────────────────────────────────────────────────
-    async def test_non_owner_token_returns_403(self):
+    async def test_non_owner_token_returns_client_view(self):
+        """Any authenticated Telegram user may hit /api/factory/bots now —
+        the shared dashboard's customer view (see decision: role-based
+        rendering, not owner-gated). They just get is_owner=False and only
+        their own bots, not a 403."""
         with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
             token = mint_magic_link_token(FACTORY_BOT_ID, OTHER_TELEGRAM_ID)
         with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
             resp = await self.client.get(f"/api/factory/bots?token={token}")
-        self.assertEqual(resp.status, 403)
+        self.assertEqual(resp.status, 200)
+        body = await resp.json()
+        self.assertFalse(body["is_owner"])
 
     async def test_no_credentials_returns_403(self):
         resp = await self.client.get("/api/factory/bots")
         self.assertEqual(resp.status, 403)
 
-    async def test_owner_id_unset_fails_closed(self):
+    async def test_owner_id_unset_denies_owner_view(self):
+        """With OWNER_ID unset (0), the real owner's credential no longer
+        matches OWNER_ID, so they fall back to the customer view (is_owner
+        False, only their own bots) rather than a hard 403 — the customer
+        path itself never depended on OWNER_ID being configured."""
         with patch("runtime.factory_analytics_api.OWNER_ID", 0):
             qs = await self._owner_qs()
             with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
                 resp = await self.client.get(f"/api/factory/bots?{qs}")
-        self.assertEqual(resp.status, 403)
+        self.assertEqual(resp.status, 200)
+        body = await resp.json()
+        self.assertFalse(body["is_owner"])
 
     # ── refresh_session_handler ───────────────────────────────────────
     async def test_session_refresh_returns_new_valid_token(self):
@@ -137,12 +149,14 @@ class FactoryAnalyticsApiTests(unittest.IsolatedAsyncioTestCase):
             resp2 = await self.client.get(f"/api/factory/bots?token={new_token}")
         self.assertEqual(resp2.status, 200)
 
-    async def test_session_refresh_non_owner_returns_403(self):
+    async def test_session_refresh_non_owner_returns_client_token(self):
         with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
             token = mint_magic_link_token(FACTORY_BOT_ID, OTHER_TELEGRAM_ID)
         with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
             resp = await self.client.get(f"/api/factory/session?token={token}")
-        self.assertEqual(resp.status, 403)
+        self.assertEqual(resp.status, 200)
+        body = await resp.json()
+        self.assertFalse(body["is_owner"])
 
     async def test_session_refresh_expired_token_returns_403(self):
         with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
