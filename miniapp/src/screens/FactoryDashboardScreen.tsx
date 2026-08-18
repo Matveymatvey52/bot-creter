@@ -12,6 +12,7 @@ import {
 import { Card, CardHeader, CardTitle, ChipRow, Chip, Badge } from '../components/Card'
 import { iconForTemplate } from '../lib/botIcons'
 import { BotDetailPanel } from './BotDetailPanel'
+import { OwnerRegistryScreen } from './OwnerRegistryScreen'
 
 const FALLBACK_REASON_LABELS: Record<string, string> = {
   no_template_match: 'нет подходящего шаблона',
@@ -197,6 +198,28 @@ export function FactoryDashboardScreen() {
     const raw = new URLSearchParams(window.location.search).get('bot')
     return raw && /^\d+$/.test(raw) ? Number(raw) : null
   })
+  // Separate owner-wide registry (design item 3 — see OwnerRegistryScreen's
+  // own header comment): "Моя фабрика" above already lists every bot to the
+  // owner, but never says WHICH customer owns which one. A ?view=registry
+  // query param toggle (same convention as ?bot=<id> above) keeps it a
+  // distinct screen without a full router.
+  const [view, setView] = useState<'dashboard' | 'registry'>(() =>
+    new URLSearchParams(window.location.search).get('view') === 'registry' ? 'registry' : 'dashboard',
+  )
+
+  const openRegistry = () => {
+    setView('registry')
+    const url = new URL(window.location.href)
+    url.searchParams.set('view', 'registry')
+    window.history.replaceState(null, '', url.toString())
+  }
+
+  const closeRegistry = () => {
+    setView('dashboard')
+    const url = new URL(window.location.href)
+    url.searchParams.delete('view')
+    window.history.replaceState(null, '', url.toString())
+  }
 
   const reload = () => {
     listFactoryBots()
@@ -253,10 +276,19 @@ export function FactoryDashboardScreen() {
     )
   }
 
+  if (view === 'registry') {
+    return <OwnerRegistryScreen onBack={closeRegistry} />
+  }
+
   return (
     <div className="screen">
       <div className="screen-header">
         <h1>Моя фабрика</h1>
+        {isOwner && (
+          <button className="btn-secondary" onClick={openRegistry}>
+            👥 Реестр ботов по владельцам
+          </button>
+        )}
       </div>
 
       {error && <div className="state-message">{error}</div>}
