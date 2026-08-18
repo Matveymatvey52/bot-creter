@@ -178,24 +178,42 @@ async def owner_registry_handler(request: web.Request) -> web.Response:
     OwnerRegistryScreen.tsx) from list_bots_handler's "Моя фабрика": that one
     already returns every bot to the owner too, but its payload/UI never
     surfaces WHICH customer owns which bot (see MEMORY.md's multitenancy
-    design note) — this endpoint exists specifically to make that visible,
-    not to duplicate the dashboard."""
+    design note) — this endpoint exists specifically to make that visible.
+
+    Upgraded (owner product-analytics design) to carry the same richer
+    per-bot fields list_bots_handler already exposes — features, edits_count,
+    avg_rating, feedback_count, archived_at, weekly_count — since this screen
+    is now full owner-facing analytics, not just an ownership lookup.
+    Summary/aggregate stats (per-template counts, active owners, feature
+    adoption, etc.) are deliberately NOT computed here — they're cheap to
+    derive client-side from this same items array (see
+    OwnerRegistryScreen.tsx's useMemo blocks), consistent with how
+    FactoryDashboardScreen already derives its templates/features filters."""
     if not await _authenticate_owner(request):
         return web.json_response({"error": "forbidden"}, status=403)
+    registry: Registry = request.app[REGISTRY_KEY]
     rows = await list_bots_with_stats(owner_telegram_id=None)
-    items = [
-        {
-            "id": row["id"],
-            "name": row["name"],
-            "username": row["username"],
-            "display_name": row["display_name"],
-            "status": row["status"],
-            "created_at": row["created_at"],
-            "template": infer_template_id(row["file_path"]),
-            "owner_telegram_id": row["owner_telegram_id"],
-        }
-        for row in rows
-    ]
+    items = []
+    for row in rows:
+        features = [f for f in row["features"].split(",") if f]
+        items.append(
+            {
+                "id": row["id"],
+                "name": row["name"],
+                "username": row["username"],
+                "display_name": row["display_name"],
+                "status": row["status"],
+                "created_at": row["created_at"],
+                "archived_at": row["archived_at"],
+                "template": infer_template_id(row["file_path"]),
+                "owner_telegram_id": row["owner_telegram_id"],
+                "features": features,
+                "edits_count": row["edits_count"],
+                "avg_rating": row["avg_rating"],
+                "feedback_count": row["feedback_count"],
+                "weekly_count": await _weekly_count_for_bot(registry, row["id"]),
+            }
+        )
     return web.json_response({"items": items})
 
 
