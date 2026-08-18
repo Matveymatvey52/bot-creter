@@ -1,5 +1,5 @@
 # FEATURE: office_events
-# COMPATIBLE_WITH: accountant, booking_beauty, booking_fitness, booking_medical, booking_restaurant, campaign_tracker, car_rental, coworking_space, debtors, delivery_tracker, event_manager, event_rsvp, expense_tracker, feedback_survey, habit_tracker, inventory, loyalty_program, manager_secretary, moderator, orders_tracker, referral_program, rental_equipment, repair_tracker, shop_catalog, staff_scheduler, support_tickets, tour_operator, tourist_documents, trip_manager, vehicle_service
+# COMPATIBLE_WITH: accountant, booking_beauty, booking_fitness, booking_medical, booking_restaurant, boss_bot, campaign_tracker, car_rental, coworking_space, debtors, delivery_tracker, event_manager, event_rsvp, expense_tracker, feedback_survey, habit_tracker, inventory, loyalty_program, manager_bot, manager_secretary, moderator, orders_tracker, referral_program, rental_equipment, repair_tracker, shop_catalog, staff_scheduler, support_tickets, tour_operator, tourist_documents, trip_manager, vehicle_service
 """MVP of "офисы" — fire-and-forget event exchange between two bots owned by
 the same factory instance (docs/OFFICES_DESIGN.md, variant A).
 
@@ -68,8 +68,19 @@ class OrderCreatedEvent:
     customer_chat_id: int
 
 
+@dataclass(frozen=True)
+class TaskAssignedEvent:
+    task_id: int
+    title: str
+    description: str
+    deadline: str          # ISO 8601
+    assignee_hint: str
+    boss_chat_id: int
+
+
 _EVENT_TYPES: dict[str, type] = {
     "order.created": OrderCreatedEvent,
+    "task.assigned": TaskAssignedEvent,
 }
 
 
