@@ -41,6 +41,13 @@ from services.attachment_service import (
     extract_document_text,
 )
 from services.github_sync import push_bot_to_github
+from services.link_context import (
+    OAUTH_ENABLED,
+    SHEET_SHARE_INSTRUCTIONS,
+    LinkKind,
+    extract_urls,
+    resolve_link,
+)
 from services.telegram_api import get_managed_bot_token
 from services.voice_service import transcribe_voice
 
@@ -523,6 +530,57 @@ async def cb_gathering_continue(callback: CallbackQuery, state: FSMContext):
     await _process_gathering_content(callback.message, state, None)
 
 
+def _sheet_auth_choice_keyboard(url: str) -> InlineKeyboardMarkup:
+    oauth_text = "🔗 Подключить Google-аккаунт" if OAUTH_ENABLED else "🔗 Google-аккаунт (скоро)"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📎 Как открыть доступ по ссылке", callback_data="sheet_share_howto")],
+        [InlineKeyboardButton(text=oauth_text, callback_data="sheet_oauth_soon")],
+    ])
+
+
+@router.callback_query(F.data == "sheet_share_howto")
+async def cb_sheet_share_howto(callback: CallbackQuery):
+    await callback.answer()
+    await callback.message.answer(SHEET_SHARE_INSTRUCTIONS)
+
+
+@router.callback_query(F.data == "sheet_oauth_soon")
+async def cb_sheet_oauth_soon(callback: CallbackQuery):
+    await callback.answer(
+        "Подключение Google-аккаунта появится в одном из следующих обновлений. "
+        "Пока проще всего дать доступ по ссылке.",
+        show_alert=True,
+    )
+
+
+async def _resolve_message_links(message: Message, text: str) -> list[dict]:
+    """Stage D: detect URLs in the gathering message, fetch context for them
+    (CSV summary for public Google Sheets, page text otherwise), and return
+    extra text blocks to append to the pending attachment buffer (same
+    {"type": "text", ...} shape build_text_block produces for documents —
+    see services/attachment_service.py's docstring, which anticipated this).
+    Sends its own status/error messages; returns [] if nothing usable was found."""
+    urls = extract_urls(text)
+    if not urls:
+        return []
+
+    link_blocks: list[dict] = []
+    for url in urls[:3]:  # cap to avoid pathological multi-link spam
+        result = await resolve_link(url)
+        if result.ok:
+            label = "Google Sheet" if result.kind == LinkKind.GOOGLE_SHEET else "Webpage"
+            link_blocks.append(build_text_block(f"[Context from {label} {url}]\n{result.context}"))
+        elif result.kind == LinkKind.GOOGLE_SHEET and result.error == "not_public":
+            await message.answer(
+                SHEET_SHARE_INSTRUCTIONS,
+                reply_markup=_sheet_auth_choice_keyboard(url),
+            )
+        else:
+            await message.answer(f"⚠️ Не удалось прочитать ссылку {url}, продолжаю без неё.")
+
+    return link_blocks
+
+
 async def _process_gathering_content(message: Message, state: FSMContext, text: str | None) -> None:
     data = await state.get_data()
     conversation: list[dict] = data.get("conversation", [])
@@ -531,6 +589,7 @@ async def _process_gathering_content(message: Message, state: FSMContext, text: 
     blocks = list(pending)
     if text:
         blocks.append(build_text_block(text))
+        blocks.extend(await _resolve_message_links(message, text))
     if not blocks:
         return
 
