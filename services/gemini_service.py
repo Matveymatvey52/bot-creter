@@ -19,6 +19,7 @@ boundary; this module has no access to those secrets at all.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 
 from config import GEMINI_API_KEY
@@ -33,6 +34,14 @@ _SUMMARY_PROMPT = (
     "Кратко суммируй следующий пост из Telegram-канала в 1-2 предложениях "
     "на русском языке, сохраняя ключевые факты. Не добавляй ничего от себя, "
     "кроме самой сути поста.\n\n"
+)
+
+_EXTRACT_PROMPT_HEADER = (
+    "Извлеки из следующего поста Telegram-канала значения полей: {fields}.\n"
+    "Верни СТРОГО валидный JSON-объект (никакого markdown, никаких ```-обёрток, "
+    "никакого текста до или после) с ключами ровно этими названиями полей "
+    "(на русском, как указано). Если поле не найдено в тексте — используй "
+    "пустую строку \"\" как значение, не пропускай ключ.\n\nПост:\n"
 )
 
 _client = None
@@ -92,3 +101,64 @@ async def summarize_post(text: str) -> str | None:
     except (AttributeError, TypeError) as e:
         logger.warning(f"summarize_post: unexpected Gemini response shape: {type(e).__name__}: {e}")
         return None
+
+
+async def extract_structured(text: str, fields: list[str]) -> dict | None:
+    """Extracts a JSON object {field: value, ...} for `fields` out of one
+    channel post's text — the channel_aggregator template's structured mode
+    (docs/CHANNEL_AGGREGATOR_TEMPLATE_DESIGN.md §3.2), used instead of/
+    alongside summarize_post() for channels with a configured extract_schema.
+
+    Same graceful-degradation contract as summarize_post: any failure
+    (missing key, network/timeout, malformed JSON in the response, unexpected
+    shape) returns None and only logs a warning — must never crash
+    runtime/userbot_worker.py's background extraction sweep. Never receives
+    session_string/phone/api credentials, same data-boundary contract as
+    summarize_post (module docstring)."""
+    if not text or not text.strip():
+        return None
+    if not fields:
+        return None
+    if not GEMINI_API_KEY:
+        logger.warning("extract_structured: GEMINI_API_KEY is not set — skipping extraction (degraded mode)")
+        return None
+
+    prompt = _EXTRACT_PROMPT_HEADER.format(fields=", ".join(fields)) + text[:_MAX_INPUT_CHARS]
+
+    try:
+        client = _get_client()
+        response = await asyncio.wait_for(
+            client.aio.models.generate_content(model=_MODEL, contents=prompt),
+            timeout=_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(f"extract_structured: Gemini API call timed out after {_TIMEOUT_SECONDS}s")
+        return None
+    except Exception as e:
+        logger.warning(f"extract_structured: Gemini API call failed: {type(e).__name__}: {e}")
+        return None
+
+    try:
+        raw = (getattr(response, "text", None) or "").strip()
+    except (AttributeError, TypeError) as e:
+        logger.warning(f"extract_structured: unexpected Gemini response shape: {type(e).__name__}: {e}")
+        return None
+    if not raw:
+        return None
+    # Models sometimes wrap JSON in ```json ... ``` despite the instruction not
+    # to — strip a leading/trailing fence defensively before parsing, rather
+    # than failing the whole extraction over formatting noise.
+    if raw.startswith("```"):
+        raw = raw.strip("`")
+        if raw.startswith("json"):
+            raw = raw[4:]
+        raw = raw.strip()
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as e:
+        logger.warning(f"extract_structured: response was not valid JSON: {e}")
+        return None
+    if not isinstance(parsed, dict):
+        logger.warning("extract_structured: response JSON was not an object — discarding")
+        return None
+    return parsed
