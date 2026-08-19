@@ -9,3 +9,5 @@ cryptography==49.0.0
 gspread==6.2.1
 telethon==1.36.0
 google-genai==0.3.0
+pypdf==5.1.0
+python-docx==1.1.2
