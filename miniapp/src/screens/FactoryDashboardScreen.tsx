@@ -139,6 +139,7 @@ export function FactoryDashboardScreen() {
   const [error, setError] = useState<string | null>(null)
   const [templateFilter, setTemplateFilter] = useState<Set<string>>(new Set())
   const [featureFilter, setFeatureFilter] = useState<Set<string>>(new Set())
+  const [officeFilter, setOfficeFilter] = useState<Set<string>>(new Set())
   const [selectedBotId, setSelectedBotId] = useState<number | null>(() => {
     const raw = new URLSearchParams(window.location.search).get('bot')
     return raw && /^\d+$/.test(raw) ? Number(raw) : null
@@ -194,11 +195,28 @@ export function FactoryDashboardScreen() {
     () => Array.from(new Set((items ?? []).flatMap((b) => b.features))).sort(),
     [items],
   )
+  const officeLabelById = useMemo(() => {
+    const byGroup = new Map<string, string[]>()
+    for (const b of items ?? []) {
+      if (!b.office_group) continue
+      const names = byGroup.get(b.office_group) ?? []
+      names.push(b.display_name || b.name)
+      byGroup.set(b.office_group, names)
+    }
+    const labels = new Map<string, string>()
+    for (const [groupId, names] of byGroup) labels.set(groupId, names.join(' + '))
+    return labels
+  }, [items])
+  const offices = useMemo(
+    () => Array.from(officeLabelById.values()).sort(),
+    [officeLabelById],
+  )
 
   const filtered = (items ?? []).filter(
     (b) =>
       (templateFilter.size === 0 || (!!b.template && templateFilter.has(b.template))) &&
-      (featureFilter.size === 0 || b.features.some((f) => featureFilter.has(f))),
+      (featureFilter.size === 0 || b.features.some((f) => featureFilter.has(f))) &&
+      (officeFilter.size === 0 || (!!b.office_group && officeFilter.has(officeLabelById.get(b.office_group) ?? ''))),
   )
 
   if (selectedBotId != null) {
@@ -225,13 +243,16 @@ export function FactoryDashboardScreen() {
           <h1>Моя фабрика</h1>
         </div>
 
-        {(templates.length > 0 || features.length > 0) && (
+        {(templates.length > 0 || features.length > 0 || offices.length > 0) && (
           <div className="filter-bar">
             {templates.length > 0 && (
-              <MultiSelectDropdown label="Шаблоны" options={templates} selected={templateFilter} onChange={setTemplateFilter} />
+              <MultiSelectDropdown label="Боты" options={templates} selected={templateFilter} onChange={setTemplateFilter} />
             )}
             {features.length > 0 && (
               <MultiSelectDropdown label="Фичи" options={features} selected={featureFilter} onChange={setFeatureFilter} />
+            )}
+            {offices.length > 0 && (
+              <MultiSelectDropdown label="Офисы" options={offices} selected={officeFilter} onChange={setOfficeFilter} />
             )}
           </div>
         )}

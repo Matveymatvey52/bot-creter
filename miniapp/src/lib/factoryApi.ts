@@ -108,6 +108,7 @@ export interface FactoryBotItem {
   avg_rating: number | null
   feedback_count: number
   weekly_count: number | null
+  office_group: string | null
 }
 
 export function listFactoryBots(): Promise<{ items: FactoryBotItem[]; is_owner: boolean }> {
@@ -135,6 +136,7 @@ export interface OwnerRegistryItem {
   avg_rating: number | null
   feedback_count: number
   weekly_count: number | null
+  office_group: string | null
 }
 
 export function listOwnerRegistry(): Promise<{ items: OwnerRegistryItem[] }> {

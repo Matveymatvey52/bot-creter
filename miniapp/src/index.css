@@ -77,6 +77,13 @@ input,
 textarea,
 select {
   font: inherit;
+  /* iOS Safari auto-zooms the viewport on focus for any field under 16px,
+     which reads as the whole layout (and the text being typed) jumping —
+     several panels set a smaller font on their containers (e.g.
+     .feature-subpanel's 12.5px), so this can't just rely on inheriting
+     16px from :root. */
+  font-size: max(16px, 1em);
+  line-height: 1.45;
   color: var(--text-primary);
   background: var(--surface-inset);
   border: 1px solid var(--border-subtle);

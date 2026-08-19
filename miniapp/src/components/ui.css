@@ -423,6 +423,15 @@
   background: var(--surface);
   border-bottom: 1px solid var(--border-hair);
   overflow-x: auto;
+  /* Tabs still scroll horizontally when they overflow, but the native
+     scrollbar itself reads as a distracting "loading bar" under the tab
+     row — hide it while keeping the scroll gesture. */
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+.detail-tabs::-webkit-scrollbar {
+  display: none;
 }
 
 .detail-tab {

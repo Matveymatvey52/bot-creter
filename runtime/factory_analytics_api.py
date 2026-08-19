@@ -29,6 +29,7 @@ from db.database import (
     add_bot_admin,
     add_bot_feedback,
     add_office_link,
+    get_all_office_links,
     clear_bot_feature_config,
     delete_bot as db_delete_bot,
     get_bot,
@@ -141,6 +142,33 @@ async def refresh_session_handler(request: web.Request) -> web.Response:
     return web.json_response({"token": token, "is_owner": telegram_user_id == OWNER_ID})
 
 
+async def _office_group_by_bot() -> dict[int, str]:
+    """Maps each bot_id that appears in bot_office_links to a stable group
+    id — the connected component (union-find over source/target pairs) it
+    belongs to, keyed by that component's smallest bot id. Used by
+    list_bots_handler to power the miniapp's "Офисы" filter dropdown
+    (FactoryDashboardScreen.tsx): grouping ignores link direction/event_type
+    since the filter only cares "is this bot part of that office or not"."""
+    links = await get_all_office_links()
+    parent: dict[int, int] = {}
+
+    def find(x: int) -> int:
+        while parent.setdefault(x, x) != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+
+    for link in links:
+        union(link["source_bot_id"], link["target_bot_id"])
+
+    return {bot_id: str(find(bot_id)) for bot_id in parent}
+
+
 async def list_bots_handler(request: web.Request) -> web.Response:
     telegram_user_id = await _authenticate_factory_user(request)
     if telegram_user_id is None:
@@ -149,6 +177,7 @@ async def list_bots_handler(request: web.Request) -> web.Response:
 
     registry: Registry = request.app[REGISTRY_KEY]
     rows = await list_bots_with_stats(owner_telegram_id=None if is_owner else telegram_user_id)
+    office_group_by_bot = await _office_group_by_bot()
     items = []
     for row in rows:
         features = [f for f in row["features"].split(",") if f]
@@ -167,6 +196,7 @@ async def list_bots_handler(request: web.Request) -> web.Response:
                 "avg_rating": row["avg_rating"],
                 "feedback_count": row["feedback_count"],
                 "weekly_count": await _weekly_count_for_bot(registry, row["id"]),
+                "office_group": office_group_by_bot.get(row["id"]),
             }
         )
     return web.json_response({"items": items, "is_owner": is_owner})
@@ -195,6 +225,7 @@ async def owner_registry_handler(request: web.Request) -> web.Response:
         return web.json_response({"error": "forbidden"}, status=403)
     registry: Registry = request.app[REGISTRY_KEY]
     rows = await list_bots_with_stats(owner_telegram_id=None)
+    office_group_by_bot = await _office_group_by_bot()
     items = []
     for row in rows:
         features = [f for f in row["features"].split(",") if f]
@@ -214,6 +245,7 @@ async def owner_registry_handler(request: web.Request) -> web.Response:
                 "avg_rating": row["avg_rating"],
                 "feedback_count": row["feedback_count"],
                 "weekly_count": await _weekly_count_for_bot(registry, row["id"]),
+                "office_group": office_group_by_bot.get(row["id"]),
             }
         )
     return web.json_response({"items": items})

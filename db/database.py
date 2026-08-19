@@ -1067,6 +1067,22 @@ async def get_office_links_for_bot(bot_id: int) -> list[dict]:
             return [dict(row) for row in rows]
 
 
+async def get_all_office_links() -> list[dict]:
+    """Every bot_office_links row in the whole factory — used by
+    factory_analytics_api.py's list_bots_handler to group bots into "офисы"
+    (connected components of the source/target graph) for the miniapp's
+    office filter. Unlike get_office_links_for_bot (one bot's rows), this is
+    a single bulk fetch so the handler can build the whole graph in one
+    query instead of one per bot."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT source_bot_id, target_bot_id FROM bot_office_links"
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
+
 async def set_office_digest_group(owner_telegram_id: int, chat_id: str) -> None:
     """Upserts this owner's office-digest showcase group — see
     office_digest_group's CREATE TABLE comment above for why this is
