@@ -487,6 +487,148 @@ async def analytics_handler(request: web.Request) -> web.Response:
     return web.json_response(metrics)
 
 
+async def office_tasks_handler(request: web.Request) -> web.Response:
+    """GET /api/{bot_id}/office/tasks — owner-only, all-employees task
+    overview for boss_bot's desktop dashboard (see office_dashboard_handler
+    below). Reads directly from THIS bot's own `tasks` table rather than
+    going through the generic miniapp_config list_resource_handler path:
+    that path is per-resource CRUD for a customer viewing their OWN data,
+    while this is a single fixed, owner-only aggregate view — same
+    reasoning analytics_handler above gives for bypassing
+    _resolve_entry_and_config(). Restricted to bot_id's whose template_id is
+    "boss_bot" (the only template with a `tasks` table in this shape) so a
+    mistargeted bot_id 404s instead of either querying a table that doesn't
+    exist or, worse, one that coincidentally does but holds unrelated
+    data."""
+    bot_id_raw = request.match_info.get("bot_id", "")
+    if err := _bad_bot_id(bot_id_raw):
+        return err
+    bot_id = int(bot_id_raw)
+
+    registry: Registry = request.app[REGISTRY_KEY]
+    entry = registry.get(bot_id)
+    if entry is None or entry.template_id != "boss_bot":
+        return web.json_response({"error": "office dashboard not available for this bot"}, status=404)
+
+    telegram_user_id = await _authenticate(request, bot_id, entry.bot.token)
+    if telegram_user_id is None:
+        return web.json_response({"error": "forbidden"}, status=403)
+
+    admin_ids = await get_bot_admins(bot_id)
+    if str(telegram_user_id) not in admin_ids:
+        return web.json_response({"error": "forbidden"}, status=403)
+
+    db_path = entry.config.get("db_path") if isinstance(entry.config, dict) else None
+    if not db_path:
+        return web.json_response({"error": "bot has no database configured"}, status=500)
+
+    async with aiosqlite.connect(db_path) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT id, title, description, deadline, assignee_hint, status, created_at "
+            "FROM tasks ORDER BY (status != 'done'), deadline IS NULL, deadline ASC LIMIT 500"
+        ) as cursor:
+            rows = [dict(r) for r in await cursor.fetchall()]
+
+    now_iso = time.strftime("%Y-%m-%dT%H:%M:%S")
+    for row in rows:
+        row["overdue"] = bool(row["deadline"] and row["status"] != "done" and row["deadline"] < now_iso)
+
+    return web.json_response({"tasks": rows})
+
+
+# Self-contained (no build step) desktop dashboard — a boss opening this from
+# a laptop browser gets a real page (sortable-by-eye table, no Telegram
+# WebApp SDK dependency, no npm build required to ship it) rather than the
+# mobile-first miniapp/ SPA stretched wide. Auth is entirely client-side
+# against /api/{bot_id}/office/tasks (same magic-link `?token=` the page was
+# opened with) — the shell itself is served unconditionally, same posture as
+# serve_app_shell's SPA shell, so a bad/expired token surfaces as a normal
+# "🔒 forbidden" message in-page instead of a bare 403 with no page at all.
+_OFFICE_DASHBOARD_HTML = """<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Веб-кабинет</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; padding: 24px;
+         background: #f7f7f8; color: #1a1a1a; }
+  @media (prefers-color-scheme: dark) { body { background: #17181c; color: #e8e8ea; } }
+  h1 { font-size: 20px; margin: 0 0 16px; }
+  table { width: 100%; border-collapse: collapse; background: #fff; border-radius: 8px; overflow: hidden;
+          box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+  @media (prefers-color-scheme: dark) { table { background: #23242a; } }
+  th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid rgba(0,0,0,.08); font-size: 14px; }
+  @media (prefers-color-scheme: dark) { th, td { border-bottom-color: rgba(255,255,255,.08); } }
+  th { font-weight: 600; color: #666; }
+  tr.overdue { background: rgba(220,50,50,.08); }
+  .status { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 12px; }
+  .status.done { background: #d7f5df; color: #1b7a37; }
+  .status.open { background: #fdeacb; color: #915c00; }
+  .status.overdue { background: #fbdada; color: #a4241f; }
+  #msg { padding: 40px; text-align: center; color: #888; }
+  .empty-cell { color: #999; }
+</style>
+</head>
+<body>
+<h1>🖥 Веб-кабинет — задачи офиса</h1>
+<div id="msg">Загрузка…</div>
+<table id="tbl" style="display:none">
+  <thead><tr><th>Задача</th><th>Исполнитель</th><th>Срок</th><th>Статус</th></tr></thead>
+  <tbody id="tbody"></tbody>
+</table>
+<script>
+(async () => {
+  const params = new URLSearchParams(location.search);
+  const token = params.get("token") || "";
+  const botId = location.pathname.split("/").pop();
+  const msg = document.getElementById("msg");
+  const tbl = document.getElementById("tbl");
+  const tbody = document.getElementById("tbody");
+  try {
+    const resp = await fetch(`/api/${botId}/office/tasks?token=${encodeURIComponent(token)}`);
+    if (resp.status === 403) { msg.textContent = "🔒 Нет доступа — ссылка устарела, откройте новую из бота."; return; }
+    if (!resp.ok) { msg.textContent = "Не удалось загрузить задачи."; return; }
+    const data = await resp.json();
+    const tasks = data.tasks || [];
+    if (!tasks.length) { msg.textContent = "Пока нет задач."; return; }
+    for (const t of tasks) {
+      const tr = document.createElement("tr");
+      if (t.overdue) tr.className = "overdue";
+      const statusClass = t.overdue ? "overdue" : (t.status === "done" ? "done" : "open");
+      const statusLabel = t.overdue ? "просрочена" : (t.status === "done" ? "выполнена" : "в работе");
+      tr.innerHTML = `
+        <td>${escapeHtml(t.title || "")}</td>
+        <td>${t.assignee_hint ? escapeHtml(t.assignee_hint) : '<span class="empty-cell">—</span>'}</td>
+        <td>${t.deadline ? escapeHtml(t.deadline) : '<span class="empty-cell">—</span>'}</td>
+        <td><span class="status ${statusClass}">${statusLabel}</span></td>
+      `;
+      tbody.appendChild(tr);
+    }
+    msg.style.display = "none";
+    tbl.style.display = "table";
+  } catch (e) {
+    msg.textContent = "Ошибка загрузки.";
+  }
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+  }
+})();
+</script>
+</body>
+</html>
+"""
+
+
+async def office_dashboard_handler(request: web.Request) -> web.Response:
+    bot_id_raw = request.match_info.get("bot_id", "")
+    if err := _bad_bot_id(bot_id_raw):
+        return err
+    return web.Response(text=_OFFICE_DASHBOARD_HTML, content_type="text/html")
+
+
 async def serve_app_shell(request: web.Request) -> web.Response:
     """Serves the SPA's index.html for /app/{bot_id} (and any client-side
     sub-route under it — the SPA does its own in-memory routing per
@@ -588,6 +730,10 @@ def register_routes(app: web.Application) -> None:
     # /schema above — "analytics" would otherwise be swallowed as a resource
     # name, and is reserved the same way "schema" already is.
     app.router.add_get("/api/{bot_id}/analytics", analytics_handler)
+    # Registered before the generic {resource} route for the same reason as
+    # /schema and /analytics above — "office" would otherwise be swallowed
+    # as a resource name.
+    app.router.add_get("/api/{bot_id}/office/tasks", office_tasks_handler)
     app.router.add_get("/api/{bot_id}/{resource}", list_resource_handler)
     app.router.add_get("/api/{bot_id}/{resource}/{item_id}", get_resource_handler)
     app.router.add_post("/api/{bot_id}/{resource}", create_resource_handler)
@@ -599,5 +745,6 @@ def register_routes(app: web.Application) -> None:
     # serve_app_shell, just reached via a different URL prefix so a plain
     # browser tab and a Telegram WebView open visibly different-looking URLs.
     app.router.add_get("/site/{bot_id}", serve_app_shell)
+    app.router.add_get("/office/{bot_id}", office_dashboard_handler)
     app.router.add_get("/owner-report", serve_owner_report_shell)
     _register_static_routes(app)

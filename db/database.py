@@ -1558,6 +1558,14 @@ async def init_channel_monitor_tables(db_path: str) -> None:
                 added_at          TEXT DEFAULT (datetime('now','localtime'))
             )
         """)
+        # extract_schema — JSON list of field names Gemini should extract per
+        # post for this channel (channel_aggregator template, see
+        # docs/CHANNEL_AGGREGATOR_TEMPLATE_DESIGN.md §3.1). NULL = old
+        # behaviour (free-text summarize_post only, no structured extraction).
+        try:
+            await db.execute("ALTER TABLE monitored_channels ADD COLUMN extract_schema TEXT")
+        except aiosqlite.OperationalError:
+            pass
         await db.execute("""
             CREATE TABLE IF NOT EXISTS channel_posts (
                 id                   INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1566,6 +1574,33 @@ async def init_channel_monitor_tables(db_path: str) -> None:
                 text                 TEXT,
                 posted_at            TEXT DEFAULT (datetime('now','localtime')),
                 summary              TEXT
+            )
+        """)
+        # extracted — JSON object {field: value, ...} from
+        # services.gemini_service.extract_structured, only populated for
+        # channels with an extract_schema. views/forwards — raw Telethon
+        # engagement counters (design doc §3.1), written at ingestion time by
+        # runtime/userbot_worker.py, not an LLM call.
+        for col in ("extracted TEXT", "views INTEGER", "forwards INTEGER"):
+            try:
+                await db.execute(f"ALTER TABLE channel_posts ADD COLUMN {col}")
+            except aiosqlite.OperationalError:
+                pass
+        # report_schedules — one active schedule per bot (channel_aggregator
+        # template §3.4): daily HH:MM, or weekly HH:MM + weekday (0=Monday,
+        # matching Python's date.weekday()). Free-text time entry per owner's
+        # decision #3 (no fixed presets) — validated at the FSM layer, not here.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS report_schedules (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                bot_id      INTEGER NOT NULL,
+                frequency   TEXT NOT NULL,
+                weekday     INTEGER,
+                hour        INTEGER NOT NULL,
+                minute      INTEGER NOT NULL,
+                active      INTEGER DEFAULT 1,
+                last_sent_at TEXT,
+                created_at  TEXT DEFAULT (datetime('now','localtime'))
             )
         """)
         await db.commit()
@@ -1843,3 +1878,171 @@ async def get_recent_posts_for_bot(db_path: str, bot_id: int, limit: int = 10) -
         ) as cursor:
             rows = await cursor.fetchall()
             return [dict(row) for row in rows]
+
+
+# ── channel_aggregator template additions (extract_schema / extracted / ────
+# views / forwards / report_schedules) — see
+# docs/CHANNEL_AGGREGATOR_TEMPLATE_DESIGN.md §5 (owner decisions).
+
+async def count_monitored_channels(db_path: str, bot_id: int) -> int:
+    """Used to enforce the 50-channels-per-bot limit (owner decision #4)
+    BEFORE a new join is attempted — cheap COUNT(*), no row materialization."""
+    async with aiosqlite.connect(db_path) as db:
+        async with db.execute(
+            "SELECT COUNT(*) FROM monitored_channels WHERE bot_id = ?", (bot_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else 0
+
+
+async def set_monitored_channel_schema(db_path: str, channel_row_id: int, extract_schema: str | None) -> None:
+    """extract_schema is a JSON-encoded list of field names (or NULL for the
+    old free-text-summary-only behaviour) — set right after a channel is
+    added, from the schema-preset picker (channel_aggregator §3.1)."""
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            "UPDATE monitored_channels SET extract_schema = ? WHERE id = ?",
+            (extract_schema, channel_row_id),
+        )
+        await db.commit()
+
+
+async def add_channel_post_with_metrics(
+    db_path: str,
+    monitored_channel_id: int,
+    message_id: int | None,
+    text: str | None,
+    views: int | None = None,
+    forwards: int | None = None,
+) -> int:
+    """Same as add_channel_post but also stores Telethon's raw engagement
+    counters at ingestion time (runtime/userbot_worker.py) — no LLM call
+    needed for these, they come straight off the NewMessage event."""
+    async with aiosqlite.connect(db_path) as db:
+        cursor = await db.execute(
+            "INSERT INTO channel_posts (monitored_channel_id, message_id, text, views, forwards) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (monitored_channel_id, message_id, text, views, forwards),
+        )
+        await db.commit()
+        return cursor.lastrowid
+
+
+async def get_posts_missing_extraction(db_path: str, limit: int = 20) -> list[dict]:
+    """Posts belonging to a channel WITH an extract_schema that haven't been
+    structured-extracted yet — mirrors get_posts_missing_summary but scoped to
+    schema-bearing channels (runtime/userbot_worker.py's _summarize_loop calls
+    extract_structured for these instead of/alongside summarize_post)."""
+    async with aiosqlite.connect(db_path) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """
+            SELECT cp.*, mc.extract_schema
+            FROM channel_posts cp
+            JOIN monitored_channels mc ON mc.id = cp.monitored_channel_id
+            WHERE mc.extract_schema IS NOT NULL AND cp.extracted IS NULL
+            ORDER BY cp.id ASC LIMIT ?
+            """,
+            (limit,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
+
+async def set_channel_post_extracted(db_path: str, post_id: int, extracted_json: str) -> None:
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            "UPDATE channel_posts SET extracted = ? WHERE id = ?", (extracted_json, post_id)
+        )
+        await db.commit()
+
+
+async def get_posts_for_report(
+    db_path: str, bot_id: int, since: str | None = None, channel_row_id: int | None = None
+) -> list[dict]:
+    """Powers "📊 Отчёт" (by-request) and the scheduled digest — every post
+    for this bot (across active AND inactive channels — a report is a
+    historical export, unlike the live feed which only shows active
+    channels), optionally filtered by `since` (posted_at >= since, an
+    ISO/`datetime('now', ...)`-comparable string) and/or one specific
+    monitored_channels.id."""
+    query = (
+        "SELECT cp.*, mc.channel_title, mc.channel_username, mc.extract_schema "
+        "FROM channel_posts cp "
+        "JOIN monitored_channels mc ON mc.id = cp.monitored_channel_id "
+        "WHERE mc.bot_id = ?"
+    )
+    params: list = [bot_id]
+    if since:
+        query += " AND cp.posted_at >= ?"
+        params.append(since)
+    if channel_row_id is not None:
+        query += " AND mc.id = ?"
+        params.append(channel_row_id)
+    query += " ORDER BY cp.posted_at ASC"
+    async with aiosqlite.connect(db_path) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(query, params) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
+
+# ── report_schedules (channel_aggregator) ───────────────────────────────────
+
+async def set_report_schedule(
+    db_path: str, bot_id: int, frequency: str, hour: int, minute: int, weekday: int | None = None
+) -> int:
+    """One active schedule per bot (owner decision #3) — any existing active
+    schedule for this bot is deactivated first, then a fresh row inserted.
+    Not a plain UPDATE, so history of past schedules is kept for debugging."""
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            "UPDATE report_schedules SET active = 0 WHERE bot_id = ? AND active = 1", (bot_id,)
+        )
+        cursor = await db.execute(
+            "INSERT INTO report_schedules (bot_id, frequency, weekday, hour, minute, active) "
+            "VALUES (?, ?, ?, ?, ?, 1)",
+            (bot_id, frequency, weekday, hour, minute),
+        )
+        await db.commit()
+        return cursor.lastrowid
+
+
+async def get_active_report_schedule(db_path: str, bot_id: int) -> dict | None:
+    async with aiosqlite.connect(db_path) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM report_schedules WHERE bot_id = ? AND active = 1 ORDER BY id DESC LIMIT 1",
+            (bot_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+
+async def get_all_active_report_schedules(db_path: str) -> list[dict]:
+    """Used by runtime/userbot_worker.py's minute-tick loop for THIS bot's
+    own db_path (one call per channel_monitor-enabled bot, same iteration
+    shape as get_active_monitored_channels)."""
+    async with aiosqlite.connect(db_path) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM report_schedules WHERE active = 1"
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
+
+async def set_report_schedule_last_sent(db_path: str, schedule_id: int, when: str) -> None:
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            "UPDATE report_schedules SET last_sent_at = ? WHERE id = ?", (when, schedule_id)
+        )
+        await db.commit()
+
+
+async def deactivate_report_schedule(db_path: str, bot_id: int) -> None:
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            "UPDATE report_schedules SET active = 0 WHERE bot_id = ? AND active = 1", (bot_id,)
+        )
+        await db.commit()
