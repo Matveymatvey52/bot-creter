@@ -79,9 +79,23 @@ class TaskAssignedEvent:
     boss_chat_id: int
 
 
+@dataclass(frozen=True)
+class TaskCompletedEvent:
+    """Back-sync counterpart to TaskAssignedEvent — published by manager_bot
+    when a manager marks a task done, so the ORIGINATING boss_bot can clear
+    its own tasks.status and features/reminders.py's overdue sweep stops
+    firing for it. task_id here is the id from the SOURCE bot's own tasks
+    table (manager_bot.incoming_tasks.source_task_id), not manager_bot's own
+    incoming_tasks.id — the only id boss_bot's on_office_event can match
+    against its own rows."""
+    task_id: int
+    completed_by: str
+
+
 _EVENT_TYPES: dict[str, type] = {
     "order.created": OrderCreatedEvent,
     "task.assigned": TaskAssignedEvent,
+    "task.completed": TaskCompletedEvent,
 }
 
 # Human-readable labels for the picker/confirmation screens in both
@@ -94,6 +108,7 @@ _EVENT_TYPES: dict[str, type] = {
 EVENT_TYPE_LABELS: dict[str, str] = {
     "order.created": "новый заказ",
     "task.assigned": "новая задача",
+    "task.completed": "задача выполнена",
 }
 
 # Which template_ids actually PUBLISH each event_type — a strict subset of
@@ -121,6 +136,7 @@ EVENT_TYPE_LABELS: dict[str, str] = {
 _EVENT_TYPE_PUBLISHER_TEMPLATES: dict[str, set[str] | None] = {
     "order.created": None,
     "task.assigned": {"boss_bot"},
+    "task.completed": {"manager_bot"},
 }
 
 

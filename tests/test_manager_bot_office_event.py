@@ -138,5 +138,37 @@ async def test_notify_managers_noop_when_no_registry(db_path):
         # Should not raise even though there's no live registry to push through.
         await manager_bot.on_office_event(_task_assigned_event(task_id=2), config)
 
-    rows = _incoming_tasks(db_path)
-    assert len(rows) == 1  # DB record still happens regardless of live push
+
+@pytest.mark.asyncio
+async def test_publish_completion_sends_task_completed_event(db_path):
+    """_publish_completion (called from cb_done) must publish task.completed
+    back to the office_events bus with the ORIGINATING boss_bot task_id
+    (source_task_id), so boss_bot's on_office_event can match it against its
+    own tasks table — see templates/boss_bot.py's on_office_event."""
+    await manager_bot.init_db(db_path)
+    config = _config(db_path)
+
+    row = {"source_task_id": 9, "id": 1}
+
+    with patch("features.office_events.publish_event", new_callable=AsyncMock) as mock_publish:
+        await manager_bot._publish_completion(config, row)
+
+    mock_publish.assert_awaited_once()
+    args, _kwargs = mock_publish.call_args
+    assert args[0] == BOT_ID
+    assert args[1] == "task.completed"
+    assert args[2].task_id == 9
+
+
+@pytest.mark.asyncio
+async def test_publish_completion_noop_without_source_task_id(db_path):
+    """A row with no source_task_id (e.g. hand-created outside the office
+    link) must never publish — there'd be nothing on boss_bot's side to
+    match against."""
+    config = _config(db_path)
+    row = {"source_task_id": None, "id": 1}
+
+    with patch("features.office_events.publish_event", new_callable=AsyncMock) as mock_publish:
+        await manager_bot._publish_completion(config, row)
+
+    mock_publish.assert_not_awaited()

@@ -371,11 +371,45 @@ async def cb_done(cb, config: ManagerBotConfig):
     except ValueError:
         return
     async with aiosqlite.connect(config.db_path) as db:
-        # Local-only status flip — no back-sync to boss_bot, out of v1 scope
-        # per the plan.
-        await db.execute("UPDATE incoming_tasks SET status='done' WHERE id=? AND status != 'done'", (task_id,))
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "UPDATE incoming_tasks SET status='done' WHERE id=? AND status != 'done'", (task_id,)
+        )
         await db.commit()
+        row = None
+        if cur.rowcount:
+            row = await (await db.execute("SELECT * FROM incoming_tasks WHERE id=?", (task_id,))).fetchone()
+    if row is not None:
+        await _publish_completion(config, row)
     await cb_tasks(cb, config)
+
+
+async def _publish_completion(config: ManagerBotConfig, row) -> None:
+    """Back-syncs completion to the ORIGINATING boss_bot via a
+    task.completed office event, so features/reminders.py's overdue sweep
+    over there stops firing for a task that was actually finished on time.
+    Requires a bot_office_links row (manager_bot -> boss_bot, task.completed)
+    set up the same way the boss_bot -> manager_bot task.assigned link is —
+    see handlers/manage_bots.py's "🏢 Офисы" flow. Silently does nothing if
+    that link is missing (row["source_task_id"] is None, or no live
+    subscriber) — same fire-and-forget degrade-gracefully contract every
+    other office_events publisher in this codebase already accepts (see
+    features/office_events.py's publish_event docstring)."""
+    if config.bot_id is None or row["source_task_id"] is None:
+        return
+    from features import office_events
+    from features.office_events import TaskCompletedEvent
+
+    try:
+        await office_events.publish_event(
+            config.bot_id, "task.completed",
+            TaskCompletedEvent(task_id=row["source_task_id"], completed_by=config.display_name or config.bot_name),
+        )
+    except Exception:
+        logger.exception(
+            f"manager_bot: failed to publish task.completed for source_task_id={row['source_task_id']} "
+            f"bot_id={config.bot_id}"
+        )
 
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────

@@ -20,7 +20,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from features import office_events, voice_intake
-from features.office_events import TaskAssignedEvent
+from features.office_events import TaskAssignedEvent, TaskCompletedEvent
 from features.voice_intake import VoiceFieldSpec, VoiceRecordType, VoiceSchema
 
 # ── CUSTOMIZE ────────────────────────────────────────────────────────────────
@@ -270,10 +270,38 @@ def _build_voice_schema(bot_id: int) -> VoiceSchema:
     )
 
 
+# ── office_events subscriber: task.completed back-sync ──────────────────────
+# Auto-wired by runtime/registry.py's build_entry() the same by-convention
+# way manager_bot.py's own on_office_event is — see that module's docstring.
+# Clears tasks.status here so features/reminders.py's boss_bot_task_overdue
+# rule (which filters on status != 'done') stops firing for a task that was
+# actually finished before its deadline; without this, a manager marking a
+# task done in manager_bot's OWN incoming_tasks table never touched this
+# row, and the boss kept getting "просрочена" pings for work that was
+# already complete.
+async def on_office_event(event, config: BossBotConfig) -> None:
+    if event.event_type != "task.completed":
+        return
+    payload = event.payload
+    if not isinstance(payload, TaskCompletedEvent):
+        return
+    try:
+        async with aiosqlite.connect(config.db_path) as db:
+            await db.execute(
+                "UPDATE tasks SET status='done' WHERE id=? AND status != 'done'", (payload.task_id,)
+            )
+            await db.commit()
+    except Exception:
+        logger.exception(
+            f"boss_bot: failed to apply task.completed for task_id={payload.task_id} bot_id={config.bot_id}"
+        )
+
+
 # ── keyboards ─────────────────────────────────────────────────────────────────
 def kb_main_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📋 Мои задачи", callback_data="bb_tasks")],
+        [InlineKeyboardButton(text="🖥 Веб-кабинет", callback_data="bb_office")],
         [InlineKeyboardButton(text="🌐 Веб-приложение", callback_data="bb_app")],
     ])
 
@@ -337,6 +365,44 @@ async def cb_app(cb, config: BossBotConfig):
         return
     await cb.message.edit_text(
         f'🌐 <a href="{url}">Открыть →</a>\n<code>{url}</code>',
+        parse_mode="HTML", disable_web_page_preview=True, reply_markup=kb_back(),
+    )
+
+
+def _office_dashboard_url(bot_id: int, telegram_user_id: int) -> str | None:
+    """Same magic-link auth as _miniapp_url, but points at /office/{bot_id} —
+    the plain-browser, desktop-oriented dashboard (runtime/miniapp_api.py's
+    office_dashboard_handler), NOT the Telegram-WebApp-shaped SPA under
+    /app/{bot_id}. Separate route/token issuance from _miniapp_url on
+    purpose: same signing mechanism, different surface, so either can be
+    disabled/changed independently later."""
+    from runtime.miniapp_api import mint_magic_link_token
+
+    try:
+        token = mint_magic_link_token(bot_id, telegram_user_id)
+    except RuntimeError:
+        return None
+    RAILWAY_DOMAIN = os.getenv("RAILWAY_PUBLIC_DOMAIN", "")
+    PORT = int(os.getenv("PORT", "8080"))
+    base_url = f"https://{RAILWAY_DOMAIN}" if RAILWAY_DOMAIN else f"http://localhost:{PORT}"
+    return f"{base_url}/office/{bot_id}?token={token}"
+
+
+@router.callback_query(F.data == "bb_office")
+async def cb_office(cb, config: BossBotConfig):
+    await cb.answer()
+    if not _is_admin(cb.from_user.id, config.admins_file):
+        return
+    url = _office_dashboard_url(config.bot_id, cb.from_user.id) if config.bot_id is not None else None
+    if not url:
+        await cb.message.edit_text(
+            "🖥 Веб-кабинет временно недоступен (не настроен MINIAPP_SECRET).",
+            reply_markup=kb_back(),
+        )
+        return
+    await cb.message.edit_text(
+        f'🖥 <b>Веб-кабинет</b> — все задачи всех сотрудников, удобно с ноутбука:\n\n'
+        f'<a href="{url}">Открыть →</a>\n<code>{url}</code>',
         parse_mode="HTML", disable_web_page_preview=True, reply_markup=kb_back(),
     )
 
