@@ -5,6 +5,9 @@
 
 import { getInitData } from './telegram'
 
+const TOKEN_STORAGE_PREFIX = 'site_token_'
+const REFRESH_INTERVAL_MS = 60 * 60 * 1000 // 1h — comfortably under SITE_LINK_TTL_SECONDS (24h)
+
 export class ApiError extends Error {
   status: number
 
@@ -14,18 +17,52 @@ export class ApiError extends Error {
   }
 }
 
-function getMagicLinkToken(): string | null {
-  return new URLSearchParams(window.location.search).get('token')
+// /site/{bot_id} (standalone website, Task B) persists its magic-link token
+// in sessionStorage the same way lib/factoryApi.ts does for /app/0 — a
+// bookmarked/reopened /site/{bot_id} tab with no ?token= in the URL (e.g.
+// after client-side navigation) still needs to keep sending SOME token.
+// /app/{bot_id} (Telegram WebView) never needed this: initData is always
+// freshly supplied by Telegram on every open, so it never had to persist a
+// token cross-navigation like /site/ does.
+function isSitePath(): boolean {
+  return /^\/site\//.test(window.location.pathname)
+}
+
+function getMagicLinkToken(botId: string): string | null {
+  const fromUrl = new URLSearchParams(window.location.search).get('token')
+  if (fromUrl) {
+    if (isSitePath()) sessionStorage.setItem(TOKEN_STORAGE_PREFIX + botId, fromUrl)
+    return fromUrl
+  }
+  if (isSitePath()) return sessionStorage.getItem(TOKEN_STORAGE_PREFIX + botId)
+  return null
 }
 
 function botIdFromPath(): string {
-  // Path is /app/{bot_id}[/...] — see runtime/combined_app.py's route and
-  // the SPA's own router in App.tsx, which both key off this same segment.
-  const match = window.location.pathname.match(/\/app\/(\d+)/)
+  // Path is /app/{bot_id}[/...] or /site/{bot_id}[/...] — see
+  // runtime/combined_app.py's routes and the SPA's own router in App.tsx,
+  // which both key off this same segment.
+  const match = window.location.pathname.match(/\/(?:app|site)\/(\d+)/)
   if (!match) {
-    throw new Error('bot_id missing from URL path (expected /app/{bot_id})')
+    throw new Error('bot_id missing from URL path (expected /app/{bot_id} or /site/{bot_id})')
   }
   return match[1]
+}
+
+let refreshTimer: ReturnType<typeof setInterval> | null = null
+
+function ensureRefreshLoop(botId: string): void {
+  if (refreshTimer !== null || !isSitePath() || getInitData()) return
+  refreshTimer = setInterval(() => {
+    const token = getMagicLinkToken(botId)
+    if (!token) return
+    request<{ token: string }>('/session')
+      .then((data) => sessionStorage.setItem(TOKEN_STORAGE_PREFIX + botId, data.token))
+      .catch(() => {
+        // A failed refresh means the token already lapsed or auth is gone —
+        // nothing to do here, the next real request will surface the error.
+      })
+  }, REFRESH_INTERVAL_MS)
 }
 
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
@@ -40,12 +77,13 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
     // which tries this header before falling back to ?token=.
     headers.set('X-Telegram-Init-Data', initData)
   } else {
-    const token = getMagicLinkToken()
+    const token = getMagicLinkToken(botId)
     if (token) {
       const separator = url.includes('?') ? '&' : '?'
       url = `${url}${separator}token=${encodeURIComponent(token)}`
     }
   }
+  ensureRefreshLoop(botId)
 
   const response = await fetch(url, { ...options, headers })
   if (!response.ok) {

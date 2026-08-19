@@ -3,8 +3,14 @@
    every access to window.Telegram.WebApp must degrade gracefully when it's
    absent (plain browser) rather than assume it exists. */
 
+interface TelegramWebAppUser {
+  id: number
+  photo_url?: string
+}
+
 interface TelegramWebApp {
   initData: string
+  initDataUnsafe?: { user?: TelegramWebAppUser }
   ready: () => void
   expand: () => void
   MainButton: {
@@ -41,4 +47,18 @@ export function getInitData(): string | null {
     _authenticate() would reject an empty initData header the same way. */
 export function isInTelegram(): boolean {
   return Boolean(getInitData())
+}
+
+/** The Telegram WebApp's own `initDataUnsafe.user.photo_url` field (see
+    Telegram's Mini Apps docs) — undefined outside Telegram or when Telegram
+    hasn't handed one back (e.g. the user has no profile photo). Deliberately
+    NOT verified against initData's HMAC signature (initDataUnsafe, as the
+    name says, isn't) — fine here since it's only ever used for a decorative
+    avatar image, never for auth. Standalone-site magic-link sessions
+    (docs/MINIAPP_WEBSITE_REDESIGN_DESIGN.md Task B) don't carry a Telegram
+    photo today — see mint_magic_link_token()/mint_site_link_token() in
+    runtime/miniapp_api.py, neither embeds one — so ScreenHeader simply
+    renders without an avatar there. */
+export function getTelegramUserPhotoUrl(): string | undefined {
+  return getTelegramWebApp()?.initDataUnsafe?.user?.photo_url
 }

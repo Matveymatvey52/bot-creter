@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Mini-App Component Redesign — мокап</title>
+<style>
+:root{
+  --bg:#0d0d10; --surface:#17171c; --surface-elevated:#1f1f27; --surface-inset:#24242b;
+  --accent:#7c5cff; --accent-hover:#8b6cff; --accent-soft:rgba(124,92,255,.14); --accent-glow:rgba(124,92,255,.35);
+  --success-bg:#16281f; --success-text:#4ade80;
+  --text-primary:#f5f5f7; --text-secondary:#9797a3; --text-tertiary:#6b6b76;
+  --border-subtle:#28282f; --white-card-bg:#ffffff; --white-card-text:#141416;
+}
+*{box-sizing:border-box}
+body{
+  background:var(--bg); color:var(--text-primary); margin:0; padding:40px 20px 80px;
+  font:16px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+  display:flex; justify-content:center;
+}
+.page{width:100%; max-width:420px; display:flex; flex-direction:column; gap:28px}
+.tag{
+  display:inline-block; align-self:flex-start; font:600 11px/1 -apple-system,sans-serif;
+  letter-spacing:.08em; text-transform:uppercase; color:var(--accent);
+  background:var(--accent-soft); padding:6px 10px; border-radius:999px; margin-bottom:6px;
+}
+
+/* ScreenHeader */
+.screen-header{display:flex; align-items:flex-start; justify-content:space-between; gap:16px}
+.screen-header .titles{display:flex; flex-direction:column; gap:6px}
+.label-caps{
+  font:600 12px/1.4 -apple-system,sans-serif; letter-spacing:.08em; text-transform:uppercase;
+  color:var(--text-tertiary);
+}
+.display-lg{
+  font:700 30px/1.15 -apple-system,sans-serif; margin:0; text-wrap:balance;
+}
+.avatar{
+  width:52px; height:52px; border-radius:50%; flex:none;
+  background:linear-gradient(135deg,var(--accent),#4a3aa8);
+  display:flex; align-items:center; justify-content:center;
+  font-size:22px; box-shadow:0 0 0 3px var(--surface-elevated);
+}
+
+/* CTA buttons */
+.cta-row{display:flex; flex-direction:column; gap:10px}
+.cta{
+  display:flex; align-items:center; gap:10px; justify-content:center;
+  font:600 15px/1 -apple-system,sans-serif; padding:15px 20px; border-radius:14px;
+  border:none; cursor:pointer; width:100%;
+}
+.cta-primary{background:var(--accent); color:#fff; box-shadow:0 8px 20px var(--accent-glow)}
+.cta-secondary{background:var(--surface-elevated); color:var(--text-primary); border:1px solid var(--border-subtle)}
+.cta-icon{font-size:17px}
+
+/* Selectable tariff cards */
+.section-label{margin:0 0 12px}
+.tariffs{display:flex; flex-direction:column; gap:10px}
+.tariff{
+  background:var(--surface); border-radius:16px; padding:16px 18px;
+  border:2px solid var(--border-subtle);
+  display:flex; align-items:center; justify-content:space-between; gap:12px;
+}
+.tariff.active{border-color:var(--accent); box-shadow:0 0 0 1px var(--accent), 0 8px 24px var(--accent-glow); background:var(--surface-elevated)}
+.tariff-name{font-weight:600; font-size:15px}
+.tariff-meta{color:var(--text-secondary); font-size:13px; margin-top:2px}
+.tariff-price{text-align:right; display:flex; flex-direction:column; gap:2px}
+.old-price{color:var(--text-tertiary); text-decoration:line-through; font-size:13px}
+.new-price{font-weight:700; font-size:17px; font-variant-numeric:tabular-nums}
+.discount{
+  display:inline-block; margin-top:2px; font:700 11px/1 -apple-system,sans-serif;
+  color:var(--success-text); background:var(--success-bg); padding:3px 7px; border-radius:999px;
+}
+
+/* QR card */
+.qr-block{display:flex; align-items:center; gap:16px; background:var(--surface); border-radius:18px; padding:18px}
+.qr-frame{
+  background:var(--white-card-bg); border-radius:14px; padding:12px; flex:none;
+  box-shadow:0 4px 16px rgba(0,0,0,.35);
+}
+.qr-frame svg{display:block}
+.qr-copy .label-caps{margin-bottom:4px}
+.qr-copy p{margin:0; color:var(--text-secondary); font-size:13px; line-height:1.5}
+
+footer{color:var(--text-tertiary); font-size:12px; text-align:center; margin-top:12px}
+</style>
+</head>
+<body>
+<div class="page">
+
+  <div>
+    <span class="tag">Компонент: ScreenHeader</span>
+    <div class="screen-header">
+      <div class="titles">
+        <span class="label-caps">Тур-оператор · Демо</span>
+        <h1 class="display-lg">Ваша поездка<br>в Каппадокию</h1>
+      </div>
+      <div class="avatar">🎈</div>
+    </div>
+  </div>
+
+  <div>
+    <span class="tag">Компонент: CTAButton</span>
+    <div class="cta-row">
+      <button class="cta cta-primary"><span class="cta-icon">⚡</span> Быстро подключиться</button>
+      <button class="cta cta-secondary"><span class="cta-icon">💳</span> Оплатить — картой / СБП</button>
+    </div>
+  </div>
+
+  <div>
+    <span class="tag">Компонент: SectionLabel + SelectableCard</span>
+    <p class="label-caps section-label">Или выберите тариф</p>
+    <div class="tariffs">
+      <div class="tariff active">
+        <div>
+          <div class="tariff-name">Стандарт</div>
+          <div class="tariff-meta">3 дня · завтрак включён</div>
+        </div>
+        <div class="tariff-price">
+          <span class="old-price">42 000 ₽</span>
+          <span class="new-price">31 500 ₽</span>
+          <span class="discount">−25%</span>
+        </div>
+      </div>
+      <div class="tariff">
+        <div>
+          <div class="tariff-name">Премиум</div>
+          <div class="tariff-meta">3 дня · полёт на шаре</div>
+        </div>
+        <div class="tariff-price">
+          <span class="new-price">54 000 ₽</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div>
+    <span class="tag">Компонент: QRCard</span>
+    <div class="qr-block">
+      <div class="qr-frame">
+        <svg width="72" height="72" viewBox="0 0 72 72" fill="#141416">
+          <rect width="72" height="72" fill="#fff"/>
+          <g fill="#141416">
+            <rect x="4" y="4" width="18" height="18"/><rect x="8" y="8" width="10" height="10" fill="#fff"/><rect x="11" y="11" width="4" height="4"/>
+            <rect x="50" y="4" width="18" height="18"/><rect x="54" y="8" width="10" height="10" fill="#fff"/><rect x="57" y="11" width="4" height="4"/>
+            <rect x="4" y="50" width="18" height="18"/><rect x="8" y="54" width="10" height="10" fill="#fff"/><rect x="11" y="57" width="4" height="4"/>
+            <rect x="26" y="4" width="4" height="4"/><rect x="34" y="4" width="4" height="4"/><rect x="26" y="12" width="4" height="4"/>
+            <rect x="34" y="20" width="4" height="4"/><rect x="26" y="26" width="4" height="4"/><rect x="42" y="26" width="4" height="4"/>
+            <rect x="50" y="34" width="4" height="4"/><rect x="58" y="34" width="4" height="4"/><rect x="26" y="34" width="4" height="4"/>
+            <rect x="34" y="42" width="4" height="4"/><rect x="42" y="42" width="4" height="4"/><rect x="50" y="42" width="4" height="4"/>
+            <rect x="26" y="50" width="4" height="4"/><rect x="42" y="50" width="4" height="4"/><rect x="58" y="50" width="4" height="4"/>
+            <rect x="34" y="58" width="4" height="4"/><rect x="50" y="58" width="4" height="4"/>
+          </g>
+        </svg>
+      </div>
+      <div class="qr-copy">
+        <p class="label-caps">Ваш билет</p>
+        <p>Покажите QR при посадке на автобус в аэропорту Невшехира.</p>
+      </div>
+    </div>
+  </div>
+
+  <footer>Мокап компонентов · палитра и токены — без изменений</footer>
+</div>
+</body>
+</html>

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react'
 import { getResource, ApiError, type ResourceItem } from '../lib/api'
 import { statusTone, type ResourceDisplay } from '../lib/displaySchema'
 import { Badge } from '../components/Card'
+import { CTAButton } from '../components/CTAButton'
 import { useTelegramMainButton } from '../lib/useMainButton'
 import { isInTelegram } from '../lib/telegram'
 
@@ -42,10 +43,10 @@ export function DetailScreen({
 
   return (
     <div className="screen">
-      <div className="screen-header">
-        <button className="btn-secondary" onClick={onBack}>
-          ← Назад
-        </button>
+      <div className="cta-row">
+        <CTAButton icon="←" variant="secondary" onClick={onBack}>
+          Назад
+        </CTAButton>
       </div>
 
       {error && <div className="state-message">{error}</div>}
@@ -71,9 +72,9 @@ export function DetailScreen({
 
       {item && !isInTelegram() && (
         <div className="bottom-bar">
-          <button className="btn-primary" onClick={onBack}>
+          <CTAButton variant="primary" onClick={onBack}>
             Назад к списку
-          </button>
+          </CTAButton>
         </div>
       )}
     </div>

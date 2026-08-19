@@ -648,6 +648,22 @@ def _miniapp_url(bot_id: int, telegram_user_id: int) -> str | None:
     return f"{BASE_URL}/app/{bot_id}?token={token}"
 
 
+def _site_url(bot_id: int, telegram_user_id: int) -> str | None:
+    """Same link machinery as _miniapp_url() above, but for the standalone
+    website outside Telegram (/site/{bot_id}, docs/
+    MINIAPP_WEBSITE_REDESIGN_DESIGN.md Task B) — a longer-lived
+    (SITE_LINK_TTL_SECONDS, 24h) token via mint_site_link_token(), since this
+    link is meant to be opened from a laptop/desktop browser and stay usable
+    for a work session, not a single Telegram-WebView click."""
+    from runtime.miniapp_api import mint_site_link_token
+
+    try:
+        token = mint_site_link_token(bot_id, telegram_user_id)
+    except RuntimeError:
+        return None
+    return f"{BASE_URL}/site/{bot_id}?token={token}"
+
+
 @router.message(Command("app"))
 async def cmd_app(m: Message, config: TourOperatorConfig):
     if not _is_admin(m.from_user.id, config.admins_file):
@@ -665,9 +681,11 @@ async def cmd_app(m: Message, config: TourOperatorConfig):
             "Пользуйтесь Telegram-командами: /tours /lip /newtrip"
         )
         return
+    site_url = _site_url(config.bot_id, m.from_user.id) if config.bot_id is not None else None
+    site_line = f'\n\n🌐 <a href="{site_url}">Открыть на сайте →</a>' if site_url else ""
     await m.answer(
         f"🌐 <b>Веб-приложение</b>\n\n"
-        f'<a href="{url}">Открыть CRM →</a>\n\n<code>{url}</code>',
+        f'<a href="{url}">Открыть CRM →</a>\n\n<code>{url}</code>{site_line}',
         parse_mode="HTML", disable_web_page_preview=True,
     )
 

@@ -3,6 +3,7 @@ import { createResource, ApiError } from '../lib/api'
 import type { ResourceDisplay } from '../lib/displaySchema'
 import { useTelegramMainButton } from '../lib/useMainButton'
 import { isInTelegram } from '../lib/telegram'
+import { CTAButton } from '../components/CTAButton'
 
 export function CreateFormScreen({
   resource,
@@ -43,11 +44,14 @@ export function CreateFormScreen({
 
   return (
     <div className="screen">
-      <div className="screen-header">
-        <button className="btn-secondary" onClick={onCancel}>
+      <div className="screen-header-v2">
+        <div className="screen-header-v2-titles">
+          <span className="label-caps">{resource.title}</span>
+          <h1 className="display-lg">Новая запись</h1>
+        </div>
+        <CTAButton variant="secondary" onClick={onCancel}>
           ✕
-        </button>
-        <h2>{resource.title}: новая запись</h2>
+        </CTAButton>
       </div>
 
       {error && <div className="state-message">{error}</div>}
@@ -66,9 +70,9 @@ export function CreateFormScreen({
 
       {!isInTelegram() && (
         <div className="bottom-bar">
-          <button className="btn-primary" onClick={handleSubmit} disabled={!requiredFilled || submitting}>
+          <CTAButton variant="primary" onClick={handleSubmit} disabled={!requiredFilled || submitting}>
             {submitting ? 'Создание…' : 'Создать'}
-          </button>
+          </CTAButton>
         </div>
       )}
     </div>

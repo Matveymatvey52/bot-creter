@@ -93,3 +93,12 @@ select {
 a {
   color: var(--accent);
 }
+
+/* Redesign tokens (docs/MINIAPP_WEBSITE_REDESIGN_DESIGN.md §1.2) — additive,
+   the existing palette above is untouched. */
+:root {
+  --font-display-lg: 700 27px/1.15 var(--sans);
+  --font-label-caps: 600 12px/1.4 var(--sans);
+  --shadow-card-active: 0 0 0 1px var(--accent), 0 6px 20px var(--accent-glow);
+  --tg-blue: #2aabee;
+}

@@ -2,6 +2,9 @@ import { useEffect, useState } from 'react'
 import { listResource, ApiError, type ResourceItem } from '../lib/api'
 import { statusTone, type ResourceDisplay } from '../lib/displaySchema'
 import { Card, CardHeader, CardTitle, ChipRow, Chip, Badge } from '../components/Card'
+import { ScreenHeader } from '../components/ScreenHeader'
+import { CTAButton } from '../components/CTAButton'
+import { getTelegramUserPhotoUrl } from '../lib/telegram'
 
 export function ListScreen({
   resource,
@@ -34,9 +37,7 @@ export function ListScreen({
 
   return (
     <div className="screen">
-      <div className="screen-header">
-        <h1>{resource.title}</h1>
-      </div>
+      <ScreenHeader eyebrow={resource.title} title={resource.title} avatarUrl={getTelegramUserPhotoUrl()} />
 
       {error && <div className="state-message">{error}</div>}
       {!error && items === null && <div className="state-message">Загрузка…</div>}
@@ -60,9 +61,11 @@ export function ListScreen({
         </Card>
       ))}
 
-      <button className="btn-primary" onClick={onCreateNew}>
-        + Добавить
-      </button>
+      <div className="cta-row">
+        <CTAButton icon="➕" variant="primary" onClick={onCreateNew}>
+          Добавить
+        </CTAButton>
+      </div>
     </div>
   )
 }

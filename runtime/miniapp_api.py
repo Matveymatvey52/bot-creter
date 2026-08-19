@@ -66,16 +66,29 @@ _MINIAPP_DIST_DIR = Path(__file__).parent.parent / "miniapp" / "dist"
 # localStorage session on first load (out of scope for this pilot's backend).
 MAGIC_LINK_TTL_SECONDS = 15 * 60
 
+# The standalone website (/site/{bot_id}, docs/MINIAPP_WEBSITE_REDESIGN_DESIGN.md
+# Task B) is a "opened it on a laptop, working for a while" session, not a
+# "click the link now" Telegram WebView open — 24h instead of 15min. Same
+# token format/verification as the Telegram-flow token above (expiry is
+# embedded in the signed payload, so _verify_magic_link_token needs no
+# separate TTL-aware code path); only the TTL used at mint time differs.
+SITE_LINK_TTL_SECONDS = 24 * 60 * 60
+
 
 def _miniapp_secret() -> str:
     return os.getenv("MINIAPP_SECRET", "")
 
 
-def mint_magic_link_token(bot_id: int, telegram_user_id: int) -> str:
+def mint_magic_link_token(bot_id: int, telegram_user_id: int, ttl_seconds: int = MAGIC_LINK_TTL_SECONDS) -> str:
     """Signs `bot_id:telegram_user_id:expiry` with HMAC-SHA256 over
     MINIAPP_SECRET. Called by a template's /app command handler (e.g.
     tour_operator.py's cmd_app) to build the link it sends the user — see
     that template's own TODO to stop embedding the bare user_id.
+
+    `ttl_seconds` defaults to the short Telegram-WebView-flow TTL
+    (MAGIC_LINK_TTL_SECONDS) so every existing caller (factory dashboard's
+    /api/factory/session, tour_operator.py's cmd_app) is unaffected; pass a
+    longer value (e.g. SITE_LINK_TTL_SECONDS) for the standalone-website flow.
 
     Raises RuntimeError if MINIAPP_SECRET is unset, rather than silently
     minting an unsigned/forgeable token — same fail-closed posture as
@@ -85,10 +98,19 @@ def mint_magic_link_token(bot_id: int, telegram_user_id: int) -> str:
     secret = _miniapp_secret()
     if not secret:
         raise RuntimeError("MINIAPP_SECRET is not set — cannot mint a magic-link token")
-    expiry = int(time.time()) + MAGIC_LINK_TTL_SECONDS
+    expiry = int(time.time()) + ttl_seconds
     payload = f"{bot_id}:{telegram_user_id}:{expiry}"
     sig = hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
     return f"{payload}:{sig}"
+
+
+def mint_site_link_token(bot_id: int, telegram_user_id: int) -> str:
+    """Convenience wrapper over mint_magic_link_token() with the longer
+    SITE_LINK_TTL_SECONDS TTL — what a template's "🌐 Открыть на сайте"
+    button (e.g. tour_operator.py's cmd_app) should call instead of
+    mint_magic_link_token() directly, so the TTL choice for that flow lives
+    in one place."""
+    return mint_magic_link_token(bot_id, telegram_user_id, ttl_seconds=SITE_LINK_TTL_SECONDS)
 
 
 def _verify_magic_link_token(token: str, bot_id: int) -> int | None:
@@ -201,6 +223,26 @@ async def _resolve_entry_and_config(request: web.Request) -> tuple[int, Any, Any
         return web.json_response({"error": "mini-app not available for this bot"}, status=404)
 
     return bot_id, entry, miniapp_config
+
+
+async def bot_session_handler(request: web.Request) -> web.Response:
+    """GET /api/{bot_id}/session — mints a fresh, full-TTL site token for the
+    standalone website (/site/{bot_id}), modeled on
+    runtime/factory_analytics_api.py's refresh_session_handler. Requires an
+    already-valid credential (current token or Telegram initData) — this
+    renews a live session, it doesn't mint one from nothing. The SPA
+    (lib/api.ts) calls this on a timer well inside SITE_LINK_TTL_SECONDS so a
+    still-open tab keeps working past the original link's TTL."""
+    resolved = await _resolve_entry_and_config(request)
+    if isinstance(resolved, web.Response):
+        return resolved
+    bot_id, entry, _config = resolved
+
+    telegram_user_id = await _authenticate(request, bot_id, entry.bot.token)
+    if telegram_user_id is None:
+        return web.json_response({"error": "forbidden"}, status=403)
+    token = mint_site_link_token(bot_id, telegram_user_id)
+    return web.json_response({"token": token})
 
 
 async def me_handler(request: web.Request) -> web.Response:
@@ -533,6 +575,9 @@ def register_routes(app: web.Application) -> None:
     by combined_app.py right after webhook_app.create_app() so both live on
     the same Application/process/port (see module docstring)."""
     app.router.add_get("/api/{bot_id}/me", me_handler)
+    # Registered before the generic {resource} route for the same reason as
+    # /schema and /analytics below — "session" is reserved the same way.
+    app.router.add_get("/api/{bot_id}/session", bot_session_handler)
     # Registered before the generic {resource} route below — aiohttp matches
     # routes in registration order, and "schema" would otherwise be swallowed
     # as if it were a resource name (see docs on _resource_spec: a bot could
@@ -547,5 +592,12 @@ def register_routes(app: web.Application) -> None:
     app.router.add_get("/api/{bot_id}/{resource}/{item_id}", get_resource_handler)
     app.router.add_post("/api/{bot_id}/{resource}", create_resource_handler)
     app.router.add_get("/app/{bot_id}", serve_app_shell)
+    # /site/{bot_id} — standalone website outside Telegram (Task B,
+    # docs/MINIAPP_WEBSITE_REDESIGN_DESIGN.md §2). Same SPA shell as
+    # /app/{bot_id} (App.tsx branches client-side on the path prefix to skip
+    # the Telegram WebApp SDK bootstrap); same bot_id validation via
+    # serve_app_shell, just reached via a different URL prefix so a plain
+    # browser tab and a Telegram WebView open visibly different-looking URLs.
+    app.router.add_get("/site/{bot_id}", serve_app_shell)
     app.router.add_get("/owner-report", serve_owner_report_shell)
     _register_static_routes(app)

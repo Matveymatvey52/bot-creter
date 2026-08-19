@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Примеры на разных ботах — v2</title>
+<style>
+:root{
+  --bg:#0d0d10; --surface:#17171c; --surface-elevated:#1f1f27;
+  --accent:#7c5cff; --accent-hover:#8b6cff; --accent-soft:rgba(124,92,255,.14); --accent-glow:rgba(124,92,255,.35);
+  --success-bg:#16281f; --success-text:#4ade80;
+  --text-primary:#f5f5f7; --text-secondary:#9797a3; --text-tertiary:#6b6b76;
+  --border-subtle:#28282f; --tg-blue:#2aabee;
+}
+*{box-sizing:border-box}
+body{
+  background:#000; color:var(--text-primary); margin:0; padding:40px 16px 100px;
+  font:16px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+  display:flex; flex-wrap:wrap; gap:40px; justify-content:center; align-items:flex-start;
+}
+.phone{
+  width:360px; background:var(--bg); border-radius:28px; padding:22px 18px 26px;
+  border:1px solid var(--border-subtle); display:flex; flex-direction:column; gap:22px;
+}
+.phone-label{
+  font:600 11px/1 -apple-system,sans-serif; letter-spacing:.08em; text-transform:uppercase;
+  color:var(--text-tertiary); text-align:center;
+}
+
+/* ScreenHeader with real Telegram avatar */
+.screen-header{display:flex; align-items:flex-start; justify-content:space-between; gap:14px}
+.screen-header .titles{display:flex; flex-direction:column; gap:6px}
+.label-caps{
+  font:600 12px/1.4 -apple-system,sans-serif; letter-spacing:.08em; text-transform:uppercase;
+  color:var(--text-tertiary);
+}
+.display-lg{ font:700 27px/1.15 -apple-system,sans-serif; margin:0; text-wrap:balance; }
+.avatar{
+  width:46px; height:46px; border-radius:50%; flex:none; position:relative;
+  background:linear-gradient(160deg,#ffd9a0,#e8a262); overflow:hidden;
+  box-shadow:0 0 0 2px var(--surface-elevated);
+}
+.avatar svg{position:absolute; inset:0; width:100%; height:100%}
+.avatar .tg-badge{
+  position:absolute; right:-2px; bottom:-2px; width:16px; height:16px; border-radius:50%;
+  background:var(--tg-blue); border:2px solid var(--bg);
+  display:flex; align-items:center; justify-content:center;
+}
+.avatar .tg-badge svg{position:static; width:9px; height:9px}
+
+/* Rectangular, compact CTA buttons (v2) */
+.cta-row{display:flex; flex-wrap:wrap; gap:8px}
+.cta{
+  display:inline-flex; align-items:center; gap:7px; justify-content:center;
+  font:600 14px/1 -apple-system,sans-serif; padding:11px 16px; border-radius:10px;
+  border:none; cursor:pointer;
+}
+.cta-primary{background:var(--accent); color:#fff}
+.cta-secondary{background:var(--surface-elevated); color:var(--text-primary); border:1px solid var(--border-subtle)}
+.cta-icon{font-size:15px}
+
+.section-label{margin:0 0 10px}
+.tariffs{display:flex; flex-direction:column; gap:9px}
+.tariff{
+  background:var(--surface); border-radius:14px; padding:14px 16px;
+  border:2px solid var(--border-subtle);
+  display:flex; align-items:center; justify-content:space-between; gap:12px;
+}
+.tariff.active{border-color:var(--accent); box-shadow:0 0 0 1px var(--accent), 0 6px 20px var(--accent-glow); background:var(--surface-elevated)}
+.tariff-name{font-weight:600; font-size:14px}
+.tariff-meta{color:var(--text-secondary); font-size:12px; margin-top:2px}
+.tariff-price{text-align:right; display:flex; flex-direction:column; gap:2px}
+.old-price{color:var(--text-tertiary); text-decoration:line-through; font-size:12px}
+.new-price{font-weight:700; font-size:16px; font-variant-numeric:tabular-nums}
+.discount{
+  display:inline-block; margin-top:2px; font:700 10px/1 -apple-system,sans-serif;
+  color:var(--success-text); background:var(--success-bg); padding:3px 6px; border-radius:999px;
+}
+</style>
+</head>
+<body>
+
+<!-- BOT 1: tour_operator -->
+<div class="phone">
+  <div class="phone-label">tour_operator</div>
+  <div class="screen-header">
+    <div class="titles">
+      <span class="label-caps">Тур-оператор</span>
+      <h1 class="display-lg">Ваша поездка<br>в Каппадокию</h1>
+    </div>
+    <div class="avatar">
+      <svg viewBox="0 0 46 46"><ellipse cx="23" cy="19" rx="9" ry="10" fill="#5b3a24"/><ellipse cx="23" cy="42" rx="16" ry="14" fill="#3d3428"/></svg>
+      <div class="tg-badge"><svg viewBox="0 0 24 24" fill="#fff"><path d="M21 4L2 11l6 2.5L20 6l-9.5 9L20 19l1-15z"/></svg></div>
+    </div>
+  </div>
+  <div class="cta-row">
+    <button class="cta cta-primary"><span class="cta-icon">📅</span>Забронировать</button>
+    <button class="cta cta-secondary"><span class="cta-icon">💳</span>Оплатить</button>
+  </div>
+  <div>
+    <p class="label-caps section-label">Или выберите тариф</p>
+    <div class="tariffs">
+      <div class="tariff active">
+        <div><div class="tariff-name">Стандарт</div><div class="tariff-meta">3 дня · завтрак включён</div></div>
+        <div class="tariff-price"><span class="old-price">42 000 ₽</span><span class="new-price">31 500 ₽</span><span class="discount">−25%</span></div>
+      </div>
+      <div class="tariff">
+        <div><div class="tariff-name">Премиум</div><div class="tariff-meta">3 дня · полёт на шаре</div></div>
+        <div class="tariff-price"><span class="new-price">54 000 ₽</span></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- BOT 2: car_rental -->
+<div class="phone">
+  <div class="phone-label">car_rental</div>
+  <div class="screen-header">
+    <div class="titles">
+      <span class="label-caps">Аренда авто</span>
+      <h1 class="display-lg">BMW X5<br>в Дубае</h1>
+    </div>
+    <div class="avatar">
+      <svg viewBox="0 0 46 46"><ellipse cx="23" cy="19" rx="9" ry="10" fill="#4a3524"/><ellipse cx="23" cy="42" rx="16" ry="14" fill="#2b2a3a"/></svg>
+      <div class="tg-badge"><svg viewBox="0 0 24 24" fill="#fff"><path d="M21 4L2 11l6 2.5L20 6l-9.5 9L20 19l1-15z"/></svg></div>
+    </div>
+  </div>
+  <div class="cta-row">
+    <button class="cta cta-primary"><span class="cta-icon">🚗</span>Арендовать</button>
+    <button class="cta cta-secondary"><span class="cta-icon">📍</span>Показать на карте</button>
+  </div>
+  <div>
+    <p class="label-caps section-label">Или выберите срок аренды</p>
+    <div class="tariffs">
+      <div class="tariff active">
+        <div><div class="tariff-name">3 дня</div><div class="tariff-meta">полная страховка</div></div>
+        <div class="tariff-price"><span class="old-price">18 000 ₽</span><span class="new-price">14 400 ₽</span><span class="discount">−20%</span></div>
+      </div>
+      <div class="tariff">
+        <div><div class="tariff-name">7 дней</div><div class="tariff-meta">полная страховка</div></div>
+        <div class="tariff-price"><span class="new-price">31 000 ₽</span></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- BOT 3: booking_restaurant -->
+<div class="phone">
+  <div class="phone-label">booking_restaurant</div>
+  <div class="screen-header">
+    <div class="titles">
+      <span class="label-caps">Бронь столика</span>
+      <h1 class="display-lg">La Terrazza<br>на двоих</h1>
+    </div>
+    <div class="avatar">
+      <svg viewBox="0 0 46 46"><ellipse cx="23" cy="19" rx="9" ry="10" fill="#6b4a3a"/><ellipse cx="23" cy="42" rx="16" ry="14" fill="#4a2e3a"/></svg>
+      <div class="tg-badge"><svg viewBox="0 0 24 24" fill="#fff"><path d="M21 4L2 11l6 2.5L20 6l-9.5 9L20 19l1-15z"/></svg></div>
+    </div>
+  </div>
+  <div class="cta-row">
+    <button class="cta cta-primary"><span class="cta-icon">🍽️</span>Забронировать</button>
+    <button class="cta cta-secondary"><span class="cta-icon">☎️</span>Позвонить</button>
+  </div>
+  <div>
+    <p class="label-caps section-label">Или выберите время</p>
+    <div class="tariffs">
+      <div class="tariff active">
+        <div><div class="tariff-name">19:00</div><div class="tariff-meta">у окна</div></div>
+        <div class="tariff-price"><span class="new-price">свободно</span></div>
+      </div>
+      <div class="tariff">
+        <div><div class="tariff-name">21:30</div><div class="tariff-meta">терраса</div></div>
+        <div class="tariff-price"><span class="new-price">свободно</span></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+</body>
+</html>

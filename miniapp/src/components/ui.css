@@ -190,6 +190,180 @@
   padding: 40px 20px;
 }
 
+/* ── Redesign v2: ScreenHeader / CTAButton / SelectableCard / SectionLabel ─
+   docs/MINIAPP_WEBSITE_REDESIGN_DESIGN.md §1.3, exact sizing from
+   docs/miniapp_redesign_examples.html. */
+
+.label-caps {
+  font: var(--font-label-caps);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+}
+
+.screen-header-v2 {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.screen-header-v2-titles {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.display-lg {
+  font: var(--font-display-lg);
+  margin: 0;
+  text-wrap: balance;
+}
+
+.avatar {
+  width: 46px;
+  height: 46px;
+  border-radius: 50%;
+  flex: none;
+  position: relative;
+  overflow: hidden;
+  box-shadow: 0 0 0 2px var(--surface-elevated);
+}
+
+.avatar img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.avatar .tg-badge {
+  position: absolute;
+  right: -2px;
+  bottom: -2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--tg-blue);
+  border: 2px solid var(--bg);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.avatar .tg-badge svg {
+  width: 9px;
+  height: 9px;
+}
+
+.cta-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.cta {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  justify-content: center;
+  font: 600 14px/1 var(--sans);
+  padding: 11px 16px;
+  border-radius: 10px;
+  border: none;
+  width: auto;
+}
+
+.cta-primary {
+  background: var(--accent);
+  color: var(--accent-text);
+}
+
+.cta-primary:hover {
+  background: var(--accent-hover);
+}
+
+.cta-secondary {
+  background: var(--surface-elevated);
+  color: var(--text-primary);
+  border: 1px solid var(--border-subtle);
+}
+
+.cta:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.cta-icon {
+  font-size: 15px;
+  display: inline-flex;
+}
+
+.section-label {
+  margin: 0 0 10px;
+}
+
+.tariffs {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+
+.tariff {
+  background: var(--surface);
+  border-radius: 14px;
+  padding: 14px 16px;
+  border: 2px solid var(--border-subtle);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.tariff-active {
+  border-color: var(--accent);
+  box-shadow: var(--shadow-card-active);
+  background: var(--surface-elevated);
+}
+
+.tariff-name {
+  font-weight: 600;
+  font-size: 14px;
+}
+
+.tariff-meta {
+  color: var(--text-secondary);
+  font-size: 12px;
+  margin-top: 2px;
+}
+
+.tariff-price {
+  text-align: right;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  align-items: flex-end;
+}
+
+.old-price {
+  color: var(--text-tertiary);
+  text-decoration: line-through;
+  font-size: 12px;
+}
+
+.new-price {
+  font-weight: 700;
+  font-size: 16px;
+  font-variant-numeric: tabular-nums;
+}
+
+.tariff-price .discount {
+  padding: 3px 6px;
+  font-size: 10px;
+  font-weight: 700;
+}
+
 /* ── Bot card (FactoryDashboardScreen "Мои боты") ─────────────────────────
    Richer than the generic .card above: icon plate, status pill with dot,
    one headline metric, "Открыть →" affordance. See docs/MINIAPP_DESIGN.md
