@@ -47,6 +47,7 @@ import aiosqlite
 from aiohttp import web
 
 from db.database import get_bot_admins, get_bot_miniapp_config, get_bot_office_hook_config
+from features.excel_export import MAX_FILE_SIZE, build_workbook, fetch_export_rows
 from features.sales_analytics import Period, compute_metrics
 from runtime.registry import FACTORY_BOT_ID, Registry, _load_template_module_async
 
@@ -487,6 +488,60 @@ async def analytics_handler(request: web.Request) -> web.Response:
     return web.json_response(metrics)
 
 
+async def export_excel_handler(request: web.Request) -> web.Response:
+    """GET /api/{bot_id}/export.xlsx — OWNER-ONLY download of this bot's own
+    business-data table (whatever office_hook_config points at) as a styled
+    .xlsx workbook, via features/excel_export.py. Same auth/ownership
+    posture as analytics_handler right below (owner-only, unlike the
+    any-authenticated-user routes above it — a bulk export of every
+    customer's records is not something a random customer of this bot should
+    ever be able to trigger, let alone download).
+
+    Reuses fetch_export_rows()'s own "degrade to unavailable, never partially
+    wrong" contract: a bot with no usable office_hook_config, or a stale one
+    whose table no longer exists, 404s the same way analytics_handler does
+    for compute_metrics() returning None — never a 500 or a malformed file."""
+    bot_id_raw = request.match_info.get("bot_id", "")
+    if err := _bad_bot_id(bot_id_raw):
+        return err
+    bot_id = int(bot_id_raw)
+
+    registry: Registry = request.app[REGISTRY_KEY]
+    entry = registry.get(bot_id)
+    if entry is None:
+        return web.json_response({"error": "unknown bot"}, status=404)
+
+    telegram_user_id = await _authenticate(request, bot_id, entry.bot.token)
+    if telegram_user_id is None:
+        return web.json_response({"error": "forbidden"}, status=403)
+
+    admin_ids = await get_bot_admins(bot_id)
+    if str(telegram_user_id) not in admin_ids:
+        return web.json_response({"error": "forbidden"}, status=403)
+
+    db_path = entry.config.get("db_path") if isinstance(entry.config, dict) else None
+    if not db_path:
+        return web.json_response({"error": "bot has no database configured"}, status=500)
+
+    hook_config = await get_bot_office_hook_config(bot_id)
+    fetched = await fetch_export_rows(db_path, hook_config)
+    if fetched is None:
+        return web.json_response({"error": "export not available for this bot"}, status=404)
+    columns, rows = fetched
+
+    data = build_workbook(columns, rows, sheet_title=str(entry.template_id or "Export"))
+    if len(data) > MAX_FILE_SIZE:
+        # build_workbook() already logged this — surfaced to the caller as a
+        # proper error response instead of trying to serve an oversized file.
+        return web.json_response({"error": "export too large to deliver"}, status=413)
+
+    return web.Response(
+        body=data,
+        content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="export_{bot_id}.xlsx"'},
+    )
+
+
 async def office_tasks_handler(request: web.Request) -> web.Response:
     """GET /api/{bot_id}/office/tasks — owner-only, all-employees task
     overview for boss_bot's desktop dashboard (see office_dashboard_handler
@@ -730,6 +785,10 @@ def register_routes(app: web.Application) -> None:
     # /schema above — "analytics" would otherwise be swallowed as a resource
     # name, and is reserved the same way "schema" already is.
     app.router.add_get("/api/{bot_id}/analytics", analytics_handler)
+    # Registered before the generic {resource} route for the same reason as
+    # /schema and /analytics above — "export.xlsx" would otherwise be
+    # swallowed as a resource name.
+    app.router.add_get("/api/{bot_id}/export.xlsx", export_excel_handler)
     # Registered before the generic {resource} route for the same reason as
     # /schema and /analytics above — "office" would otherwise be swallowed
     # as a resource name.
