@@ -373,10 +373,16 @@ async def _start_create_flow(user_id: int, answer, state: FSMContext) -> None:
     (CallbackQuery) — callers pass their own user_id and an answer() sink
     (message.answer / callback.message.answer) so this never reads
     callback.message.from_user, which is the BOT, not the presser."""
-    _pending.pop(user_id, None)
+    dropped = _pending.pop(user_id, None)
     await state.clear()
     await state.set_state(CreateBotStates.gathering)
     await state.update_data(conversation=[], pending_attachments=[])
+    if dropped is not None:
+        await answer(
+            "⚠️ Предыдущее создание бота (ожидавшее токен от BotFather) отменено — "
+            "начинаем новое. В следующий раз используйте /cancel, если хотите "
+            "прервать создание осознанно."
+        )
     await answer(
         "Вы можете описать текстом или записать голосовое, в котором расскажете "
         "подробно какого бота или систему ботов вы хотите сделать. А также можете "
@@ -908,6 +914,16 @@ async def auto_launch_managed_bot(managed_data: dict, bot: Bot, storage=None) ->
     pending = _pending.pop(creator_user_id, None)
     if not pending:
         logger.info(f"No pending creation for user {creator_user_id}")
+        try:
+            await bot.send_message(
+                creator_user_id,
+                "⚠️ Бот в Telegram создан, но я потерял данные для его активации "
+                "(возможно, вы начали создание нового бота до завершения этого). "
+                "Напишите нам в поддержку — бот не будет работать, пока мы не "
+                "привяжем его вручную.",
+            )
+        except Exception as e:
+            logger.error(f"Failed to notify user {creator_user_id} about lost pending: {e}")
         return
 
     chat_id = pending["chat_id"]
