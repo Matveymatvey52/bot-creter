@@ -12,6 +12,18 @@ from config import ANTHROPIC_API_KEY
 client = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 logger = logging.getLogger(__name__)
 
+def _event_type_catalog_text() -> str:
+    """Renders features/office_events.py's closed _EVENT_TYPES/EVENT_TYPE_LABELS
+    set into the system prompt so the model only ever offers links the runtime
+    can actually deliver (docs/MULTIBOT_OFFICE_ROUTING_DESIGN.md §2.1/§4 q3) —
+    imported lazily to avoid a features <-> services import-time cycle (mirrors
+    features/office_events.py's own lazy `from runtime.registry import
+    discover_features` for the same reason)."""
+    from features.office_events import EVENT_TYPE_LABELS
+
+    return "\n".join(f'- "{k}" ({v})' for k, v in EVENT_TYPE_LABELS.items())
+
+
 GATHER_SYSTEM_PROMPT = """You are a Telegram bot development assistant. Your job is to understand what bot (or connected system of bots) the user wants to create.
 
 The user may send, at any point in the conversation, screenshots, photos, extracted text from documents (PDF/Word/Excel), or web page/spreadsheet content alongside their message. Treat all of that as part of the requirements — read screenshots and documents carefully, they often describe the exact workflow, data fields, or interface the user wants automated.
@@ -20,13 +32,25 @@ Ask 1-2 concise clarifying questions at a time to understand:
 - The bot's main purpose and functionality
 - Key commands or features needed
 - Any specific behaviors (stores data per user, sends notifications, etc.)
-- Whether this is a single bot, several independent bots, or a connected system ("office") of bots
+- Whether this is a single bot, several independent bots, or a connected system ("office") of bots that should notify each other
+
+If the user wants two or more bots to notify each other of events (an "office"), the ONLY event types that can actually be wired up right now are:
+{event_type_catalog}
+If the user asks for a connection that doesn't match one of these, tell them plainly that this specific link isn't supported yet and continue without inventing a new event type — never make one up.
 
 When you have enough information (usually after 2-4 exchanges), output exactly:
 ===READY_TO_GENERATE===
-[Structured summary of the bot to build, in English, with all key requirements, including anything learned from attached images/documents]
+followed by ONE JSON object (nothing else after it) with this exact shape:
+{{"bots": [{{"role_hint": "short_snake_case_tag", "summary": "structured summary in English of this one bot, with all key requirements, including anything learned from attached images/documents/links"}}], "links": [{{"source_role_hint": "...", "target_role_hint": "...", "event_type": "..."}}]}}
 
-Always respond in the same language as the user. Keep questions short."""
+Rules for this JSON:
+- A single bot is just "bots" with ONE element and "links": [].
+- Several independent bots the user does NOT want connected: multiple "bots" entries, "links": [].
+- An "office": multiple "bots" entries plus "links" entries connecting them by role_hint.
+- role_hint is a short internal tag (e.g. "orders", "accounting"), NOT a bot name or username — it only has to be unique within this one response, used to wire "links" to the right "bots" entry.
+- event_type in every "links" entry MUST be one of the exact strings from the list above — never invent one.
+
+Always respond in the same language as the user (only the JSON keys/values in the payload itself are in English). Keep questions short."""
 
 GENERATE_SYSTEM_PROMPT = """You are an expert Python developer specializing in Telegram bots using aiogram 3.13.
 
@@ -1374,13 +1398,65 @@ async def ask_assistant(user_message: str, bots_summary: str = "") -> str:
 
 
 async def chat_gather_requirements(conversation: list[dict]) -> str:
+    system = GATHER_SYSTEM_PROMPT.format(event_type_catalog=_event_type_catalog_text())
     response = await client.messages.create(
         model="claude-haiku-4-5-20251001",
         max_tokens=2048,
-        system=GATHER_SYSTEM_PROMPT,
+        system=system,
         messages=conversation,
     )
     return response.content[0].text
+
+
+def parse_gather_result(ready_payload: str) -> dict | None:
+    """Parses the JSON payload GATHER_SYSTEM_PROMPT emits after
+    ===READY_TO_GENERATE=== into {"bots": [{"role_hint", "summary"}, ...],
+    "links": [{"source_role_hint", "target_role_hint", "event_type"}, ...]}.
+
+    Falls back to treating the whole payload as a single bot's plain-text
+    summary (docs/MULTIBOT_OFFICE_ROUTING_DESIGN.md §3.1's noted risk: Haiku
+    may occasionally drop the JSON envelope under conversational pressure) —
+    this keeps the single-bot path working even if the model regresses to
+    the old plain-text format, at the cost of never detecting multi-bot/office
+    intent in that fallback case. Returns None only if payload is empty.
+    """
+    payload = ready_payload.strip()
+    if not payload:
+        return None
+    try:
+        from features.office_events import EVENT_TYPE_LABELS
+
+        parsed = json.loads(payload)
+        bots = parsed.get("bots")
+        if isinstance(bots, list) and bots and all(
+            isinstance(b, dict) and isinstance(b.get("summary"), str) and b["summary"].strip()
+            for b in bots
+        ):
+            links = parsed.get("links")
+            # A hallucinated event_type outside the closed set (docs/
+            # MULTIBOT_OFFICE_ROUTING_DESIGN.md §4 q3, decision "а") is
+            # dropped silently here rather than raising — the prompt already
+            # tells the model not to invent one, this is the last-resort
+            # guard so a slip can't reach add_office_link() downstream.
+            return {
+                "bots": [
+                    {"role_hint": str(b.get("role_hint") or f"bot_{i+1}"), "summary": b["summary"].strip()}
+                    for i, b in enumerate(bots)
+                ],
+                "links": [
+                    {
+                        "source_role_hint": str(link["source_role_hint"]),
+                        "target_role_hint": str(link["target_role_hint"]),
+                        "event_type": str(link["event_type"]),
+                    }
+                    for link in (links if isinstance(links, list) else [])
+                    if isinstance(link, dict) and link.get("source_role_hint")
+                    and link.get("target_role_hint") and link.get("event_type") in EVENT_TYPE_LABELS
+                ],
+            }
+    except (json.JSONDecodeError, TypeError, KeyError, AttributeError):
+        pass
+    return {"bots": [{"role_hint": "bot_1", "summary": payload}], "links": []}
 
 
 async def extract_bot_name(requirements_summary: str) -> str:
