@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 import os
 import tempfile
@@ -31,6 +32,14 @@ from runtime.registry_holder import RegistryHandle
 from runtime.webhook_setup import build_webhook_url, set_miniapp_menu_button, set_webhook_for_bot
 from services.bot_runner import start_bot
 from services.claude_service import chat_gather_requirements, extract_bot_name, generate_bot_code, generate_bot_guide
+from services.attachment_service import (
+    MAX_DOCUMENT_SIZE_BYTES,
+    MAX_PENDING_ATTACHMENTS,
+    SUPPORTED_IMAGE_MIME,
+    build_image_block,
+    build_text_block,
+    extract_document_text,
+)
 from services.github_sync import push_bot_to_github
 from services.telegram_api import get_managed_bot_token
 from services.voice_service import transcribe_voice
@@ -304,6 +313,7 @@ async def _set_bot_profile_photo(token: str, photo_path: str) -> None:
 
 class CreateBotStates(StatesGroup):
     gathering = State()
+    confirming = State()
     waiting_for_display_name = State()
     waiting_for_welcome_photo = State()
     waiting_for_avatar_photo = State()
@@ -359,11 +369,12 @@ async def _start_create_flow(user_id: int, answer, state: FSMContext) -> None:
     _pending.pop(user_id, None)
     await state.clear()
     await state.set_state(CreateBotStates.gathering)
-    await state.update_data(conversation=[])
+    await state.update_data(conversation=[], pending_attachments=[])
     await answer(
-        "Расскажите, какого бота хотите создать.\n"
-        "Опишите его назначение и функции.\n\n"
-        "Можно текстом или голосовым сообщением 🎤"
+        "Вы можете описать текстом или записать голосовое, в котором расскажете "
+        "подробно какого бота или систему ботов вы хотите сделать. А также можете "
+        "присылать мне скриншоты, документы, ссылки на таблицы и т.д., чтобы я "
+        "лучше понял, что мы будем автоматизировать😉"
     )
 
 
@@ -412,22 +423,119 @@ async def _recognize_voice(message: Message, bot: Bot) -> str | None:
     return text
 
 
-@router.message(CreateBotStates.gathering, F.voice)
+_GATHER_STATES = StateFilter(CreateBotStates.gathering, CreateBotStates.confirming)
+
+
+def _confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Начать генерацию", callback_data="confirm_generate")
+    ]])
+
+
+def _continue_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="▶️ Продолжить без текста", callback_data="gathering_continue")
+    ]])
+
+
+@router.message(_GATHER_STATES, F.voice)
 async def handle_gathering_voice(message: Message, state: FSMContext, bot: Bot):
     text = await _recognize_voice(message, bot)
     if text:
-        await _process_gathering_text(message, state, text)
+        await _process_gathering_content(message, state, text)
 
 
-@router.message(CreateBotStates.gathering, F.text, ~F.text.startswith("/"))
+@router.message(_GATHER_STATES, F.text, ~F.text.startswith("/"))
 async def handle_gathering(message: Message, state: FSMContext):
-    await _process_gathering_text(message, state, message.text)
+    await _process_gathering_content(message, state, message.text)
 
 
-async def _process_gathering_text(message: Message, state: FSMContext, text: str):
+@router.message(_GATHER_STATES, F.photo)
+async def handle_gathering_photo(message: Message, state: FSMContext, bot: Bot):
+    photo = message.photo[-1]
+    file = await bot.get_file(photo.file_id)
+    buf = io.BytesIO()
+    await bot.download_file(file.file_path, destination=buf)
+    block = build_image_block(buf.getvalue(), "image/jpeg")
+    await _add_pending_attachment(message, state, block, "📎 Принял скриншот")
+
+
+@router.message(_GATHER_STATES, F.document)
+async def handle_gathering_document(message: Message, state: FSMContext, bot: Bot):
+    doc = message.document
+    if doc.file_size and doc.file_size > MAX_DOCUMENT_SIZE_BYTES:
+        await message.answer("Файл слишком большой (максимум 15 МБ). Пришлите файл поменьше.")
+        return
+
+    file = await bot.get_file(doc.file_id)
+    buf = io.BytesIO()
+    await bot.download_file(file.file_path, destination=buf)
+    data = buf.getvalue()
+
+    if doc.mime_type in SUPPORTED_IMAGE_MIME:
+        block = build_image_block(data, doc.mime_type)
+        await _add_pending_attachment(message, state, block, "📎 Принял изображение")
+        return
+
+    try:
+        extracted = extract_document_text(data, doc.file_name or "")
+    except Exception:
+        await message.answer("Не удалось прочитать этот файл 😔 Попробуйте другой формат.")
+        return
+
+    if extracted is None:
+        await message.answer(
+            "Пока умею читать только PDF, Word (.docx) и Excel (.xlsx/.xls). "
+            "Пришлите файл в одном из этих форматов или опишите содержимое текстом."
+        )
+        return
+
+    block = build_text_block(f"[Документ: {doc.file_name}]\n{extracted}")
+    await _add_pending_attachment(message, state, block, f"📎 Принял документ «{doc.file_name}»")
+
+
+async def _add_pending_attachment(message: Message, state: FSMContext, block: dict, ack: str) -> None:
+    data = await state.get_data()
+    pending: list[dict] = data.get("pending_attachments", [])
+    if len(pending) >= MAX_PENDING_ATTACHMENTS:
+        await message.answer(
+            f"Уже накопил {MAX_PENDING_ATTACHMENTS} вложений — напишите текст, "
+            "чтобы я их обработал, прежде чем присылать ещё."
+        )
+        return
+    pending.append(block)
+    await state.update_data(pending_attachments=pending)
+    await message.answer(
+        f"{ack} ({len(pending)}). Жду ещё вложения или текст/голосовое с описанием — "
+        "или нажмите «Продолжить».",
+        reply_markup=_continue_keyboard(),
+    )
+
+
+@router.callback_query(F.data == "gathering_continue", _GATHER_STATES)
+async def cb_gathering_continue(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    data = await state.get_data()
+    pending: list[dict] = data.get("pending_attachments", [])
+    if not pending:
+        await callback.message.answer("Вложений нет — напишите текст или пришлите файл.")
+        return
+    await _process_gathering_content(callback.message, state, None)
+
+
+async def _process_gathering_content(message: Message, state: FSMContext, text: str | None) -> None:
     data = await state.get_data()
     conversation: list[dict] = data.get("conversation", [])
-    conversation.append({"role": "user", "content": text})
+    pending: list[dict] = data.get("pending_attachments", [])
+
+    blocks = list(pending)
+    if text:
+        blocks.append(build_text_block(text))
+    if not blocks:
+        return
+
+    conversation.append({"role": "user", "content": blocks})
+    await state.update_data(pending_attachments=[])
 
     analyzing_msg = await message.answer("Анализирую... ⏳")
     response = await chat_gather_requirements(conversation)
@@ -450,17 +558,28 @@ async def _process_gathering_text(message: Message, state: FSMContext, text: str
             bot_summary=summary,
             bot_name=bot_name,
         )
-        await state.set_state(CreateBotStates.waiting_for_display_name)
+        await state.set_state(CreateBotStates.confirming)
         await message.answer(
-            "Отлично! Осталось пару вопросов.\n\n"
-            "👤 *Как будут звать этого бота?*\n"
-            "Например: Макс, Катя, Алекс — это имя для общения в групповом чате.\n\n"
-            "Напишите имя или /skip чтобы пропустить.",
-            parse_mode="Markdown",
+            "Я готов создавать бота по вашему запросу. Вам есть ещё что добавить: "
+            "какие-нибудь детали, нюансы, пожелания?🤗",
+            reply_markup=_confirm_keyboard(),
         )
     else:
         await state.update_data(conversation=conversation)
         await message.answer(response)
+
+
+@router.callback_query(F.data == "confirm_generate", CreateBotStates.confirming)
+async def cb_confirm_generate(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.set_state(CreateBotStates.waiting_for_display_name)
+    await callback.message.answer(
+        "Отлично! Осталось пару вопросов.\n\n"
+        "👤 *Как будут звать этого бота?*\n"
+        "Например: Макс, Катя, Алекс — это имя для общения в групповом чате.\n\n"
+        "Напишите имя или /skip чтобы пропустить.",
+        parse_mode="Markdown",
+    )
 
 
 # ── waiting_for_display_name ──────────────────────────────────────────────────
@@ -558,13 +677,22 @@ async def _generate_and_show_button(message: Message, state: FSMContext) -> None
 def _first_user_message(conversation: list[dict]) -> str | None:
     """The original free-text request that kicked off this /create flow —
     the FIRST role="user" entry in the gathering conversation (see
-    _process_gathering_text), before any Claude clarification turned it into
-    bot_summary/description. None if the conversation is empty/malformed
-    (shouldn't happen post-gathering, but defensive)."""
+    _process_gathering_content), before any Claude clarification turned it into
+    bot_summary/description. content is either a plain string or a list of
+    Claude content blocks (text/image) since attachments were added — in the
+    latter case this pulls the first text block. None if the conversation is
+    empty/malformed or the first turn has no text at all."""
     for turn in conversation:
         if isinstance(turn, dict) and turn.get("role") == "user":
             content = turn.get("content")
-            return content if isinstance(content, str) else None
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        return block.get("text")
+                return None
+            return None
     return None
 
 

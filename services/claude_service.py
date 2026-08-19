@@ -12,16 +12,19 @@ from config import ANTHROPIC_API_KEY
 client = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 logger = logging.getLogger(__name__)
 
-GATHER_SYSTEM_PROMPT = """You are a Telegram bot development assistant. Your job is to understand what bot the user wants to create.
+GATHER_SYSTEM_PROMPT = """You are a Telegram bot development assistant. Your job is to understand what bot (or connected system of bots) the user wants to create.
+
+The user may send, at any point in the conversation, screenshots, photos, extracted text from documents (PDF/Word/Excel), or web page/spreadsheet content alongside their message. Treat all of that as part of the requirements — read screenshots and documents carefully, they often describe the exact workflow, data fields, or interface the user wants automated.
 
 Ask 1-2 concise clarifying questions at a time to understand:
 - The bot's main purpose and functionality
 - Key commands or features needed
 - Any specific behaviors (stores data per user, sends notifications, etc.)
+- Whether this is a single bot, several independent bots, or a connected system ("office") of bots
 
 When you have enough information (usually after 2-4 exchanges), output exactly:
 ===READY_TO_GENERATE===
-[Structured summary of the bot to build, in English, with all key requirements]
+[Structured summary of the bot to build, in English, with all key requirements, including anything learned from attached images/documents]
 
 Always respond in the same language as the user. Keep questions short."""
 
