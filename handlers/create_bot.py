@@ -18,6 +18,7 @@ from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, Inli
 
 from config import ASSEMBLYAI_API_KEY, BOT_TOKEN, DATA_DIR
 from db.database import (
+    add_office_link,
     add_template_candidate,
     create_bot_record_with_admins,
     enable_bot_feature,
@@ -31,7 +32,13 @@ from db.database import (
 from runtime.registry_holder import RegistryHandle
 from runtime.webhook_setup import build_webhook_url, set_miniapp_menu_button, set_webhook_for_bot
 from services.bot_runner import start_bot
-from services.claude_service import chat_gather_requirements, extract_bot_name, generate_bot_code, generate_bot_guide
+from services.claude_service import (
+    chat_gather_requirements,
+    extract_bot_name,
+    generate_bot_code,
+    generate_bot_guide,
+    parse_gather_result,
+)
 from services.attachment_service import (
     MAX_DOCUMENT_SIZE_BYTES,
     MAX_PENDING_ATTACHMENTS,
@@ -612,33 +619,76 @@ async def _process_gathering_content(message: Message, state: FSMContext, text: 
 
     if "===READY_TO_GENERATE===" in response:
         parts = response.split("===READY_TO_GENERATE===")
-        summary = parts[1].strip() if len(parts) > 1 else response
+        raw_payload = parts[1].strip() if len(parts) > 1 else response
+        plan = parse_gather_result(raw_payload)
+        if plan is None:
+            await state.update_data(conversation=conversation)
+            await message.answer(response)
+            return
+
+        office_bots = plan["bots"]
+        office_links = plan["links"]
+        first_summary = office_bots[0]["summary"]
         try:
-            bot_name = await extract_bot_name(summary)
+            bot_name = await extract_bot_name(first_summary)
         except Exception:
             bot_name = "my_bot"
 
         await state.update_data(
             conversation=conversation,
-            bot_summary=summary,
+            bot_summary=first_summary,
             bot_name=bot_name,
+            office_bots=office_bots,
+            office_links=office_links,
+            office_index=0,
+            office_bot_ids={},
         )
         await state.set_state(CreateBotStates.confirming)
-        await message.answer(
-            "Я готов создавать бота по вашему запросу. Вам есть ещё что добавить: "
-            "какие-нибудь детали, нюансы, пожелания?🤗",
-            reply_markup=_confirm_keyboard(),
-        )
+        if len(office_bots) > 1:
+            roles = ", ".join(b["role_hint"] for b in office_bots)
+            link_descriptions = [
+                f"{link['source_role_hint']}→{link['target_role_hint']} ({link['event_type']})"
+                for link in office_links
+            ]
+            links_note = f"\n🔗 Свяжу их через: {', '.join(link_descriptions)}" if link_descriptions else ""
+            await message.answer(
+                f"Я готов создавать офис из {len(office_bots)} ботов: {roles}.{links_note}\n\n"
+                f"Начнём с первого («{office_bots[0]['role_hint']}»). Вам есть ещё что добавить "
+                "по всему офису: какие-нибудь детали, нюансы, пожелания?🤗",
+                reply_markup=_confirm_keyboard(),
+            )
+        else:
+            await message.answer(
+                "Я готов создавать бота по вашему запросу. Вам есть ещё что добавить: "
+                "какие-нибудь детали, нюансы, пожелания?🤗",
+                reply_markup=_confirm_keyboard(),
+            )
     else:
         await state.update_data(conversation=conversation)
         await message.answer(response)
+
+
+def _office_progress_prefix(data: dict) -> str:
+    """"Бот 2 из 3: accounting" prefix shown ahead of every per-bot onboarding
+    question once an office/multi-bot plan is active (docs/
+    MULTIBOT_OFFICE_ROUTING_DESIGN.md §4 q1: owner confirmed the BotFather
+    step must repeat per bot, with a progress indicator). Empty string for
+    the single-bot case, so existing single-bot messages are unchanged."""
+    office_bots: list[dict] = data.get("office_bots") or []
+    if len(office_bots) <= 1:
+        return ""
+    index: int = data.get("office_index", 0)
+    role_hint = office_bots[index]["role_hint"] if index < len(office_bots) else "?"
+    return f"🏢 Бот {index + 1} из {len(office_bots)}: {role_hint}\n\n"
 
 
 @router.callback_query(F.data == "confirm_generate", CreateBotStates.confirming)
 async def cb_confirm_generate(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     await state.set_state(CreateBotStates.waiting_for_display_name)
+    data = await state.get_data()
     await callback.message.answer(
+        _office_progress_prefix(data) +
         "Отлично! Осталось пару вопросов.\n\n"
         "👤 *Как будут звать этого бота?*\n"
         "Например: Макс, Катя, Алекс — это имя для общения в групповом чате.\n\n"
@@ -835,8 +885,15 @@ async def _run_generation(chat_id: int, user_id: int, bot: Bot, state: FSMContex
         "office_hook_config": office_hook_config,
         "voice_cashflow_config": voice_cashflow_config,
         "fallback_info": fallback_info,
+        "office_bots": data.get("office_bots") or [],
+        "office_links": data.get("office_links") or [],
+        "office_index": data.get("office_index", 0),
+        "office_bot_ids": data.get("office_bot_ids") or {},
+        "office_role_hint": (data.get("office_bots") or [{}])[data.get("office_index", 0)].get("role_hint")
+            if data.get("office_bots") else None,
     }
 
+    progress_prefix = _office_progress_prefix(data)
     suggested_username = f"{bot_name}Bot"
     display_name = bot_name.replace("_", " ").title()
     if _manager_username:
@@ -846,7 +903,7 @@ async def _run_generation(chat_id: int, user_id: int, bot: Bot, state: FSMContex
         )
         button_text = "Создать бота ✨"
         instructions = (
-            f"Код готов! ✅\n\n"
+            f"{progress_prefix}Код готов! ✅\n\n"
             f"Предлагаемый username: *@{suggested_username}*\n\n"
             f"1️⃣ Нажми кнопку ниже\n"
             f"2️⃣ Проверь имя и username в BotFather (можно изменить)\n"
@@ -856,7 +913,7 @@ async def _run_generation(chat_id: int, user_id: int, bot: Bot, state: FSMContex
         url = "https://t.me/BotFather?start=newbot"
         button_text = "Открыть BotFather 🤖"
         instructions = (
-            f"Код готов! ✅\n\n"
+            f"{progress_prefix}Код готов! ✅\n\n"
             f"Предлагаемое имя: *{bot_name}_bot*\n\n"
             f"1️⃣ Нажми кнопку → BotFather\n"
             f"2️⃣ Отправь /newbot, введи имя и username\n"
@@ -886,6 +943,112 @@ async def cb_retry_generate(callback: CallbackQuery, state: FSMContext):
         bot=callback.bot,
         state=state,
     )
+
+
+# ── office/multi-bot queue continuation ───────────────────────────────────────
+
+def _office_link_summary(office_links: list[dict], office_bot_ids: dict, created: int) -> str:
+    """Human-readable report of which links got created vs skipped, sent once
+    the last bot in an office plan is activated (docs/
+    MULTIBOT_OFFICE_ROUTING_DESIGN.md §3.3)."""
+    parts = [f"🔗 Связей создано: {created} из {len(office_links)}."]
+    if created < len(office_links):
+        parts.append(
+            "Часть связей не удалось создать (роль без реально созданного бота "
+            "или связь между ботами разных владельцев) — их можно донастроить "
+            "вручную в разделе «🏢 Офисы»."
+        )
+    return "\n".join(parts)
+
+
+async def _finish_office_plan(pending: dict, bot: Bot, chat_id: int) -> None:
+    """Called once the LAST bot in an office/multi-bot plan has been created —
+    resolves every link's role_hint to a real bot_id and wires it up via the
+    already-existing db.database.add_office_link() (docs/OFFICES_DESIGN.md's
+    infra, reused as-is — see docs/MULTIBOT_OFFICE_ROUTING_DESIGN.md §3.3)."""
+    office_links: list[dict] = pending.get("office_links") or []
+    if not office_links:
+        return
+    office_bot_ids: dict = pending.get("office_bot_ids") or {}
+    created = 0
+    for link in office_links:
+        source_id = office_bot_ids.get(link["source_role_hint"])
+        target_id = office_bot_ids.get(link["target_role_hint"])
+        if source_id is None or target_id is None:
+            continue
+        if await add_office_link(source_id, target_id, link["event_type"]):
+            created += 1
+    await bot.send_message(chat_id, _office_link_summary(office_links, office_bot_ids, created))
+
+
+async def _continue_office_queue(
+    pending: dict, bot_record_id: int, creator_user_id: int, bot: Bot, storage
+) -> bool:
+    """After a single bot from _pending finishes activation, records its
+    role_hint -> real bot_id and either kicks off onboarding for the next bot
+    in an office/multi-bot queue, or — if this was the last one — wires up
+    every office_links entry and reports the result. No-op for the ordinary
+    single-bot case (office_bots absent/length<=1). See docs/
+    MULTIBOT_OFFICE_ROUTING_DESIGN.md §3.2 (variant A: owner repeats the
+    BotFather step per bot, no way around Telegram's one-bot-per-action API)
+    and §3.3 (link resolution happens only once every bot has a real id).
+
+    Returns True if it advanced the queue to the next bot (a fresh FSM state
+    was just set for creator_user_id — callers must NOT clear/overwrite it
+    afterwards), False otherwise (ordinary single-bot case, or this was the
+    last bot in the office and the links were just wired up)."""
+    office_bots: list[dict] = pending.get("office_bots") or []
+    if len(office_bots) <= 1:
+        return False
+
+    role_hint = pending.get("office_role_hint")
+    office_bot_ids: dict = pending.get("office_bot_ids") or {}
+    if role_hint:
+        office_bot_ids[role_hint] = bot_record_id
+    pending["office_bot_ids"] = office_bot_ids
+
+    office_index: int = pending.get("office_index", 0)
+    chat_id = pending["chat_id"]
+
+    if office_index + 1 >= len(office_bots):
+        await _finish_office_plan(pending, bot, chat_id)
+        return False
+
+    next_index = office_index + 1
+    next_bot = office_bots[next_index]
+    try:
+        next_bot_name = await extract_bot_name(next_bot["summary"])
+    except Exception:
+        next_bot_name = f"my_bot_{next_index + 1}"
+
+    if not storage or not _bot_id:
+        logger.warning(
+            f"Office queue for user {creator_user_id} cannot continue — no FSM storage available"
+        )
+        return False
+    from aiogram.fsm.storage.base import StorageKey
+    key = StorageKey(bot_id=_bot_id, chat_id=creator_user_id, user_id=creator_user_id)
+    next_state = FSMContext(storage=storage, key=key)
+    await next_state.set_data({
+        "conversation": [],
+        "bot_summary": next_bot["summary"],
+        "bot_name": next_bot_name,
+        "office_bots": office_bots,
+        "office_links": pending.get("office_links") or [],
+        "office_index": next_index,
+        "office_bot_ids": office_bot_ids,
+    })
+    await next_state.set_state(CreateBotStates.waiting_for_display_name)
+    await bot.send_message(
+        chat_id,
+        f"▶️ Переходим к следующему боту офиса.\n\n"
+        f"🏢 Бот {next_index + 1} из {len(office_bots)}: {next_bot['role_hint']}\n\n"
+        "👤 *Как будут звать этого бота?*\n"
+        "Например: Макс, Катя, Алекс — это имя для общения в групповом чате.\n\n"
+        "Напишите имя или /skip чтобы пропустить.",
+        parse_mode="Markdown",
+    )
+    return True
 
 
 # ── managed bot auto-launch ───────────────────────────────────────────────────
@@ -1018,6 +1181,7 @@ async def auto_launch_managed_bot(managed_data: dict, bot: Bot, storage=None) ->
         extra_env["BOT_DISPLAY_NAME"] = display_name
     activation = await _activate_new_bot(bot_record_id, bot_name, bot_file, token, extra_env, has_miniapp=bool(miniapp_config))
     await _notify_bot_created(bot, chat_id, bot_record_id, bot_name, bot_summary, username_display, activation)
+    await _continue_office_queue(pending, bot_record_id, creator_user_id, bot, storage)
 
 
 # ── manual token entry (fallback) ─────────────────────────────────────────────
@@ -1103,4 +1267,15 @@ async def handle_token(message: Message, state: FSMContext, bot: Bot):
     activation = await _activate_new_bot(bot_id, bot_name, bot_file, token, extra_env, has_miniapp=bool(miniapp_config))
     await _notify_bot_created(bot, message.chat.id, bot_id, bot_name, bot_summary, username_display, activation)
 
-    await state.clear()
+    office_pending = {
+        "chat_id": message.chat.id,
+        "office_bots": data.get("office_bots") or [],
+        "office_links": data.get("office_links") or [],
+        "office_index": data.get("office_index", 0),
+        "office_bot_ids": data.get("office_bot_ids") or {},
+        "office_role_hint": (data.get("office_bots") or [{}])[data.get("office_index", 0)].get("role_hint")
+            if data.get("office_bots") else None,
+    }
+    advanced = await _continue_office_queue(office_pending, bot_id, message.from_user.id, bot, state.storage)
+    if not advanced:
+        await state.clear()

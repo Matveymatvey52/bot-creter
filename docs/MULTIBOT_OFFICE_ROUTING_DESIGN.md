@@ -1,6 +1,11 @@
 # Этап E: мультибот/офис-роутинг в /create — дизайн
 
-Статус: ЧЕРНОВИК, СТОП перед реализацией. Ждёт решения владельца.
+Статус: РЕАЛИЗОВАНО. Все 4 вопроса раздела 4 решены владельцем (вариант A
+для UX-цикла, JSON-формат вывода, "не поддерживается" для неизвестных
+event_type, отдельный трек от этапа D) — код в `services/claude_service.py`
+(`parse_gather_result`, обновлённый `GATHER_SYSTEM_PROMPT`) и
+`handlers/create_bot.py` (`_continue_office_queue`, `_finish_office_plan`),
+тесты в `tests/test_office_multibot_gather.py`.
 
 ## 1. Что уже есть (факты из кода)
 
