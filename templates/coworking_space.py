@@ -273,6 +273,81 @@ async def init_db(db_path: str):
         await db.commit()
 
 
+# ── mini-app config (see docs/MINIAPP_DESIGN.md, templates/car_rental.py's
+# own miniapp_config for the authoring contract) ────────────────────────────
+# bookings is creatable despite the overlap-check business logic above — same
+# tradeoff templates/car_rental.py already accepts (a generic mini-app create
+# form bypasses _has_overlap's guarded transaction, so an owner using it to
+# add a booking manually could in principle create a double-booking; this is
+# accepted here too since the admin-facing use case is a manual/offline
+# override, not the self-service client flow). service_requests/
+# guest_registrations are read-only: both are produced only as a side effect
+# of an existing booking (svc_type/guest_name FSMs), not standalone records.
+miniapp_config = {
+    "resources": [
+        {
+            "name": "resources",
+            "table": "resources",
+            "order_by": "id DESC",
+            "creatable": True,
+            "title": "Ресурсы",
+            "titleField": "name",
+            "fields": [
+                {"name": "name", "required": True, "label": "Название", "kind": "text", "list": True, "detail": True, "create": True},
+                {"name": "resource_type", "required": True, "label": "Тип", "kind": "text", "list": True, "detail": True, "create": True},
+                {"name": "is_active", "label": "Активен", "kind": "status", "list": True, "detail": True, "create": False},
+            ],
+        },
+        {
+            "name": "bookings",
+            "table": "bookings",
+            "order_by": "created_at DESC",
+            "creatable": True,
+            "title": "Брони",
+            "titleField": "client_name",
+            "fields": [
+                {"name": "resource_id", "required": True, "label": "ID ресурса", "kind": "number", "list": False, "detail": False, "create": True},
+                {"name": "client_user_id", "required": True, "label": "ID клиента", "kind": "number", "list": False, "detail": False, "create": True},
+                {"name": "client_name", "label": "Имя клиента", "kind": "text", "list": True, "detail": True, "create": True},
+                {"name": "booking_date", "required": True, "label": "Дата", "kind": "date", "list": True, "detail": True, "create": True},
+                {"name": "time_slot_start", "required": True, "label": "Начало", "kind": "text", "list": True, "detail": True, "create": True},
+                {"name": "time_slot_end", "required": True, "label": "Окончание", "kind": "text", "list": True, "detail": True, "create": True},
+                {"name": "tariff", "label": "Тариф", "kind": "text", "list": False, "detail": True, "create": True},
+                {"name": "status", "label": "Статус", "kind": "status", "list": True, "detail": True, "create": False},
+            ],
+        },
+        {
+            "name": "guests",
+            "table": "guest_registrations",
+            "order_by": "created_at DESC",
+            "creatable": False,
+            "title": "Гости",
+            "titleField": "guest_name",
+            "fields": [
+                {"name": "booking_id", "label": "ID брони", "kind": "number", "list": True, "detail": True, "create": False},
+                {"name": "guest_name", "label": "Имя гостя", "kind": "text", "list": True, "detail": True, "create": False},
+                {"name": "created_at", "label": "Дата", "kind": "date", "list": True, "detail": True, "create": False},
+            ],
+        },
+        {
+            "name": "service_requests",
+            "table": "service_requests",
+            "order_by": "created_at DESC",
+            "creatable": False,
+            "title": "Заявки на услуги",
+            "titleField": "service_type",
+            "fields": [
+                {"name": "client_user_id", "label": "ID клиента", "kind": "number", "list": True, "detail": True, "create": False},
+                {"name": "booking_id", "label": "ID брони", "kind": "number", "list": False, "detail": True, "create": False},
+                {"name": "service_type", "label": "Тип услуги", "kind": "text", "list": True, "detail": True, "create": False},
+                {"name": "status", "label": "Статус", "kind": "status", "list": True, "detail": True, "create": False},
+                {"name": "created_at", "label": "Дата", "kind": "date", "list": False, "detail": True, "create": False},
+            ],
+        },
+    ],
+}
+
+
 # ── overlap check ────────────────────────────────────────────────────────────
 # The one piece of real business logic in this template — see DESIGN NOTE
 # above. `db` must be an already-open aiosqlite connection; caller controls

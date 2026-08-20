@@ -539,5 +539,57 @@ class CoworkingSpaceStandaloneSmokeTest(unittest.TestCase):
         self.assertTrue(hasattr(coworking_space, "main"))
 
 
+class CoworkingSpaceMiniAppConfigTests(unittest.IsolatedAsyncioTestCase):
+    """miniapp_config's declared table/field names must match init_db()'s
+    real schema — miniapp_api.py builds SQL directly off these names, so a
+    drift here would 500 at request time instead of failing a test."""
+
+    def test_miniapp_config_resource_names(self):
+        names = {r["name"] for r in coworking_space.miniapp_config["resources"]}
+        self.assertEqual(names, {"resources", "bookings", "guests", "service_requests"})
+
+    def test_resources_resource_targets_resources_table(self):
+        resources = next(r for r in coworking_space.miniapp_config["resources"] if r["name"] == "resources")
+        self.assertEqual(resources["table"], "resources")
+        self.assertTrue(resources["creatable"])
+        self.assertIn("name", {f["name"] for f in resources["fields"]})
+
+    def test_bookings_resource_targets_bookings_table(self):
+        bookings = next(r for r in coworking_space.miniapp_config["resources"] if r["name"] == "bookings")
+        self.assertEqual(bookings["table"], "bookings")
+        self.assertTrue(bookings["creatable"])
+        field_names = {f["name"] for f in bookings["fields"]}
+        self.assertEqual(
+            field_names,
+            {"resource_id", "client_user_id", "client_name", "booking_date",
+             "time_slot_start", "time_slot_end", "tariff", "status"},
+        )
+
+    def test_guests_resource_targets_guest_registrations_table(self):
+        guests = next(r for r in coworking_space.miniapp_config["resources"] if r["name"] == "guests")
+        self.assertEqual(guests["table"], "guest_registrations")
+        self.assertFalse(guests["creatable"])
+
+    def test_service_requests_resource_targets_service_requests_table(self):
+        svc = next(r for r in coworking_space.miniapp_config["resources"] if r["name"] == "service_requests")
+        self.assertEqual(svc["table"], "service_requests")
+        self.assertFalse(svc["creatable"])
+
+    async def test_miniapp_config_fields_match_real_schema(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "schema_check.db")
+            await coworking_space.init_db(db_path)
+            async with aiosqlite.connect(db_path) as db:
+                for resource in coworking_space.miniapp_config["resources"]:
+                    cur = await db.execute(f"PRAGMA table_info({resource['table']})")
+                    real_columns = {row[1] for row in await cur.fetchall()}
+                    declared = {f["name"] for f in resource["fields"]} | {"id"}
+                    self.assertTrue(
+                        declared.issubset(real_columns),
+                        f"{resource['name']}: declared fields {declared} not all in "
+                        f"real columns {real_columns}",
+                    )
+
+
 if __name__ == "__main__":
     unittest.main()
