@@ -189,6 +189,52 @@ async def init_db(db_path: str):
         await db.commit()
 
 
+# ── mini-app config (see docs/MINIAPP_DESIGN.md, templates/car_rental.py's
+# own miniapp_config for the authoring contract) ────────────────────────────
+# metric_entries is not creatable here: rows come from the multi-step
+# MetricsEntry FSM (clicks -> leads -> sales, all bound to an existing
+# campaign_id) — a generic single-form create would let the mini-app insert
+# an orphaned entry with no existence check, unlike metrics_sales() above.
+miniapp_config = {
+    "resources": [
+        {
+            "name": "campaigns",
+            "table": "campaigns",
+            "order_by": "created_at DESC",
+            "creatable": True,
+            "title": "Кампании",
+            "titleField": "name",
+            "fields": [
+                {"name": "name", "required": True, "label": "Название", "kind": "text", "list": True, "detail": True, "create": True},
+                {"name": "channel", "required": True, "label": "Канал", "kind": "text", "list": True, "detail": True, "create": True},
+                {"name": "budget", "label": "Бюджет", "kind": "number", "list": True, "detail": True, "create": True},
+                {"name": "start_date", "required": True, "label": "Начало", "kind": "date", "list": False, "detail": True, "create": True},
+                {"name": "end_date", "label": "Окончание", "kind": "date", "list": False, "detail": True, "create": True},
+                {"name": "status", "label": "Статус", "kind": "status", "list": True, "detail": True, "create": False},
+                {"name": "created_by", "label": "Создал", "kind": "number", "list": False, "detail": True, "create": False},
+                {"name": "created_at", "label": "Создано", "kind": "date", "list": False, "detail": True, "create": False},
+            ],
+        },
+        {
+            "name": "metrics",
+            "table": "metric_entries",
+            "order_by": "entered_at DESC",
+            "creatable": False,
+            "title": "Метрики",
+            "titleField": "entered_at",
+            "fields": [
+                {"name": "campaign_id", "label": "ID кампании", "kind": "number", "list": True, "detail": True, "create": False},
+                {"name": "clicks", "label": "Переходы", "kind": "number", "list": True, "detail": True, "create": False},
+                {"name": "leads", "label": "Заявки", "kind": "number", "list": True, "detail": True, "create": False},
+                {"name": "sales", "label": "Продажи", "kind": "number", "list": True, "detail": True, "create": False},
+                {"name": "entered_by", "label": "Внёс", "kind": "number", "list": False, "detail": True, "create": False},
+                {"name": "entered_at", "label": "Дата", "kind": "date", "list": True, "detail": True, "create": False},
+            ],
+        },
+    ],
+}
+
+
 async def _campaign_totals(db: aiosqlite.Connection, campaign_id: int) -> dict:
     row = await (await db.execute(
         "SELECT COALESCE(SUM(clicks),0), COALESCE(SUM(leads),0), COALESCE(SUM(sales),0) "

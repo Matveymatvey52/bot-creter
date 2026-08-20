@@ -598,5 +598,47 @@ class ReviewFixRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(_metric_entries(self.config.db_path), [])
 
 
+class CampaignTrackerMiniAppConfigTests(unittest.IsolatedAsyncioTestCase):
+    """miniapp_config's declared table/field names must match init_db()'s
+    real schema — miniapp_api.py builds SQL directly off these names, so a
+    drift here would 500 at request time instead of failing a test."""
+
+    def test_miniapp_config_resource_names(self):
+        names = {r["name"] for r in campaign_tracker.miniapp_config["resources"]}
+        self.assertEqual(names, {"campaigns", "metrics"})
+
+    def test_campaigns_resource_targets_campaigns_table(self):
+        campaigns = next(r for r in campaign_tracker.miniapp_config["resources"] if r["name"] == "campaigns")
+        self.assertEqual(campaigns["table"], "campaigns")
+        self.assertTrue(campaigns["creatable"])
+        self.assertIn("name", {f["name"] for f in campaigns["fields"]})
+
+    def test_metrics_resource_targets_metric_entries_table(self):
+        metrics = next(r for r in campaign_tracker.miniapp_config["resources"] if r["name"] == "metrics")
+        self.assertEqual(metrics["table"], "metric_entries")
+        self.assertFalse(metrics["creatable"])
+        field_names = {f["name"] for f in metrics["fields"]}
+        self.assertEqual(
+            field_names,
+            {"campaign_id", "clicks", "leads", "sales", "entered_by", "entered_at"},
+        )
+
+    async def test_miniapp_config_fields_match_real_schema(self):
+        import aiosqlite
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "schema_check.db")
+            await campaign_tracker.init_db(db_path)
+            async with aiosqlite.connect(db_path) as db:
+                for resource in campaign_tracker.miniapp_config["resources"]:
+                    cur = await db.execute(f"PRAGMA table_info({resource['table']})")
+                    real_columns = {row[1] for row in await cur.fetchall()}
+                    declared = {f["name"] for f in resource["fields"]} | {"id"}
+                    self.assertTrue(
+                        declared.issubset(real_columns),
+                        f"{resource['name']}: declared fields {declared} not all in "
+                        f"real columns {real_columns}",
+                    )
+
+
 if __name__ == "__main__":
     unittest.main()
