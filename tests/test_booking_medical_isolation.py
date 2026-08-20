@@ -28,6 +28,7 @@ from datetime import date, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import aiosqlite
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
 
@@ -484,6 +485,46 @@ class BookingMedicalButtonPathAndFixRegressionTests(unittest.IsolatedAsyncioTest
         count = conn.execute("SELECT COUNT(*) FROM appointments").fetchall()[0][0]
         conn.close()
         self.assertEqual(count, 0)
+
+
+class BookingMedicalMiniAppConfigTests(unittest.IsolatedAsyncioTestCase):
+    """miniapp_config's declared table/field names must match init_db()'s
+    real schema — miniapp_api.py builds SQL directly off these names, so a
+    drift here would 500 at request time instead of failing a test."""
+
+    def test_miniapp_config_resource_names(self):
+        names = {r["name"] for r in booking_medical.miniapp_config["resources"]}
+        self.assertEqual(names, {"doctors", "slots", "patients", "appointments"})
+
+    def test_doctors_resource_targets_doctors_table(self):
+        doctors = next(r for r in booking_medical.miniapp_config["resources"] if r["name"] == "doctors")
+        self.assertEqual(doctors["table"], "doctors")
+        self.assertTrue(doctors["creatable"])
+
+    def test_appointments_resource_targets_appointments_table(self):
+        appointments = next(r for r in booking_medical.miniapp_config["resources"] if r["name"] == "appointments")
+        self.assertEqual(appointments["table"], "appointments")
+        field_names = {f["name"] for f in appointments["fields"]}
+        self.assertEqual(
+            field_names,
+            {"slot_id", "patient_id", "complaint", "allergies", "policy_number",
+             "is_repeat_visit", "status", "created_at"},
+        )
+
+    async def test_miniapp_config_fields_match_real_schema(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "schema_check.db")
+            await booking_medical.init_db(db_path)
+            async with aiosqlite.connect(db_path) as db:
+                for resource in booking_medical.miniapp_config["resources"]:
+                    cur = await db.execute(f"PRAGMA table_info({resource['table']})")
+                    real_columns = {row[1] for row in await cur.fetchall()}
+                    declared = {f["name"] for f in resource["fields"]} | {"id"}
+                    self.assertTrue(
+                        declared.issubset(real_columns),
+                        f"{resource['name']}: declared fields {declared} not all in "
+                        f"real columns {real_columns}",
+                    )
 
 
 class BookingMedicalStandaloneSmokeTest(unittest.TestCase):

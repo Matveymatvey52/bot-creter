@@ -160,6 +160,78 @@ def _normalize_phone(raw: str) -> str | None:
     return f"+{digits[0]} ({digits[1:4]}) {digits[4:7]}-{digits[7:9]}-{digits[9:11]}"
 
 
+# ── mini-app config (see docs/MINIAPP_DESIGN.md) ────────────────────────────
+# Sensitive appointment fields (complaint/allergies/policy_number) are shown
+# only in appointments' detail view, not list — mirrors the bot's own privacy
+# boundary (🗂 Карта пациента is a deliberate, explicit action, never
+# broadcast) — the mini-app is owner-only, same audience as that admin action.
+miniapp_config = {
+    "resources": [
+        {
+            "name": "doctors",
+            "table": "doctors",
+            "order_by": "id DESC",
+            "creatable": True,
+            "title": "Врачи",
+            "titleField": "name",
+            "fields": [
+                {"name": "name", "required": True, "label": "Имя", "kind": "text", "list": True, "detail": True, "create": True},
+                {"name": "specialization", "required": True, "label": "Специализация", "kind": "text", "list": True, "detail": True, "create": True},
+                {"name": "active", "label": "Активен", "kind": "status", "list": True, "detail": True, "create": False},
+            ],
+        },
+        {
+            "name": "slots",
+            "table": "slots",
+            "order_by": "slot_date DESC, slot_time DESC",
+            "creatable": False,
+            "title": "Слоты",
+            "titleField": "slot_time",
+            "fields": [
+                {"name": "doctor_id", "label": "ID врача", "kind": "number", "list": False, "detail": True, "create": False},
+                {"name": "slot_date", "label": "Дата", "kind": "date", "list": True, "detail": True, "create": False},
+                {"name": "slot_time", "label": "Время", "kind": "text", "list": True, "detail": True, "create": False},
+                {"name": "duration_min", "label": "Длительность (мин)", "kind": "number", "list": False, "detail": True, "create": False},
+                {"name": "status", "label": "Статус", "kind": "status", "list": True, "detail": True, "create": False},
+            ],
+        },
+        {
+            "name": "patients",
+            "table": "patients",
+            "order_by": "created_at DESC",
+            "creatable": False,
+            "title": "Пациенты",
+            "titleField": "full_name",
+            "fields": [
+                {"name": "user_id", "label": "ID пользователя", "kind": "number", "list": False, "detail": True, "create": False},
+                {"name": "full_name", "label": "ФИО", "kind": "text", "list": True, "detail": True, "create": False},
+                {"name": "phone", "label": "Телефон", "kind": "text", "list": True, "detail": True, "create": False},
+                {"name": "policy_number", "label": "Полис", "kind": "text", "list": False, "detail": True, "create": False},
+                {"name": "created_at", "label": "Создан", "kind": "date", "list": False, "detail": True, "create": False},
+            ],
+        },
+        {
+            "name": "appointments",
+            "table": "appointments",
+            "order_by": "created_at DESC",
+            "creatable": False,
+            "title": "Записи на приём",
+            "titleField": "status",
+            "fields": [
+                {"name": "slot_id", "label": "ID слота", "kind": "number", "list": False, "detail": True, "create": False},
+                {"name": "patient_id", "label": "ID пациента", "kind": "number", "list": False, "detail": True, "create": False},
+                {"name": "complaint", "label": "Жалоба", "kind": "text", "list": False, "detail": True, "create": False},
+                {"name": "allergies", "label": "Аллергии", "kind": "text", "list": False, "detail": True, "create": False},
+                {"name": "policy_number", "label": "Полис", "kind": "text", "list": False, "detail": True, "create": False},
+                {"name": "is_repeat_visit", "label": "Повторный визит", "kind": "status", "list": True, "detail": True, "create": False},
+                {"name": "status", "label": "Статус", "kind": "status", "list": True, "detail": True, "create": False},
+                {"name": "created_at", "label": "Создано", "kind": "date", "list": True, "detail": True, "create": False},
+            ],
+        },
+    ],
+}
+
+
 # ── db ────────────────────────────────────────────────────────────────────────
 
 async def init_db(db_path: str):
