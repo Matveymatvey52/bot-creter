@@ -53,6 +53,15 @@ LOW_VISITS_THRESHOLD = 2
 EXPIRING_SOON_DAYS = 3
 REMINDER_POLL_SECONDS = 6 * 3600
 NAME_MAX_LEN = 100
+MAX_RATING = 5
+# 0 = занятие можно оценить сразу, как только его дата прошла (slot_date <
+# today) — a trainer rating only makes sense for a session the client
+# actually attended, so this is measured from the SESSION's own date, not
+# from booking time. Kept as a knob (not hardcoded 0) in case an owner wants
+# to wait a day or two before prompting.
+RATING_PROMPT_DAYS_AFTER = 0
+RATING_COMMENT_MAX_LEN = 300
+STATS_RECENT_DAYS = 30  # window for attendance-by-trainer / churn heuristic in 📊 Статистика
 # ── END CUSTOMIZE ─────────────────────────────────────────────────────────────
 
 logging.basicConfig(level=logging.INFO)
@@ -198,6 +207,32 @@ def _normalize_phone(raw: str) -> str | None:
 # owner-editable catalogs (🏋 Тренеры / 🎟 Тарифы абонционов admin panels),
 # bookings/subscriptions are the resulting client records. bot_settings is a
 # single toggle row, not a list of records — no resource for it.
+#
+# role_filter DELIBERATELY NOT added to bookings/subscriptions — read
+# docs/MINIAPP_ROLE_SCOPING_DESIGN.md's "Auth-layer admin gate" section
+# before changing this. _admin_gate_ok() in runtime/miniapp_api.py exempts
+# ANY resource that declares role_filter from the blanket bot-admin check —
+# and the ownership-only shape's `where` then applies UNCONDITIONALLY to
+# EVERY authenticated viewer, admin included (there's no "admin sees
+# everything" carve-out in _apply_role_filter; it isn't told who the admin
+# is). This template has no roles TABLE at all — admins live in admins_file
+# (a JSON file), which a SQL `where` predicate cannot see — so the
+# role-resolved shape is not applicable either. Concretely: adding
+# {"where": "user_id = :telegram_user_id"} here would make the bot owner's
+# own /app/{bot_id} resource-editor show only bookings/subscriptions rows
+# where user_id happens to equal the OWNER's own Telegram id (almost always
+# none) — a straight regression of the existing owner-oversight use case,
+# to buy a client-side view that already exists another way (see below).
+# Net effect of leaving these two resources filter-less: unchanged from
+# before this change — visible via /app/{bot_id} ONLY to bot admins (owner
+# oversight, unaffected), NOT visible to a regular client through the
+# mini-app. That's an acceptable trade, not a gap: a client's own
+# records are already fully readable via the bot's own Telegram buttons —
+# "📋 Мои записи" and "💳 Мой абонемент" — which query `WHERE user_id = ?`
+# bound to the requesting Telegram user directly, no mini-app auth layer
+# involved. If a future engine change lets _admin_gate_ok distinguish
+# "this specific viewer is a bot admin" from "this resource has ANY
+# role_filter", revisit this decision.
 miniapp_config = {
     "resources": [
         {
@@ -294,6 +329,27 @@ miniapp_config = {
                 {"name": "expires_at", "label": "Истекает", "kind": "date", "list": True, "detail": True, "create": True},
             ],
         },
+        {
+            # Operational resource, same posture as bookings/slots above:
+            # owner-only oversight via the admin gate, no per-client
+            # role_filter for the same reason spelled out in the comment
+            # above — clients see/leave their own ratings entirely through
+            # Telegram (⭐ Оценить тренера), never through /app/{bot_id}.
+            "name": "trainer_ratings",
+            "table": "trainer_ratings",
+            "order_by": "created_at DESC",
+            "creatable": False,
+            "title": "Оценки тренеров",
+            "titleField": "comment",
+            "fields": [
+                {"name": "trainer_id", "label": "ID тренера", "kind": "number", "list": True, "detail": True, "create": False},
+                {"name": "user_id", "label": "ID клиента", "kind": "number", "list": False, "detail": True, "create": False},
+                {"name": "booking_id", "label": "ID записи", "kind": "number", "list": False, "detail": True, "create": False},
+                {"name": "rating", "label": "Оценка", "kind": "number", "list": True, "detail": True, "create": False},
+                {"name": "comment", "label": "Комментарий", "kind": "text", "list": True, "detail": True, "create": False},
+                {"name": "created_at", "label": "Создано", "kind": "date", "list": True, "detail": True, "create": False},
+            ],
+        },
     ],
 }
 
@@ -384,7 +440,40 @@ async def init_db(db_path: str):
                 purchased_at         TEXT DEFAULT (datetime('now','localtime')),
                 expires_at           TEXT,
                 low_balance_notified INTEGER DEFAULT 0,
-                expiry_notified      INTEGER DEFAULT 0
+                expiry_notified      INTEGER DEFAULT 0,
+                autorenew            INTEGER NOT NULL DEFAULT 0,
+                autorenew_done       INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        # Same try/except ALTER guard as booking_beauty.py's bookings.user_id
+        # backfill — CREATE TABLE IF NOT EXISTS above is a no-op against a
+        # subscriptions table created by an already-running bot BEFORE this
+        # change shipped, so these two columns need a separate migration
+        # path for existing installs. "duplicate column" on a fresh/already-
+        # migrated DB is expected and silently ignored.
+        for ddl in (
+            "ALTER TABLE subscriptions ADD COLUMN autorenew INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE subscriptions ADD COLUMN autorenew_done INTEGER NOT NULL DEFAULT 0",
+        ):
+            try:
+                await db.execute(ddl)
+            except Exception:
+                pass
+        # One rating per booking (UNIQUE(booking_id)) — a client can only
+        # attend/be-charged for a given session once, so more than one
+        # rating against the same booking_id would just be the same
+        # double-tap race _book_slot already guards against elsewhere,
+        # replayed here. INSERT OR IGNORE at write time (see _record_rating)
+        # makes that race a no-op instead of a constraint-error 500.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS trainer_ratings (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                trainer_id  INTEGER NOT NULL,
+                user_id     INTEGER NOT NULL,
+                booking_id  INTEGER NOT NULL UNIQUE,
+                rating      INTEGER NOT NULL,
+                comment     TEXT,
+                created_at  TEXT DEFAULT (datetime('now','localtime'))
             )
         """)
         # Single-row settings table — see runtime toggles in the admin panel
@@ -667,12 +756,81 @@ async def _cancel_booking(db_path: str, booking_id: int, requesting_user_id: int
         return {"ok": True, "promoted": promoted}
 
 
+# ── trainer ratings ──────────────────────────────────────────────────────────
+
+async def _unrated_past_bookings(db_path: str, user_id: int) -> list[dict]:
+    """Confirmed bookings whose SESSION date has already passed (offset by
+    RATING_PROMPT_DAYS_AFTER) and that don't yet have a trainer_ratings row —
+    the candidate list for "⭐ Оценить тренера". Only bookings with a real
+    trainer_id are eligible (a group slot with no trainer assigned has
+    nobody to rate)."""
+    cutoff = (date.today() - timedelta(days=RATING_PROMPT_DAYS_AFTER)).isoformat()
+    async with aiosqlite.connect(db_path) as db:
+        db.row_factory = aiosqlite.Row
+        rows = await (await db.execute(
+            "SELECT b.id AS booking_id, s.trainer_id, s.slot_date, s.slot_time, s.class_name, t.name AS trainer_name "
+            "FROM bookings b JOIN slots s ON b.slot_id=s.id LEFT JOIN trainers t ON s.trainer_id=t.id "
+            "WHERE b.user_id=? AND b.status='confirmed' AND s.trainer_id IS NOT NULL AND s.slot_date <= ? "
+            "AND NOT EXISTS (SELECT 1 FROM trainer_ratings r WHERE r.booking_id = b.id) "
+            "ORDER BY s.slot_date DESC LIMIT 20",
+            (user_id, cutoff),
+        )).fetchall()
+    return [dict(r) for r in rows]
+
+
+async def _record_rating(db_path: str, booking_id: int, user_id: int, rating: int, comment: str | None) -> dict:
+    """Returns {"ok": True} / {"ok": False, "error": "not_found"|"forbidden"|"not_yet"|"already_rated"}.
+    BEGIN IMMEDIATE isn't needed for the write itself (UNIQUE(booking_id) +
+    INSERT OR IGNORE already makes a concurrent double-submit race a no-op
+    at the DB level, same idea as _book_slot's existing-row check) — but the
+    ownership/eligibility reads must still happen before that INSERT so a
+    forged booking_id from another user (or an unfinished/未-confirmed
+    booking) can't be rated."""
+    rating = max(1, min(MAX_RATING, rating))
+    async with aiosqlite.connect(db_path) as db:
+        db.row_factory = aiosqlite.Row
+        booking = await (await db.execute(
+            "SELECT b.user_id, b.status, s.trainer_id, s.slot_date FROM bookings b "
+            "JOIN slots s ON b.slot_id=s.id WHERE b.id=?", (booking_id,),
+        )).fetchone()
+        if booking is None or booking["trainer_id"] is None:
+            return {"ok": False, "error": "not_found"}
+        if booking["user_id"] != user_id:
+            return {"ok": False, "error": "forbidden"}
+        if booking["status"] != "confirmed":
+            return {"ok": False, "error": "not_found"}
+        cutoff = (date.today() - timedelta(days=RATING_PROMPT_DAYS_AFTER)).isoformat()
+        if booking["slot_date"] > cutoff:
+            return {"ok": False, "error": "not_yet"}
+        cur = await db.execute(
+            "INSERT OR IGNORE INTO trainer_ratings (trainer_id, user_id, booking_id, rating, comment) "
+            "VALUES (?,?,?,?,?)",
+            (booking["trainer_id"], user_id, booking_id, rating, comment),
+        )
+        await db.commit()
+        if cur.rowcount == 0:
+            return {"ok": False, "error": "already_rated"}
+        return {"ok": True}
+
+
+async def _trainer_rating_summary(db, trainer_id: int) -> tuple[float | None, int]:
+    """Must be called with an already-open connection — same convention as
+    _active_subscription_row. Returns (average rounded to 1 decimal, count);
+    average is None when the trainer has no ratings yet (0/0 avoided)."""
+    row = await (await db.execute(
+        "SELECT AVG(rating), COUNT(*) FROM trainer_ratings WHERE trainer_id=?", (trainer_id,)
+    )).fetchone()
+    avg, count = row[0], row[1]
+    return (round(avg, 1) if avg is not None else None, count or 0)
+
+
 # ── keyboards: client menu ─────────────────────────────────────────────────────
 
 def kb_main(is_admin: bool) -> ReplyKeyboardMarkup:
     rows = [
         [KeyboardButton(text="📅 Групповое занятие"), KeyboardButton(text="🧑 Индивидуальная тренировка")],
         [KeyboardButton(text="📋 Мои записи"), KeyboardButton(text="💳 Мой абонемент")],
+        [KeyboardButton(text="⭐ Оценить тренера")],
     ]
     if is_admin:
         rows.append([KeyboardButton(text="⚙️ Панель администратора")])
@@ -801,6 +959,9 @@ def kb_individual_confirm(slot_id: int) -> InlineKeyboardMarkup:
 class IndividualBookFlow(StatesGroup):
     trainer = State(); day = State(); time = State(); name = State(); phone = State(); confirm = State()
 
+class RatingFlow(StatesGroup):
+    comment = State()
+
 class AdminFlow(StatesGroup):
     trainer_name = State(); trainer_specs = State()
     sched_day = State(); sched_time = State(); sched_trainer = State(); sched_capacity = State(); sched_name = State()
@@ -887,8 +1048,11 @@ def kb_settings_panel(settings: dict) -> InlineKeyboardMarkup:
 async def kb_trainers_admin(db_path: str) -> InlineKeyboardMarkup:
     async with aiosqlite.connect(db_path) as db:
         rows = await (await db.execute("SELECT id, name, specializations FROM trainers WHERE active=1 ORDER BY name")).fetchall()
-    btns = [[InlineKeyboardButton(text=f"➖ {name} ({specs})", callback_data=f"fit_adm_trainer_rm:{tid}")]
-            for tid, name, specs in rows]
+        btns = []
+        for tid, name, specs in rows:
+            avg, count = await _trainer_rating_summary(db, tid)
+            rating_note = f" · ⭐{avg} ({count})" if count else ""
+            btns.append([InlineKeyboardButton(text=f"➖ {name} ({specs}){rating_note}", callback_data=f"fit_adm_trainer_rm:{tid}")])
     btns.append([InlineKeyboardButton(text="➕ Добавить тренера", callback_data="fit_adm_trainer_add")])
     btns.append([InlineKeyboardButton(text="◀️ Назад", callback_data="fit_adm_back")])
     return InlineKeyboardMarkup(inline_keyboard=btns)
@@ -1296,7 +1460,86 @@ async def cb_cancel_booking(cb: CallbackQuery, bot: Bot, config: BookingFitnessC
             pass
 
 
+# ── TRAINER RATINGS (client-facing) ─────────────────────────────────────────
+
+def kb_rating_stars(booking_id: int) -> InlineKeyboardMarkup:
+    row = [InlineKeyboardButton(text="⭐" * n, callback_data=f"fit_rate_stars:{booking_id}:{n}")
+           for n in range(1, MAX_RATING + 1)]
+    return InlineKeyboardMarkup(inline_keyboard=[row])
+
+def kb_rating_comment_skip() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="➡️ Пропустить", callback_data="fit_rate_skip")]])
+
+@router.message(F.text == "⭐ Оценить тренера")
+async def rate_trainer_start(msg: Message, state: FSMContext, config: BookingFitnessConfig):
+    await state.clear()
+    candidates = await _unrated_past_bookings(config.db_path, msg.from_user.id)
+    if not candidates:
+        await msg.answer("У вас нет прошедших занятий, ожидающих оценки."); return
+    btns = []
+    for c in candidates:
+        label = f"{_date_label(c['slot_date'])} {c['slot_time']} · {c['class_name'] or c['trainer_name'] or ''} ({c['trainer_name'] or '—'})"
+        btns.append([InlineKeyboardButton(text=label, callback_data=f"fit_rate_pick:{c['booking_id']}")])
+    await msg.answer("Выберите занятие, которое хотите оценить:", reply_markup=InlineKeyboardMarkup(inline_keyboard=btns))
+
+@router.callback_query(F.data.startswith("fit_rate_pick:"))
+async def cb_rate_pick(cb: CallbackQuery):
+    await cb.answer()
+    booking_id = int(cb.data.split(":", 1)[1])
+    await cb.message.edit_text("⭐ Оцените тренера:", reply_markup=kb_rating_stars(booking_id))
+
+@router.callback_query(F.data.startswith("fit_rate_stars:"))
+async def cb_rate_stars(cb: CallbackQuery, state: FSMContext):
+    await cb.answer()
+    _, booking_id, rating = cb.data.split(":", 2)
+    await state.update_data(rate_booking_id=int(booking_id), rate_value=int(rating), started_at=time.time())
+    await state.set_state(RatingFlow.comment)
+    await cb.message.edit_text(
+        f"Оценка: {'⭐' * int(rating)}\n\nХотите добавить комментарий? Пришлите текст или нажмите «Пропустить».",
+        reply_markup=kb_rating_comment_skip(),
+    )
+
+async def _finish_rating(config: BookingFitnessConfig, user_id: int, data: dict, comment: str | None) -> str:
+    booking_id = data.get("rate_booking_id")
+    rating = data.get("rate_value")
+    if booking_id is None or rating is None:
+        return "⏳ Время ожидания истекло — начните заново кнопкой «⭐ Оценить тренера»."
+    result = await _record_rating(config.db_path, booking_id, user_id, rating, comment)
+    if result["ok"]:
+        return "✅ Спасибо за оценку!"
+    if result["error"] == "already_rated":
+        return "Вы уже оценили это занятие."
+    return "⚠️ Не удалось сохранить оценку — попробуйте ещё раз через «⭐ Оценить тренера»."
+
+@router.message(RatingFlow.comment, F.text)
+async def rate_comment_text(msg: Message, state: FSMContext, config: BookingFitnessConfig):
+    data = await state.get_data()
+    if _flow_expired(data):
+        await state.clear()
+        await msg.answer("⏳ Время ожидания истекло — начните заново кнопкой «⭐ Оценить тренера»."); return
+    comment = msg.text.strip()[:RATING_COMMENT_MAX_LEN]
+    reply = await _finish_rating(config, msg.from_user.id, data, comment or None)
+    await state.clear()
+    await msg.answer(reply)
+
+@router.callback_query(F.data == "fit_rate_skip")
+async def cb_rate_skip(cb: CallbackQuery, state: FSMContext, config: BookingFitnessConfig):
+    await cb.answer()
+    data = await state.get_data()
+    if _flow_expired(data):
+        await state.clear()
+        await cb.message.edit_text("⏳ Время ожидания истекло — начните заново кнопкой «⭐ Оценить тренера»."); return
+    reply = await _finish_rating(config, cb.from_user.id, data, None)
+    await state.clear()
+    await cb.message.edit_text(reply)
+
+
 # ── SUBSCRIPTION VIEW ────────────────────────────────────────────────────────
+
+def kb_subscription_view(subscription_id: int, autorenew: bool) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+        text=f"🔁 Автопродление: {_on_off(autorenew)}", callback_data=f"fit_sub_autorenew:{subscription_id}",
+    )]])
 
 @router.message(F.text == "💳 Мой абонемент")
 async def my_subscription(msg: Message, config: BookingFitnessConfig):
@@ -1308,12 +1551,43 @@ async def my_subscription(msg: Message, config: BookingFitnessConfig):
     if not row:
         await msg.answer("У вас нет абонемента. Обратитесь к администратору."); return
     expiry = f"до {row['expires_at']}" if row["expires_at"] else "без ограничения по сроку"
+    autorenew_note = "" if row["expires_at"] is None else (
+        "\n🔁 Автопродление включено — по тому же тарифу." if row["autorenew"] else ""
+    )
     await msg.answer(
         f"💳 <b>{_esc(row['plan_name'])}</b>\n"
         f"Осталось посещений: <b>{row['visits_left']}</b> из {row['total_visits']}\n"
-        f"Срок действия: {expiry}",
+        f"Срок действия: {expiry}{autorenew_note}",
         parse_mode="HTML",
+        # Autorenew only makes sense for a subscription that actually
+        # expires — a NULL expires_at (SUBSCRIPTION_VALIDITY_OPTIONS' "0 =
+        # без ограничения" choice) never lapses, so there's nothing to
+        # auto-renew and the toggle would be a confusing no-op.
+        reply_markup=kb_subscription_view(row["id"], bool(row["autorenew"])) if row["expires_at"] else None,
     )
+
+@router.callback_query(F.data.startswith("fit_sub_autorenew:"))
+async def cb_sub_autorenew_toggle(cb: CallbackQuery, config: BookingFitnessConfig):
+    await cb.answer()
+    subscription_id = int(cb.data.split(":", 1)[1])
+    async with aiosqlite.connect(config.db_path) as db:
+        db.row_factory = aiosqlite.Row
+        # Ownership check baked into the UPDATE's WHERE, not a separate
+        # SELECT-then-UPDATE — same "no window for a stale read" reasoning
+        # as _cancel_booking's forbidden check, just cheap enough here not
+        # to need a full BEGIN IMMEDIATE transaction (a single UPDATE is
+        # already atomic).
+        await db.execute(
+            "UPDATE subscriptions SET autorenew = 1 - autorenew WHERE id=? AND user_id=?",
+            (subscription_id, cb.from_user.id),
+        )
+        await db.commit()
+        row = await (await db.execute(
+            "SELECT id, autorenew FROM subscriptions WHERE id=? AND user_id=?", (subscription_id, cb.from_user.id),
+        )).fetchone()
+    if row is None:
+        await cb.message.edit_reply_markup(reply_markup=None); return
+    await cb.message.edit_reply_markup(reply_markup=kb_subscription_view(row["id"], bool(row["autorenew"])))
 
 
 # ── ADMIN PANEL ──────────────────────────────────────────────────────────────
@@ -1939,21 +2213,58 @@ async def cb_adm_stats(cb: CallbackQuery, bot: Bot, state: FSMContext, config: B
     await cb.answer()
     if not _is_bot_admin(cb.from_user.id, config):
         return
+    since = (date.today() - timedelta(days=STATS_RECENT_DAYS)).isoformat()
     async with aiosqlite.connect(config.db_path) as db:
+        db.row_factory = aiosqlite.Row
         total = (await (await db.execute("SELECT COUNT(*) FROM bookings")).fetchone())[0]
         confirmed = (await (await db.execute("SELECT COUNT(*) FROM bookings WHERE status='confirmed'")).fetchone())[0]
         waitlisted = (await (await db.execute("SELECT COUNT(*) FROM bookings WHERE status='waitlist'")).fetchone())[0]
         active_subs = (await (await db.execute(
             "SELECT COUNT(*) FROM subscriptions WHERE visits_left>0 AND (expires_at IS NULL OR expires_at>=date('now','localtime'))"
         )).fetchone())[0]
-    text = (
-        f"📊 <b>Статистика</b>\n\n"
-        f"📋 Всего записей: {total}\n"
-        f"✅ Подтверждённых: {confirmed}\n"
-        f"⏳ В листе ожидания: {waitlisted}\n"
-        f"💳 Активных абонементов: {active_subs}"
-    )
-    await _replace_panel(bot, state, chat_id, text, reply_markup=kb_admin_panel_main())
+
+        # Attendance by trainer over the last STATS_RECENT_DAYS: confirmed
+        # bookings for sessions that actually happened in that window
+        # (slot_date, not booking created_at — "attendance" means the
+        # session date, a booking made today for next month isn't
+        # attendance yet). Paired with each trainer's rating summary so the
+        # owner sees both numbers together without a second screen.
+        attendance_rows = await (await db.execute(
+            "SELECT t.id, t.name, COUNT(*) AS visits FROM bookings b "
+            "JOIN slots s ON b.slot_id=s.id JOIN trainers t ON s.trainer_id=t.id "
+            "WHERE b.status='confirmed' AND s.slot_date >= ? AND s.slot_date <= date('now','localtime') "
+            "GROUP BY t.id ORDER BY visits DESC LIMIT 5",
+            (since,),
+        )).fetchall()
+        trainer_lines = []
+        for r in attendance_rows:
+            avg, count = await _trainer_rating_summary(db, r["id"])
+            rating_note = f", ⭐{avg} ({count})" if count else ""
+            trainer_lines.append(f"  • {_esc(r['name'])}: {r['visits']} посещений{rating_note}")
+
+        # Churn heuristic (owner-requested, deliberately simple): clients
+        # whose subscription lapsed in the last STATS_RECENT_DAYS and who
+        # have NOT purchased a newer one since — no payment/LTV modeling,
+        # just "did they come back after their last subscription ran out."
+        churned = (await (await db.execute(
+            "SELECT COUNT(DISTINCT s1.user_id) FROM subscriptions s1 "
+            "WHERE s1.expires_at IS NOT NULL AND s1.expires_at < date('now','localtime') AND s1.expires_at >= ? "
+            "AND NOT EXISTS (SELECT 1 FROM subscriptions s2 WHERE s2.user_id = s1.user_id AND s2.id != s1.id "
+            "AND s2.purchased_at > s1.expires_at)",
+            (since,),
+        )).fetchone())[0]
+
+    text_lines = [
+        "📊 <b>Статистика</b>\n",
+        f"📋 Всего записей: {total}",
+        f"✅ Подтверждённых: {confirmed}",
+        f"⏳ В листе ожидания: {waitlisted}",
+        f"💳 Активных абонементов: {active_subs}\n",
+        f"👥 Посещаемость по тренерам (последние {STATS_RECENT_DAYS} дн.):",
+    ]
+    text_lines.extend(trainer_lines or ["  • нет данных"])
+    text_lines.append(f"\n📉 Клиентов без продления за {STATS_RECENT_DAYS} дн. (отток): {churned}")
+    await _replace_panel(bot, state, chat_id, "\n".join(text_lines), reply_markup=kb_admin_panel_main())
 
 
 # ── subscription reminder loop ──────────────────────────────────────────────
@@ -2008,6 +2319,51 @@ async def _subscription_reminder_loop(bot: Bot, db_path: str, bot_name: str) -> 
                     except Exception as e:
                         logger.warning(f"[{bot_name}] expiry reminder send error for {row['user_id']}: {e}")
                     await db.execute("UPDATE subscriptions SET expiry_notified=1 WHERE id=?", (row["id"],))
+                await db.commit()
+
+                # Autorenew: subscriptions that have ALREADY lapsed
+                # (expires_at strictly in the past — distinct from the
+                # "expiring soon" reminder above, which fires BEFORE
+                # expiry) with autorenew=1 and not yet processed. Re-issues
+                # a fresh subscription under the SAME plan NAME, same shape
+                # as cb_adm_issue_plan's manual issue path — no payment
+                # step exists anywhere in this template, so "autorenew"
+                # here means "the owner doesn't have to manually re-issue
+                # it," not an actual charge. autorenew_done is set
+                # regardless of whether a matching active plan still
+                # exists, so a deleted/deactivated plan doesn't retry this
+                # client every poll forever — the owner sees the client
+                # dropped off via the churn stat instead.
+                expired_autorenew = await (await db.execute(
+                    "SELECT id, user_id, plan_name FROM subscriptions "
+                    "WHERE autorenew=1 AND autorenew_done=0 AND expires_at IS NOT NULL "
+                    "AND expires_at < date('now','localtime')",
+                )).fetchall()
+                for row in expired_autorenew:
+                    plan = await (await db.execute(
+                        "SELECT name, total_visits, validity_days FROM subscription_plans "
+                        "WHERE name=? AND active=1 ORDER BY id DESC LIMIT 1",
+                        (row["plan_name"],),
+                    )).fetchone()
+                    if plan is not None:
+                        new_expires_at = (
+                            (date.today() + timedelta(days=plan["validity_days"])).isoformat()
+                            if plan["validity_days"] else None
+                        )
+                        await db.execute(
+                            "INSERT INTO subscriptions (user_id, plan_name, total_visits, visits_left, expires_at, autorenew) "
+                            "VALUES (?,?,?,?,?,1)",
+                            (row["user_id"], plan["name"], plan["total_visits"], plan["total_visits"], new_expires_at),
+                        )
+                        try:
+                            await bot.send_message(
+                                row["user_id"],
+                                f"🔁 Абонемент «{_esc(plan['name'])}» автопродлён — {plan['total_visits']} посещений.",
+                                parse_mode="HTML",
+                            )
+                        except Exception as e:
+                            logger.warning(f"[{bot_name}] autorenew notify error for {row['user_id']}: {e}")
+                    await db.execute("UPDATE subscriptions SET autorenew_done=1 WHERE id=?", (row["id"],))
                 await db.commit()
         except Exception:
             logger.exception(f"[{bot_name}] subscription reminder loop error")
