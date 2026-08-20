@@ -501,5 +501,44 @@ class ReviewFixRegressionTests(unittest.IsolatedAsyncioTestCase):
                 await self.dp.feed_webhook_update(self.bot, _callback_update(99, ADMIN_ID, data))
 
 
+class DebtorsMiniAppConfigTests(unittest.IsolatedAsyncioTestCase):
+    """miniapp_config's declared table/field names must match init_db()'s
+    real schema — miniapp_api.py builds SQL directly off these names, so a
+    drift here would 500 at request time instead of failing a test."""
+
+    def test_miniapp_config_resource_names(self):
+        names = {r["name"] for r in dbt.miniapp_config["resources"]}
+        self.assertEqual(names, {"debtors", "debt_entries"})
+
+    def test_debtors_resource_targets_debtors_table(self):
+        debtors = next(r for r in dbt.miniapp_config["resources"] if r["name"] == "debtors")
+        self.assertEqual(debtors["table"], "debtors")
+        self.assertTrue(debtors["creatable"])
+
+    def test_debt_entries_resource_targets_debt_entries_table(self):
+        entries = next(r for r in dbt.miniapp_config["resources"] if r["name"] == "debt_entries")
+        self.assertEqual(entries["table"], "debt_entries")
+        field_names = {f["name"] for f in entries["fields"]}
+        self.assertEqual(field_names, {"debtor_id", "amount", "description", "entry_date"})
+
+    async def test_miniapp_config_fields_match_real_schema(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "schema_check.db")
+            await dbt.init_db(db_path)
+            conn = sqlite3.connect(db_path)
+            try:
+                for resource in dbt.miniapp_config["resources"]:
+                    cur = conn.execute(f"PRAGMA table_info({resource['table']})")
+                    real_columns = {row[1] for row in cur.fetchall()}
+                    declared = {f["name"] for f in resource["fields"]} | {"id"}
+                    self.assertTrue(
+                        declared.issubset(real_columns),
+                        f"{resource['name']}: declared fields {declared} not all in "
+                        f"real columns {real_columns}",
+                    )
+            finally:
+                conn.close()
+
+
 if __name__ == "__main__":
     unittest.main()

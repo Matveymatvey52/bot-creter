@@ -265,6 +265,46 @@ async def init_db(db_path: str):
         await db.commit()
 
 
+# ── mini-app config (see docs/MINIAPP_DESIGN.md, templates/car_rental.py's
+# own miniapp_config for the authoring contract) ────────────────────────────
+# debt_entries is creatable, but only with a plain unsigned "amount" field —
+# the real sign (мне должны / я должен) is a business decision this template
+# always makes via the two-button cb_add_start flow (dbt_add:...:p vs ...:m),
+# never a raw column the generic create form should expose; a create-form
+# amount here writes the value as-is (positive), matching the "мне должны"
+# direction, the more common case.
+miniapp_config = {
+    "resources": [
+        {
+            "name": "debtors",
+            "table": "debtors",
+            "order_by": "name",
+            "creatable": True,
+            "title": "Должники",
+            "titleField": "name",
+            "fields": [
+                {"name": "name", "required": True, "label": "Имя", "kind": "text", "list": True, "detail": True, "create": True},
+                {"name": "contact", "label": "Контакт", "kind": "text", "list": False, "detail": True, "create": True},
+                {"name": "created_at", "label": "Создан", "kind": "date", "list": False, "detail": True, "create": False},
+            ],
+        },
+        {
+            "name": "debt_entries",
+            "table": "debt_entries",
+            "order_by": "entry_date DESC, id DESC",
+            "creatable": True,
+            "title": "Записи",
+            "fields": [
+                {"name": "debtor_id", "required": True, "label": "ID должника", "kind": "number", "list": True, "detail": True, "create": True},
+                {"name": "amount", "required": True, "label": "Сумма", "kind": "number", "list": True, "detail": True, "create": True},
+                {"name": "description", "label": "Описание", "kind": "text", "list": False, "detail": True, "create": True},
+                {"name": "entry_date", "label": "Дата", "kind": "date", "list": True, "detail": True, "create": False},
+            ],
+        },
+    ],
+}
+
+
 async def _insert_debtor(db_path: str, name: str, contact: str | None) -> int:
     async with aiosqlite.connect(db_path) as db:
         cur = await db.execute("INSERT INTO debtors (name, contact) VALUES (?,?)", (name, contact))
