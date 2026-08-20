@@ -102,3 +102,65 @@ a {
   --shadow-card-active: 0 0 0 1px var(--accent), 0 6px 20px var(--accent-glow);
   --tg-blue: #2aabee;
 }
+
+/* ── Adaptive desktop layout ───────────────────────────────────────────────
+   Everything above (and every unqualified rule in this file/ui.css) is the
+   mobile default, unchanged — Telegram's in-app WebView is always narrow
+   and never crosses this breakpoint. Outside Telegram (the standalone
+   /site/{bot_id} page on a real monitor), 1024px is the one breakpoint used
+   consistently here and in ui.css: below it, phones/small tablets keep the
+   single-column mobile layout; at/above it, `.screen` becomes a wide grid
+   so list/bot cards can flow two-up instead of stretching one-per-row
+   edge-to-edge, and ui.css layers on matching desktop rules for the header,
+   detail fields, and stat/table chrome. No component markup changes —
+   `.screen`'s children are exactly what ListScreen/DetailScreen/
+   CreateFormScreen/FactoryDashboardScreen/OwnerRegistryScreen already
+   render; this just repositions them via CSS grid. */
+@media (min-width: 1024px) {
+  body {
+    /* Telegram WebView has no visible page background outside `.screen`,
+       but the standalone /site/ page does — give the extra margin around
+       the centered column a subtle depth cue instead of flat --bg. */
+    background: radial-gradient(ellipse 1200px 600px at 50% -10%, rgba(124, 92, 255, 0.06), transparent 60%),
+      var(--bg);
+  }
+
+  .screen {
+    max-width: 1080px;
+    padding: 40px 32px calc(40px + env(safe-area-inset-bottom, 0px));
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+    gap: 16px 20px;
+    align-items: start;
+  }
+
+  /* Everything that isn't a grid card spans the full row so the layout
+     reads as "wide header, then a two-up card grid below it" rather than
+     every child trying to slot into the card grid. */
+  .screen > .screen-header,
+  .screen > .screen-header-v2,
+  .screen > .factory-dashboard-header,
+  .screen > .state-message,
+  .screen > .registry-stats-grid,
+  .screen > .registry-table-wrap,
+  .screen > .screen-section,
+  .screen > .cta-row,
+  .screen > .bottom-bar,
+  .screen > .field,
+  .screen > form {
+    grid-column: 1 / -1;
+  }
+
+  /* CreateFormScreen's fields: two-up on wide screens instead of one long
+     stacked column, since manager_bot/team_manager/boss_bot resources can
+     have a dozen+ createFields. */
+  .screen:has(> .field) {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  /* DetailScreen renders exactly one `.card` as the sole grid item — let it
+     take the full row instead of collapsing to a single ~340px column. */
+  .screen > .card:only-of-type {
+    grid-column: 1 / -1;
+  }
+}

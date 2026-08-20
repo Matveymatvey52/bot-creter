@@ -1063,3 +1063,76 @@
   color: var(--text-tertiary);
   margin-top: 1px;
 }
+
+/* ── Adaptive desktop layout (≥1024px, see index.css's matching block) ───
+   `.screen` switches to a grid at this breakpoint; these rules make the
+   components that live inside it read as intentional desktop chrome
+   instead of a mobile layout stretched wide. Mobile styles above are
+   untouched — Telegram WebView never reaches this width. */
+@media (min-width: 1024px) {
+  /* ScreenHeader: bigger display title, no longer competing with a cramped
+     ~600px column. */
+  .screen-header-v2 .display-lg {
+    font-size: 34px;
+  }
+
+  .factory-dashboard-header .screen-header h1 {
+    font-size: 28px;
+  }
+
+  /* List/bot cards: a bit more breathing room per card now that several
+     sit side by side instead of one per full-width row. */
+  .card,
+  .bot-card {
+    padding: 22px;
+  }
+
+  /* DetailScreen's single card: field rows as a two-column grid instead of
+     one long stack — generalizes to resources with a dozen+ detailFields
+     (manager_bot/team_manager/boss_bot) as well as 2-3 field ones (the
+     extra column just stays short). */
+  .card:only-of-type {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 4px 24px;
+    align-items: start;
+  }
+
+  .card:only-of-type .card-header,
+  .card:only-of-type .divider {
+    grid-column: 1 / -1;
+  }
+
+  .card:only-of-type .meta-row {
+    padding: 10px 0;
+    border-bottom: 1px solid var(--border-hair);
+  }
+
+  .card:only-of-type .meta-row:last-of-type {
+    border-bottom: none;
+  }
+
+  /* Stat tiles and the registry table get more columns/space once the
+     screen itself is wider — auto-fit already scales them up, this just
+     raises the minimum tile size so they don't look sparse at 1080px. */
+  .registry-stats-grid {
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 12px;
+  }
+
+  .registry-table th,
+  .registry-table td {
+    padding: 10px 14px;
+  }
+
+  /* Bottom action bar / CTA row no longer need to hug the viewport edge —
+     the `.screen` padding already gives them margin, but the gradient
+     scrim under `.bottom-bar` was tuned for edge-to-edge mobile; keep it
+     visually anchored to the (now inset) content column instead of the
+     full viewport width. */
+  .bottom-bar {
+    padding-left: 0;
+    padding-right: 0;
+    background: linear-gradient(to top, var(--bg) 70%, transparent);
+  }
+}
