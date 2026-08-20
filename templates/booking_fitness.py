@@ -192,6 +192,112 @@ def _normalize_phone(raw: str) -> str | None:
     return f"+{digits[0]} ({digits[1:4]}) {digits[4:7]}-{digits[7:9]}-{digits[9:11]}"
 
 
+# ── mini-app config (see docs/MINIAPP_DESIGN.md) ────────────────────────────
+# group_schedule_templates and slots are both auto-expanded/recurring
+# (_ensure_group_sessions/_ensure_individual_slots) — trainers/plans are the
+# owner-editable catalogs (🏋 Тренеры / 🎟 Тарифы абонционов admin panels),
+# bookings/subscriptions are the resulting client records. bot_settings is a
+# single toggle row, not a list of records — no resource for it.
+miniapp_config = {
+    "resources": [
+        {
+            "name": "trainers",
+            "table": "trainers",
+            "order_by": "id DESC",
+            "creatable": True,
+            "title": "Тренеры",
+            "titleField": "name",
+            "fields": [
+                {"name": "name", "required": True, "label": "Имя", "kind": "text", "list": True, "detail": True, "create": True},
+                {"name": "specializations", "label": "Специализации", "kind": "text", "list": True, "detail": True, "create": True},
+                {"name": "active", "label": "Активен", "kind": "status", "list": True, "detail": True, "create": False},
+            ],
+        },
+        {
+            "name": "group_schedule_templates",
+            "table": "group_schedule_templates",
+            "order_by": "day_of_week ASC, slot_time ASC",
+            "creatable": True,
+            "title": "Групповое расписание",
+            "titleField": "class_name",
+            "fields": [
+                {"name": "day_of_week", "required": True, "label": "День недели", "kind": "number", "list": True, "detail": True, "create": True},
+                {"name": "slot_time", "required": True, "label": "Время", "kind": "text", "list": True, "detail": True, "create": True},
+                {"name": "trainer_id", "label": "ID тренера", "kind": "number", "list": False, "detail": True, "create": True},
+                {"name": "class_name", "required": True, "label": "Занятие", "kind": "text", "list": True, "detail": True, "create": True},
+                {"name": "capacity", "required": True, "label": "Вместимость", "kind": "number", "list": True, "detail": True, "create": True},
+                {"name": "duration_min", "label": "Длительность (мин)", "kind": "number", "list": False, "detail": True, "create": True},
+                {"name": "active", "label": "Активен", "kind": "status", "list": True, "detail": True, "create": False},
+            ],
+        },
+        {
+            "name": "slots",
+            "table": "slots",
+            "order_by": "slot_date DESC, slot_time DESC",
+            "creatable": False,
+            "title": "Слоты",
+            "titleField": "class_name",
+            "fields": [
+                {"name": "session_type", "label": "Тип", "kind": "status", "list": True, "detail": True, "create": False},
+                {"name": "trainer_id", "label": "ID тренера", "kind": "number", "list": False, "detail": True, "create": False},
+                {"name": "slot_date", "label": "Дата", "kind": "date", "list": True, "detail": True, "create": False},
+                {"name": "slot_time", "label": "Время", "kind": "text", "list": True, "detail": True, "create": False},
+                {"name": "duration_min", "label": "Длительность (мин)", "kind": "number", "list": False, "detail": True, "create": False},
+                {"name": "class_name", "label": "Занятие", "kind": "text", "list": True, "detail": True, "create": False},
+                {"name": "capacity", "label": "Вместимость", "kind": "number", "list": False, "detail": True, "create": False},
+                {"name": "status", "label": "Статус", "kind": "status", "list": True, "detail": True, "create": False},
+            ],
+        },
+        {
+            "name": "bookings",
+            "table": "bookings",
+            "order_by": "created_at DESC",
+            "creatable": False,
+            "title": "Записи",
+            "titleField": "client_name",
+            "fields": [
+                {"name": "slot_id", "label": "ID слота", "kind": "number", "list": False, "detail": True, "create": False},
+                {"name": "client_name", "label": "Имя клиента", "kind": "text", "list": True, "detail": True, "create": False},
+                {"name": "client_phone", "label": "Телефон", "kind": "text", "list": False, "detail": True, "create": False},
+                {"name": "status", "label": "Статус", "kind": "status", "list": True, "detail": True, "create": False},
+                {"name": "subscription_id", "label": "ID абонемента", "kind": "number", "list": False, "detail": True, "create": False},
+                {"name": "created_at", "label": "Создано", "kind": "date", "list": True, "detail": True, "create": False},
+            ],
+        },
+        {
+            "name": "subscription_plans",
+            "table": "subscription_plans",
+            "order_by": "id DESC",
+            "creatable": True,
+            "title": "Тарифы абонементов",
+            "titleField": "name",
+            "fields": [
+                {"name": "name", "required": True, "label": "Название", "kind": "text", "list": True, "detail": True, "create": True},
+                {"name": "total_visits", "required": True, "label": "Посещений", "kind": "number", "list": True, "detail": True, "create": True},
+                {"name": "validity_days", "label": "Срок действия (дн)", "kind": "number", "list": True, "detail": True, "create": True},
+                {"name": "active", "label": "Активен", "kind": "status", "list": True, "detail": True, "create": False},
+            ],
+        },
+        {
+            "name": "subscriptions",
+            "table": "subscriptions",
+            "order_by": "purchased_at DESC",
+            "creatable": True,
+            "title": "Абонементы клиентов",
+            "titleField": "plan_name",
+            "fields": [
+                {"name": "user_id", "required": True, "label": "ID клиента", "kind": "number", "list": True, "detail": True, "create": True},
+                {"name": "plan_name", "required": True, "label": "Тариф", "kind": "text", "list": True, "detail": True, "create": True},
+                {"name": "total_visits", "required": True, "label": "Всего посещений", "kind": "number", "list": False, "detail": True, "create": True},
+                {"name": "visits_left", "required": True, "label": "Осталось посещений", "kind": "number", "list": True, "detail": True, "create": True},
+                {"name": "purchased_at", "label": "Куплен", "kind": "date", "list": False, "detail": True, "create": False},
+                {"name": "expires_at", "label": "Истекает", "kind": "date", "list": True, "detail": True, "create": True},
+            ],
+        },
+    ],
+}
+
+
 # ── db ────────────────────────────────────────────────────────────────────────
 
 async def init_db(db_path: str):

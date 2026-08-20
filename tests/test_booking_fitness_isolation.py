@@ -429,5 +429,49 @@ class MenuBranchSeparationTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(group_text, individual_text)
 
 
+class BookingFitnessMiniAppConfigTests(unittest.IsolatedAsyncioTestCase):
+    """miniapp_config's declared table/field names must match init_db()'s
+    real schema — miniapp_api.py builds SQL directly off these names, so a
+    drift here would 500 at request time instead of failing a test."""
+
+    def test_miniapp_config_resource_names(self):
+        names = {r["name"] for r in bf.miniapp_config["resources"]}
+        self.assertEqual(
+            names,
+            {"trainers", "group_schedule_templates", "slots", "bookings",
+             "subscription_plans", "subscriptions"},
+        )
+
+    def test_trainers_resource_targets_trainers_table(self):
+        trainers = next(r for r in bf.miniapp_config["resources"] if r["name"] == "trainers")
+        self.assertEqual(trainers["table"], "trainers")
+        self.assertTrue(trainers["creatable"])
+
+    def test_bookings_resource_targets_bookings_table_not_creatable(self):
+        bookings = next(r for r in bf.miniapp_config["resources"] if r["name"] == "bookings")
+        self.assertEqual(bookings["table"], "bookings")
+        self.assertFalse(bookings["creatable"])
+
+    def test_slots_resource_not_creatable(self):
+        slots = next(r for r in bf.miniapp_config["resources"] if r["name"] == "slots")
+        self.assertEqual(slots["table"], "slots")
+        self.assertFalse(slots["creatable"])
+
+    async def test_miniapp_config_fields_match_real_schema(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "schema_check.db")
+            await bf.init_db(db_path)
+            async with aiosqlite.connect(db_path) as db:
+                for resource in bf.miniapp_config["resources"]:
+                    cur = await db.execute(f"PRAGMA table_info({resource['table']})")
+                    real_columns = {row[1] for row in await cur.fetchall()}
+                    declared = {f["name"] for f in resource["fields"]} | {"id"}
+                    self.assertTrue(
+                        declared.issubset(real_columns),
+                        f"{resource['name']}: declared fields {declared} not all in "
+                        f"real columns {real_columns}",
+                    )
+
+
 if __name__ == "__main__":
     unittest.main()
