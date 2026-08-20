@@ -53,8 +53,30 @@ def _can_manage_bot(user_id: int, bot_row: dict) -> bool:
     return _is_owner(user_id) or bot_row.get("owner_telegram_id") == user_id
 
 
+async def _bot_display_name(bot_id: int) -> str:
+    # get_bot(FACTORY_BOT_ID) returns None (no bots-table row for bot_id=0),
+    # so the synthetic registry entry needs its own label here.
+    from runtime.registry import FACTORY_BOT_ID
+
+    if bot_id == FACTORY_BOT_ID:
+        return "Реестр ботов (Creator-бот)"
+    b = await get_bot(bot_id)
+    return b["name"] if b else "?"
+
+
 def _bots_keyboard(bots: list[dict], action: str) -> InlineKeyboardMarkup:
+    # FACTORY_BOT_ID (0, the Creator bot / registry itself) has no bots-table
+    # row — get_all_bots() never returns it — so it's injected here as a
+    # synthetic first entry. This is the only way to reach bot_admins for
+    # bot_id=0 through the UI, which gates "📋 Реестр ботов" in /start (see
+    # handlers/start.py's _is_creator_bot_admin).
+    from runtime.registry import FACTORY_BOT_ID
+
     rows = [[InlineKeyboardButton(
+        text="📋 Реестр ботов (Creator-бот)",
+        callback_data=f"adm_{action}:{FACTORY_BOT_ID}",
+    )]]
+    rows += [[InlineKeyboardButton(
         text=f"🤖 {b['name']}",
         callback_data=f"adm_{action}:{b['id']}",
     )] for b in bots]
@@ -105,9 +127,6 @@ async def cmd_add_admin(message: Message, state: FSMContext):
     if not _is_owner(message.from_user.id):
         return
     bots = await get_all_bots()
-    if not bots:
-        await message.answer("Ботов пока нет.")
-        return
     await state.set_state(AdminStates.choosing_bot_to_add)
     await message.answer("Выбери бота, которому хочешь добавить админа:", reply_markup=_bots_keyboard(bots, "add"))
 
@@ -116,11 +135,11 @@ async def cmd_add_admin(message: Message, state: FSMContext):
 async def cb_bot_selected_add(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     bot_id = int(callback.data.split(":")[1])
-    b = await get_bot(bot_id)
-    await state.update_data(bot_id=bot_id, bot_name=b["name"] if b else "?")
+    bot_name = await _bot_display_name(bot_id)
+    await state.update_data(bot_id=bot_id, bot_name=bot_name)
     await state.set_state(AdminStates.entering_id_to_add)
     await callback.message.edit_text(
-        f"Отправь Telegram ID пользователя, которого хочешь добавить как админа для <b>{b['name'] if b else '?'}</b>.\n\n"
+        f"Отправь Telegram ID пользователя, которого хочешь добавить как админа для <b>{bot_name}</b>.\n\n"
         "Узнать ID можно через @userinfobot.",
         parse_mode="HTML",
     )
@@ -147,9 +166,6 @@ async def cmd_remove_admin(message: Message, state: FSMContext):
     if not _is_owner(message.from_user.id):
         return
     bots = await get_all_bots()
-    if not bots:
-        await message.answer("Ботов пока нет.")
-        return
     await state.set_state(AdminStates.choosing_bot_to_remove)
     await message.answer("Выбери бота, у которого хочешь убрать админа:", reply_markup=_bots_keyboard(bots, "rem"))
 
@@ -158,17 +174,17 @@ async def cmd_remove_admin(message: Message, state: FSMContext):
 async def cb_bot_selected_remove(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     bot_id = int(callback.data.split(":")[1])
-    b = await get_bot(bot_id)
+    bot_name = await _bot_display_name(bot_id)
     admins = await get_bot_admins(bot_id)
     if not admins:
         await state.clear()
-        await callback.message.edit_text(f"У бота <b>{b['name'] if b else '?'}</b> нет дополнительных админов.", parse_mode="HTML")
+        await callback.message.edit_text(f"У бота <b>{bot_name}</b> нет дополнительных админов.", parse_mode="HTML")
         return
-    await state.update_data(bot_id=bot_id, bot_name=b["name"] if b else "?")
+    await state.update_data(bot_id=bot_id, bot_name=bot_name)
     await state.set_state(AdminStates.entering_id_to_remove)
     lines = "\n".join(f"• <code>{i}</code>" for i in admins)
     await callback.message.edit_text(
-        f"Текущие админы <b>{b['name'] if b else '?'}</b>:\n{lines}\n\nОтправь ID пользователя, которого убрать.",
+        f"Текущие админы <b>{bot_name}</b>:\n{lines}\n\nОтправь ID пользователя, которого убрать.",
         parse_mode="HTML",
     )
 
@@ -194,9 +210,6 @@ async def cmd_list_admins(message: Message, state: FSMContext):
     if not _is_owner(message.from_user.id):
         return
     bots = await get_all_bots()
-    if not bots:
-        await message.answer("Ботов пока нет.")
-        return
     await state.set_state(AdminStates.choosing_bot_to_list)
     await message.answer("Выбери бота, чтобы посмотреть его админов:", reply_markup=_bots_keyboard(bots, "lst"))
 
@@ -206,14 +219,14 @@ async def cb_bot_selected_list(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     await state.clear()
     bot_id = int(callback.data.split(":")[1])
-    b = await get_bot(bot_id)
+    bot_name = await _bot_display_name(bot_id)
     admins = await get_bot_admins(bot_id)
     if not admins:
-        await callback.message.edit_text(f"У бота <b>{b['name'] if b else '?'}</b> нет дополнительных админов.", parse_mode="HTML")
+        await callback.message.edit_text(f"У бота <b>{bot_name}</b> нет дополнительных админов.", parse_mode="HTML")
         return
     lines = "\n".join(f"• <code>{i}</code>" for i in admins)
     await callback.message.edit_text(
-        f"👥 Админы бота <b>{b['name'] if b else '?'}</b>:\n{lines}",
+        f"👥 Админы бота <b>{bot_name}</b>:\n{lines}",
         parse_mode="HTML",
     )
 
