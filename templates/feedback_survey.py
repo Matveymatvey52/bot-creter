@@ -216,6 +216,26 @@ async def init_db(db_path: str):
         await db.commit()
 
 
+miniapp_config = {
+    "resources": [
+        {
+            "name": "feedback",
+            "table": "feedback",
+            "order_by": "created_at DESC",
+            "creatable": True,
+            "title": "Отзывы",
+            "titleField": "client_label",
+            "fields": [
+                {"name": "rating", "required": True, "label": "Оценка", "kind": "number", "list": True, "detail": True, "create": True},
+                {"name": "comment", "label": "Комментарий", "kind": "text", "list": False, "detail": True, "create": True},
+                {"name": "source", "label": "Источник", "kind": "status", "list": True, "detail": True, "create": False},
+                {"name": "client_label", "label": "От кого", "kind": "text", "list": True, "detail": True, "create": True},
+            ],
+        },
+    ],
+}
+
+
 async def _insert_feedback(
     db_path: str, rating: int, comment: str | None, source: str,
     client_user_id: int | None, client_label: str | None,
