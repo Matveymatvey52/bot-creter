@@ -207,11 +207,43 @@ async def init_db():
             "last_status TEXT",
             "last_payment_methods_json TEXT",
             "last_checked_at TIMESTAMP",
+            # provider_type distinguishes the two payment tracks a bot can
+            # connect (see PaymentConnectFlow in handlers/manage_bots.py):
+            # 'yookassa' (default, unchanged) sends Telegram Payments
+            # invoices via provider_token above; 'cloudpayments' instead
+            # sends a link to runtime/cloudpayments_api.py's own /pay page
+            # and never touches provider_token/shop_id/secret_key at all.
+            "provider_type TEXT NOT NULL DEFAULT 'yookassa'",
         ):
             try:
                 await db.execute(f"ALTER TABLE bot_payment_providers ADD COLUMN {col}")
             except aiosqlite.OperationalError:
                 pass
+        # cloudpayments_invoices — one row per checkout link generated for a
+        # Cloudpayments-connected bot. Separate from features/payments.py's
+        # own per-bot `payments` table (which only records a COMPLETED
+        # payment) because a Cloudpayments invoice must exist and be
+        # resolvable by invoice_id BEFORE payment succeeds, for the /pay
+        # page to render an amount at all. This table lives in the central
+        # DB (not per-bot) since runtime/cloudpayments_api.py's webhook has
+        # no per-bot Config/db_path to work from — only bot_id off the URL.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS cloudpayments_invoices (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                bot_id              INTEGER NOT NULL REFERENCES bots(id),
+                invoice_payload     TEXT NOT NULL,
+                title               TEXT NOT NULL,
+                description         TEXT NOT NULL,
+                currency            TEXT NOT NULL,
+                amount              INTEGER NOT NULL,
+                chat_id             INTEGER NOT NULL,
+                status              TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','paid','failed')),
+                provider_charge_id  TEXT,
+                card_last_four      TEXT,
+                created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                paid_at             TIMESTAMP
+            )
+        """)
         # owner_payment_credentials — the ЮKassa shop_id/secret_key entered
         # once, reused as a suggested default when connecting payments to a
         # later bot (owner_user_id-scoped, same pattern as userbot_sessions
@@ -606,6 +638,7 @@ async def delete_bot(bot_id: int) -> None:
             "DELETE FROM bot_office_links WHERE source_bot_id = ? OR target_bot_id = ?", (bot_id, bot_id)
         )
         await db.execute("DELETE FROM bot_group_task_config WHERE bot_id = ?", (bot_id,))
+        await db.execute("DELETE FROM cloudpayments_invoices WHERE bot_id = ?", (bot_id,))
         await db.commit()
 
 
@@ -638,6 +671,107 @@ async def get_bot_payment_provider(bot_id: int) -> str | None:
         ) as cursor:
             row = await cursor.fetchone()
             return _decrypt_token(row[0]) if row else None
+
+
+async def set_bot_provider_type(bot_id: int, provider_type: str, public_id: str, api_secret: str) -> None:
+    """Upserts the Cloudpayments track — separate row shape from
+    set_bot_payment_provider's Telegram provider_token, but the SAME table
+    (bot_payment_providers stays the single source of truth for "does this
+    bot have payments connected, and how"). provider_token itself is left
+    NULL for a cloudpayments-only bot; shop_id/secret_key are reused to
+    carry public_id/api_secret (Cloudpayments' own two credentials) so a
+    third pair of columns isn't needed — get_bot_cloudpayments_credentials
+    reads them back under their own names."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO bot_payment_providers (bot_id, provider_token, provider_type, shop_id, secret_key)
+            VALUES (?, '', ?, ?, ?)
+            ON CONFLICT(bot_id) DO UPDATE SET
+                provider_type = excluded.provider_type,
+                shop_id = excluded.shop_id,
+                secret_key = excluded.secret_key
+            """,
+            (bot_id, provider_type, public_id, _encrypt_token(api_secret)),
+        )
+        await db.commit()
+    logger.info(f"set_bot_provider_type: provider_type={provider_type} set for bot_id={bot_id}")
+
+
+async def get_bot_provider_type(bot_id: int) -> str | None:
+    """Returns 'yookassa'/'cloudpayments', or None if no payment provider is
+    connected at all (no bot_payment_providers row)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT provider_type FROM bot_payment_providers WHERE bot_id = ?", (bot_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else None
+
+
+async def get_bot_cloudpayments_credentials(bot_id: int) -> tuple[str, str] | None:
+    """Returns (public_id, api_secret) for a cloudpayments-connected bot, or
+    None. See set_bot_provider_type's docstring for why these ride on the
+    shop_id/secret_key columns."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT shop_id, secret_key FROM bot_payment_providers WHERE bot_id = ? AND provider_type = 'cloudpayments'",
+            (bot_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            if not row or not row[0] or not row[1]:
+                return None
+            return row[0], _decrypt_token(row[1])
+
+
+async def create_cloudpayments_invoice(
+    bot_id: int, invoice_payload: str, title: str, description: str, currency: str, amount: int, chat_id: int,
+) -> int:
+    """Creates a 'pending' checkout row and returns its id — this becomes the
+    invoice_id in /pay/{bot_id}/{invoice_id}, generated BEFORE the customer
+    ever reaches the Cloudpayments widget (see cloudpayments_invoices'
+    docstring in init_db())."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            """
+            INSERT INTO cloudpayments_invoices
+                (bot_id, invoice_payload, title, description, currency, amount, chat_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (bot_id, invoice_payload, title, description, currency, amount, chat_id),
+        )
+        await db.commit()
+        return cursor.lastrowid
+
+
+async def get_cloudpayments_invoice(invoice_id: int) -> dict | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM cloudpayments_invoices WHERE id = ?", (invoice_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+
+async def mark_cloudpayments_invoice_paid(
+    invoice_id: int, provider_charge_id: str, card_last_four: str,
+) -> bool:
+    """Flips a 'pending' row to 'paid'. Only transitions from 'pending' (same
+    idempotency guard as features/payments.py's telegram_payment_charge_id
+    UNIQUE constraint) — a redelivered webhook for an already-'paid' invoice
+    hits rowcount==0 and is silently ignored by the caller, not double-processed."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            """
+            UPDATE cloudpayments_invoices
+            SET status = 'paid', provider_charge_id = ?, card_last_four = ?, paid_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND status = 'pending'
+            """,
+            (provider_charge_id, card_last_four, invoice_id),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
 
 
 async def set_bot_yookassa_credentials(bot_id: int, shop_id: str, secret_key: str) -> None:

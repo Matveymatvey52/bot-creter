@@ -30,7 +30,9 @@ from db.database import (
     get_bot,
     get_bot_by_name,
     get_bot_features,
+    get_bot_cloudpayments_credentials,
     get_bot_payment_provider,
+    get_bot_provider_type,
     get_bot_sheets_config,
     get_bot_yookassa_credentials,
     get_bot_yookassa_status_cache,
@@ -42,6 +44,7 @@ from db.database import (
     set_bot_miniapp_config,
     set_bot_office_hook_config,
     set_bot_payment_provider,
+    set_bot_provider_type,
     set_bot_sheets_config,
     set_bot_voice_cashflow_config,
     set_bot_yookassa_credentials,
@@ -103,6 +106,15 @@ class PaymentConnectFlow(StatesGroup):
     waiting_for_token = State()
     waiting_for_shop_id = State()
     waiting_for_secret_key = State()
+
+
+class CloudpaymentsConnectFlow(StatesGroup):
+    """Separate, much shorter flow from PaymentConnectFlow above — Cloudpayments
+    needs only public_id + api_secret (no BotFather trip, no Telegram
+    provider_token), so it doesn't share PaymentConnectFlow's 4-step wizard
+    states. See cb_paychoose_cloudpayments for the entry point."""
+    waiting_for_public_id = State()
+    waiting_for_api_secret = State()
 
 
 class AiDialogStates(StatesGroup):
@@ -1383,6 +1395,35 @@ async def _show_payment_step(callback: CallbackQuery, bot_id: int, step: int) ->
 
 @router.callback_query(F.data.startswith("paystart:"))
 async def cb_payment_connect_start(callback: CallbackQuery, state: FSMContext):
+    """Provider choice — first screen of the payments connect flow. ЮKassa
+    keeps its existing 4-step BotFather wizard (paychooseyk: below); Cloudpayments
+    branches into the separate, shorter CloudpaymentsConnectFlow (public_id +
+    api_secret only, no Telegram provider_token at all — see docs discussion
+    at https://claude.ai/code/artifact/ca3f6b07-28b3-4719-86e4-fc3b2d2536ce,
+    "Вариант 1": a standalone /pay/{bot_id}/{invoice_id} page instead of a
+    Telegram Payments invoice)."""
+    await callback.answer()
+    bot_id = int(callback.data.split(":")[1])
+    if not await _bot_or_deny(callback.from_user.id, bot_id):
+        await callback.message.answer("Бот не найден.")
+        return
+    await state.clear()
+    await _edit_or_resend(
+        callback,
+        "💳 Какой платёжный провайдер подключить?\n\n"
+        "<b>ЮKassa</b> — оплата прямо в Telegram (стандартный счёт от бота).\n"
+        "<b>Cloudpayments</b> — отдельная страница оплаты по ссылке (вне Telegram).",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="ЮKassa", callback_data=f"paychooseyk:{bot_id}")],
+            [InlineKeyboardButton(text="Cloudpayments", callback_data=f"paychoosecp:{bot_id}")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data=f"paycancel:{bot_id}")],
+        ]),
+    )
+
+
+@router.callback_query(F.data.startswith("paychooseyk:"))
+async def cb_payment_choose_yookassa(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     bot_id = int(callback.data.split(":")[1])
     if not await _bot_or_deny(callback.from_user.id, bot_id):
@@ -1396,6 +1437,115 @@ async def cb_payment_connect_start(callback: CallbackQuery, state: FSMContext):
     await state.set_state(PaymentConnectFlow.browsing_step)
     await state.update_data(bot_id=bot_id)
     await _show_payment_step(callback, bot_id, 1)
+
+
+_CLOUDPAYMENTS_PUBLIC_ID_RE = re.compile(r"^pk_[A-Za-z0-9]{8,64}$")
+
+
+@router.callback_query(F.data.startswith("paychoosecp:"))
+async def cb_payment_choose_cloudpayments(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    bot_id = int(callback.data.split(":")[1])
+    if not await _bot_or_deny(callback.from_user.id, bot_id):
+        await callback.message.answer("Бот не найден.")
+        return
+    await state.set_state(CloudpaymentsConnectFlow.waiting_for_public_id)
+    await state.update_data(bot_id=bot_id)
+    await _edit_or_resend(
+        callback,
+        "💳 Подключение Cloudpayments.\n\n"
+        "1️⃣ Зарегистрируйся в личном кабинете Cloudpayments, если ещё не сделал этого.\n"
+        "2️⃣ Пришли <b>Public ID</b> магазина (вида <code>pk_...</code>, раздел "
+        "«Настройки → API» в личном кабинете).",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔗 Открыть Cloudpayments", url="https://merchant.cloudpayments.ru/")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data=f"paycancel:{bot_id}")],
+        ]),
+    )
+
+
+@router.message(CloudpaymentsConnectFlow.waiting_for_public_id, F.text, ~F.text.startswith("/"))
+async def msg_cloudpayments_public_id(message: Message, state: FSMContext):
+    data = await state.get_data()
+    bot_id = data.get("bot_id")
+    if bot_id is None:
+        await state.clear()
+        return
+    if not await _bot_or_deny(message.from_user.id, bot_id):
+        await state.clear()
+        return
+    public_id = message.text.strip()
+    if not _CLOUDPAYMENTS_PUBLIC_ID_RE.match(public_id):
+        await message.answer(
+            "⚠️ Не похоже на Public ID Cloudpayments. Ожидается формат вида "
+            "<code>pk_1234567890abcdef</code>. Проверь и пришли ещё раз, либо нажми ❌ Отмена.",
+            parse_mode="HTML",
+        )
+        return
+    await state.update_data(bot_id=bot_id, public_id=public_id)
+    await state.set_state(CloudpaymentsConnectFlow.waiting_for_api_secret)
+    await message.answer(
+        "✅ Public ID сохранён.\n\n"
+        "3️⃣ Теперь пришли <b>API Secret</b> (раздел «Настройки → API», "
+        "показывается один раз при создании — если потерян, сгенерируй новый в кабинете).",
+        parse_mode="HTML",
+    )
+
+
+@router.message(CloudpaymentsConnectFlow.waiting_for_public_id)
+async def msg_cloudpayments_public_id_invalid(message: Message) -> None:
+    await message.answer("Пришли Public ID текстом, либо нажми ❌ Отмена.")
+
+
+@router.message(CloudpaymentsConnectFlow.waiting_for_api_secret, F.text, ~F.text.startswith("/"))
+async def msg_cloudpayments_api_secret(message: Message, state: FSMContext):
+    data = await state.get_data()
+    bot_id = data.get("bot_id")
+    public_id = data.get("public_id")
+    if bot_id is None or not public_id:
+        await state.clear()
+        return
+    if not await _bot_or_deny(message.from_user.id, bot_id):
+        await state.clear()
+        return
+    api_secret = message.text.strip()
+    if len(api_secret) < 8:
+        await message.answer(
+            "⚠️ Похоже на слишком короткий ключ. Пришли API Secret из кабинета Cloudpayments ещё раз, "
+            "либо нажми ❌ Отмена.",
+        )
+        return
+    if bot_id in _busy_bots:
+        await message.answer(_BUSY_TEXT)
+        return
+    _busy_bots.add(bot_id)
+    try:
+        if not await get_bot(bot_id):
+            await state.clear()
+            await message.answer("Бот не найден.")
+            return
+        await set_bot_provider_type(bot_id, "cloudpayments", public_id, api_secret)
+    finally:
+        _busy_bots.discard(bot_id)
+    await state.clear()
+    # Best-effort: delete the message carrying the raw API secret so it
+    # doesn't sit in the chat history in plaintext (mirrors the same
+    # trade-off msg_payment_secret_key already makes for ЮKassa's secret_key —
+    # see that handler a bit further down).
+    try:
+        await message.delete()
+    except TelegramBadRequest:
+        pass
+    await message.answer(
+        "✅ Cloudpayments подключён. Теперь счета для этого бота будут отправляться "
+        "ссылкой на отдельную страницу оплаты вместо стандартного Telegram-инвойса."
+    )
+
+
+@router.message(CloudpaymentsConnectFlow.waiting_for_api_secret)
+async def msg_cloudpayments_api_secret_invalid(message: Message) -> None:
+    await message.answer("Пришли API Secret текстом, либо нажми ❌ Отмена.")
 
 
 @router.callback_query(F.data.startswith("paystep:"))

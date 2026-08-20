@@ -21,14 +21,15 @@ Callers must surface that as "отметить как возвращённый",
 from __future__ import annotations
 
 import logging
+import os
 import sqlite3
 from typing import Protocol
 
 import aiosqlite
 from aiogram import Bot, F, Router
-from aiogram.types import LabeledPrice, Message, PreCheckoutQuery
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice, Message, PreCheckoutQuery
 
-from db.database import get_bot_payment_provider
+from db.database import create_cloudpayments_invoice, get_bot_payment_provider, get_bot_provider_type
 from features.office_events import OrderCreatedEvent, publish_event
 
 logger = logging.getLogger(__name__)
@@ -90,10 +91,34 @@ async def create_invoice(
     currency: str,
     prices: list[LabeledPrice],
 ) -> Message:
-    """Thin wrapper over bot.send_invoice() — fetches this bot's provider_token
-    from bot_payment_providers so callers never handle the credential directly.
-    Raises ValueError (caller's to catch and turn into an admin-facing message)
-    if no provider is configured for this bot yet."""
+    """Sends a payment prompt via whichever provider this bot has connected
+    (bot_payment_providers.provider_type — see handlers/manage_bots.py's
+    PaymentConnectFlow / CloudpaymentsConnectFlow). Two entirely different
+    payment mechanisms live behind this one signature so every one of the
+    ~24 payments-compatible templates keeps calling create_invoice() exactly
+    as before regardless of which provider the bot owner picked:
+
+      - 'yookassa' (default): the original behavior — bot.send_invoice()
+        with provider_token, a native Telegram Payments invoice message.
+      - 'cloudpayments': no Telegram provider_token exists at all for this
+        bot. Instead a `cloudpayments_invoices` row is created and a message
+        with an inline "Оплатить" button (url=...) pointing at
+        runtime/cloudpayments_api.py's own /pay/{bot_id}/{invoice_id} page is
+        sent — see PAYMENT_STATUS.md / docs discussion "Вариант 1", same
+        button-not-raw-link shape as ЮKassa's own send_invoice message.
+        on_successful_payment's aiogram
+        F.successful_payment listener never fires for this path; the
+        webhook handler in cloudpayments_api.py performs the equivalent
+        payments-table insert + office_events publish itself.
+
+    Raises ValueError (caller's to catch and turn into an admin-facing
+    message) if no provider is configured for this bot yet."""
+    provider_type = await get_bot_provider_type(bot_id)
+    if provider_type == "cloudpayments":
+        return await _create_cloudpayments_invoice_message(
+            bot, bot_id, chat_id, title, description, payload, currency, prices,
+        )
+
     provider_token = await get_bot_payment_provider(bot_id)
     if not provider_token:
         logger.warning(f"create_invoice: no payment provider configured for bot_id={bot_id}")
@@ -112,6 +137,45 @@ async def create_invoice(
     )
     logger.info(f"create_invoice: sent invoice bot_id={bot_id} chat_id={chat_id} payload={payload}")
     return invoice_message
+
+
+async def _create_cloudpayments_invoice_message(
+    bot: Bot,
+    bot_id: int,
+    chat_id: int,
+    title: str,
+    description: str,
+    payload: str,
+    currency: str,
+    prices: list[LabeledPrice],
+) -> Message:
+    """LabeledPrice amounts are minor units summed the same way Telegram's
+    own send_invoice expects (see aiogram's LabeledPrice docs) — reused
+    as-is so callers don't need a different amount convention per provider."""
+    total_amount = sum(p.amount for p in prices)
+    invoice_id = await create_cloudpayments_invoice(
+        bot_id=bot_id,
+        invoice_payload=payload,
+        title=title,
+        description=description,
+        currency=currency,
+        amount=total_amount,
+        chat_id=chat_id,
+    )
+    base_url = os.getenv("PUBLIC_BASE_URL", "").strip()
+    if not base_url:
+        logger.error(f"create_invoice: PUBLIC_BASE_URL not set — cannot build a Cloudpayments /pay link for bot_id={bot_id}")
+        raise ValueError("PUBLIC_BASE_URL is not configured — cannot generate a Cloudpayments payment link.")
+    pay_url = f"{base_url.rstrip('/')}/pay/{bot_id}/{invoice_id}"
+    message = await bot.send_message(
+        chat_id=chat_id,
+        text=f"💳 {title}\n{description}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Оплатить", url=pay_url)],
+        ]),
+    )
+    logger.info(f"create_invoice: sent Cloudpayments link bot_id={bot_id} chat_id={chat_id} invoice_id={invoice_id}")
+    return message
 
 
 async def on_pre_checkout_query(query: PreCheckoutQuery) -> None:

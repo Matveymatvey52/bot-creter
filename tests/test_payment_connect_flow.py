@@ -74,11 +74,26 @@ class PaymentConnectStartTests(unittest.IsolatedAsyncioTestCase):
         self._owner_patcher.stop()
         await delete_bot(self.bot_id)
 
-    async def test_shows_step_1_with_registration_link(self):
+    async def test_shows_provider_choice_screen(self):
         callback = _make_callback(self.owner_id, f"paystart:{self.bot_id}")
         state = _make_fsm_context(self.owner_id)
 
         await manage_bots.cb_payment_connect_start(callback, state)
+
+        callback.message.edit_text.assert_awaited_once()
+        text = callback.message.edit_text.call_args[0][0]
+        self.assertIn("ЮKassa", text)
+        self.assertIn("Cloudpayments", text)
+        markup = callback.message.edit_text.call_args[1]["reply_markup"]
+        callback_datas = [btn.callback_data for row in markup.inline_keyboard for btn in row if btn.callback_data]
+        self.assertIn(f"paychooseyk:{self.bot_id}", callback_datas)
+        self.assertIn(f"paychoosecp:{self.bot_id}", callback_datas)
+
+    async def test_choosing_yookassa_shows_step_1_with_registration_link(self):
+        callback = _make_callback(self.owner_id, f"paychooseyk:{self.bot_id}")
+        state = _make_fsm_context(self.owner_id)
+
+        await manage_bots.cb_payment_choose_yookassa(callback, state)
 
         callback.message.edit_text.assert_awaited_once()
         text = callback.message.edit_text.call_args[0][0]
