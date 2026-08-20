@@ -53,9 +53,14 @@ async def _is_creator_bot_admin(telegram_user_id: int) -> bool:
     # a bot's own analytics to that bot's admins (get_bot_admins(bot_id),
     # membership by str(telegram_user_id)) — reused as-is here, scoped to
     # FACTORY_BOT_ID (bot_id=0, the Creator bot itself), rather than
-    # inventing a separate check. Deliberately NOT the same thing as
-    # OWNER_ID: any admin of the Creator bot (db/database.py's bot_admins
-    # table for bot_id=0) qualifies, not just the single system owner.
+    # inventing a separate check. Not just OWNER_ID: any admin of the
+    # Creator bot (db/database.py's bot_admins table for bot_id=0)
+    # qualifies too. OWNER_ID is included as a fallback because bot_id=0
+    # has no bots-table row, so /addadmin can never target it and there is
+    # otherwise no way to populate that table for the owner.
+    if _OWNER_ID != 0 and telegram_user_id == _OWNER_ID:
+        return True
+
     from runtime.registry import FACTORY_BOT_ID
 
     admin_ids = await get_bot_admins(FACTORY_BOT_ID)

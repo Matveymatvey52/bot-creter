@@ -108,7 +108,9 @@ class StartRegistryButtonTests(unittest.IsolatedAsyncioTestCase):
     to any admin of the Creator bot itself (bot_admins for bot_id=0), reusing
     the exact same get_bot_admins(bot_id) + str(telegram_user_id) membership
     check runtime/miniapp_api.py's compute_metrics route already uses to gate
-    a bot's own analytics to that bot's admins — NOT an OWNER_ID check."""
+    a bot's own analytics to that bot's admins. OWNER_ID is also accepted as
+    a fallback, since bot_id=0 has no bots-table row and so can never be
+    targeted by /addadmin — see handlers/start.py's _is_creator_bot_admin."""
 
     ADMIN_USER_ID = 424242
 
@@ -141,6 +143,21 @@ class StartRegistryButtonTests(unittest.IsolatedAsyncioTestCase):
         markup = message.answer_photo.call_args.kwargs["reply_markup"]
         labels = [btn.text for row in markup.inline_keyboard for btn in row]
         self.assertNotIn("📋 Реестр ботов", labels)
+
+    async def test_owner_id_sees_registry_button_without_bot_admins_row(self):
+        # bot_id=0 has no bots-table row, so OWNER_ID can never be added to
+        # bot_admins through the normal /addadmin flow — this is the only
+        # path that lets the owner actually reach the registry button.
+        owner_id = 999999
+        with patch.object(start_module, "_OWNER_ID", owner_id):
+            message = _make_message(owner_id, "/start")
+
+            await start_module.cmd_start(message)
+
+        message.answer_photo.assert_awaited_once()
+        markup = message.answer_photo.call_args.kwargs["reply_markup"]
+        labels = [btn.text for row in markup.inline_keyboard for btn in row]
+        self.assertIn("📋 Реестр ботов", labels)
 
 
 if __name__ == "__main__":
