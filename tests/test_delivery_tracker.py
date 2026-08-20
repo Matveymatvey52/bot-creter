@@ -426,5 +426,40 @@ class DeliveryTrackerStandaloneSmokeTest(unittest.TestCase):
         self.assertTrue(hasattr(delivery_tracker, "main"))
 
 
+class DeliveryTrackerMiniAppConfigTests(unittest.IsolatedAsyncioTestCase):
+    """miniapp_config's declared table/field names must match init_db()'s
+    real schema — miniapp_api.py builds SQL directly off these names, so a
+    drift here would 500 at request time instead of failing a test."""
+
+    def test_miniapp_config_resource_names(self):
+        names = {r["name"] for r in delivery_tracker.miniapp_config["resources"]}
+        self.assertEqual(names, {"deliveries"})
+
+    def test_deliveries_resource_targets_deliveries_table(self):
+        deliveries = next(
+            r for r in delivery_tracker.miniapp_config["resources"] if r["name"] == "deliveries"
+        )
+        self.assertEqual(deliveries["table"], "deliveries")
+        self.assertFalse(deliveries["creatable"])
+
+    async def test_miniapp_config_fields_match_real_schema(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "schema_check.db")
+            await delivery_tracker.init_db(db_path)
+            conn = sqlite3.connect(db_path)
+            try:
+                for resource in delivery_tracker.miniapp_config["resources"]:
+                    cur = conn.execute(f"PRAGMA table_info({resource['table']})")
+                    real_columns = {row[1] for row in cur.fetchall()}
+                    declared = {f["name"] for f in resource["fields"]} | {"id"}
+                    self.assertTrue(
+                        declared.issubset(real_columns),
+                        f"{resource['name']}: declared fields {declared} not all in "
+                        f"real columns {real_columns}",
+                    )
+            finally:
+                conn.close()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -266,6 +266,39 @@ async def init_db(db_path: str):
         await db.commit()
 
 
+# ── mini-app config (see docs/MINIAPP_DESIGN.md, templates/car_rental.py's
+# own miniapp_config for the authoring contract) ────────────────────────────
+# Not creatable: every real delivery is created by a client via DeliveryFlow
+# (pickup/dropoff/item/phone), never by the owner typing raw rows — same
+# read-only posture as car_rental.py's bookings.status field (owner-managed
+# transitions belong in Telegram's guided status/price/note flows, not a
+# generic create form that would bypass StatusPriceFlow's price-collection
+# step).
+miniapp_config = {
+    "resources": [
+        {
+            "name": "deliveries",
+            "table": "deliveries",
+            "order_by": "created_at DESC",
+            "creatable": False,
+            "title": "Доставки",
+            "titleField": "item_description",
+            "fields": [
+                {"name": "client_name", "label": "Клиент", "kind": "text", "list": True, "detail": True, "create": False},
+                {"name": "client_phone", "label": "Телефон", "kind": "text", "list": False, "detail": True, "create": False},
+                {"name": "pickup_address", "label": "Откуда", "kind": "text", "list": True, "detail": True, "create": False},
+                {"name": "dropoff_address", "label": "Куда", "kind": "text", "list": True, "detail": True, "create": False},
+                {"name": "item_description", "label": "Что везём", "kind": "text", "list": False, "detail": True, "create": False},
+                {"name": "status", "label": "Статус", "kind": "status", "list": True, "detail": True, "create": False},
+                {"name": "price", "label": "Цена", "kind": "number", "list": True, "detail": True, "create": False},
+                {"name": "courier_note", "label": "Заметка курьера", "kind": "text", "list": False, "detail": True, "create": False},
+                {"name": "created_at", "label": "Создано", "kind": "date", "list": False, "detail": True, "create": False},
+            ],
+        },
+    ],
+}
+
+
 # ── FSM staleness guard ─────────────────────────────────────────────────────────
 FLOW_TIMEOUT_SECONDS = 300
 
