@@ -112,6 +112,15 @@ class MiniAppApiTests(unittest.IsolatedAsyncioTestCase):
         )
         self._db_patcher.start()
 
+        # These fixture resources (tours/readonly_res) have no role_filter,
+        # so _admin_gate_ok requires admin membership (docs/
+        # MINIAPP_AUTH_GATE_GAP.md) — telegram_user_id=111 is what
+        # _auth_query() below mints tokens for.
+        self._admins_patcher = patch(
+            "runtime.miniapp_api.get_bot_admins", AsyncMock(return_value=["111"])
+        )
+        self._admins_patcher.start()
+
         self.server = TestServer(self.app)
         self.client = TestClient(self.server)
         await self.client.start_server()
@@ -120,6 +129,7 @@ class MiniAppApiTests(unittest.IsolatedAsyncioTestCase):
         await self.client.close()
         self._patcher.stop()
         self._db_patcher.stop()
+        self._admins_patcher.stop()
         self._tmpdir.cleanup()
 
     # ── magic-link token auth ──────────────────────────────────────────
@@ -305,6 +315,43 @@ class MiniAppApiTests(unittest.IsolatedAsyncioTestCase):
         resp = await self.client.get("/api/999999/tours")
         self.assertEqual(resp.status, 404)
 
+    # ── admin gate (docs/MINIAPP_AUTH_GATE_GAP.md) ─────────────────────
+    # `tours`/`readonly_res` have no role_filter, so a genuinely-authenticated
+    # but non-admin viewer (999, not in the ["111"] admins fixture) must be
+    # denied — this is the exact leak the gate exists to close: any Telegram
+    # user who has ever messaged the bot gets a valid initData/token, but
+    # that alone must not grant access to another admin's business data.
+    async def _non_admin_auth_query(self) -> str:
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            return f"token={mint_magic_link_token(KNOWN_BOT_ID, 999)}"
+
+    async def test_list_resource_denies_non_admin(self):
+        qs = await self._non_admin_auth_query()
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            resp = await self.client.get(f"/api/{KNOWN_BOT_ID}/tours?{qs}")
+        self.assertEqual(resp.status, 403)
+
+    async def test_get_resource_denies_non_admin(self):
+        qs = await self._non_admin_auth_query()
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            resp = await self.client.get(f"/api/{KNOWN_BOT_ID}/tours/1?{qs}")
+        self.assertEqual(resp.status, 403)
+
+    async def test_create_resource_denies_non_admin(self):
+        qs = await self._non_admin_auth_query()
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            resp = await self.client.post(f"/api/{KNOWN_BOT_ID}/tours?{qs}", json={"name": "x"})
+        self.assertEqual(resp.status, 403)
+
+    async def test_non_admin_gate_denial_happens_before_row_lookup(self):
+        """A non-admin querying a real, existing item id still gets 403, not
+        404 — the gate runs before any row/existence check, so it never
+        leaks whether an id exists to an unauthorized viewer."""
+        qs = await self._non_admin_auth_query()
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            resp = await self.client.get(f"/api/{KNOWN_BOT_ID}/tours/999999?{qs}")
+        self.assertEqual(resp.status, 403)
+
 
 class MiniappConfigDbPrecedenceTests(unittest.IsolatedAsyncioTestCase):
     """DB is authoritative when present (see docs/MINIAPP_DESIGN.md §6) — a
@@ -349,6 +396,13 @@ class MiniappConfigDbPrecedenceTests(unittest.IsolatedAsyncioTestCase):
         )
         self._module_patcher.start()
 
+        # DB_CONFIG's "orders" resource has no role_filter — same admin
+        # gate as MiniAppApiTests above, see docs/MINIAPP_AUTH_GATE_GAP.md.
+        self._admins_patcher = patch(
+            "runtime.miniapp_api.get_bot_admins", AsyncMock(return_value=["111"])
+        )
+        self._admins_patcher.start()
+
         self.server = TestServer(self.app)
         self.client = TestClient(self.server)
         await self.client.start_server()
@@ -356,6 +410,7 @@ class MiniappConfigDbPrecedenceTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         await self.client.close()
         self._module_patcher.stop()
+        self._admins_patcher.stop()
 
     async def _auth_query(self) -> str:
         with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
@@ -486,6 +541,11 @@ class RoleFilterRegressionTests(unittest.IsolatedAsyncioTestCase):
         )
         self._db_patcher.start()
 
+        self._admins_patcher = patch(
+            "runtime.miniapp_api.get_bot_admins", AsyncMock(return_value=["111"])
+        )
+        self._admins_patcher.start()
+
         self.server = TestServer(self.app)
         self.client = TestClient(self.server)
         await self.client.start_server()
@@ -494,6 +554,7 @@ class RoleFilterRegressionTests(unittest.IsolatedAsyncioTestCase):
         await self.client.close()
         self._module_patcher.stop()
         self._db_patcher.stop()
+        self._admins_patcher.stop()
         self._tmpdir.cleanup()
 
     async def test_course_tracker_config_has_no_role_filter_anywhere(self):
@@ -511,6 +572,16 @@ class RoleFilterRegressionTests(unittest.IsolatedAsyncioTestCase):
         body = await resp.json()
         self.assertEqual(body["resource"], first_resource["name"])
         self.assertIsInstance(body["items"], list)
+
+    async def test_course_tracker_non_admin_denied_by_admin_gate(self):
+        """docs/MINIAPP_AUTH_GATE_GAP.md: a resource with no role_filter is
+        admin-only. telegram_user_id=222 is deliberately absent from the
+        ["111"] admin list this class patches get_bot_admins to."""
+        first_resource = self._course_tracker_module.miniapp_config["resources"][0]
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            token = mint_magic_link_token(KNOWN_BOT_ID, telegram_user_id=222)
+            resp = await self.client.get(f"/api/{KNOWN_BOT_ID}/{first_resource['name']}?token={token}")
+        self.assertEqual(resp.status, 403)
 
 
 class OwnershipOnlyRoleFilterTests(unittest.IsolatedAsyncioTestCase):

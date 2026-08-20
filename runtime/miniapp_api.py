@@ -432,6 +432,33 @@ async def _apply_role_filter(
     return sql, params
 
 
+async def _admin_gate_ok(bot_id: int, resource: dict, telegram_user_id: int) -> bool:
+    """Closes docs/MINIAPP_AUTH_GATE_GAP.md: _authenticate() only proves a
+    genuine Telegram identity, not that this identity is entitled to use
+    the mini-app at all — and the bot's Telegram Menu Button opens
+    /app/{bot_id} for EVERY user who has ever messaged the bot, not just
+    admins (see that doc for the full incident). A resource with NO
+    role_filter has no per-row ownership concept to fall back on, so
+    without this gate any such user could list every other user's rows.
+
+    A resource that DOES declare role_filter (either shape — role-resolved
+    or ownership-only, docs/MINIAPP_ROLE_SCOPING_DESIGN.md) already scopes
+    rows to what this viewer is entitled to see, so it is exempt from this
+    gate — that mechanism IS the authorization for that resource (e.g.
+    team_manager's worker role, or a customer's own bookings via an
+    ownership-only filter). Re-checking admin membership on top would
+    incorrectly lock out those legitimate non-admin viewers.
+
+    Admin membership is checked against db.database.get_bot_admins() — the
+    same factory-level admin list each template's own admins.json is kept
+    in sync with (sync_bot_admins_json), already used identically by
+    analytics_handler/export_excel_handler/office_tasks_handler below."""
+    if resource.get("role_filter") is not None:
+        return True
+    admin_ids = await get_bot_admins(bot_id)
+    return str(telegram_user_id) in admin_ids
+
+
 async def list_resource_handler(request: web.Request) -> web.Response:
     resolved = await _resolve_entry_and_config(request)
     if isinstance(resolved, web.Response):
@@ -446,6 +473,9 @@ async def list_resource_handler(request: web.Request) -> web.Response:
     resource = _resource_spec(miniapp_config, resource_name)
     if resource is None:
         return web.json_response({"error": "unknown resource"}, status=404)
+
+    if not await _admin_gate_ok(bot_id, resource, telegram_user_id):
+        return web.json_response({"error": "forbidden"}, status=403)
 
     db_path = entry.config.get("db_path") if isinstance(entry.config, dict) else None
     if not db_path:
@@ -487,6 +517,9 @@ async def get_resource_handler(request: web.Request) -> web.Response:
     resource = _resource_spec(miniapp_config, resource_name)
     if resource is None:
         return web.json_response({"error": "unknown resource"}, status=404)
+
+    if not await _admin_gate_ok(bot_id, resource, telegram_user_id):
+        return web.json_response({"error": "forbidden"}, status=403)
 
     item_id_raw = request.match_info.get("item_id", "")
     if not item_id_raw.isdigit():
@@ -541,6 +574,9 @@ async def create_resource_handler(request: web.Request) -> web.Response:
         return web.json_response({"error": "unknown resource"}, status=404)
     if not resource.get("creatable", False):
         return web.json_response({"error": "resource is read-only"}, status=403)
+
+    if not await _admin_gate_ok(bot_id, resource, telegram_user_id):
+        return web.json_response({"error": "forbidden"}, status=403)
 
     try:
         payload = await request.json()
