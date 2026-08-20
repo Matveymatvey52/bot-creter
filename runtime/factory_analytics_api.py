@@ -63,6 +63,7 @@ from handlers.manage_bots import (
     autofix_bot_core,
     disable_feature_and_reload,
     enable_feature_and_reload,
+    generate_fix_preview_core,
     recreate_bot_core,
 )
 from runtime.miniapp_api import _authenticate, mint_magic_link_token
@@ -638,7 +639,14 @@ async def autofix_bot_handler(request: web.Request) -> web.Response:
     return await _guard_action(bot_id, action)
 
 
-async def fixbug_bot_handler(request: web.Request) -> web.Response:
+async def fixbug_preview_handler(request: web.Request) -> web.Response:
+    """POST /api/factory/bots/{bot_id}/fixbug/preview — generation-only half
+    of the web fixbug flow (see handlers/manage_bots.py's
+    generate_fix_preview_core): runs the fix and returns fixed_code +
+    explanation + main_code_hash WITHOUT writing anything to disk. The
+    caller shows the explanation to the owner, then POSTs fixed_code +
+    main_code_hash to fixbug_apply_handler once confirmed — same
+    generate/apply split as the Telegram flow, so nothing is applied blind."""
     bot_id = _bot_id_from_match_info(request)
     if bot_id is None:
         return web.json_response({"error": "bad bot_id"}, status=404)
@@ -653,7 +661,38 @@ async def fixbug_bot_handler(request: web.Request) -> web.Response:
         return web.json_response({"error": "description is required"}, status=400)
 
     async def action():
-        result = await apply_fix_core(bot_id, description.strip())
+        result = await generate_fix_preview_core(bot_id, description.strip())
+        status = 200 if result["ok"] else 422
+        return web.json_response(result, status=status)
+
+    return await _guard_action(bot_id, action)
+
+
+async def fixbug_apply_handler(request: web.Request) -> web.Response:
+    """POST /api/factory/bots/{bot_id}/fixbug/apply — apply half of the web
+    fixbug flow. Takes fixed_code + main_code_hash exactly as returned by
+    fixbug_preview_handler (never regenerates); apply_fix_core re-validates
+    main_code_hash against the CURRENT file before writing, so a fix
+    generated against a since-changed file is rejected rather than applied
+    stale."""
+    bot_id = _bot_id_from_match_info(request)
+    if bot_id is None:
+        return web.json_response({"error": "bad bot_id"}, status=404)
+    if not await _authenticate_bot_access(request, bot_id):
+        return web.json_response({"error": "forbidden"}, status=403)
+    try:
+        payload = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON body"}, status=400)
+    fixed_code = payload.get("fixed_code") if isinstance(payload, dict) else None
+    if not isinstance(fixed_code, str) or not fixed_code.strip():
+        return web.json_response({"error": "fixed_code is required"}, status=400)
+    main_code_hash = payload.get("main_code_hash") if isinstance(payload, dict) else None
+    if main_code_hash is not None and not isinstance(main_code_hash, str):
+        return web.json_response({"error": "main_code_hash must be a string"}, status=400)
+
+    async def action():
+        result = await apply_fix_core(bot_id, fixed_code, main_code_hash)
         status = 200 if result["ok"] else 422
         return web.json_response(result, status=status)
 
@@ -957,7 +996,8 @@ def register_routes(app: web.Application) -> None:
     app.router.add_get("/api/factory/bots/{bot_id}/activity", bot_activity_handler)
     app.router.add_post("/api/factory/bots/{bot_id}/recreate", recreate_bot_handler)
     app.router.add_post("/api/factory/bots/{bot_id}/autofix", autofix_bot_handler)
-    app.router.add_post("/api/factory/bots/{bot_id}/fixbug", fixbug_bot_handler)
+    app.router.add_post("/api/factory/bots/{bot_id}/fixbug/preview", fixbug_preview_handler)
+    app.router.add_post("/api/factory/bots/{bot_id}/fixbug/apply", fixbug_apply_handler)
 
     app.router.add_get("/api/factory/bots/{bot_id}/features", list_features_handler)
     app.router.add_post("/api/factory/bots/{bot_id}/features/{name}/disable", disable_feature_handler)

@@ -289,11 +289,35 @@ export function autofixBot(botId: number): Promise<{ ok: boolean; error: string 
   return request(`/bots/${botId}/autofix`, { method: 'POST' })
 }
 
-export function fixBug(
+export interface FixBugPreview {
+  ok: boolean
+  error: string | null
+  bot_name: string | null
+  fixed_code: string | null
+  explanation: string | null
+  main_code_hash: string | null
+}
+
+// Two-step fixbug flow — mirrors the Telegram bot's own preview-before-apply
+// pattern (handlers/manage_bots.py's _generate_and_preview_fix / cb_apply_fix):
+// previewFixBug() only generates and returns a diff explanation, nothing is
+// written to disk until applyFixBug() is called with the fixed_code +
+// main_code_hash it returned. Do not skip straight to applyFixBug with
+// hand-written fixed_code — main_code_hash must come from a real preview
+// call, or the freshness check on the server will reject it.
+export function previewFixBug(botId: number, description: string): Promise<FixBugPreview> {
+  return request(`/bots/${botId}/fixbug/preview`, { method: 'POST', body: JSON.stringify({ description }) })
+}
+
+export function applyFixBug(
   botId: number,
-  description: string,
+  fixedCode: string,
+  mainCodeHash: string | null,
 ): Promise<{ ok: boolean; error: string | null; bot_name: string | null }> {
-  return request(`/bots/${botId}/fixbug`, { method: 'POST', body: JSON.stringify({ description }) })
+  return request(`/bots/${botId}/fixbug/apply`, {
+    method: 'POST',
+    body: JSON.stringify({ fixed_code: fixedCode, main_code_hash: mainCodeHash }),
+  })
 }
 
 export function listBotFeatures(botId: number): Promise<{ items: FeatureStatusItem[] }> {

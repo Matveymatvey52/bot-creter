@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast as _ast
 import asyncio
+import difflib
 import json
 import logging
 import re
@@ -1259,6 +1260,56 @@ async def fix_bot_code(current_code: str, bug_description: str) -> str:
         code = _strip_code_fences(cont.content[0].text)
         _ast.parse(code)
     return code
+
+
+# Bounded the same way EXPLAIN_CUSTOM_FEATURE_PROMPT's input is implicitly
+# bounded (a custom_features patch is small by construction) — fix_bot_code
+# rewrites the WHOLE file (300-1500+ lines), so the raw unified diff can be
+# far larger than a Haiku-sized preview call should carry. Cap at a line
+# count rather than a char count: unified_diff lines are already short
+# (prefix + one source line each), so this reliably keeps the prompt small
+# without cutting off mid-hunk in a way that would look broken.
+_BUG_FIX_DIFF_LINE_LIMIT = 400
+
+
+def _bounded_bug_fix_diff(current_code: str, fixed_code: str) -> str:
+    diff_lines = list(difflib.unified_diff(
+        current_code.splitlines(), fixed_code.splitlines(),
+        fromfile="before", tofile="after", lineterm="",
+    ))
+    if len(diff_lines) > _BUG_FIX_DIFF_LINE_LIMIT:
+        shown = diff_lines[:_BUG_FIX_DIFF_LINE_LIMIT]
+        shown.append(f"... ({len(diff_lines) - _BUG_FIX_DIFF_LINE_LIMIT} more diff lines omitted)")
+        return "\n".join(shown)
+    return "\n".join(diff_lines)
+
+
+EXPLAIN_BUG_FIX_PROMPT = """Ты объясняешь владельцу Telegram-бота, что изменится в его боте после исправления бага — ДО того, как изменение применится.
+
+Пиши по-русски, 3-5 строк, простым языком, без кода и технических терминов (не говори "diff", "функция", "хендлер" и т.п.). Опиши, что было не так и что теперь исправлено, с точки зрения обычного человека. Используй HTML-теги (<b>, <i>) для акцентов.
+
+Если из diff видно, что появилась новая команда (например /excel) — обязательно назови её."""
+
+
+async def explain_bug_fix_diff(current_code: str, fixed_code: str, bug_description: str) -> str:
+    """Haiku-sized plain-language translation of a fix_bot_code whole-file
+    rewrite, shown to the owner alongside "✅ Применить"/"❌ Отмена" BEFORE the
+    fix is written to disk — same pre-apply confirmation shape as
+    explain_custom_feature, but built from a bounded unified diff (see
+    _bounded_bug_fix_diff) rather than the whole new file, since a fixbug
+    rewrite is typically hundreds of lines of unchanged boilerplate around a
+    small actual change."""
+    diff_text = _bounded_bug_fix_diff(current_code, fixed_code)
+    response = await client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=500,
+        system=EXPLAIN_BUG_FIX_PROMPT,
+        messages=[{
+            "role": "user",
+            "content": f"Баг/запрос владельца:\n{bug_description}\n\nИзменения в коде (diff):\n{diff_text}",
+        }],
+    )
+    return response.content[0].text.strip()
 
 
 IMPROVE_SYSTEM_PROMPT = """You are an expert Python developer specializing in Telegram bots using aiogram 3.13.

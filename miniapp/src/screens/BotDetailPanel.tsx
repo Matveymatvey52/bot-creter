@@ -8,7 +8,9 @@ import {
   getBotLogs,
   recreateBot,
   autofixBot,
-  fixBug,
+  previewFixBug,
+  applyFixBug,
+  type FixBugPreview,
   disableFeature,
   configureFeature,
   cancelFeatureConfigure,
@@ -948,6 +950,7 @@ function MaintenanceTab({
 }) {
   const [fixDescribing, setFixDescribing] = useState(false)
   const [bugText, setBugText] = useState('')
+  const [fixPreview, setFixPreview] = useState<FixBugPreview | null>(null)
   const [rating, setRating] = useState(false)
 
   const run = async (fn: () => Promise<{ ok: boolean; error: string | null }>) => {
@@ -966,6 +969,36 @@ function MaintenanceTab({
     }
   }
 
+  const generateFix = async () => {
+    setBusy(true)
+    setActionError(null)
+    try {
+      const preview = await previewFixBug(botId, bugText.trim())
+      if (!preview.ok || !preview.fixed_code) {
+        setActionError(preview.error || 'Не удалось сгенерировать исправление')
+        return
+      }
+      setFixPreview(preview)
+      setFixDescribing(false)
+    } catch (err) {
+      setActionError(err instanceof ApiError ? err.message : 'Не удалось сгенерировать исправление')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const confirmFix = async () => {
+    if (!fixPreview?.fixed_code) return
+    await run(() => applyFixBug(botId, fixPreview.fixed_code as string, fixPreview.main_code_hash))
+    setFixPreview(null)
+    setBugText('')
+  }
+
+  const cancelFix = () => {
+    setFixPreview(null)
+    setBugText('')
+  }
+
   return (
     <div>
       <button className="maint-btn" disabled={busy} onClick={() => run(() => autofixBot(botId))}>
@@ -975,7 +1008,20 @@ function MaintenanceTab({
           <div className="maint-sub">найти и объяснить ошибки</div>
         </div>
       </button>
-      {fixDescribing ? (
+      {fixPreview ? (
+        <div className="feature-subpanel">
+          <div>{fixPreview.explanation}</div>
+          <div className="maint-sub">Проверь и подтверди применение.</div>
+          <div className="row">
+            <button className="mini-btn" disabled={busy} onClick={() => confirmFix()}>
+              ✅ Применить
+            </button>
+            <button className="mini-btn danger" disabled={busy} onClick={cancelFix}>
+              ❌ Отмена
+            </button>
+          </div>
+        </div>
+      ) : fixDescribing ? (
         <div className="feature-subpanel">
           <textarea
             value={bugText}
@@ -985,15 +1031,7 @@ function MaintenanceTab({
             style={{ width: '100%' }}
           />
           <div className="row">
-            <button
-              className="mini-btn"
-              disabled={!bugText.trim() || busy}
-              onClick={() => {
-                run(() => fixBug(botId, bugText.trim()))
-                setFixDescribing(false)
-                setBugText('')
-              }}
-            >
+            <button className="mini-btn" disabled={!bugText.trim() || busy} onClick={() => generateFix()}>
               Отправить
             </button>
             <button className="mini-btn danger" onClick={() => setFixDescribing(false)}>

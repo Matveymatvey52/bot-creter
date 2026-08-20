@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import hashlib
 import html
 import json
 import logging
@@ -65,6 +66,7 @@ from runtime.webhook_setup import set_miniapp_menu_button
 from services.bot_runner import _make_extra_env, get_bot_logs, is_running, start_bot, stop_bot
 from services.claude_service import (
     append_from_scratch_registry_wiring,
+    explain_bug_fix_diff,
     fix_bot_code,
     generate_bot_code,
     improve_bot_code,
@@ -96,6 +98,7 @@ def set_registry(registry) -> None:
 
 class FixBotStates(StatesGroup):
     describing_bug = State()
+    previewing_fix = State()
 
 
 class SheetsConnectFlow(StatesGroup):
@@ -155,6 +158,24 @@ async def _bot_or_deny(user_id: int, bot_id: int) -> dict | None:
     if not b or not _can_manage_bot(user_id, b):
         return None
     return b
+
+
+def _hash_bot_code(code: str) -> str:
+    return hashlib.sha256(code.encode("utf-8")).hexdigest()
+
+
+def _fix_preview_keyboard(bot_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Применить", callback_data=f"applyfix:{bot_id}"),
+        InlineKeyboardButton(text="❌ Отмена", callback_data=f"cancelfix:{bot_id}"),
+    ]])
+
+
+def _fix_retry_keyboard(bot_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🐛 Попробовать снова", callback_data=f"fixbug:{bot_id}"),
+        InlineKeyboardButton(text="◀ Назад", callback_data=f"info:{bot_id}"),
+    ]])
 
 
 async def _edit_or_resend(callback: CallbackQuery, text: str, **kwargs) -> None:
@@ -477,18 +498,17 @@ async def disable_feature_and_reload(bot_id: int, feature_name: str) -> None:
     await _reload_registry(bot_id)
 
 
-# ── core actions shared between Telegram callbacks and the factory REST API ────
+# ── core actions used by the factory REST API (runtime/factory_analytics_api.py) ────
 #
-# recreate_bot_core / autofix_bot_core / apply_fix_core are the ACTUAL work
-# cb_recreate / cb_auto_diagnose / _apply_fix perform, with all
-# Telegram-message-editing stripped out — they return a plain dict describing
-# what happened instead of calling callback.message.edit_text at each step.
-# Both the Telegram callback (which renders the dict into chat messages/
-# keyboards) and runtime/factory_analytics_api.py's REST handlers (which
-# render it into a JSON response) call these, so the actual generation/
-# write-to-disk/restart sequence exists in exactly one place. Callers are
-# responsible for the _busy_bots guard — these functions assume the caller
-# already holds it, same as the Telegram callbacks currently do inline.
+# recreate_bot_core / autofix_bot_core mirror what cb_recreate / cb_auto_diagnose
+# do for the Telegram flow (each keeps its own separate implementation for the
+# chat-message-editing version) — these return a plain dict instead of editing
+# a callback.message. generate_fix_preview_core / apply_fix_core are the
+# web-API counterpart of the Telegram fixbug flow's own
+# _generate_and_preview_fix / cb_apply_fix split (same generate-then-apply
+# shape, same main_code_hash freshness guard against a stale base file — see
+# apply_fix_core's docstring). Callers are responsible for the _busy_bots
+# guard — these functions assume the caller already holds it.
 
 async def recreate_bot_core(bot_id: int, creator_user_id: int) -> dict:
     """Returns {"ok": bool, "error": str|None, "bot_name": str|None}. Mirrors
@@ -624,10 +644,56 @@ async def autofix_bot_core(bot_id: int) -> dict:
         return {"ok": False, "error": f"start_failed:{str(e)[-300:]}", "bot_name": b["name"]}
 
 
-async def apply_fix_core(bot_id: int, bug_description: str) -> dict:
-    """Returns {"ok": bool, "error": str|None, "bot_name": str|None}. Mirrors
-    _apply_fix's sequence — same as autofix_bot_core but with an
-    owner-supplied bug_description instead of one derived from crash logs."""
+async def generate_fix_preview_core(bot_id: int, bug_description: str) -> dict:
+    """Returns {"ok": bool, "error": str|None, "bot_name": str|None,
+    "fixed_code": str|None, "explanation": str|None, "main_code_hash": str|None}.
+    Generation-only half of the web-API fixbug flow — mirrors
+    _generate_and_preview_fix's sequence (run fix_bot_code, get a
+    plain-language diff explanation, hash the pre-generation source) WITHOUT
+    writing anything to disk or restarting the bot. Pairs with apply_fix_core
+    below, which takes this function's fixed_code + main_code_hash and does
+    the actual write+restart after re-validating freshness — same
+    generate/apply split as the Telegram flow, so a future web UI can show
+    the same preview before the owner confirms."""
+    b = await get_bot(bot_id)
+    if not b:
+        return {"ok": False, "error": "not_found", "bot_name": None, "fixed_code": None, "explanation": None, "main_code_hash": None}
+    if not b.get("file_path") or not Path(b["file_path"]).exists():
+        return {"ok": False, "error": "file_missing", "bot_name": b["name"], "fixed_code": None, "explanation": None, "main_code_hash": None}
+
+    current_code = Path(b["file_path"]).read_text(encoding="utf-8")
+    try:
+        fixed_code = await asyncio.wait_for(fix_bot_code(current_code, bug_description), timeout=240.0)
+    except Exception:
+        logger.error(f"generate_fix_preview_core: fix_bot_code failed for bot_id={bot_id}")
+        return {"ok": False, "error": "fix_failed", "bot_name": b["name"], "fixed_code": None, "explanation": None, "main_code_hash": None}
+
+    try:
+        explanation = await asyncio.wait_for(
+            explain_bug_fix_diff(current_code, fixed_code, bug_description), timeout=60.0
+        )
+    except Exception:
+        logger.exception(f"generate_fix_preview_core: bot_id={bot_id} explain_bug_fix_diff failed")
+        explanation = "Исправление сгенерировано. Проверь и подтверди применение."
+
+    return {
+        "ok": True,
+        "error": None,
+        "bot_name": b["name"],
+        "fixed_code": fixed_code,
+        "explanation": explanation,
+        "main_code_hash": _hash_bot_code(current_code),
+    }
+
+
+async def apply_fix_core(bot_id: int, fixed_code: str, main_code_hash: str | None) -> dict:
+    """Returns {"ok": bool, "error": str|None, "bot_name": str|None}. Apply
+    half of the web-API fixbug flow — takes generate_fix_preview_core's
+    output (never regenerates), re-validates main_code_hash against the
+    CURRENT file on disk (same freshness guard as cb_apply_fix/
+    cb_apply_custom_feature: rejects applying a fix generated against a file
+    that has since changed, e.g. a concurrent /recreate), then writes,
+    pushes, and restarts."""
     b = await get_bot(bot_id)
     if not b:
         return {"ok": False, "error": "not_found", "bot_name": None}
@@ -635,11 +701,8 @@ async def apply_fix_core(bot_id: int, bug_description: str) -> dict:
         return {"ok": False, "error": "file_missing", "bot_name": b["name"]}
 
     current_code = Path(b["file_path"]).read_text(encoding="utf-8")
-    try:
-        fixed_code = await asyncio.wait_for(fix_bot_code(current_code, bug_description), timeout=240.0)
-    except Exception:
-        logger.error(f"apply_fix_core: fix_bot_code failed for bot_id={bot_id}")
-        return {"ok": False, "error": "fix_failed", "bot_name": b["name"]}
+    if main_code_hash is not None and _hash_bot_code(current_code) != main_code_hash:
+        return {"ok": False, "error": "stale_source", "bot_name": b["name"]}
 
     await stop_bot(bot_id)
     fixed_code = append_from_scratch_registry_wiring(fixed_code)
@@ -2384,10 +2447,20 @@ async def _recognize_voice_fix(message: Message, bot: Bot) -> str | None:
     return text
 
 
-async def _apply_fix(message: Message, state: FSMContext, bug_description: str, bot: Bot) -> None:
+async def _generate_and_preview_fix(message: Message, state: FSMContext, bug_description: str) -> None:
+    """Generation half of the fixbug flow — mirrors
+    handlers/custom_features.py's _generate_and_preview: runs fix_bot_code,
+    stashes the result in FSM state (never writes to disk here), and shows
+    a plain-language preview with Применить/Отмена. Previously this and the
+    apply step (now cb_apply_fix) were one function (_apply_fix) that wrote
+    and restarted immediately with no pause — see this module's docstring-
+    level comment history in handlers/custom_features.py for why that's
+    risky when the owner is actively troubleshooting a live client issue."""
     data = await state.get_data()
-    bot_id = data["fix_bot_id"]
+    bot_id = data.get("fix_bot_id")
     await state.clear()
+    if bot_id is None:
+        return
 
     if bot_id in _busy_bots:
         await message.answer(_BUSY_TEXT)
@@ -2395,13 +2468,13 @@ async def _apply_fix(message: Message, state: FSMContext, bug_description: str, 
     _busy_bots.add(bot_id)
     try:
         b = await _bot_or_deny(message.from_user.id, bot_id)
-        if not b:
-            await message.answer("Бот не найден.")
+        if not b or not b.get("file_path") or not Path(b["file_path"]).exists():
+            await message.answer("❌ Файл бота не найден — попробуй Перегенерировать.")
             return
 
         current_code = Path(b["file_path"]).read_text(encoding="utf-8")
 
-        fix_msg = await message.answer(f"🔧 Исправляю код <b>{b['name']}</b>...", parse_mode="HTML")
+        fix_msg = await message.answer(f"🔧 Исправляю код <b>{html.escape(b['name'])}</b>...", parse_mode="HTML")
         try:
             fixed_code = await asyncio.wait_for(
                 fix_bot_code(current_code, bug_description), timeout=240.0
@@ -2413,20 +2486,136 @@ async def _apply_fix(message: Message, state: FSMContext, bug_description: str, 
                 pass
             await message.answer(
                 "⚠️ Не удалось исправить код. Попробуй ещё раз.",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                    InlineKeyboardButton(text="🐛 Попробовать снова", callback_data=f"fixbug:{bot_id}"),
-                ]]),
+                reply_markup=_fix_retry_keyboard(bot_id),
             )
             return
+
+        try:
+            explanation = await asyncio.wait_for(
+                explain_bug_fix_diff(current_code, fixed_code, bug_description), timeout=60.0
+            )
+        except Exception:
+            logger.exception(f"_generate_and_preview_fix: bot_id={bot_id} explain_bug_fix_diff failed")
+            explanation = "Исправление сгенерировано. Проверь и подтверди применение."
 
         try:
             await fix_msg.delete()
         except Exception:
             pass
 
+        # fix_main_code_hash lets cb_apply_fix detect if the bot's file
+        # changed since this fix was generated against it (e.g. a
+        # /recreate or a second "Исправить баг" run while this preview sat
+        # waiting for the owner) — same freshness-guard reasoning as
+        # handlers/custom_features.py's cf_main_code_hash.
+        await state.set_state(FixBotStates.previewing_fix)
+        await state.set_data({
+            "fix_bot_id": bot_id,
+            "fix_pending_code": fixed_code,
+            "fix_bug_description": bug_description,
+            "fix_main_code_hash": _hash_bot_code(current_code),
+        })
+        preview_text = f"{explanation}\n\n<i>Проверь и подтверди применение.</i>"
+        try:
+            await message.answer(preview_text, parse_mode="HTML", reply_markup=_fix_preview_keyboard(bot_id))
+        except TelegramBadRequest:
+            # explanation is Haiku's own free-form output — fall back to
+            # plain text if it produced something HTML can't parse, same
+            # pattern as custom_features.py's preview send.
+            logger.warning(f"_generate_and_preview_fix: bot_id={bot_id} preview HTML failed to parse, sending as plain text")
+            await message.answer(preview_text, reply_markup=_fix_preview_keyboard(bot_id))
+    finally:
+        _busy_bots.discard(bot_id)
+
+
+async def _can_manage_pending_fix(user_id: int, data: dict) -> bool:
+    bot_id = data.get("fix_bot_id")
+    if bot_id is None:
+        return False
+    b = await get_bot(bot_id)
+    return bool(b) and _can_manage_bot(user_id, b)
+
+
+@router.message(FixBotStates.describing_bug, F.voice)
+async def msg_fix_voice(message: Message, state: FSMContext, bot: Bot):
+    # Access already checked when this FSM state was entered (cb_fix_bug) and
+    # re-checked inside _generate_and_preview_fix before anything is written.
+    text = await _recognize_voice_fix(message, bot)
+    if text:
+        await _generate_and_preview_fix(message, state, text)
+
+
+@router.message(FixBotStates.describing_bug, F.text, ~F.text.startswith("/"))
+async def msg_fix_text(message: Message, state: FSMContext, bot: Bot):
+    await _generate_and_preview_fix(message, state, message.text)
+
+
+@router.message(FixBotStates.describing_bug)
+async def msg_fix_unsupported(message: Message):
+    await message.answer(
+        "Не понял — отправь текст или голосовое с описанием бага.",
+        reply_markup=cancel_keyboard(),
+    )
+
+
+@router.message(FixBotStates.previewing_fix)
+async def msg_fix_preview_pending(message: Message, state: FSMContext):
+    # A preview is already sitting in front of the owner — any message here
+    # is ambiguous (new bug? more detail?) and would silently overwrite
+    # fix_pending_code out from under the two buttons already shown. Same
+    # guard as custom_features.py's identical check.
+    data = await state.get_data()
+    if not await _can_manage_pending_fix(message.from_user.id, data):
+        await _deny_message(message)
+        return
+    await message.answer("Сначала подтверди или отмени текущее исправление кнопками выше.")
+
+
+@router.callback_query(F.data.startswith("applyfix:"))
+async def cb_apply_fix(callback: CallbackQuery, state: FSMContext):
+    bot_id = int(callback.data.split(":")[1])
+    b = await get_bot(bot_id)
+    if not b or not _can_manage_bot(callback.from_user.id, b):
+        await _deny_callback(callback)
+        return
+    # Check-then-add with no await in between — same double-tap race guard
+    # as cb_recreate/cb_apply_custom_feature.
+    if bot_id in _busy_bots:
+        await callback.answer(_BUSY_TEXT, show_alert=True)
+        return
+    _busy_bots.add(bot_id)
+    try:
+        await callback.answer()
+        data = await state.get_data()
+        if data.get("fix_bot_id") != bot_id or "fix_pending_code" not in data:
+            await callback.message.edit_text("Исправление устарело — начни заново.")
+            return
+        fixed_code = data["fix_pending_code"]
+        stored_hash = data.get("fix_main_code_hash")
+        await state.clear()
+
+        b = await get_bot(bot_id)
+        if not b or not b.get("file_path") or not Path(b["file_path"]).exists():
+            await callback.message.edit_text("❌ Файл бота не найден.")
+            return
+
+        # See _generate_and_preview_fix's comment on fix_main_code_hash —
+        # the actual guard against applying a fix generated against a file
+        # that has since changed (e.g. a /recreate while this preview sat
+        # waiting for the tap).
+        current_code = Path(b["file_path"]).read_text(encoding="utf-8")
+        if stored_hash is not None and _hash_bot_code(current_code) != stored_hash:
+            await callback.message.edit_text(
+                "⚠️ Код бота изменился с момента генерации этого исправления "
+                "(например, через Перегенерировать или другое исправление) — "
+                "применять устаревшее исправление рискованно. Сгенерируй заново.",
+                reply_markup=_fix_retry_keyboard(bot_id),
+            )
+            return
+
         await stop_bot(bot_id)
-        # Same re-append as cb_recreate above — fix_bot_code() is also a
-        # whole-file LLM rewrite that can drop the appended office-hook wiring.
+        # Same re-append as cb_recreate — fix_bot_code() is a whole-file LLM
+        # rewrite that can drop the appended office-hook wiring.
         fixed_code = append_from_scratch_registry_wiring(fixed_code)
         Path(b["file_path"]).write_text(fixed_code, encoding="utf-8")
         asyncio.create_task(push_bot_to_github(b["name"], fixed_code))
@@ -2434,14 +2623,14 @@ async def _apply_fix(message: Message, state: FSMContext, bug_description: str, 
         try:
             pid = await start_bot(bot_id, b["file_path"], b["token"], extra_env=_make_extra_env(b))
             await update_bot_status(bot_id, "running", pid)
-            await message.answer(
-                f"✅ Бот <b>{b['name']}</b> исправлен и перезапущен!",
+            await callback.message.edit_text(
+                f"✅ Бот <b>{html.escape(b['name'])}</b> исправлен и перезапущен!",
                 parse_mode="HTML",
                 reply_markup=_bot_keyboard(bot_id),
             )
         except Exception as e:
             await update_bot_status(bot_id, "error")
-            await message.answer(
+            await callback.message.edit_text(
                 f"⚠️ Код исправлен, но бот не запустился.\n\n<code>{html.escape(str(e)[-300:])}</code>",
                 parse_mode="HTML",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
@@ -2453,25 +2642,18 @@ async def _apply_fix(message: Message, state: FSMContext, bug_description: str, 
         _busy_bots.discard(bot_id)
 
 
-@router.message(FixBotStates.describing_bug, F.voice)
-async def msg_fix_voice(message: Message, state: FSMContext, bot: Bot):
-    # Access already checked when this FSM state was entered (cb_fix_bug) and
-    # re-checked inside _apply_fix before anything is written.
-    text = await _recognize_voice_fix(message, bot)
-    if text:
-        await _apply_fix(message, state, text, bot)
-
-
-@router.message(FixBotStates.describing_bug, F.text, ~F.text.startswith("/"))
-async def msg_fix_text(message: Message, state: FSMContext, bot: Bot):
-    await _apply_fix(message, state, message.text, bot)
-
-
-@router.message(FixBotStates.describing_bug)
-async def msg_fix_unsupported(message: Message):
-    await message.answer(
-        "Не понял — отправь текст или голосовое с описанием бага.",
-        reply_markup=cancel_keyboard(),
+@router.callback_query(F.data.startswith("cancelfix:"))
+async def cb_cancel_fix(callback: CallbackQuery, state: FSMContext):
+    bot_id = int(callback.data.split(":")[1])
+    b = await get_bot(bot_id)
+    if not b or not _can_manage_bot(callback.from_user.id, b):
+        await _deny_callback(callback)
+        return
+    await state.clear()
+    await callback.answer()
+    await callback.message.edit_text(
+        "❌ Отменено — ничего не изменено.",
+        reply_markup=_bot_keyboard(bot_id),
     )
 
 
