@@ -1,9 +1,10 @@
-# Mini-app: missing admin/owner gate at the auth layer — known gap
+# Mini-app: missing admin/owner gate at the auth layer — FIXED
 
-Status: **known, not fixed here**. Found while batch-authoring `miniapp_config`
-for templates/*.py (see git log — commits `feat: <template> — hardcoded
-miniapp_config...`). A separate session is working the fix; this doc exists so
-it isn't lost/rediscovered from scratch.
+Status: **fixed**, `runtime/miniapp_api.py`'s `_admin_gate_ok()`. Found while
+batch-authoring `miniapp_config` for templates/*.py (see git log — commits
+`feat: <template> — hardcoded miniapp_config...`). This doc is kept as the
+record of the gap and the fix, since docs/MINIAPP_ROLE_SCOPING_DESIGN.md
+covers the row-scoping half only.
 
 ## The gap
 
@@ -62,10 +63,33 @@ per-bot admin check, analogous to how `analytics_handler`/`export_handler`/
 per-template `miniapp_config` change — `role_filter` operates strictly after
 that gate, not instead of it.
 
+## Fix
+
+`runtime/miniapp_api.py`'s `_admin_gate_ok(bot_id, resource, telegram_user_id)`
+is called by `list_resource_handler`, `get_resource_handler`, and
+`create_resource_handler` right after resource lookup, before any row is
+read or written. It is a per-resource gate, not a per-request one: a
+resource with **no** `role_filter` key requires the viewer to be listed in
+`db.database.get_bot_admins(bot_id)` (the same factory-level admin list
+each template's own `admins.json` is synced from — see
+`sync_bot_admins_json`), else the handler returns 403. A resource that
+**does** declare `role_filter` (either shape — role-resolved or
+ownership-only, docs/MINIAPP_ROLE_SCOPING_DESIGN.md) skips this gate
+entirely: that mechanism already scopes rows to what the viewer is
+entitled to see, so it fully subsumes the admin-only gate for that
+resource — a customer viewing their own booking, or `team_manager`'s
+worker viewing only their assigned tasks, is exactly what `role_filter`
+exists to allow. `_admin_gate_ok` never re-checks resources that already
+opted into `role_filter`.
+
+The 18 templates named above needed **zero** `miniapp_config` changes —
+their configs were already schema-accurate, 1:1 with each template's
+owner-facing Telegram data; they simply started being properly gated once
+`_admin_gate_ok` shipped. `team_manager` and `habit_tracker` (the two
+templates with `role_filter`) are unaffected by this gate — their rows
+were already scoped per-viewer and remain so.
+
 ## Status at time of writing
 
-Not fixed in this doc/commit. A separate session has been asked to address it
-directly in `runtime/miniapp_api.py`. The 18 templates' `miniapp_config`
-values are otherwise correct (schema-accurate, 1:1 with each template's
-owner-facing Telegram data) and do not need re-authoring once the auth gate
-is fixed — they'll simply start being properly gated.
+Fixed. See docs/MINIAPP_ROLE_SCOPING_DESIGN.md's "Auth-layer admin gate"
+section for how this interacts with `role_filter`.

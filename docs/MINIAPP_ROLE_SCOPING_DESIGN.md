@@ -6,6 +6,35 @@ ownership-only shape, applied to `habit_tracker`. This is the FROZEN
 `miniapp_config` for the remaining templates should read this file directly
 rather than re-deriving the shape.
 
+## Auth-layer admin gate (a separate, lower layer — read this first)
+
+`role_filter` (this whole doc) answers "which rows does an already-
+authorized viewer see." It does NOT answer "is this viewer authorized to
+use the mini-app at all" — that question sits one layer below, in
+`runtime/miniapp_api.py`'s `_admin_gate_ok()` (docs/MINIAPP_AUTH_GATE_GAP.md
+has the full incident writeup). The two layers compose as:
+
+1. `_authenticate()` — is this a genuine Telegram identity? (HMAC-verified
+   `initData` or magic-link token)
+2. `_admin_gate_ok()` — is this identity entitled to use this resource at
+   all? A resource with no `role_filter` requires bot-admin membership
+   (`db.database.get_bot_admins()`); a resource WITH `role_filter` (either
+   shape below) is exempt from this gate — its own row-scoping already
+   answers the entitlement question, so re-checking admin membership on
+   top would incorrectly lock out a legitimate non-admin viewer (e.g.
+   `team_manager`'s worker role, or any future per-customer ownership
+   shape).
+3. `role_filter` (this doc) — for resources that passed step 2, which rows
+   does this specific viewer see.
+
+**Practical rule for anyone authoring a new `miniapp_config`:** declaring
+`role_filter` on a resource is what opts it OUT of the blanket admin-only
+gate. A resource meant for regular bot users (not just admins) — a
+customer viewing their own bookings, an employee viewing their own tasks —
+MUST declare `role_filter` (ownership-only shape at minimum, `{"where":
+"<owner_column> = :telegram_user_id"}`) or it will 403 for everyone except
+bot admins.
+
 **Two `role_filter` shapes exist — pick whichever matches the template's
 actual data model, don't force one onto the other:**
 1. Role-resolved (below) — a real roles table exists (e.g.
@@ -95,37 +124,69 @@ closed.
 
 ## team_manager.py resource mapping
 
-- **`tasks`**: `owner` → `where: None` (sees all tasks in the bot's DB —
-  note the resolve table is NOT project-scoped by this filter, see
-  Limitations below); `worker` → `where: "assigned_to =
-  :telegram_user_id"`.
+- **`tasks`**: `owner` → `where: "project_id IN (SELECT project_id FROM
+  project_members WHERE user_id = :telegram_user_id AND role = 'owner')"`;
+  `worker` → `where: "assigned_to = :telegram_user_id"`. Owner is scoped to
+  the specific projects they own, never every task on the bot instance —
+  see "Per-related-record scoping" below for why the flat `resolve` step
+  doesn't need to change to express this.
 - **`projects`**: same `role_filter.resolve` (`project_members`), but
   BOTH `owner` and `worker` rules use `where: "id IN (SELECT project_id
   FROM project_members WHERE user_id = :telegram_user_id)"` — a project
   admin should only see projects they are actually a member of, same as a
   worker; there's no "owner sees every project on the bot" concept in this
-  schema, unlike `tasks` where owner-role genuinely means "sees everything
-  visible in the app."
-- **`reports`**: mirrors `tasks` — `owner` → unfiltered; `worker` →
-  `where: "task_id IN (SELECT id FROM tasks WHERE assigned_to =
-  :telegram_user_id)"` (reports don't carry `assigned_to` directly, so the
-  predicate joins through `tasks`).
-- **`attachments`**: same shape as `reports`, same `task_id IN (SELECT id
-  FROM tasks WHERE assigned_to = :telegram_user_id)` predicate for
-  `worker`.
+  schema.
+- **`reports`**: mirrors `tasks` — `owner` → `where: "task_id IN (SELECT
+  id FROM tasks WHERE project_id IN (SELECT project_id FROM
+  project_members WHERE user_id = :telegram_user_id AND role =
+  'owner'))"`; `worker` → `where: "task_id IN (SELECT id FROM tasks WHERE
+  assigned_to = :telegram_user_id)"` (reports don't carry `assigned_to` or
+  `project_id` directly, so both predicates join through `tasks`).
+- **`attachments`**: same shape as `reports`, same nested-subquery
+  predicates for both `owner` and `worker`.
 
-## Known limitation (documented, not fixed here)
+## Per-related-record scoping (part of the general contract)
 
-`tasks`'s `owner` rule (`where: None`) sees every task across every
-project on this bot instance, not just projects that person owns —
-because `project_members` role resolution here is global-per-bot, not
-project-scoped (the contract's `resolve` step returns a flat role set,
-not `(project_id, role)` pairs). This matches the pilot's scope ("read-
-scoping the existing flat CRUD resources by role", not a full
-multi-tenant-within-a-bot redesign) and is an honest carry-over of the
-same limitation the pre-existing flat `miniapp_config` had. A future
-iteration could extend `resolve` to return scoped role sets, but that is
-out of scope for this pilot and not implemented.
+A role held "somewhere" (the flat set `resolve` returns) is not the same
+claim as a role held **for the specific record being read**. The contract
+does not need a distinct format for this — a rule's `where` is an
+arbitrary predicate over the resource's own table, so scoping by a
+related record's owning id (e.g. `project_id`) is just a subquery against
+the same `resolve.table`, filtered to the matched role:
+
+```
+"where": "<fk_or_id_column> IN (SELECT <related_id> FROM <resolve.table>
+           WHERE <resolve.identity_column> = :telegram_user_id
+             AND <resolve.role_column> = '<this rule's role>')"
+```
+
+When the resource's own table doesn't carry the related id directly (e.g.
+`reports`/`attachments` only have `task_id`, not `project_id`), nest an
+additional `SELECT id FROM <bridge_table> WHERE <same subquery>` join, as
+`tasks` mediates for `reports`/`attachments` above.
+
+**Any future template with multiple independent teams/tenants sharing one
+bot instance must use this pattern for every role whose `where` would
+otherwise be `None` (unfiltered).** An unfiltered `where` for a role that
+is held per-related-record (not globally, e.g. per-bot admin) is very
+likely a cross-tenant data leak, not a legitimate "sees everything" role.
+`where: None` should be reserved for roles that generically mean
+"administers this entire bot instance," not "administers some subset of
+records I'm a member of."
+
+## Formerly: known limitation (fixed)
+
+Earlier versions of `tasks`/`reports`/`attachments` used `where: None` for
+`owner`, meaning any user who was `owner` in ANY project saw every task
+across ALL projects on the bot instance — including projects run by
+unrelated teams sharing the same bot. Confirmed as a real, frequent
+scenario (multiple independent teams using one `team_manager` bot
+simultaneously) and fixed by replacing `where: None` with the
+per-related-record subqueries above. No `role_filter` engine or contract
+change was needed — `_apply_role_filter` in `runtime/miniapp_api.py`
+already executes arbitrary `where` predicates with nested subqueries (the
+`projects` resource proves this); the bug was purely in what
+`team_manager.py`'s config declared.
 
 ## Ownership-only filters (no roles table)
 
