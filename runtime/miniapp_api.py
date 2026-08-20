@@ -38,6 +38,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -310,6 +311,102 @@ def _resource_spec(miniapp_config: dict, resource_name: str) -> dict | None:
     return None
 
 
+# Only :telegram_user_id is meaningful today — the engine has no other
+# per-viewer identity to bind. Keeping this an explicit whitelist (rather
+# than "any :identifier-looking token") is what lets _compile_role_where
+# reject an unrecognized template with a clear error instead of executing
+# a predicate shape nobody reviewed.
+_ROLE_WHERE_ALLOWED_PARAMS = frozenset({"telegram_user_id"})
+
+# WHY this narrow a shape: the where-template is authored by whoever writes
+# miniapp_config (a human or the Haiku generator), not by an HTTP caller —
+# but it still ends up interpolated into SQL text (values are bound, the
+# template's SQL keywords/column names are not). Restricting the character
+# set blocks the template itself from smuggling extra clauses/statements;
+# real parameter binding is still what keeps VALUES safe.
+_ROLE_WHERE_SAFE_RE = re.compile(r"^[A-Za-z0-9_.\s=<>!()':]+$")
+
+
+class RoleFilterError(ValueError):
+    """Raised when a resource's role_filter.rules[*].where doesn't match the
+    whitelisted safe-predicate shape — surfaced as a 500 rather than ever
+    executing an unvalidated SQL string."""
+
+
+def _compile_role_where(where: str) -> tuple[str, tuple[str, ...]]:
+    """Parses `:identifier`-style named placeholders out of a where-template
+    and returns (sql_with_qmarks, ordered_param_names) ready for aiosqlite's
+    positional binding. Rejects anything containing a placeholder outside
+    _ROLE_WHERE_ALLOWED_PARAMS, or any character outside the safe-predicate
+    whitelist, rather than trying to guess intent."""
+    if not _ROLE_WHERE_SAFE_RE.match(where):
+        raise RoleFilterError(f"role_filter where-template has disallowed characters: {where!r}")
+    param_names: list[str] = []
+
+    def _replace(match: re.Match[str]) -> str:
+        name = match.group(1)
+        if name not in _ROLE_WHERE_ALLOWED_PARAMS:
+            raise RoleFilterError(f"role_filter where-template uses unsupported placeholder :{name}")
+        param_names.append(name)
+        return "?"
+
+    sql = re.sub(r":([A-Za-z_][A-Za-z0-9_]*)", _replace, where)
+    return sql, tuple(param_names)
+
+
+async def _resolve_viewer_roles(db: aiosqlite.Connection, resolve: dict, telegram_user_id: int) -> set[str]:
+    table = resolve["table"]
+    identity_column = resolve["identity_column"]
+    role_column = resolve["role_column"]
+    async with db.execute(
+        f"SELECT {role_column} FROM {table} WHERE {identity_column} = ?", (telegram_user_id,)
+    ) as cursor:
+        rows = await cursor.fetchall()
+    return {row[0] for row in rows}
+
+
+class RoleFilterDenied(Exception):
+    """Viewer holds none of role_filter.rules' declared roles and
+    default_deny applies — caller translates this to an empty list (list
+    endpoints) or 403 (get/create endpoints), never an unfiltered query."""
+
+
+async def _apply_role_filter(
+    db: aiosqlite.Connection,
+    resource: dict,
+    telegram_user_id: int,
+) -> tuple[str, tuple] | None:
+    """Returns None when the resource has no role_filter (today's behavior,
+    unchanged) or the matched rule's where is None (unfiltered). Otherwise
+    returns (sql_fragment, params) for the caller to AND onto its own query.
+    Raises RoleFilterDenied when no rule matches and default_deny applies —
+    default_deny defaults to True (fail closed) even if the key is omitted,
+    per docs/MINIAPP_ROLE_SCOPING_DESIGN.md."""
+    role_filter = resource.get("role_filter")
+    if role_filter is None:
+        return None
+
+    viewer_roles = await _resolve_viewer_roles(db, role_filter["resolve"], telegram_user_id)
+    matched_rule = None
+    for rule in role_filter.get("rules", []):
+        if rule["role"] in viewer_roles:
+            matched_rule = rule
+            break
+
+    if matched_rule is None:
+        if role_filter.get("default_deny", True):
+            raise RoleFilterDenied()
+        return None
+
+    where = matched_rule.get("where")
+    if where is None:
+        return None
+
+    sql, param_names = _compile_role_where(where)
+    params = tuple(telegram_user_id if name == "telegram_user_id" else None for name in param_names)
+    return sql, params
+
+
 async def list_resource_handler(request: web.Request) -> web.Response:
     resolved = await _resolve_entry_and_config(request)
     if isinstance(resolved, web.Response):
@@ -334,9 +431,19 @@ async def list_resource_handler(request: web.Request) -> web.Response:
     order_by = resource.get("order_by", "id DESC")
     async with aiosqlite.connect(db_path) as db:
         db.row_factory = aiosqlite.Row
-        async with db.execute(
-            f"SELECT id, {columns} FROM {resource['table']} ORDER BY {order_by} LIMIT 200"
-        ) as cursor:
+        try:
+            role_clause = await _apply_role_filter(db, resource, telegram_user_id)
+        except RoleFilterDenied:
+            return web.json_response({"resource": resource_name, "items": []})
+
+        sql = f"SELECT id, {columns} FROM {resource['table']}"
+        params: tuple = ()
+        if role_clause is not None:
+            where_sql, where_params = role_clause
+            sql += f" WHERE {where_sql}"
+            params = where_params
+        sql += f" ORDER BY {order_by} LIMIT 200"
+        async with db.execute(sql, params) as cursor:
             rows = [dict(r) for r in await cursor.fetchall()]
     return web.json_response({"resource": resource_name, "items": rows})
 
@@ -368,9 +475,18 @@ async def get_resource_handler(request: web.Request) -> web.Response:
     columns = ", ".join(f["name"] for f in fields)
     async with aiosqlite.connect(db_path) as db:
         db.row_factory = aiosqlite.Row
-        async with db.execute(
-            f"SELECT id, {columns} FROM {resource['table']} WHERE id = ?", (int(item_id_raw),)
-        ) as cursor:
+        try:
+            role_clause = await _apply_role_filter(db, resource, telegram_user_id)
+        except RoleFilterDenied:
+            return web.json_response({"error": "forbidden"}, status=403)
+
+        sql = f"SELECT id, {columns} FROM {resource['table']} WHERE id = ?"
+        params: tuple = (int(item_id_raw),)
+        if role_clause is not None:
+            where_sql, where_params = role_clause
+            sql += f" AND ({where_sql})"
+            params = params + where_params
+        async with db.execute(sql, params) as cursor:
             row = await cursor.fetchone()
     if row is None:
         return web.json_response({"error": "not found"}, status=404)
@@ -421,9 +537,20 @@ async def create_resource_handler(request: web.Request) -> web.Response:
     if not db_path:
         return web.json_response({"error": "bot has no database configured"}, status=500)
 
-    columns = ", ".join(values.keys())
-    placeholders = ", ".join("?" for _ in values)
     async with aiosqlite.connect(db_path) as db:
+        try:
+            owner_column = await _resolve_create_owner_column(db, resource, telegram_user_id)
+        except RoleFilterDenied:
+            return web.json_response({"error": "forbidden"}, status=403)
+        if owner_column is not None:
+            if owner_column in values and values[owner_column] != telegram_user_id:
+                return web.json_response(
+                    {"error": f"{owner_column} must match the authenticated user"}, status=400
+                )
+            values[owner_column] = telegram_user_id
+
+        columns = ", ".join(values.keys())
+        placeholders = ", ".join("?" for _ in values)
         cursor = await db.execute(
             f"INSERT INTO {resource['table']} ({columns}) VALUES ({placeholders})",
             tuple(values.values()),
@@ -431,6 +558,38 @@ async def create_resource_handler(request: web.Request) -> web.Response:
         await db.commit()
         new_id = cursor.lastrowid
     return web.json_response({"resource": resource_name, "id": new_id}, status=201)
+
+
+async def _resolve_create_owner_column(db: aiosqlite.Connection, resource: dict, telegram_user_id: int) -> str | None:
+    """Minimal create-time enforcement (see design doc): only handles the
+    single-column-equality shape `"<column> = :telegram_user_id"` that the
+    read-side where-templates already use for row ownership. Returns the
+    owner column name to force to telegram_user_id, or None when
+    role_filter is absent, the matched rule is unfiltered (where=None), or
+    the where-template isn't this exact shape — deliberately not attempting
+    to enforce anything beyond what this pilot's rules actually declare."""
+    role_filter = resource.get("role_filter")
+    if role_filter is None:
+        return None
+
+    viewer_roles = await _resolve_viewer_roles(db, role_filter["resolve"], telegram_user_id)
+    matched_rule = None
+    for rule in role_filter.get("rules", []):
+        if rule["role"] in viewer_roles:
+            matched_rule = rule
+            break
+
+    if matched_rule is None:
+        if role_filter.get("default_deny", True):
+            raise RoleFilterDenied()
+        return None
+
+    where = matched_rule.get("where")
+    if where is None:
+        return None
+
+    match = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)\s*=\s*:telegram_user_id", where.strip())
+    return match.group(1) if match else None
 
 
 _ANALYTICS_PERIODS: frozenset[str] = frozenset(("week", "month", "quarter"))

@@ -454,5 +454,212 @@ class MiniAppShellTests(unittest.IsolatedAsyncioTestCase):
             self._dist_patcher.start()  # so asyncTearDown's stop() call is balanced
 
 
+class RoleFilterRegressionTests(unittest.IsolatedAsyncioTestCase):
+    """Pins that a resource with no role_filter key (course_tracker.py's
+    REAL config, not a fabricated stand-in) behaves byte-for-byte like
+    before role_filter existed."""
+
+    async def asyncSetUp(self):
+        import templates.course_tracker as course_tracker_module
+
+        self._course_tracker_module = course_tracker_module
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.db_path = os.path.join(self._tmpdir.name, "bot.db")
+        await course_tracker_module.init_db(self.db_path)
+
+        entry = BotEntry(
+            bot=_FakeBot(FAKE_TOKEN),
+            dispatcher=None,
+            template_id="course_tracker",
+            config={"bot_id": KNOWN_BOT_ID, "db_path": self.db_path},
+        )
+        self.app = create_app({KNOWN_BOT_ID: entry})
+        register_routes(self.app)
+
+        self._module_patcher = patch(
+            "runtime.miniapp_api._load_template_module_async",
+            AsyncMock(return_value=course_tracker_module),
+        )
+        self._module_patcher.start()
+        self._db_patcher = patch(
+            "runtime.miniapp_api.get_bot_miniapp_config", AsyncMock(return_value=None)
+        )
+        self._db_patcher.start()
+
+        self.server = TestServer(self.app)
+        self.client = TestClient(self.server)
+        await self.client.start_server()
+
+    async def asyncTearDown(self):
+        await self.client.close()
+        self._module_patcher.stop()
+        self._db_patcher.stop()
+        self._tmpdir.cleanup()
+
+    async def test_course_tracker_config_has_no_role_filter_anywhere(self):
+        resources = self._course_tracker_module.miniapp_config["resources"]
+        self.assertTrue(resources)
+        for resource in resources:
+            self.assertNotIn("role_filter", resource)
+
+    async def test_course_tracker_list_resource_unaffected_by_role_filter_engine_code(self):
+        first_resource = self._course_tracker_module.miniapp_config["resources"][0]
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            token = mint_magic_link_token(KNOWN_BOT_ID, telegram_user_id=111)
+            resp = await self.client.get(f"/api/{KNOWN_BOT_ID}/{first_resource['name']}?token={token}")
+        self.assertEqual(resp.status, 200)
+        body = await resp.json()
+        self.assertEqual(body["resource"], first_resource["name"])
+        self.assertIsInstance(body["items"], list)
+
+
+class TeamManagerRoleFilterTests(unittest.IsolatedAsyncioTestCase):
+    """team_manager.py is the role_filter pilot — real schema, real
+    miniapp_config, no fabricated fixtures."""
+
+    OWNER_ID = 1001
+    WORKER_ID = 2002
+    OTHER_PROJECT_OWNER_ID = 3003
+    STRANGER_ID = 9999
+
+    async def asyncSetUp(self):
+        import templates.team_manager as team_manager_module
+
+        self._tm = team_manager_module
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.db_path = os.path.join(self._tmpdir.name, "bot.db")
+        await team_manager_module.init_db(self.db_path)
+
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "INSERT INTO projects (id, name, created_by, code) VALUES (1, 'Alpha', ?, 'CODEALPHA0000000')",
+                (self.OWNER_ID,),
+            )
+            await db.execute(
+                "INSERT INTO project_members (project_id, user_id, role) VALUES (1, ?, 'owner')",
+                (self.OWNER_ID,),
+            )
+            await db.execute(
+                "INSERT INTO project_members (project_id, user_id, role) VALUES (1, ?, 'worker')",
+                (self.WORKER_ID,),
+            )
+            # OWNER_ID also holds a 'worker' role in a second project, to
+            # exercise multi-role resolution (owner in project 1, worker in
+            # project 2) resolving to the FIRST matching rule (owner, since
+            # it's declared first) rather than either being ambiguous.
+            await db.execute(
+                "INSERT INTO projects (id, name, created_by, code) VALUES (2, 'Beta', ?, 'CODEBETA00000000')",
+                (self.OTHER_PROJECT_OWNER_ID,),
+            )
+            await db.execute(
+                "INSERT INTO project_members (project_id, user_id, role) VALUES (2, ?, 'owner')",
+                (self.OTHER_PROJECT_OWNER_ID,),
+            )
+            await db.execute(
+                "INSERT INTO project_members (project_id, user_id, role) VALUES (2, ?, 'worker')",
+                (self.OWNER_ID,),
+            )
+            await db.execute(
+                "INSERT INTO tasks (id, project_id, created_by, assigned_to, text, category, deadline, status) "
+                "VALUES (1, 1, ?, ?, 'Do the thing', 'general', '2099-01-01T00:00:00', 'not_taken')",
+                (self.OWNER_ID, self.WORKER_ID),
+            )
+            await db.execute(
+                "INSERT INTO tasks (id, project_id, created_by, assigned_to, text, category, deadline, status) "
+                "VALUES (2, 1, ?, ?, 'Owner-assigned-to-self', 'general', '2099-01-01T00:00:00', 'not_taken')",
+                (self.OWNER_ID, self.OWNER_ID),
+            )
+            await db.commit()
+
+        entry = BotEntry(
+            bot=_FakeBot(FAKE_TOKEN),
+            dispatcher=None,
+            template_id="team_manager",
+            config={"bot_id": KNOWN_BOT_ID, "db_path": self.db_path},
+        )
+        self.app = create_app({KNOWN_BOT_ID: entry})
+        register_routes(self.app)
+
+        self._module_patcher = patch(
+            "runtime.miniapp_api._load_template_module_async",
+            AsyncMock(return_value=team_manager_module),
+        )
+        self._module_patcher.start()
+        self._db_patcher = patch(
+            "runtime.miniapp_api.get_bot_miniapp_config", AsyncMock(return_value=None)
+        )
+        self._db_patcher.start()
+
+        self.server = TestServer(self.app)
+        self.client = TestClient(self.server)
+        await self.client.start_server()
+
+    async def asyncTearDown(self):
+        await self.client.close()
+        self._module_patcher.stop()
+        self._db_patcher.stop()
+        self._tmpdir.cleanup()
+
+    async def _get(self, path: str, user_id: int):
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            token = mint_magic_link_token(KNOWN_BOT_ID, telegram_user_id=user_id)
+            return await self.client.get(f"/api/{KNOWN_BOT_ID}{path}?token={token}")
+
+    async def test_owner_sees_all_tasks_in_their_project(self):
+        resp = await self._get("/tasks", self.OWNER_ID)
+        self.assertEqual(resp.status, 200)
+        body = await resp.json()
+        self.assertEqual({row["id"] for row in body["items"]}, {1, 2})
+
+    async def test_worker_sees_only_their_own_tasks(self):
+        resp = await self._get("/tasks", self.WORKER_ID)
+        self.assertEqual(resp.status, 200)
+        body = await resp.json()
+        self.assertEqual([row["id"] for row in body["items"]], [1])
+
+    async def test_stranger_with_no_role_gets_empty_list_default_deny(self):
+        resp = await self._get("/tasks", self.STRANGER_ID)
+        self.assertEqual(resp.status, 200)
+        body = await resp.json()
+        self.assertEqual(body["items"], [])
+
+    async def test_stranger_get_single_task_is_403(self):
+        resp = await self._get("/tasks/1", self.STRANGER_ID)
+        self.assertEqual(resp.status, 403)
+
+    async def test_worker_get_own_task_succeeds(self):
+        resp = await self._get("/tasks/1", self.WORKER_ID)
+        self.assertEqual(resp.status, 200)
+
+    async def test_worker_get_others_task_is_404_not_leaked(self):
+        # task 2 exists and belongs to this bot/project, but isn't assigned
+        # to WORKER_ID — the role_filter's AND-clause makes it invisible,
+        # same "not found" the row would get if it genuinely didn't exist.
+        resp = await self._get("/tasks/2", self.WORKER_ID)
+        self.assertEqual(resp.status, 404)
+
+    async def test_multi_role_viewer_resolves_to_first_matching_rule(self):
+        # OWNER_ID is 'owner' in project 1 and 'worker' in project 2 — the
+        # tasks rules list declares 'owner' first, so OWNER_ID's viewer role
+        # set {owner, worker} matches 'owner' and gets the unfiltered query,
+        # not the narrower worker predicate.
+        resp = await self._get("/tasks", self.OWNER_ID)
+        self.assertEqual(resp.status, 200)
+        body = await resp.json()
+        self.assertEqual({row["id"] for row in body["items"]}, {1, 2})
+
+    async def test_projects_scoped_to_membership_for_both_roles(self):
+        resp = await self._get("/projects", self.OTHER_PROJECT_OWNER_ID)
+        self.assertEqual(resp.status, 200)
+        body = await resp.json()
+        self.assertEqual([row["id"] for row in body["items"]], [2])
+
+    async def test_stranger_projects_list_empty(self):
+        resp = await self._get("/projects", self.STRANGER_ID)
+        self.assertEqual(resp.status, 200)
+        body = await resp.json()
+        self.assertEqual(body["items"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -63,14 +63,20 @@ logger = logging.getLogger(__name__)
 router = Router()
 
 
-# ── mini-app config (flat/unscoped read view — see note below) ─────────────
-# The generic CRUD engine in runtime/miniapp_api.py has no notion of
-# per-viewer role: every field is either shown or not, uniformly for anyone
-# with access to this bot's mini-app, same as templates/course_tracker.py's
-# own miniapp_config. There is no "owner sees X, worker sees Y" branching
-# here — this is an honest flat listing of projects/tasks/reports/
-# attachments, not the role-scoped dashboard experience a human UI could
-# offer; access to the mini-app itself is still gated per-bot-instance.
+# ── mini-app config (role-scoped read view) ─────────────────────────────────
+# Was flat/unscoped (every viewer saw every row) until
+# docs/MINIAPP_ROLE_SCOPING_DESIGN.md's role_filter addition to
+# runtime/miniapp_api.py — this is the pilot template for that feature.
+# `resolve` always points at project_members: it's the only table in this
+# schema mapping a Telegram user id to a role, and that mapping is global
+# per-bot (not per-project) — see the design doc's "Known limitation" note
+# for what that does and doesn't scope.
+_PROJECT_MEMBERS_RESOLVE = {
+    "table": "project_members",
+    "identity_column": "user_id",
+    "role_column": "role",
+}
+
 miniapp_config = {
     "resources": [
         {
@@ -85,6 +91,23 @@ miniapp_config = {
                 {"name": "code", "label": "Код приглашения", "kind": "text", "list": False, "detail": True, "create": False},
                 {"name": "created_at", "label": "Создан", "kind": "date", "list": False, "detail": True, "create": False},
             ],
+            # Membership, not ownership-of-all: even an "owner" role only
+            # owns specific projects, never every project on the bot — so
+            # both rules share the same membership predicate.
+            "role_filter": {
+                "resolve": _PROJECT_MEMBERS_RESOLVE,
+                "rules": [
+                    {
+                        "role": "owner",
+                        "where": "id IN (SELECT project_id FROM project_members WHERE user_id = :telegram_user_id)",
+                    },
+                    {
+                        "role": "worker",
+                        "where": "id IN (SELECT project_id FROM project_members WHERE user_id = :telegram_user_id)",
+                    },
+                ],
+                "default_deny": True,
+            },
         },
         {
             "name": "tasks",
@@ -99,6 +122,14 @@ miniapp_config = {
                 {"name": "deadline", "label": "Дедлайн", "kind": "date", "list": True, "detail": True, "create": False},
                 {"name": "status", "label": "Статус", "kind": "status", "list": True, "detail": True, "create": False},
             ],
+            "role_filter": {
+                "resolve": _PROJECT_MEMBERS_RESOLVE,
+                "rules": [
+                    {"role": "owner", "where": None},
+                    {"role": "worker", "where": "assigned_to = :telegram_user_id"},
+                ],
+                "default_deny": True,
+            },
         },
         {
             "name": "reports",
@@ -112,6 +143,19 @@ miniapp_config = {
                 {"name": "text", "label": "Отчёт", "kind": "text", "list": False, "detail": True, "create": False},
                 {"name": "submitted_at", "label": "Сдан", "kind": "date", "list": True, "detail": True, "create": False},
             ],
+            # reports has no assigned_to of its own — scoped through the
+            # owning task, same as attachments below.
+            "role_filter": {
+                "resolve": _PROJECT_MEMBERS_RESOLVE,
+                "rules": [
+                    {"role": "owner", "where": None},
+                    {
+                        "role": "worker",
+                        "where": "task_id IN (SELECT id FROM tasks WHERE assigned_to = :telegram_user_id)",
+                    },
+                ],
+                "default_deny": True,
+            },
         },
         {
             "name": "attachments",
@@ -125,6 +169,17 @@ miniapp_config = {
                 {"name": "name", "label": "Файл", "kind": "text", "list": True, "detail": True, "create": False},
                 {"name": "type", "label": "Тип", "kind": "text", "list": False, "detail": True, "create": False},
             ],
+            "role_filter": {
+                "resolve": _PROJECT_MEMBERS_RESOLVE,
+                "rules": [
+                    {"role": "owner", "where": None},
+                    {
+                        "role": "worker",
+                        "where": "task_id IN (SELECT id FROM tasks WHERE assigned_to = :telegram_user_id)",
+                    },
+                ],
+                "default_deny": True,
+            },
         },
     ],
 }
