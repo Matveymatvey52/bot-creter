@@ -246,6 +246,42 @@ async def init_db(db_path: str):
         await db.commit()
 
 
+miniapp_config = {
+    "resources": [
+        {
+            "name": "events",
+            "table": "events",
+            "order_by": "event_dt",
+            "creatable": True,
+            "title": "Мероприятия",
+            "titleField": "name",
+            "fields": [
+                {"name": "name", "required": True, "label": "Название", "kind": "text", "list": True, "detail": True, "create": True},
+                {"name": "event_dt", "required": True, "label": "Дата и время", "kind": "date", "list": True, "detail": True, "create": True},
+                {"name": "location", "label": "Место", "kind": "text", "list": False, "detail": True, "create": True},
+                {"name": "guest_limit", "label": "Лимит гостей", "kind": "number", "list": False, "detail": True, "create": True},
+                {"name": "active", "label": "Активно", "kind": "status", "list": True, "detail": True, "create": False},
+            ],
+        },
+        {
+            "name": "guests",
+            "table": "guests",
+            "order_by": "name",
+            "creatable": False,
+            "title": "Гости",
+            "titleField": "name",
+            "fields": [
+                {"name": "event_id", "required": True, "label": "ID мероприятия", "kind": "number", "list": False, "detail": True, "create": False},
+                {"name": "name", "label": "Имя", "kind": "text", "list": True, "detail": True, "create": False},
+                {"name": "contact", "label": "Контакт", "kind": "text", "list": False, "detail": True, "create": False},
+                {"name": "rsvp_status", "label": "RSVP", "kind": "status", "list": True, "detail": True, "create": False},
+                {"name": "checked_in", "label": "Чек-ин", "kind": "status", "list": True, "detail": True, "create": False},
+            ],
+        },
+    ],
+}
+
+
 async def _active_events(db_path: str) -> list[dict]:
     async with aiosqlite.connect(db_path) as db:
         db.row_factory = aiosqlite.Row
