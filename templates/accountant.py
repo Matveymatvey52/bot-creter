@@ -177,6 +177,46 @@ def _esc(value, max_len: int = 500) -> str:
     return html.escape(text)
 
 
+# ── mini-app config (see docs/MINIAPP_DESIGN.md) ────────────────────────────
+# `table`/field `name`s below must match init_db()'s CREATE TABLE columns
+# verbatim. transactions.kind doubles as the "type" — rendered as a status
+# badge since it's an enum ('income'/'expense'), not a workflow state.
+miniapp_config = {
+    "resources": [
+        {
+            "name": "projects",
+            "table": "projects",
+            "order_by": "id DESC",
+            "creatable": True,
+            "title": "Проекты",
+            "titleField": "name",
+            "fields": [
+                {"name": "name", "required": True, "label": "Название", "kind": "text", "list": True, "detail": True, "create": True},
+                {"name": "created_at", "label": "Создан", "kind": "date", "list": False, "detail": True, "create": False},
+            ],
+        },
+        {
+            "name": "transactions",
+            "table": "transactions",
+            "order_by": "tx_date DESC, id DESC",
+            "creatable": True,
+            "title": "Операции",
+            "titleField": "category",
+            "fields": [
+                {"name": "project_id", "required": True, "label": "ID проекта", "kind": "number", "list": False, "detail": True, "create": True},
+                {"name": "kind", "required": True, "label": "Тип", "kind": "status", "list": True, "detail": True, "create": True},
+                {"name": "amount", "required": True, "label": "Сумма", "kind": "number", "list": True, "detail": True, "create": True},
+                {"name": "currency", "label": "Валюта", "kind": "text", "list": False, "detail": True, "create": False},
+                {"name": "category", "label": "Категория", "kind": "text", "list": True, "detail": True, "create": True},
+                {"name": "note", "label": "Комментарий", "kind": "text", "list": False, "detail": True, "create": True},
+                {"name": "tx_date", "label": "Дата", "kind": "date", "list": True, "detail": True, "create": False},
+                {"name": "created_at", "label": "Создано", "kind": "date", "list": False, "detail": False, "create": False},
+            ],
+        },
+    ],
+}
+
+
 # ── db ────────────────────────────────────────────────────────────────────────
 
 async def init_db(db_path: str):

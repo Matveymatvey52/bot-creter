@@ -18,6 +18,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import aiosqlite
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
 
@@ -172,6 +173,46 @@ class AccountantIsolationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(names_c, ["Gamma Project"])
         self.assertEqual(names_d, ["Delta Project"])
+
+
+class AccountantMiniAppConfigTests(unittest.IsolatedAsyncioTestCase):
+    """miniapp_config's declared table/field names must match init_db()'s
+    real schema — miniapp_api.py builds SQL directly off these names, so a
+    drift here would 500 at request time instead of failing a test."""
+
+    def test_miniapp_config_resource_names(self):
+        names = {r["name"] for r in accountant.miniapp_config["resources"]}
+        self.assertEqual(names, {"projects", "transactions"})
+
+    def test_projects_resource_targets_projects_table(self):
+        projects = next(r for r in accountant.miniapp_config["resources"] if r["name"] == "projects")
+        self.assertEqual(projects["table"], "projects")
+        self.assertTrue(projects["creatable"])
+        self.assertIn("name", {f["name"] for f in projects["fields"]})
+
+    def test_transactions_resource_targets_transactions_table(self):
+        transactions = next(r for r in accountant.miniapp_config["resources"] if r["name"] == "transactions")
+        self.assertEqual(transactions["table"], "transactions")
+        field_names = {f["name"] for f in transactions["fields"]}
+        self.assertEqual(
+            field_names,
+            {"project_id", "kind", "amount", "currency", "category", "note", "tx_date", "created_at"},
+        )
+
+    async def test_miniapp_config_fields_match_real_schema(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "schema_check.db")
+            await accountant.init_db(db_path)
+            async with aiosqlite.connect(db_path) as db:
+                for resource in accountant.miniapp_config["resources"]:
+                    cur = await db.execute(f"PRAGMA table_info({resource['table']})")
+                    real_columns = {row[1] for row in await cur.fetchall()}
+                    declared = {f["name"] for f in resource["fields"]} | {"id"}
+                    self.assertTrue(
+                        declared.issubset(real_columns),
+                        f"{resource['name']}: declared fields {declared} not all in "
+                        f"real columns {real_columns}",
+                    )
 
 
 class AccountantStandaloneSmokeTest(unittest.TestCase):
