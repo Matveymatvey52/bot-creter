@@ -2105,7 +2105,7 @@ async def _review_narrow_risk_code(code: str, context: str, reference_code: str 
 
 async def generate_bot_code(
     requirements_summary: str,
-) -> tuple[str, dict | None, dict | None, dict | None, dict | None]:
+) -> tuple[str, dict | None, dict | None, dict | None, dict | None, dict | None]:
     """Generates the bot's code, then a mini-app config, an office-hook
     config, AND a voice-intake/cashflow-ledger config for it (docs/
     MINIAPP_DESIGN.md §6, docs/OFFICES_DESIGN.md §11, docs/
@@ -2151,14 +2151,30 @@ async def generate_bot_code(
     handlers/manage_bots.py's cb_recreate) persist it via
     db.database.add_template_candidate so the owner can review recurring
     from-scratch requests in the /analytics dashboard. No candidate is
-    logged when a template match succeeded — only the fallback cases."""
+    logged when a template match succeeded — only the fallback cases.
+
+    miniapp_failure_info is a sixth, optional element, same shape/posture as
+    fallback_info but for _generate_miniapp_config specifically: None on
+    success (including the valid "this bot needs no mini-app" answer),
+    otherwise {"reason": "timeout" | "api_error" | "parse_error"
+    | "validation_failed"} once _generate_miniapp_config's own single retry
+    has also failed. Callers with a bot_id in hand persist it via
+    db.database.add_miniapp_config_failure and notify the bot's creator —
+    unlike fallback_info (which is about the bot's CODE falling back to
+    from-scratch, still a working bot), a miniapp failure means the owner
+    silently got a bot with no mini-app at all and would otherwise have no
+    way to know without noticing its absence themselves."""
     code, fallback_info = await _generate_bot_code_inner(requirements_summary)
-    miniapp_config, office_hook_config, voice_cashflow_config = await asyncio.gather(
+    (
+        (miniapp_config, miniapp_failure_info),
+        office_hook_config,
+        voice_cashflow_config,
+    ) = await asyncio.gather(
         _generate_miniapp_config(code, requirements_summary),
         _generate_office_hook_config(code, requirements_summary),
         _generate_voice_cashflow_config(code, requirements_summary),
     )
-    return code, miniapp_config, office_hook_config, voice_cashflow_config, fallback_info
+    return code, miniapp_config, office_hook_config, voice_cashflow_config, fallback_info, miniapp_failure_info
 
 
 async def _generate_bot_code_inner(requirements_summary: str) -> tuple[str, dict | None]:
@@ -2383,10 +2399,22 @@ def _extract_create_table_names(bot_code: str) -> dict[str, set[str]]:
     """Best-effort scan of init_db()'s CREATE TABLE statements: table name ->
     set of column names. Regex, not a SQL parser — good enough to catch a
     hallucinated table/column (the failure mode this guards against), not
-    meant to validate SQL syntax. Never raises on malformed input."""
+    meant to validate SQL syntax. Never raises on malformed input.
+
+    Column list ends at the first ')' followed by either ';' (a SQL
+    statement terminator — needed for templates that batch multiple CREATE
+    TABLEs into one db.executescript(\"\"\"...;...;...\"\"\") block, e.g.
+    templates/tour_operator.py's init_db()) OR the enclosing Python string's
+    own closing '\"\"\"'/"'''" (needed for templates that call
+    db.execute(\"\"\"CREATE TABLE ...\"\"\") once per table with no
+    trailing ';', e.g. templates/course_tracker.py's init_db()). Requiring
+    ONLY one of the two (either prior version of this pattern) silently
+    dropped every table for whichever style wasn't covered, which made
+    _validate_miniapp_config_against_code reject every resource as
+    hallucinated even when the model got the schema exactly right."""
     tables: dict[str, set[str]] = {}
     for table_match in re.finditer(
-        r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)\s*\((.*?)\)\s*(?:\"\"\"|''')",
+        r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)\s*\((.*?)\)\s*(?:;|\"\"\"|''')",
         bot_code,
         re.IGNORECASE | re.DOTALL,
     ):
@@ -2424,30 +2452,39 @@ def _validate_miniapp_config_against_code(config: dict, bot_code: str) -> bool:
     return True
 
 
-def _parse_miniapp_config(raw: str, bot_code: str) -> dict | None:
+def _parse_miniapp_config(raw: str, bot_code: str) -> tuple[dict | None, str | None]:
     """Best-effort JSON parse + schema validation — any malformed shape or
-    hallucinated table/column degrades to None (never raises), mirroring
-    _parse_connect_feature_intent's fallback pattern: a parsing hiccup here
-    must never surface an error or block bot creation."""
+    hallucinated table/column degrades to (None, reason) (never raises),
+    mirroring _parse_connect_feature_intent's fallback pattern: a parsing
+    hiccup here must never surface an error or block bot creation.
+
+    Returns (config, failure_reason). failure_reason is one of
+    "parse_error" (malformed JSON/shape) or "validation_failed"
+    (well-formed JSON that didn't pass schema/table/column validation) on
+    failure, or None on success — including the valid "no mini-app needed"
+    answer ({"resources": []}), which returns (None, None) since that's not
+    a failure at all, just nothing to store (see
+    _generate_miniapp_config's docstring for how callers distinguish the
+    two None-config cases)."""
     try:
         data = json.loads(_strip_code_fences(raw))
     except (json.JSONDecodeError, ValueError):
-        return None
+        return None, "parse_error"
     if not isinstance(data, dict) or not isinstance(data.get("resources"), list):
-        return None
+        return None, "parse_error"
     if not data["resources"]:
-        return None  # valid "no mini-app for this bot" answer, nothing to store
+        return None, None  # valid "no mini-app for this bot" answer, nothing to store
     for resource in data["resources"]:
         if not isinstance(resource, dict):
-            return None
+            return None, "parse_error"
         if not isinstance(resource.get("name"), str) or not isinstance(resource.get("table"), str):
-            return None
+            return None, "parse_error"
         if not isinstance(resource.get("fields"), list) or not resource["fields"]:
-            return None
+            return None, "parse_error"
         field_names = set()
         for field in resource["fields"]:
             if not isinstance(field, dict) or not isinstance(field.get("name"), str):
-                return None
+                return None, "parse_error"
             field_names.add(field["name"])
         # titleField is optional display metadata (older/pre-Phase-2 configs
         # omit it — the frontend falls back to "#{id}" when absent, see
@@ -2456,31 +2493,74 @@ def _parse_miniapp_config(raw: str, bot_code: str) -> dict | None:
         # resource — same "never invent" posture as table/column names above.
         title_field = resource.get("titleField")
         if title_field is not None and title_field not in field_names:
-            return None
+            return None, "parse_error"
     if not _validate_miniapp_config_against_code(data, bot_code):
-        return None
-    return data
+        return None, "validation_failed"
+    return data, None
 
 
-async def _generate_miniapp_config(bot_code: str, requirements_summary: str) -> dict | None:
+async def _generate_miniapp_config(bot_code: str, requirements_summary: str) -> tuple[dict | None, dict | None]:
     """Never raises — any failure (API error, malformed/hallucinated output)
-    returns None, which callers treat as "no mini-app for this bot", exactly
-    like a template with no miniapp_config today. Must never block or delay
-    bot creation on its own error."""
-    try:
-        response = await client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=1500,
-            system=MINIAPP_CONFIG_SYSTEM_PROMPT,
-            messages=[{
-                "role": "user",
-                "content": f"Bot code:\n\n{bot_code}\n\nBot description:\n{requirements_summary}",
-            }],
-        )
-    except Exception as e:
-        logger.warning(f"_generate_miniapp_config: API call failed: {type(e).__name__}: {e}")
-        return None
-    return _parse_miniapp_config(response.content[0].text, bot_code)
+    returns (None, failure_info), which callers treat as "no mini-app for
+    this bot", exactly like a template with no miniapp_config today. Must
+    never block or delay bot creation on its own error.
+
+    Returns (config, failure_info). failure_info is None on success —
+    INCLUDING the valid "no mini-app needed" case (data.get("resources") ==
+    []), which is not a failure — and otherwise
+    {"reason": "timeout" | "api_error" | "parse_error" | "validation_failed"}
+    once a single retry has also failed (see below). Callers with a bot_id
+    in hand persist failure_info via db.database.add_miniapp_config_failure
+    so the owner can spot bots that silently got no mini-app (mirrors
+    fallback_info/template_candidates' "never block, but never lose the
+    signal either" posture — docs/TEMPLATE_CANDIDATE_LOGGING_DESIGN.md).
+
+    One retry (a single extra Haiku call, not a loop) is attempted after
+    EITHER an API failure or a parse/validation failure before giving up —
+    Haiku's hallucination/malformed-output rate on this task is low enough
+    that a second try clears most transient misses without meaningfully
+    increasing latency (this step already runs concurrently with the other
+    post-generation config calls, see generate_bot_code)."""
+    for attempt in range(2):
+        reason: str
+        try:
+            response = await asyncio.wait_for(
+                client.messages.create(
+                    model="claude-haiku-4-5-20251001",
+                    # 1500 was sized for a bot with 1-2 simple resources; a
+                    # multi-domain bot (e.g. tour_operator: tours/program/
+                    # locations/hotels/guests, ~5-10 fields each) reliably
+                    # exceeds it and gets cut off mid-JSON (stop_reason
+                    # "max_tokens"), which _parse_miniapp_config then reports
+                    # as a plain "parse_error" — indistinguishable from a
+                    # genuine hallucination, and the one retry doesn't help
+                    # since the same truncation happens again. 4096 covers
+                    # tour_operator's 5-resource/~40-field schema with room
+                    # to spare (verified: full response fits well under it).
+                    max_tokens=4096,
+                    system=MINIAPP_CONFIG_SYSTEM_PROMPT,
+                    messages=[{
+                        "role": "user",
+                        "content": f"Bot code:\n\n{bot_code}\n\nBot description:\n{requirements_summary}",
+                    }],
+                ),
+                timeout=60.0,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f"_generate_miniapp_config: timed out (attempt {attempt + 1}/2)")
+            reason = "timeout"
+        except Exception as e:
+            logger.warning(f"_generate_miniapp_config: API call failed (attempt {attempt + 1}/2): {type(e).__name__}: {e}")
+            reason = "api_error"
+        else:
+            config, parse_reason = _parse_miniapp_config(response.content[0].text, bot_code)
+            if parse_reason is None:
+                return config, None  # success, including the valid empty-resources answer
+            logger.warning(f"_generate_miniapp_config: {parse_reason} (attempt {attempt + 1}/2)")
+            reason = parse_reason
+        if attempt == 1:
+            return None, {"reason": reason}
+    return None, {"reason": "api_error"}  # unreachable, satisfies type checkers
 
 
 # ── office-hook config generation (see docs/OFFICES_DESIGN.md §11) ─────────────

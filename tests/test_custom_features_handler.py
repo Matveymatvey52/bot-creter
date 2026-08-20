@@ -225,7 +225,7 @@ class ApplyRegeneratesMiniappConfigTests(_CustomFeatureHandlerTestBase):
         fake_config = {
             "resources": [{"name": "orders", "table": "orders", "fields": [{"name": "x"}]}]
         }
-        with patch.object(cf_module, "_generate_miniapp_config", AsyncMock(return_value=fake_config)):
+        with patch.object(cf_module, "_generate_miniapp_config", AsyncMock(return_value=(fake_config, None))):
             await self._apply_patch_and_wait_for_regeneration(state)
 
         self.assertEqual(await get_bot_miniapp_config(self.bot_id), fake_config)

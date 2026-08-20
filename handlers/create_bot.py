@@ -18,6 +18,7 @@ from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, Inli
 
 from config import ASSEMBLYAI_API_KEY, BOT_TOKEN, DATA_DIR
 from db.database import (
+    add_miniapp_config_failure,
     add_office_link,
     add_template_candidate,
     create_bot_record_with_admins,
@@ -246,6 +247,30 @@ _ADMIN_BLOCK = (
     "💡 Узнать Telegram ID: попроси человека написать боту @userinfobot\n\n"
     "Управление ботом: /list"
 )
+
+
+async def _notify_miniapp_config_failure(bot: Bot, chat_id: int, bot_name: str) -> None:
+    """Follow-up message sent right after _notify_bot_created when
+    generate_bot_code's miniapp_failure_info is non-None — i.e. mini-app
+    generation genuinely failed (API error/timeout/parse/validation, after
+    its own retry), not the valid "this bot needs no mini-app" case. The
+    owner would otherwise have no way to notice their bot silently has no
+    mini-app besides stumbling onto it themselves; the failure is also
+    logged via add_miniapp_config_failure for the /analytics dashboard, but
+    a proactive nudge here is cheap and matches this bot's own creation
+    flow being the moment the owner is already paying attention.
+
+    Wrapped in try/except — same posture as the real_username fetch above:
+    a notification failure must never break bot creation, which has already
+    fully succeeded by the time this runs."""
+    try:
+        await bot.send_message(
+            chat_id,
+            f"⚠️ У бота <b>{bot_name}</b> не получилось создать мини-апп автоматически — нужна ручная проверка.",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logger.warning(f"_notify_miniapp_config_failure: bot_name={bot_name} send failed: {type(e).__name__}: {e}")
 
 
 async def _notify_bot_created(
@@ -827,7 +852,7 @@ async def _run_generation(chat_id: int, user_id: int, bot: Bot, state: FSMContex
 
     gen_msg = await bot.send_message(chat_id, "Генерирую код... 🔧")
     try:
-        code, miniapp_config, office_hook_config, voice_cashflow_config, fallback_info = await asyncio.wait_for(
+        code, miniapp_config, office_hook_config, voice_cashflow_config, fallback_info, miniapp_failure_info = await asyncio.wait_for(
             generate_bot_code(summary), timeout=360.0
         )
     except asyncio.TimeoutError:
@@ -871,6 +896,7 @@ async def _run_generation(chat_id: int, user_id: int, bot: Bot, state: FSMContex
         office_hook_config=office_hook_config,
         voice_cashflow_config=voice_cashflow_config,
         fallback_info=fallback_info,
+        miniapp_failure_info=miniapp_failure_info,
     )
     await state.set_state(CreateBotStates.waiting_for_token)
 
@@ -885,6 +911,7 @@ async def _run_generation(chat_id: int, user_id: int, bot: Bot, state: FSMContex
         "office_hook_config": office_hook_config,
         "voice_cashflow_config": voice_cashflow_config,
         "fallback_info": fallback_info,
+        "miniapp_failure_info": miniapp_failure_info,
         "office_bots": data.get("office_bots") or [],
         "office_links": data.get("office_links") or [],
         "office_index": data.get("office_index", 0),
@@ -1121,6 +1148,7 @@ async def auto_launch_managed_bot(managed_data: dict, bot: Bot, storage=None) ->
     office_hook_config: dict | None = pending.get("office_hook_config")
     voice_cashflow_config: dict | None = pending.get("voice_cashflow_config")
     fallback_info: dict | None = pending.get("fallback_info")
+    miniapp_failure_info: dict | None = pending.get("miniapp_failure_info")
 
     avatar_path = AVATAR_DIR / f"{bot_name}.jpg"
     if avatar_path.exists():
@@ -1161,6 +1189,14 @@ async def auto_launch_managed_bot(managed_data: dict, bot: Bot, storage=None) ->
             bot_name=bot_name,
             bot_id=bot_record_id,
         )
+    if miniapp_failure_info:
+        await add_miniapp_config_failure(
+            creator_user_id=creator_user_id,
+            summary=bot_summary,
+            failure_reason=miniapp_failure_info["reason"],
+            bot_name=bot_name,
+            bot_id=bot_record_id,
+        )
 
     # The welcome photo was saved during onboarding under the bot's NAME
     # (handle_welcome_photo, before this bot's row/id existed). All five
@@ -1181,6 +1217,8 @@ async def auto_launch_managed_bot(managed_data: dict, bot: Bot, storage=None) ->
         extra_env["BOT_DISPLAY_NAME"] = display_name
     activation = await _activate_new_bot(bot_record_id, bot_name, bot_file, token, extra_env, has_miniapp=bool(miniapp_config))
     await _notify_bot_created(bot, chat_id, bot_record_id, bot_name, bot_summary, username_display, activation)
+    if miniapp_failure_info:
+        await _notify_miniapp_config_failure(bot, chat_id, bot_name)
     await _continue_office_queue(pending, bot_record_id, creator_user_id, bot, storage)
 
 
@@ -1209,6 +1247,8 @@ async def handle_token(message: Message, state: FSMContext, bot: Bot):
     miniapp_config: dict | None = data.get("miniapp_config")
     office_hook_config: dict | None = data.get("office_hook_config")
     voice_cashflow_config: dict | None = data.get("voice_cashflow_config")
+    fallback_info: dict | None = data.get("fallback_info")
+    miniapp_failure_info: dict | None = data.get("miniapp_failure_info")
 
     real_username: str | None = None
     try:
@@ -1247,6 +1287,29 @@ async def handle_token(message: Message, state: FSMContext, bot: Bot):
     if office_hook_config:
         await set_bot_office_hook_config(bot_id, office_hook_config)
     await _apply_voice_cashflow_config(bot_id, voice_cashflow_config)
+    # fallback_info/miniapp_failure_info: this manual-token path previously
+    # never threaded either through from FSM state at all (only
+    # auto_launch_managed_bot's _pending-based path did) — a gap, not a
+    # deliberate omission, since both signals are just as meaningful for a
+    # bot created via manual token entry. Same persistence as
+    # auto_launch_managed_bot below.
+    if fallback_info:
+        await add_template_candidate(
+            creator_user_id=message.from_user.id,
+            summary=bot_summary,
+            fallback_reason=fallback_info["reason"],
+            selected_templates=fallback_info["selected_templates"],
+            bot_name=bot_name,
+            bot_id=bot_id,
+        )
+    if miniapp_failure_info:
+        await add_miniapp_config_failure(
+            creator_user_id=message.from_user.id,
+            summary=bot_summary,
+            failure_reason=miniapp_failure_info["reason"],
+            bot_name=bot_name,
+            bot_id=bot_id,
+        )
 
     # See the equivalent comment in _run_generation() above — the welcome
     # photo was saved under the bot's name before its row/id existed; all
@@ -1266,6 +1329,8 @@ async def handle_token(message: Message, state: FSMContext, bot: Bot):
         extra_env["BOT_DISPLAY_NAME"] = display_name
     activation = await _activate_new_bot(bot_id, bot_name, bot_file, token, extra_env, has_miniapp=bool(miniapp_config))
     await _notify_bot_created(bot, message.chat.id, bot_id, bot_name, bot_summary, username_display, activation)
+    if miniapp_failure_info:
+        await _notify_miniapp_config_failure(bot, message.chat.id, bot_name)
 
     office_pending = {
         "chat_id": message.chat.id,

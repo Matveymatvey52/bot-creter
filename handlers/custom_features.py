@@ -304,7 +304,15 @@ async def _regenerate_miniapp_config_after_custom_feature(
     it (this task is created fire-and-forget, nothing awaits it)."""
     try:
         combined_code = f"{main_code}\n\n# ── custom_features/bot_{bot_id}.py ──\n{patch_code}"
-        miniapp_config = await _generate_miniapp_config(combined_code, description)
+        miniapp_config, miniapp_failure_info = await _generate_miniapp_config(combined_code, description)
+        # miniapp_failure_info is intentionally not persisted here — this
+        # path re-derives the config after every custom_features patch, so a
+        # single failed regeneration just leaves the bot's PREVIOUS
+        # miniapp_config (if any) in place rather than losing it outright,
+        # unlike the initial-creation paths in handlers/create_bot.py where
+        # a failure means the bot gets NO mini-app at all. Still logged
+        # below via the existing except-Exception warning if anything about
+        # this whole step blows up.
         if miniapp_config:
             await set_bot_miniapp_config(bot_id, miniapp_config)
             base_url = os.getenv("PUBLIC_BASE_URL", "").strip()

@@ -494,6 +494,31 @@ async def init_db():
                 await db.execute(f"ALTER TABLE template_candidates ADD COLUMN {col}")
             except aiosqlite.OperationalError:
                 pass
+        # miniapp_config_failures — mirrors template_candidates' shape and
+        # reasoning exactly, but for a different failure mode: services/
+        # claude_service.py's _generate_miniapp_config (docs/MINIAPP_DESIGN.md
+        # §6) genuinely failing after its one retry (API error, timeout,
+        # malformed JSON, or a hallucinated table/column that failed
+        # validation) rather than degrading silently to "no mini-app for
+        # this bot" with nobody told why. bot_id is nullable for the SAME
+        # reason as template_candidates: the row is written from
+        # handlers/create_bot.py AFTER the bot record exists, and a crash
+        # between generation and that point must not silently lose the
+        # failure signal — see add_miniapp_config_failure(). Feeds a
+        # dedicated /analytics section (parallel to "Кандидаты на новый
+        # шаблон") so the owner can spot bots that quietly got no mini-app
+        # and manually build one.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS miniapp_config_failures (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                bot_id              INTEGER REFERENCES bots(id),
+                creator_user_id     INTEGER NOT NULL,
+                bot_name            TEXT,
+                summary             TEXT NOT NULL,
+                failure_reason      TEXT NOT NULL,
+                created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         await db.commit()
     await migrate_encrypt_tokens()
 
@@ -1394,6 +1419,53 @@ async def add_template_candidate(
         f"add_template_candidate: bot_id={bot_id} reason={fallback_reason} "
         f"selected_templates={selected_templates}"
     )
+
+
+async def add_miniapp_config_failure(
+    creator_user_id: int,
+    summary: str,
+    failure_reason: str,
+    bot_name: str | None = None,
+    bot_id: int | None = None,
+) -> None:
+    """Append-only log of _generate_miniapp_config failures that survived its
+    own retry (see miniapp_config_failures' comment in init_db()). Mirrors
+    add_template_candidate exactly — same nullable bot_id, same "log it, then
+    logger.info the outcome" shape."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO miniapp_config_failures "
+            "(bot_id, creator_user_id, bot_name, summary, failure_reason) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (bot_id, creator_user_id, bot_name, summary, failure_reason),
+        )
+        await db.commit()
+    logger.info(
+        f"add_miniapp_config_failure: bot_id={bot_id} reason={failure_reason}"
+    )
+
+
+async def list_miniapp_config_failures(limit: int = 200) -> list[dict]:
+    """Most recent failures first, for the /analytics dashboard's mini-app
+    failure section — mirrors list_template_candidates exactly."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT id, bot_id, creator_user_id, bot_name, summary, failure_reason, created_at "
+            "FROM miniapp_config_failures ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
+
+async def count_miniapp_config_failures() -> int:
+    """Total row count, for a small /analytics metric tile — cheaper than
+    fetching list_miniapp_config_failures() just to call len() on it."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT COUNT(*) FROM miniapp_config_failures") as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else 0
 
 
 async def list_template_candidates(limit: int = 200) -> list[dict]:

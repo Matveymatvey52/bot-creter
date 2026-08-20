@@ -9,6 +9,7 @@ creation — any malformed or hallucinated output degrades to None.
 """
 from __future__ import annotations
 
+import asyncio
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -73,6 +74,37 @@ class ExtractCreateTableNames(unittest.TestCase):
     def test_empty_for_code_with_no_create_table(self):
         self.assertEqual(claude_service._extract_create_table_names("print('hello')"), {})
 
+    def test_finds_all_tables_in_a_single_executescript_block(self):
+        """Regression test: templates/tour_operator.py's init_db() batches
+        multiple CREATE TABLEs into ONE db.executescript(\"\"\"...\"\"\")
+        string, each statement terminated by ';' rather than by the string's
+        own closing quotes. A prior version of this regex only matched a
+        ')' immediately followed by '\"\"\"'/"'''" — true for the LAST table
+        in such a block but not the earlier ones — so it silently found
+        ZERO tables here, which made every miniapp_config resource for this
+        template fail validation as "hallucinated" even when correct."""
+        code = '''
+import aiosqlite
+
+async def init_db(db_path):
+    async with aiosqlite.connect(db_path) as db:
+        await db.executescript("""
+            CREATE TABLE IF NOT EXISTS tours (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS guests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tour_id INTEGER,
+                name TEXT NOT NULL
+            );
+        """)
+'''
+        tables = claude_service._extract_create_table_names(code)
+        self.assertEqual(tables.keys(), {"tours", "guests"})
+        self.assertEqual(tables["tours"], {"id", "name"})
+        self.assertEqual(tables["guests"], {"id", "tour_id", "name"})
+
 
 class ValidateMiniappConfigAgainstCode(unittest.TestCase):
     def test_valid_config_passes(self):
@@ -114,37 +146,59 @@ class ValidateMiniappConfigAgainstCode(unittest.TestCase):
 
 
 class ParseMiniappConfig(unittest.TestCase):
+    """_parse_miniapp_config now returns (config, failure_reason) — see its
+    docstring. failure_reason is None on success, INCLUDING the valid
+    "no mini-app needed" ({"resources": []}) answer, and otherwise
+    "parse_error" (malformed shape) or "validation_failed" (well-formed JSON
+    that failed table/column validation)."""
+
     def test_valid_json_matching_code_parses(self):
-        result = claude_service._parse_miniapp_config(VALID_CONFIG_JSON, SAMPLE_BOT_CODE)
+        result, reason = claude_service._parse_miniapp_config(VALID_CONFIG_JSON, SAMPLE_BOT_CODE)
         self.assertIsNotNone(result)
+        self.assertIsNone(reason)
         self.assertEqual(result["resources"][0]["table"], "orders")
 
     def test_strips_markdown_fences(self):
         fenced = f"```json\n{VALID_CONFIG_JSON}\n```"
-        result = claude_service._parse_miniapp_config(fenced, SAMPLE_BOT_CODE)
+        result, reason = claude_service._parse_miniapp_config(fenced, SAMPLE_BOT_CODE)
         self.assertIsNotNone(result)
+        self.assertIsNone(reason)
 
-    def test_malformed_json_returns_none(self):
-        self.assertIsNone(claude_service._parse_miniapp_config("not json at all {{{", SAMPLE_BOT_CODE))
+    def test_malformed_json_returns_none_with_parse_error(self):
+        result, reason = claude_service._parse_miniapp_config("not json at all {{{", SAMPLE_BOT_CODE)
+        self.assertIsNone(result)
+        self.assertEqual(reason, "parse_error")
 
-    def test_empty_resources_returns_none_not_empty_dict(self):
+    def test_empty_resources_returns_none_config_and_none_reason(self):
         # {"resources": []} is a valid "nothing to show" answer from the
-        # model, but there's nothing to store — treated as no config.
-        self.assertIsNone(claude_service._parse_miniapp_config('{"resources": []}', SAMPLE_BOT_CODE))
+        # model, but there's nothing to store — treated as no config AND
+        # not a failure (reason stays None, distinguishing it from a real
+        # parse/validation failure).
+        result, reason = claude_service._parse_miniapp_config('{"resources": []}', SAMPLE_BOT_CODE)
+        self.assertIsNone(result)
+        self.assertIsNone(reason)
 
-    def test_missing_resources_key_returns_none(self):
-        self.assertIsNone(claude_service._parse_miniapp_config('{"foo": "bar"}', SAMPLE_BOT_CODE))
+    def test_missing_resources_key_returns_parse_error(self):
+        result, reason = claude_service._parse_miniapp_config('{"foo": "bar"}', SAMPLE_BOT_CODE)
+        self.assertIsNone(result)
+        self.assertEqual(reason, "parse_error")
 
-    def test_hallucinated_table_returns_none(self):
+    def test_hallucinated_table_returns_validation_failed(self):
         bad = '{"resources": [{"name": "x", "table": "nonexistent", "fields": [{"name": "y"}]}]}'
-        self.assertIsNone(claude_service._parse_miniapp_config(bad, SAMPLE_BOT_CODE))
+        result, reason = claude_service._parse_miniapp_config(bad, SAMPLE_BOT_CODE)
+        self.assertIsNone(result)
+        self.assertEqual(reason, "validation_failed")
 
-    def test_resource_missing_required_keys_returns_none(self):
+    def test_resource_missing_required_keys_returns_parse_error(self):
         bad = '{"resources": [{"name": "orders"}]}'  # no "table", no "fields"
-        self.assertIsNone(claude_service._parse_miniapp_config(bad, SAMPLE_BOT_CODE))
+        result, reason = claude_service._parse_miniapp_config(bad, SAMPLE_BOT_CODE)
+        self.assertIsNone(result)
+        self.assertEqual(reason, "parse_error")
 
-    def test_not_a_dict_returns_none(self):
-        self.assertIsNone(claude_service._parse_miniapp_config("[1, 2, 3]", SAMPLE_BOT_CODE))
+    def test_not_a_dict_returns_parse_error(self):
+        result, reason = claude_service._parse_miniapp_config("[1, 2, 3]", SAMPLE_BOT_CODE)
+        self.assertIsNone(result)
+        self.assertEqual(reason, "parse_error")
 
     def test_display_metadata_passes_through_when_present(self):
         with_display = """{
@@ -159,8 +213,9 @@ class ParseMiniappConfig(unittest.TestCase):
                 }
             ]
         }"""
-        result = claude_service._parse_miniapp_config(with_display, SAMPLE_BOT_CODE)
+        result, reason = claude_service._parse_miniapp_config(with_display, SAMPLE_BOT_CODE)
         self.assertIsNotNone(result)
+        self.assertIsNone(reason)
         resource = result["resources"][0]
         self.assertEqual(resource["title"], "Заказы")
         self.assertEqual(resource["titleField"], "customer_name")
@@ -171,11 +226,12 @@ class ParseMiniappConfig(unittest.TestCase):
     def test_missing_display_metadata_still_parses(self):
         # Older-shape configs (no title/label/kind/list/detail/create) must
         # keep working — display metadata is optional, not required.
-        result = claude_service._parse_miniapp_config(VALID_CONFIG_JSON, SAMPLE_BOT_CODE)
+        result, reason = claude_service._parse_miniapp_config(VALID_CONFIG_JSON, SAMPLE_BOT_CODE)
         self.assertIsNotNone(result)
+        self.assertIsNone(reason)
         self.assertNotIn("title", result["resources"][0])
 
-    def test_title_field_referencing_unknown_field_returns_none(self):
+    def test_title_field_referencing_unknown_field_returns_parse_error(self):
         bad = """{
             "resources": [
                 {
@@ -185,7 +241,9 @@ class ParseMiniappConfig(unittest.TestCase):
                 }
             ]
         }"""
-        self.assertIsNone(claude_service._parse_miniapp_config(bad, SAMPLE_BOT_CODE))
+        result, reason = claude_service._parse_miniapp_config(bad, SAMPLE_BOT_CODE)
+        self.assertIsNone(result)
+        self.assertEqual(reason, "parse_error")
 
     def test_title_field_referencing_real_field_passes(self):
         ok = """{
@@ -197,12 +255,18 @@ class ParseMiniappConfig(unittest.TestCase):
                 }
             ]
         }"""
-        result = claude_service._parse_miniapp_config(ok, SAMPLE_BOT_CODE)
+        result, reason = claude_service._parse_miniapp_config(ok, SAMPLE_BOT_CODE)
         self.assertIsNotNone(result)
+        self.assertIsNone(reason)
         self.assertEqual(result["resources"][0]["titleField"], "customer_name")
 
 
 class GenerateMiniappConfig(unittest.IsolatedAsyncioTestCase):
+    """_generate_miniapp_config now returns (config, failure_info) with ONE
+    retry on failure before giving up — see its docstring. failure_info is
+    None on success (including the valid empty-resources answer), otherwise
+    {"reason": ...} once the retry has ALSO failed."""
+
     async def asyncSetUp(self):
         self._patcher = patch.object(claude_service, "client")
         self.mock_client = self._patcher.start()
@@ -213,12 +277,14 @@ class GenerateMiniappConfig(unittest.IsolatedAsyncioTestCase):
     async def test_uses_haiku_and_the_miniapp_prompt(self):
         create = AsyncMock(return_value=_fake_response(VALID_CONFIG_JSON))
         self.mock_client.messages.create = create
-        result = await claude_service._generate_miniapp_config(SAMPLE_BOT_CODE, "an order-taking bot")
+        result, failure_info = await claude_service._generate_miniapp_config(SAMPLE_BOT_CODE, "an order-taking bot")
         _, kwargs = create.call_args
         self.assertEqual(kwargs["model"], "claude-haiku-4-5-20251001")
         self.assertEqual(kwargs["system"], claude_service.MINIAPP_CONFIG_SYSTEM_PROMPT)
         self.assertIsNotNone(result)
+        self.assertIsNone(failure_info)
         self.assertEqual(result["resources"][0]["table"], "orders")
+        create.assert_awaited_once()  # success on the first try, no retry needed
 
     async def test_few_shot_example_is_the_real_tour_operator_config(self):
         # The prompt must actually embed the tour_operator example, not just
@@ -234,88 +300,149 @@ class GenerateMiniappConfig(unittest.IsolatedAsyncioTestCase):
             self.assertIn(keyword, prompt)
         self.assertIn('"titleField": "name"', claude_service._TOUR_OPERATOR_MINIAPP_CONFIG_EXAMPLE)
 
-    async def test_api_exception_never_raises_returns_none(self):
-        self.mock_client.messages.create = AsyncMock(side_effect=RuntimeError("network broke"))
-        result = await claude_service._generate_miniapp_config(SAMPLE_BOT_CODE, "whatever")
+    async def test_empty_resources_is_success_not_a_retriggered_retry(self):
+        # The valid "no mini-app needed" answer must not be treated as a
+        # failure — no retry, failure_info stays None.
+        create = AsyncMock(return_value=_fake_response('{"resources": []}'))
+        self.mock_client.messages.create = create
+        result, failure_info = await claude_service._generate_miniapp_config(SAMPLE_BOT_CODE, "a purely conversational bot")
         self.assertIsNone(result)
+        self.assertIsNone(failure_info)
+        create.assert_awaited_once()
 
-    async def test_malformed_response_never_raises_returns_none(self):
-        self.mock_client.messages.create = AsyncMock(return_value=_fake_response("garbage{{{"))
-        result = await claude_service._generate_miniapp_config(SAMPLE_BOT_CODE, "whatever")
+    async def test_api_exception_never_raises_retries_once_then_returns_failure_info(self):
+        self.mock_client.messages.create = AsyncMock(side_effect=RuntimeError("network broke"))
+        result, failure_info = await claude_service._generate_miniapp_config(SAMPLE_BOT_CODE, "whatever")
         self.assertIsNone(result)
+        self.assertEqual(failure_info, {"reason": "api_error"})
+        self.assertEqual(self.mock_client.messages.create.await_count, 2)  # one retry
+
+    async def test_malformed_response_never_raises_retries_once_then_returns_failure_info(self):
+        self.mock_client.messages.create = AsyncMock(return_value=_fake_response("garbage{{{"))
+        result, failure_info = await claude_service._generate_miniapp_config(SAMPLE_BOT_CODE, "whatever")
+        self.assertIsNone(result)
+        self.assertEqual(failure_info, {"reason": "parse_error"})
+        self.assertEqual(self.mock_client.messages.create.await_count, 2)
+
+    async def test_hallucinated_response_retries_once_then_returns_validation_failed(self):
+        bad = '{"resources": [{"name": "x", "table": "nonexistent", "fields": [{"name": "y"}]}]}'
+        self.mock_client.messages.create = AsyncMock(return_value=_fake_response(bad))
+        result, failure_info = await claude_service._generate_miniapp_config(SAMPLE_BOT_CODE, "whatever")
+        self.assertIsNone(result)
+        self.assertEqual(failure_info, {"reason": "validation_failed"})
+        self.assertEqual(self.mock_client.messages.create.await_count, 2)
+
+    async def test_success_on_retry_after_one_failed_attempt(self):
+        # First call fails, second (retry) succeeds — the whole point of the
+        # retry is to recover from exactly this.
+        create = AsyncMock(side_effect=[RuntimeError("transient"), _fake_response(VALID_CONFIG_JSON)])
+        self.mock_client.messages.create = create
+        result, failure_info = await claude_service._generate_miniapp_config(SAMPLE_BOT_CODE, "whatever")
+        self.assertIsNotNone(result)
+        self.assertIsNone(failure_info)
+        self.assertEqual(create.await_count, 2)
+
+    async def test_timeout_returns_timeout_reason(self):
+        self.mock_client.messages.create = AsyncMock(return_value=_fake_response(VALID_CONFIG_JSON))
+        with patch.object(claude_service.asyncio, "wait_for", AsyncMock(side_effect=asyncio.TimeoutError)):
+            result, failure_info = await claude_service._generate_miniapp_config(SAMPLE_BOT_CODE, "whatever")
+        self.assertIsNone(result)
+        self.assertEqual(failure_info, {"reason": "timeout"})
 
     async def test_max_tokens_is_small_not_full_generation_size(self):
         create = AsyncMock(return_value=_fake_response(VALID_CONFIG_JSON))
         self.mock_client.messages.create = create
         await claude_service._generate_miniapp_config(SAMPLE_BOT_CODE, "whatever")
         _, kwargs = create.call_args
-        self.assertLessEqual(kwargs["max_tokens"], 2000)
+        # Sized for a multi-domain template (tour_operator's 5 resources /
+        # ~40 fields) without truncation — see the call site's own comment —
+        # but still far below a full code-generation pass's budget.
+        self.assertLessEqual(kwargs["max_tokens"], 8000)
 
 
 class GenerateBotCodeReturnsCodeAndMiniappConfig(unittest.IsolatedAsyncioTestCase):
     """generate_bot_code's public contract: always a (code, miniapp_config,
-    office_hook_config, voice_cashflow_config) tuple, and any one config
-    generator's failure never prevents code (or the other configs) from
-    coming back."""
+    office_hook_config, voice_cashflow_config, fallback_info,
+    miniapp_failure_info) tuple, and any one config generator's failure
+    never prevents code (or the other configs) from coming back."""
 
     async def test_wraps_inner_generation_and_appends_miniapp_config(self):
         with patch.object(
             claude_service, "_generate_bot_code_inner", AsyncMock(return_value=(SAMPLE_BOT_CODE, None))
         ), patch.object(
-            claude_service, "_generate_miniapp_config", AsyncMock(return_value={"resources": [{"name": "orders"}]})
+            claude_service, "_generate_miniapp_config",
+            AsyncMock(return_value=({"resources": [{"name": "orders"}]}, None)),
         ), patch.object(
             claude_service, "_generate_office_hook_config", AsyncMock(return_value=None)
         ), patch.object(
             claude_service, "_generate_voice_cashflow_config", AsyncMock(return_value=None)
         ):
-            code, miniapp_config, office_hook_config, voice_cashflow_config, _fallback_info = await claude_service.generate_bot_code("an order bot")
+            code, miniapp_config, office_hook_config, voice_cashflow_config, _fallback_info, miniapp_failure_info = await claude_service.generate_bot_code("an order bot")
         self.assertEqual(code, SAMPLE_BOT_CODE)
         self.assertEqual(miniapp_config, {"resources": [{"name": "orders"}]})
         self.assertIsNone(office_hook_config)
         self.assertIsNone(voice_cashflow_config)
+        self.assertIsNone(miniapp_failure_info)
 
     async def test_miniapp_config_none_still_returns_the_code(self):
         with patch.object(
             claude_service, "_generate_bot_code_inner", AsyncMock(return_value=(SAMPLE_BOT_CODE, None))
         ), patch.object(
-            claude_service, "_generate_miniapp_config", AsyncMock(return_value=None)
+            claude_service, "_generate_miniapp_config", AsyncMock(return_value=(None, None))
         ), patch.object(
             claude_service, "_generate_office_hook_config", AsyncMock(return_value=None)
         ), patch.object(
             claude_service, "_generate_voice_cashflow_config", AsyncMock(return_value=None)
         ):
-            code, miniapp_config, office_hook_config, voice_cashflow_config, _fallback_info = await claude_service.generate_bot_code("an order bot")
+            code, miniapp_config, office_hook_config, voice_cashflow_config, _fallback_info, miniapp_failure_info = await claude_service.generate_bot_code("an order bot")
         self.assertEqual(code, SAMPLE_BOT_CODE)
         self.assertIsNone(miniapp_config)
         self.assertIsNone(office_hook_config)
         self.assertIsNone(voice_cashflow_config)
+        self.assertIsNone(miniapp_failure_info)
+
+    async def test_miniapp_failure_info_is_threaded_through_as_sixth_element(self):
+        with patch.object(
+            claude_service, "_generate_bot_code_inner", AsyncMock(return_value=(SAMPLE_BOT_CODE, None))
+        ), patch.object(
+            claude_service, "_generate_miniapp_config",
+            AsyncMock(return_value=(None, {"reason": "validation_failed"})),
+        ), patch.object(
+            claude_service, "_generate_office_hook_config", AsyncMock(return_value=None)
+        ), patch.object(
+            claude_service, "_generate_voice_cashflow_config", AsyncMock(return_value=None)
+        ):
+            code, miniapp_config, _office_hook_config, _voice_cashflow_config, _fallback_info, miniapp_failure_info = await claude_service.generate_bot_code("an order bot")
+        self.assertEqual(code, SAMPLE_BOT_CODE)
+        self.assertIsNone(miniapp_config)
+        self.assertEqual(miniapp_failure_info, {"reason": "validation_failed"})
 
     async def test_office_hook_config_is_appended_when_generated(self):
         with patch.object(
             claude_service, "_generate_bot_code_inner", AsyncMock(return_value=(SAMPLE_BOT_CODE, None))
         ), patch.object(
-            claude_service, "_generate_miniapp_config", AsyncMock(return_value=None)
+            claude_service, "_generate_miniapp_config", AsyncMock(return_value=(None, None))
         ), patch.object(
             claude_service, "_generate_office_hook_config",
             AsyncMock(return_value={"table": "orders", "match_field": "user_id"}),
         ), patch.object(
             claude_service, "_generate_voice_cashflow_config", AsyncMock(return_value=None)
         ):
-            code, miniapp_config, office_hook_config, voice_cashflow_config, _fallback_info = await claude_service.generate_bot_code("an order bot")
+            code, miniapp_config, office_hook_config, voice_cashflow_config, _fallback_info, _miniapp_failure_info = await claude_service.generate_bot_code("an order bot")
         self.assertEqual(office_hook_config, {"table": "orders", "match_field": "user_id"})
 
     async def test_voice_cashflow_config_is_appended_when_generated(self):
         with patch.object(
             claude_service, "_generate_bot_code_inner", AsyncMock(return_value=(SAMPLE_BOT_CODE, None))
         ), patch.object(
-            claude_service, "_generate_miniapp_config", AsyncMock(return_value=None)
+            claude_service, "_generate_miniapp_config", AsyncMock(return_value=(None, None))
         ), patch.object(
             claude_service, "_generate_office_hook_config", AsyncMock(return_value=None)
         ), patch.object(
             claude_service, "_generate_voice_cashflow_config",
             AsyncMock(return_value={"voice_intake": None, "cashflow_ledger": True}),
         ):
-            code, miniapp_config, office_hook_config, voice_cashflow_config, _fallback_info = await claude_service.generate_bot_code("an order bot")
+            code, miniapp_config, office_hook_config, voice_cashflow_config, _fallback_info, _miniapp_failure_info = await claude_service.generate_bot_code("an order bot")
         self.assertEqual(voice_cashflow_config, {"voice_intake": None, "cashflow_ledger": True})
 
 

@@ -177,6 +177,25 @@ export function listTemplateCandidateClusters(): Promise<{ items: TemplateCandid
   return request('/candidate-clusters')
 }
 
+// Mini-app generation failures (services/claude_service.py's
+// _generate_miniapp_config genuinely failing after its retry — see
+// db.database's miniapp_config_failures table comment) — same shape/posture
+// as TemplateCandidateItem above, surfaced in its own OwnerRegistryScreen.tsx
+// section so the owner can spot bots that silently got no mini-app.
+export interface MiniappConfigFailureItem {
+  id: number
+  bot_id: number | null
+  bot_name: string | null
+  summary: string
+  failure_reason: string
+  creator_user_id: number
+  created_at: string
+}
+
+export function listMiniappConfigFailures(): Promise<{ items: MiniappConfigFailureItem[] }> {
+  return request('/miniapp-failures')
+}
+
 export function addFactoryFeedback(
   botId: number,
   rating: number,

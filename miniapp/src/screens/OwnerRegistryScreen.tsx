@@ -3,10 +3,12 @@ import {
   listOwnerRegistry,
   listTemplateCandidates,
   listTemplateCandidateClusters,
+  listMiniappConfigFailures,
   ApiError,
   type OwnerRegistryItem,
   type TemplateCandidateItem,
   type TemplateCandidateClusterItem,
+  type MiniappConfigFailureItem,
 } from '../lib/factoryApi'
 import { Card, CardHeader, CardTitle, ChipRow, Chip, Badge } from '../components/Card'
 import { iconForTemplate } from '../lib/botIcons'
@@ -26,6 +28,18 @@ const FALLBACK_REASON_LABELS: Record<string, string> = {
 }
 
 const CLUSTER_HIGHLIGHT_THRESHOLD = 3
+
+// Mirrors FALLBACK_REASON_LABELS above — see
+// services/claude_service.py's _generate_miniapp_config for what each
+// reason means (timeout/api_error are transient, parse_error/
+// validation_failed mean Haiku's output was malformed or hallucinated a
+// table/column, after one retry already failed).
+const MINIAPP_FAILURE_REASON_LABELS: Record<string, string> = {
+  timeout: 'таймаут запроса',
+  api_error: 'ошибка API',
+  parse_error: 'не удалось разобрать ответ',
+  validation_failed: 'ответ не прошёл проверку схемы',
+}
 
 // The separate owner-wide registry (multitenancy design item 3):
 // FactoryDashboardScreen's "Моя фабрика" already lists every bot to the
@@ -204,6 +218,7 @@ export function OwnerRegistryScreen({ onBack }: { onBack: () => void }) {
 
       <TemplateCandidateClustersSection />
       <TemplateCandidatesSection />
+      <MiniappConfigFailuresSection />
 
       {filtered.length > 0 && (
         <div className="registry-table-wrap">
@@ -340,6 +355,52 @@ function TemplateCandidatesSection() {
           ))}
         </Card>
       ))}
+    </div>
+  )
+}
+
+function MiniappConfigFailuresSection() {
+  // Reliability-hardening addition (see MEMORY.md miniapp_config generation
+  // reliability note): _generate_miniapp_config used to silently degrade to
+  // "no mini-app" on ANY failure. It now retries once and, if that also
+  // fails, logs a row here — this section is the owner-facing surface for
+  // that signal, same "flat recent list" MVP posture as
+  // TemplateCandidatesSection above (no clustering, just raw rows).
+  const [failures, setFailures] = useState<MiniappConfigFailureItem[] | null>(null)
+  const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => {
+    listMiniappConfigFailures()
+      .then((data) => setFailures(data.items))
+      .catch((err) => setError(err instanceof ApiError ? err.message : 'Не удалось загрузить ошибки мини-аппа'))
+  }, [])
+
+  return (
+    <div className="screen-section">
+      <h2 style={{ margin: '16px 0 8px' }}>Боты без мини-аппа (ошибка генерации)</h2>
+      {error && <div className="state-message">{error}</div>}
+      {!error && failures === null && <div className="state-message">Загрузка…</div>}
+      {failures !== null && failures.length === 0 && (
+        <div className="state-message">Пока нет ботов, для которых мини-апп не сгенерировался.</div>
+      )}
+      {failures !== null && failures.length > 0 && (
+        <Card>
+          <CardHeader>
+            <CardTitle>Требуют ручной проверки</CardTitle>
+            <Badge tone="neutral">{failures.length}</Badge>
+          </CardHeader>
+          {failures.map((f) => (
+            <div key={f.id} style={{ marginTop: 8, paddingTop: 8, borderTop: '1px solid var(--border, #333)' }}>
+              <div>{f.summary}</div>
+              <ChipRow>
+                <Chip>{MINIAPP_FAILURE_REASON_LABELS[f.failure_reason] || f.failure_reason}</Chip>
+                <Chip>{f.created_at}</Chip>
+                {f.bot_name && <Chip>бот: {f.bot_name}</Chip>}
+              </ChipRow>
+            </div>
+          ))}
+        </Card>
+      )}
     </div>
   )
 }

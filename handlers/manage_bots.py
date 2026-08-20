@@ -21,6 +21,7 @@ from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, Inli
 
 from config import ASSEMBLYAI_API_KEY
 from db.database import (
+    add_miniapp_config_failure,
     add_office_link,
     add_template_candidate,
     delete_bot,
@@ -518,10 +519,11 @@ async def recreate_bot_core(bot_id: int, creator_user_id: int) -> dict:
     office_hook_config: dict | None = None
     voice_cashflow_config: dict | None = None
     fallback_info: dict | None = None
+    miniapp_failure_info: dict | None = None
     try:
         result = await asyncio.wait_for(task, timeout=240.0)
         if regenerating_from_scratch:
-            code, miniapp_config, office_hook_config, voice_cashflow_config, fallback_info = result
+            code, miniapp_config, office_hook_config, voice_cashflow_config, fallback_info, miniapp_failure_info = result
         else:
             code = result
     except Exception as e:
@@ -548,6 +550,19 @@ async def recreate_bot_core(bot_id: int, creator_user_id: int) -> dict:
             summary=b.get("description", ""),
             fallback_reason=fallback_info["reason"],
             selected_templates=fallback_info["selected_templates"],
+            bot_name=b["name"],
+            bot_id=bot_id,
+        )
+    if miniapp_failure_info:
+        # See handlers/create_bot.py's equivalent block for the full
+        # rationale — logged here too (recreate can regenerate the config)
+        # but no Telegram notification: this code path has no chat_id to
+        # notify into (recreate_bot_core is a headless helper shared by both
+        # the Telegram callback and the /analytics "restart" button).
+        await add_miniapp_config_failure(
+            creator_user_id=creator_user_id,
+            summary=b.get("description", ""),
+            failure_reason=miniapp_failure_info["reason"],
             bot_name=b["name"],
             bot_id=bot_id,
         )
@@ -2122,10 +2137,11 @@ async def cb_recreate(callback: CallbackQuery):
         office_hook_config: dict | None = None
         voice_cashflow_config: dict | None = None
         fallback_info: dict | None = None
+        miniapp_failure_info: dict | None = None
         try:
             result = await asyncio.wait_for(task, timeout=240.0)
             if regenerating_from_scratch:
-                code, miniapp_config, office_hook_config, voice_cashflow_config, fallback_info = result
+                code, miniapp_config, office_hook_config, voice_cashflow_config, fallback_info, miniapp_failure_info = result
             else:
                 code = result
         except Exception as e:
@@ -2169,6 +2185,19 @@ async def cb_recreate(callback: CallbackQuery):
                 summary=b.get("description", ""),
                 fallback_reason=fallback_info["reason"],
                 selected_templates=fallback_info["selected_templates"],
+                bot_name=b["name"],
+                bot_id=bot_id,
+            )
+        if miniapp_failure_info:
+            # See handlers/create_bot.py's equivalent block for the full
+            # rationale. No extra Telegram notification here beyond the
+            # regular "бот пересоздан" message below — this callback already
+            # has the owner's chat open, so a silent log entry (surfaced via
+            # /analytics) is enough rather than a second interrupting message.
+            await add_miniapp_config_failure(
+                creator_user_id=callback.from_user.id,
+                summary=b.get("description", ""),
+                failure_reason=miniapp_failure_info["reason"],
                 bot_name=b["name"],
                 bot_id=bot_id,
             )

@@ -79,7 +79,8 @@ class RegenerateMiniappConfigResetsMenuButton(unittest.IsolatedAsyncioTestCase):
 
     def _patch(self, generated_config, bot_row):
         self._gen = patch.object(
-            custom_features_module, "_generate_miniapp_config", new=AsyncMock(return_value=generated_config)
+            custom_features_module, "_generate_miniapp_config",
+            new=AsyncMock(return_value=(generated_config, None)),
         )
         self._set_cfg = patch.object(custom_features_module, "set_bot_miniapp_config", new=AsyncMock())
         self._get_bot = patch.object(custom_features_module, "get_bot", new=AsyncMock(return_value=bot_row))

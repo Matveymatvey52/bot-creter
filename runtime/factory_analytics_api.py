@@ -43,6 +43,7 @@ from db.database import (
     get_office_links_for_bot,
     list_bots_with_stats,
     list_feedback_activity,
+    list_miniapp_config_failures,
     list_template_candidate_clusters_with_stats,
     list_template_candidates,
     remove_bot_admin,
@@ -262,6 +263,19 @@ async def candidates_handler(request: web.Request) -> web.Response:
     if not await _authenticate_owner(request):
         return web.json_response({"error": "forbidden"}, status=403)
     items = await list_template_candidates()
+    return web.json_response({"items": items})
+
+
+async def miniapp_failures_handler(request: web.Request) -> web.Response:
+    """GET /api/factory/miniapp-failures — mini-app generation failures
+    (services/claude_service.py's _generate_miniapp_config genuinely failing
+    after its retry — see db.database's miniapp_config_failures table
+    comment) for a section on OwnerRegistryScreen.tsx analogous to
+    candidates_handler's "Кандидаты на новый шаблон", so the owner can spot
+    bots that silently got no mini-app and build one by hand."""
+    if not await _authenticate_owner(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    items = await list_miniapp_config_failures()
     return web.json_response({"items": items})
 
 
@@ -929,6 +943,7 @@ def register_routes(app: web.Application) -> None:
     app.router.add_get("/api/factory/owner-registry", owner_registry_handler)
     app.router.add_get("/api/factory/candidates", candidates_handler)
     app.router.add_get("/api/factory/candidate-clusters", candidate_clusters_handler)
+    app.router.add_get("/api/factory/miniapp-failures", miniapp_failures_handler)
     app.router.add_post("/api/factory/bots/{bot_id}/feedback", add_feedback_handler)
 
     # Detail panel — level 2 of the dashboard (docs discussion: "Детальная
