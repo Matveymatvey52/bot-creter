@@ -391,3 +391,63 @@ export function removeAdmin(botId: number, telegramId: string): Promise<{ ok: tr
   return request(`/bots/${botId}/admins/${telegramId}`, { method: 'DELETE' })
 }
 
+// Owner support-session record editor — mirrors miniapp/src/lib/api.ts's
+// getSchema/listResource shape (same SchemaResource/SchemaField JSON, same
+// ResourceItem row shape), but hits /api/factory/bots/{bot_id}/... instead
+// of the customer-facing /api/{bot_id}/... path, since editing/deleting an
+// arbitrary row is an owner-only capability (see
+// runtime/factory_analytics_api.py's resource_schema_handler/
+// resource_list_handler/resource_update_handler/resource_delete_handler
+// docstrings for why this couldn't reuse the customer-facing auth).
+export interface FactorySchemaField {
+  name: string
+  required?: boolean
+  creatable?: boolean
+  label?: string
+  kind?: 'text' | 'number' | 'date' | 'status'
+  list?: boolean
+  detail?: boolean
+  create?: boolean
+}
+
+export interface FactorySchemaResource {
+  name: string
+  creatable?: boolean
+  title?: string
+  titleField?: string
+  fields: FactorySchemaField[]
+}
+
+export interface FactoryResourceItem {
+  id: number
+  [key: string]: unknown
+}
+
+export function getBotSchema(botId: number): Promise<{ resources: FactorySchemaResource[] }> {
+  return request(`/bots/${botId}/schema`)
+}
+
+export function listBotResource(
+  botId: number,
+  resource: string,
+): Promise<{ resource: string; items: FactoryResourceItem[] }> {
+  return request(`/bots/${botId}/${resource}`)
+}
+
+export function updateBotResource(
+  botId: number,
+  resource: string,
+  itemId: number,
+  payload: Record<string, unknown>,
+): Promise<{ resource: string; id: number }> {
+  return request(`/bots/${botId}/${resource}/${itemId}`, { method: 'PATCH', body: JSON.stringify(payload) })
+}
+
+export function deleteBotResource(
+  botId: number,
+  resource: string,
+  itemId: number,
+): Promise<{ resource: string; id: number }> {
+  return request(`/bots/${botId}/${resource}/${itemId}`, { method: 'DELETE' })
+}
+

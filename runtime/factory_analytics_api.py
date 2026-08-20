@@ -36,6 +36,7 @@ from db.database import (
     get_bot_admins,
     get_bot_feature_config,
     get_bot_features,
+    get_bot_miniapp_config,
     get_bot_office_hook_config,
     get_bot_sheets_config,
     get_bot_yookassa_credentials,
@@ -66,8 +67,8 @@ from handlers.manage_bots import (
     generate_fix_preview_core,
     recreate_bot_core,
 )
-from runtime.miniapp_api import _authenticate, mint_magic_link_token
-from runtime.registry import FACTORY_BOT_ID, Registry, discover_features, infer_template_id
+from runtime.miniapp_api import _authenticate, _resource_display_schema, _resource_spec, mint_magic_link_token
+from runtime.registry import FACTORY_BOT_ID, Registry, _load_template_module_async, discover_features, infer_template_id
 from runtime.webhook_app import REGISTRY_KEY
 from services.bot_runner import _make_extra_env, get_bot_logs, is_running, start_bot, stop_bot
 from services.claude_service import assess_feature_description
@@ -382,6 +383,199 @@ async def bot_activity_handler(request: web.Request) -> web.Response:
 
     entries.sort(key=lambda e: e["created_at"] or "", reverse=True)
     return web.json_response({"items": entries[:100]})
+
+
+# ── owner support-session: view/edit/delete one bot's OWN records ──────────
+#
+# The "connect to a client's bot and fix a stuck record" scenario — the
+# owner needs to see and edit rows in a bot's own per-bot database (bookings,
+# orders, clients), not just the central factory DB's bookkeeping about the
+# bot itself. runtime/miniapp_api.py already has this exact generic list/
+# get/create-by-miniapp_config machinery for the CUSTOMER-facing mini-app,
+# but that module's auth (_authenticate) verifies against the TARGET bot's
+# own token/site-session — there is no way to mint a credential scoped to an
+# arbitrary bot_id from inside the owner-only factory dashboard, which only
+# ever authenticates against FACTORY_BOT_ID (see _authenticate_owner).
+# Rather than extend miniapp_api.py's auth scheme to accept a second kind of
+# token, these three handlers live here instead, under the SAME
+# /api/factory/bots/{bot_id}/... namespace and _authenticate_owner gate as
+# every other per-bot action in this file (recreate/autofix/fixbug/etc.) —
+# the owner is already authenticated once, against the factory bot, and that
+# single credential now reaches into any bot's own data too. Reuses
+# miniapp_api._resource_spec (same miniapp_config lookup contract) rather
+# than re-deriving it, but does its OWN SQL (not miniapp_api's handlers)
+# since those are wired to the customer-facing auth/role-filter/admin-gate
+# checks this owner-only path deliberately skips (the owner can fix ANY row,
+# not just ones a resource's role_filter would let a given viewer see).
+async def _resolve_bot_resource(bot_id: int, resource_name: str, request: web.Request) -> tuple[dict, str] | web.Response:
+    """Shared prologue for the three handlers below: resolves this bot_id's
+    miniapp_config + the named resource + its db_path. Returns
+    (resource_spec, db_path) on success, or an already-built error response.
+    Mirrors miniapp_api._resolve_entry_and_config's DB-then-template-module
+    fallback for miniapp_config, since older bots created before that table
+    existed still only have the template's own hand-authored attribute."""
+    registry: Registry = request.app[REGISTRY_KEY]
+    entry = registry.get(bot_id)
+    if entry is None:
+        return web.json_response({"error": "unknown bot"}, status=404)
+
+    miniapp_config = await get_bot_miniapp_config(bot_id)
+    if miniapp_config is None and entry.template_id:
+        module = await _load_template_module_async(entry.template_id)
+        miniapp_config = getattr(module, "miniapp_config", None) if module is not None else None
+    if miniapp_config is None:
+        return web.json_response({"error": "mini-app not available for this bot"}, status=404)
+
+    resource = _resource_spec(miniapp_config, resource_name)
+    if resource is None:
+        return web.json_response({"error": "unknown resource"}, status=404)
+
+    db_path = entry.config.get("db_path") if isinstance(entry.config, dict) else None
+    if not db_path:
+        return web.json_response({"error": "bot has no database configured"}, status=500)
+
+    return resource, db_path
+
+
+async def _resolve_bot_miniapp_config(bot_id: int, request: web.Request) -> dict | web.Response:
+    """Same DB-then-template-module fallback _resolve_bot_resource uses,
+    factored out for resource_schema_handler which needs the whole config
+    (every resource), not one resource_spec."""
+    registry: Registry = request.app[REGISTRY_KEY]
+    entry = registry.get(bot_id)
+    if entry is None:
+        return web.json_response({"error": "unknown bot"}, status=404)
+
+    miniapp_config = await get_bot_miniapp_config(bot_id)
+    if miniapp_config is None and entry.template_id:
+        module = await _load_template_module_async(entry.template_id)
+        miniapp_config = getattr(module, "miniapp_config", None) if module is not None else None
+    if miniapp_config is None:
+        return web.json_response({"error": "mini-app not available for this bot"}, status=404)
+    return miniapp_config
+
+
+async def resource_schema_handler(request: web.Request) -> web.Response:
+    """GET /api/factory/bots/{bot_id}/schema — owner-only display schema for
+    the support-session record editor, same shape as
+    miniapp_api.schema_handler (display metadata only, no table/order_by SQL
+    plumbing)."""
+    bot_id = _bot_id_from_match_info(request)
+    if bot_id is None:
+        return web.json_response({"error": "bad bot_id"}, status=404)
+    if not await _authenticate_owner(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+
+    resolved = await _resolve_bot_miniapp_config(bot_id, request)
+    if isinstance(resolved, web.Response):
+        return resolved
+    miniapp_config = resolved
+
+    resources = [_resource_display_schema(r) for r in miniapp_config.get("resources", [])]
+    return web.json_response({"resources": resources})
+
+
+async def resource_list_handler(request: web.Request) -> web.Response:
+    """GET /api/factory/bots/{bot_id}/{resource} — owner-only listing of one
+    bot's own records for the support-session record editor. Unlike
+    miniapp_api.list_resource_handler, this ignores role_filter entirely
+    (see module comment above) and returns every row up to the same LIMIT
+    200 cap that handler uses."""
+    bot_id = _bot_id_from_match_info(request)
+    if bot_id is None:
+        return web.json_response({"error": "bad bot_id"}, status=404)
+    if not await _authenticate_owner(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+
+    resource_name = request.match_info.get("resource", "")
+    resolved = await _resolve_bot_resource(bot_id, resource_name, request)
+    if isinstance(resolved, web.Response):
+        return resolved
+    resource, db_path = resolved
+
+    columns = ", ".join(f["name"] for f in resource["fields"])
+    order_by = resource.get("order_by", "id DESC")
+    async with aiosqlite.connect(db_path) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            f"SELECT id, {columns} FROM {resource['table']} ORDER BY {order_by} LIMIT 200"
+        ) as cursor:
+            rows = [dict(r) for r in await cursor.fetchall()]
+    return web.json_response({"resource": resource_name, "items": rows})
+
+
+async def resource_update_handler(request: web.Request) -> web.Response:
+    """PATCH /api/factory/bots/{bot_id}/{resource}/{item_id} — owner-only
+    point edit of one record. Payload keys are validated against
+    resource["fields"] the same allowlist-by-declared-field-name approach
+    miniapp_api.create_resource_handler uses for creates (only accepts keys
+    that exactly match a field the resource spec declares, values always
+    bound as parameters, never string-interpolated)."""
+    bot_id = _bot_id_from_match_info(request)
+    if bot_id is None:
+        return web.json_response({"error": "bad bot_id"}, status=404)
+    if not await _authenticate_owner(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+
+    resource_name = request.match_info.get("resource", "")
+    resolved = await _resolve_bot_resource(bot_id, resource_name, request)
+    if isinstance(resolved, web.Response):
+        return resolved
+    resource, db_path = resolved
+
+    item_id_raw = request.match_info.get("item_id", "")
+    if not item_id_raw.isdigit():
+        return web.json_response({"error": "bad item id"}, status=404)
+
+    try:
+        payload = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON body"}, status=400)
+    if not isinstance(payload, dict):
+        return web.json_response({"error": "invalid JSON body"}, status=400)
+
+    allowed_fields = {f["name"] for f in resource["fields"]}
+    values = {k: v for k, v in payload.items() if k in allowed_fields}
+    if not values:
+        return web.json_response({"error": "no valid fields in payload"}, status=400)
+
+    set_clause = ", ".join(f"{col} = ?" for col in values)
+    async with aiosqlite.connect(db_path) as db:
+        cursor = await db.execute(
+            f"UPDATE {resource['table']} SET {set_clause} WHERE id = ?",
+            tuple(values.values()) + (int(item_id_raw),),
+        )
+        await db.commit()
+        if cursor.rowcount == 0:
+            return web.json_response({"error": "not found"}, status=404)
+    return web.json_response({"resource": resource_name, "id": int(item_id_raw)})
+
+
+async def resource_delete_handler(request: web.Request) -> web.Response:
+    """DELETE /api/factory/bots/{bot_id}/{resource}/{item_id} — owner-only,
+    same posture as resource_update_handler above."""
+    bot_id = _bot_id_from_match_info(request)
+    if bot_id is None:
+        return web.json_response({"error": "bad bot_id"}, status=404)
+    if not await _authenticate_owner(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+
+    resource_name = request.match_info.get("resource", "")
+    resolved = await _resolve_bot_resource(bot_id, resource_name, request)
+    if isinstance(resolved, web.Response):
+        return resolved
+    resource, db_path = resolved
+
+    item_id_raw = request.match_info.get("item_id", "")
+    if not item_id_raw.isdigit():
+        return web.json_response({"error": "bad item id"}, status=404)
+
+    async with aiosqlite.connect(db_path) as db:
+        cursor = await db.execute(f"DELETE FROM {resource['table']} WHERE id = ?", (int(item_id_raw),))
+        await db.commit()
+        if cursor.rowcount == 0:
+            return web.json_response({"error": "not found"}, status=404)
+    return web.json_response({"resource": resource_name, "id": int(item_id_raw)})
 
 
 async def _weekly_count_for_bot(registry: Registry, bot_id: int) -> int | None:
@@ -1013,3 +1207,16 @@ def register_routes(app: web.Application) -> None:
     app.router.add_get("/api/factory/bots/{bot_id}/admins", list_admins_handler)
     app.router.add_post("/api/factory/bots/{bot_id}/admins", add_admin_handler)
     app.router.add_delete("/api/factory/bots/{bot_id}/admins/{telegram_id}", remove_admin_handler)
+
+    # Owner support-session record editor (see _resolve_bot_resource's module
+    # comment) — {resource} is a generic path segment like miniapp_api.py's
+    # own routes, registered last among /bots/{bot_id}/... routes so every
+    # fixed-prefix route above (features/offices/admins/etc.) is matched
+    # first rather than swallowed as if it were a resource name. /schema is
+    # reserved the same way miniapp_api.py reserves it — registered before
+    # the generic {resource} route so a bot could never accidentally shadow
+    # it with a resource literally named "schema".
+    app.router.add_get("/api/factory/bots/{bot_id}/schema", resource_schema_handler)
+    app.router.add_get("/api/factory/bots/{bot_id}/{resource}", resource_list_handler)
+    app.router.add_patch("/api/factory/bots/{bot_id}/{resource}/{item_id}", resource_update_handler)
+    app.router.add_delete("/api/factory/bots/{bot_id}/{resource}/{item_id}", resource_delete_handler)

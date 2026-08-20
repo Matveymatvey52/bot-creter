@@ -11,6 +11,12 @@ import {
   previewFixBug,
   applyFixBug,
   type FixBugPreview,
+  getBotSchema,
+  listBotResource,
+  updateBotResource,
+  deleteBotResource,
+  type FactorySchemaResource,
+  type FactoryResourceItem,
   disableFeature,
   configureFeature,
   cancelFeatureConfigure,
@@ -30,13 +36,14 @@ import {
 import { iconForTemplate } from '../lib/botIcons'
 import { FeedbackForm } from './FactoryDashboardScreen'
 
-type Tab = 'overview' | 'features' | 'offices' | 'admins' | 'maintenance'
+type Tab = 'overview' | 'features' | 'offices' | 'admins' | 'data' | 'maintenance'
 
 const TABS: { key: Tab; label: string }[] = [
   { key: 'overview', label: 'Обзор' },
   { key: 'features', label: 'Фичи' },
   { key: 'offices', label: 'Офисы' },
   { key: 'admins', label: 'Админы' },
+  { key: 'data', label: 'Данные' },
   { key: 'maintenance', label: 'Обслуживание' },
 ]
 
@@ -246,6 +253,7 @@ export function BotDetailPanel({
           <OfficesTab botId={botId} offices={detail.offices} allBots={allBots} onChanged={load} />
         )}
         {tab === 'admins' && <AdminsTab botId={botId} admins={detail.admins} onChanged={load} />}
+        {tab === 'data' && <DataTab botId={botId} />}
         {tab === 'maintenance' && (
           <MaintenanceTab
             botId={botId}
@@ -929,6 +937,201 @@ function AdminsTab({ botId, admins, onChanged }: { botId: number; admins: string
           + Добавить админа по Telegram ID
         </button>
       )}
+    </div>
+  )
+}
+
+// Owner support-session record editor — "Данные" tab. Scenario: a client
+// wrote "не получается сделать X" and the owner needs to see and fix the
+// actual stuck record (a booking, an order) without touching code. Reuses
+// the resource/field shape runtime/factory_analytics_api.py's
+// resource_schema_handler exposes (same miniapp_config authoring contract
+// templates already declare for the customer-facing mini-app), but through
+// the owner-only /api/factory/bots/{bot_id}/... path — deliberately UI-
+// driven point edit/delete, not raw SQL access (see project memory: owner
+// confirmed "нужно уметь много чего менять" but point edit through UI is
+// safer than a SQL console).
+function DataTab({ botId }: { botId: number }) {
+  const [resources, setResources] = useState<FactorySchemaResource[] | null>(null)
+  const [schemaError, setSchemaError] = useState<string | null>(null)
+  const [selected, setSelected] = useState<string | null>(null)
+
+  useEffect(() => {
+    setResources(null)
+    setSchemaError(null)
+    setSelected(null)
+    getBotSchema(botId)
+      .then((data) => {
+        setResources(data.resources)
+        setSelected(data.resources[0]?.name ?? null)
+      })
+      .catch((err) => setSchemaError(err instanceof ApiError ? err.message : 'Не удалось загрузить схему данных'))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [botId])
+
+  if (schemaError) return <div className="state-message">{schemaError}</div>
+  if (resources === null) return <div className="state-message">Загрузка…</div>
+  if (resources.length === 0) return <div className="state-message">У этого бота нет данных для редактирования.</div>
+
+  const resource = resources.find((r) => r.name === selected) ?? resources[0]
+
+  return (
+    <div>
+      {resources.length > 1 && (
+        <div className="row" style={{ flexWrap: 'wrap', marginBottom: 8 }}>
+          {resources.map((r) => (
+            <button
+              key={r.name}
+              className={`mini-btn ${r.name === resource.name ? 'active' : ''}`}
+              onClick={() => setSelected(r.name)}
+            >
+              {r.title || r.name}
+            </button>
+          ))}
+        </div>
+      )}
+      <ResourceRecordsList key={resource.name} botId={botId} resource={resource} />
+    </div>
+  )
+}
+
+function ResourceRecordsList({ botId, resource }: { botId: number; resource: FactorySchemaResource }) {
+  const [items, setItems] = useState<FactoryResourceItem[] | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [editingId, setEditingId] = useState<number | null>(null)
+
+  const load = () => {
+    setItems(null)
+    setError(null)
+    listBotResource(botId, resource.name)
+      .then((data) => setItems(data.items))
+      .catch((err) => setError(err instanceof ApiError ? err.message : 'Не удалось загрузить записи'))
+  }
+
+  useEffect(load, [botId, resource.name])
+
+  const handleDelete = (item: FactoryResourceItem) => {
+    const label = String(item[resource.titleField || 'id'] ?? `#${item.id}`)
+    if (!window.confirm(`Удалить запись «${label}»? Это необратимо.`)) return
+    deleteBotResource(botId, resource.name, item.id)
+      .then(load)
+      .catch((err) => setError(err instanceof ApiError ? err.message : 'Не удалось удалить запись'))
+  }
+
+  if (error) return <div className="state-message">{error}</div>
+  if (items === null) return <div className="state-message">Загрузка…</div>
+  if (items.length === 0) return <div className="state-message">Пока пусто.</div>
+
+  const listFields = resource.fields.filter((f) => (f.list ?? false) === true)
+
+  return (
+    <div>
+      {items.map((item) => (
+        <div className="admin-row" key={item.id} style={{ alignItems: 'flex-start', flexDirection: 'column', gap: 6 }}>
+          {editingId === item.id ? (
+            <ResourceEditForm
+              botId={botId}
+              resource={resource}
+              item={item}
+              onSaved={() => {
+                setEditingId(null)
+                load()
+              }}
+              onCancel={() => setEditingId(null)}
+            />
+          ) : (
+            <>
+              <div style={{ width: '100%' }}>
+                <div className="admin-id">
+                  {String(item[resource.titleField || 'id'] ?? `#${item.id}`)}
+                </div>
+                {listFields.length > 0 && (
+                  <div className="feature-desc">
+                    {listFields
+                      .filter((f) => item[f.name] != null && item[f.name] !== '')
+                      .map((f) => `${f.label || f.name}: ${String(item[f.name])}`)
+                      .join(' · ')}
+                  </div>
+                )}
+              </div>
+              <div className="row">
+                <button className="mini-btn" onClick={() => setEditingId(item.id)}>
+                  Изменить
+                </button>
+                <button className="mini-btn danger" onClick={() => handleDelete(item)}>
+                  Удалить
+                </button>
+              </div>
+            </>
+          )}
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function ResourceEditForm({
+  botId,
+  resource,
+  item,
+  onSaved,
+  onCancel,
+}: {
+  botId: number
+  resource: FactorySchemaResource
+  item: FactoryResourceItem
+  onSaved: () => void
+  onCancel: () => void
+}) {
+  const editableFields = resource.fields.filter((f) => f.name !== 'id')
+  const [values, setValues] = useState<Record<string, string>>(() => {
+    const initial: Record<string, string> = {}
+    for (const f of editableFields) {
+      const raw = item[f.name]
+      initial[f.name] = raw == null ? '' : String(raw)
+    }
+    return initial
+  })
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  const submit = () => {
+    setSaving(true)
+    setError(null)
+    const payload: Record<string, unknown> = {}
+    for (const f of editableFields) {
+      const raw = values[f.name]
+      payload[f.name] = f.kind === 'number' ? Number(raw) : raw
+    }
+    updateBotResource(botId, resource.name, item.id, payload)
+      .then(onSaved)
+      .catch((err) => setError(err instanceof ApiError ? err.message : 'Не удалось сохранить'))
+      .finally(() => setSaving(false))
+  }
+
+  return (
+    <div className="feature-subpanel" style={{ width: '100%' }}>
+      {error && <div>{error}</div>}
+      {editableFields.map((f) => (
+        <div className="field" key={f.name}>
+          <label htmlFor={`edit-${f.name}`}>{f.label || f.name}</label>
+          <input
+            id={`edit-${f.name}`}
+            type={f.kind === 'number' ? 'number' : f.kind === 'date' ? 'date' : 'text'}
+            value={values[f.name] ?? ''}
+            onChange={(e) => setValues((prev) => ({ ...prev, [f.name]: e.target.value }))}
+            style={{ width: '100%' }}
+          />
+        </div>
+      ))}
+      <div className="row">
+        <button className="mini-btn" disabled={saving} onClick={submit}>
+          {saving ? 'Сохранение…' : 'Сохранить'}
+        </button>
+        <button className="mini-btn danger" disabled={saving} onClick={onCancel}>
+          Отмена
+        </button>
+      </div>
     </div>
   )
 }
