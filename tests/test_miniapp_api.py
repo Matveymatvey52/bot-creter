@@ -513,6 +513,57 @@ class RoleFilterRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(body["items"], list)
 
 
+class OwnershipOnlyRoleFilterTests(unittest.IsolatedAsyncioTestCase):
+    """The `{"where": "..."}`-without-`resolve` shape (docs/
+    MINIAPP_ROLE_SCOPING_DESIGN.md "Ownership-only filters") — for
+    templates like habit_tracker where every row has an owner column but
+    there is no separate roles table at all, so role-resolution has
+    nothing to resolve against. Unit-level against the private engine
+    functions directly (no HTTP layer)."""
+
+    async def asyncSetUp(self):
+        self.db = await aiosqlite.connect(":memory:")
+        self.db.row_factory = aiosqlite.Row
+        await self.db.execute(
+            "CREATE TABLE habits (id INTEGER PRIMARY KEY, owner_user_id INTEGER NOT NULL, name TEXT)"
+        )
+        await self.db.execute("INSERT INTO habits (owner_user_id, name) VALUES (111, 'Bobs habit')")
+        await self.db.execute("INSERT INTO habits (owner_user_id, name) VALUES (222, 'Alices habit')")
+        await self.db.commit()
+
+    async def asyncTearDown(self):
+        await self.db.close()
+
+    async def test_ownership_only_filter_scopes_to_viewer(self):
+        resource = {"role_filter": {"where": "owner_user_id = :telegram_user_id"}}
+        sql_and_params = await miniapp_api_module._apply_role_filter(self.db, resource, telegram_user_id=111)
+        self.assertIsNotNone(sql_and_params)
+        where_sql, params = sql_and_params
+        async with self.db.execute(
+            f"SELECT owner_user_id, name FROM habits WHERE {where_sql}", params
+        ) as cursor:
+            rows = await cursor.fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["owner_user_id"], 111)
+
+    async def test_ownership_only_filter_never_denies(self):
+        # No resolve/rules means no role to hold — a viewer owning zero rows
+        # still gets a (empty) filtered result, never RoleFilterDenied,
+        # since there is no role-membership concept in this shape.
+        resource = {"role_filter": {"where": "owner_user_id = :telegram_user_id"}}
+        sql_and_params = await miniapp_api_module._apply_role_filter(self.db, resource, telegram_user_id=999)
+        where_sql, params = sql_and_params
+        async with self.db.execute(
+            f"SELECT owner_user_id FROM habits WHERE {where_sql}", params
+        ) as cursor:
+            rows = await cursor.fetchall()
+        self.assertEqual(rows, [])
+
+    async def test_resource_with_no_role_filter_key_still_unaffected(self):
+        result = await miniapp_api_module._apply_role_filter(self.db, {}, telegram_user_id=111)
+        self.assertIsNone(result)
+
+
 class TeamManagerRoleFilterTests(unittest.IsolatedAsyncioTestCase):
     """team_manager.py is the role_filter pilot — real schema, real
     miniapp_config, no fabricated fixtures."""

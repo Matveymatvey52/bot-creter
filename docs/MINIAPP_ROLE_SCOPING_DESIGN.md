@@ -1,9 +1,21 @@
 # Mini-app role-scoped resource filtering — frozen contract
 
-Status: implemented, pilot template `team_manager`. This is the FROZEN
+Status: implemented, pilot template `team_manager`; extended with an
+ownership-only shape, applied to `habit_tracker`. This is the FROZEN
 `miniapp_config` schema addition — other sessions batch-generating
 `miniapp_config` for the remaining templates should read this file directly
 rather than re-deriving the shape.
+
+**Two `role_filter` shapes exist — pick whichever matches the template's
+actual data model, don't force one onto the other:**
+1. Role-resolved (below) — a real roles table exists (e.g.
+   `project_members`), multiple named roles, coarse allow/deny per role.
+2. Ownership-only (see "Ownership-only filters" section) — no roles table
+   at all, every row just has an owner column and every user only ever
+   sees their own rows. This is likely the MORE COMMON shape for
+   single-owner bots (each Telegram user is their own tenant, no
+   admin/worker split) — check for this first before assuming a template
+   needs the heavier role-resolved shape.
 
 ## Schema addition
 
@@ -114,6 +126,36 @@ multi-tenant-within-a-bot redesign) and is an honest carry-over of the
 same limitation the pre-existing flat `miniapp_config` had. A future
 iteration could extend `resolve` to return scoped role sets, but that is
 out of scope for this pilot and not implemented.
+
+## Ownership-only filters (no roles table)
+
+For templates where every user of the bot only ever owns/sees their own
+rows — no separate admin/worker split, no roles table at all, just a
+per-row owner column — `role_filter` can omit `resolve`/`rules` entirely:
+
+```python
+"role_filter": {"where": "owner_user_id = :telegram_user_id"}
+```
+
+- No role resolution happens at all; the `where` template applies
+  unconditionally to every authenticated viewer.
+- `RoleFilterDenied`/`default_deny` do not apply to this shape — there is
+  no role to hold or lack, so a viewer who owns zero rows simply gets an
+  empty (correctly scoped) result, never a 403.
+- Same safe-predicate whitelist and `:telegram_user_id`-only placeholder
+  binding as the role-resolved shape — no new engine trust boundary.
+- Resources without a direct owner column (e.g. a child row referencing a
+  parent that has one) scope through a subquery, same join-through pattern
+  as `team_manager`'s `reports`/`attachments`:
+  `"habit_id IN (SELECT id FROM habits WHERE owner_user_id = :telegram_user_id)"`.
+
+**Applied to `habit_tracker.py`** (found by a peer session while reading
+this contract — every user's habits/checkins were previously visible to
+every other user of the same bot through `/app/{bot_id}`, a real privacy
+leak in the pre-existing flat config):
+- `habits`: `{"where": "owner_user_id = :telegram_user_id"}`.
+- `habit_checkins`: `{"where": "habit_id IN (SELECT id FROM habits WHERE owner_user_id = :telegram_user_id)"}`
+  (checkins have no owner column directly, scoped through the parent habit).
 
 ## Backward compatibility
 

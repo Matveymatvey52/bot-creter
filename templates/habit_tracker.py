@@ -228,6 +228,12 @@ miniapp_config = {
                 {"name": "forgiving_mode", "label": "Режим", "kind": "status", "list": False, "detail": True, "create": False},
                 {"name": "is_active", "label": "Активна", "kind": "status", "list": True, "detail": True, "create": False},
             ],
+            # Ownership-only role_filter (docs/MINIAPP_ROLE_SCOPING_DESIGN.md
+            # "Ownership-only filters") — every user of this bot owns their
+            # own habits directly via owner_user_id, there is no separate
+            # roles table to resolve against. Without this every viewer of
+            # /app/{bot_id} could see every other user's habits.
+            "role_filter": {"where": "owner_user_id = :telegram_user_id"},
         },
         {
             "name": "habit_checkins",
@@ -241,6 +247,12 @@ miniapp_config = {
                 {"name": "checkin_date", "label": "Дата", "kind": "date", "list": True, "detail": True, "create": False},
                 {"name": "done", "label": "Выполнено", "kind": "status", "list": True, "detail": True, "create": False},
             ],
+            # Checkins have no owner column directly — scope through the
+            # parent habit's owner, same join-through pattern as
+            # team_manager's reports/attachments resources.
+            "role_filter": {
+                "where": "habit_id IN (SELECT id FROM habits WHERE owner_user_id = :telegram_user_id)"
+            },
         },
     ],
 }

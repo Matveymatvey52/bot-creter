@@ -368,23 +368,32 @@ async def _resolve_viewer_roles(db: aiosqlite.Connection, resolve: dict, telegra
 class RoleFilterDenied(Exception):
     """Viewer holds none of role_filter.rules' declared roles and
     default_deny applies — caller translates this to an empty list (list
-    endpoints) or 403 (get/create endpoints), never an unfiltered query."""
+    endpoints) or 403 (get/create endpoints), never an unfiltered query.
+    Not raised by the ownership-only shape (no `resolve`/`rules`) — that
+    shape has no roles to hold or deny, it always applies its `where`."""
 
 
-async def _apply_role_filter(
+async def _resolve_role_filter_where(
     db: aiosqlite.Connection,
-    resource: dict,
+    role_filter: dict,
     telegram_user_id: int,
-) -> tuple[str, tuple] | None:
-    """Returns None when the resource has no role_filter (today's behavior,
-    unchanged) or the matched rule's where is None (unfiltered). Otherwise
-    returns (sql_fragment, params) for the caller to AND onto its own query.
-    Raises RoleFilterDenied when no rule matches and default_deny applies —
-    default_deny defaults to True (fail closed) even if the key is omitted,
-    per docs/MINIAPP_ROLE_SCOPING_DESIGN.md."""
-    role_filter = resource.get("role_filter")
-    if role_filter is None:
-        return None
+) -> str | None:
+    """Returns the where-template that applies for this viewer, or None
+    (unfiltered). Two role_filter shapes, per
+    docs/MINIAPP_ROLE_SCOPING_DESIGN.md:
+
+    - Ownership-only (no `resolve` key): `{"where": "<template>"}` applies
+      unconditionally to every authenticated viewer — no role concept, no
+      resolve table, no default_deny (there is nothing to hold or deny; it
+      is a plain row-ownership predicate). For templates like
+      habit_tracker where every user owns their own rows and there is no
+      separate roles table at all, only a per-row owner column.
+    - Role-resolved (has `resolve`): the original pilot shape — resolves
+      the viewer's role set from `resolve`, matches the first rule in
+      `rules` whose role the viewer holds, raises RoleFilterDenied when
+      none match and default_deny applies (defaults True, fail closed)."""
+    if "resolve" not in role_filter:
+        return role_filter.get("where")
 
     viewer_roles = await _resolve_viewer_roles(db, role_filter["resolve"], telegram_user_id)
     matched_rule = None
@@ -398,7 +407,23 @@ async def _apply_role_filter(
             raise RoleFilterDenied()
         return None
 
-    where = matched_rule.get("where")
+    return matched_rule.get("where")
+
+
+async def _apply_role_filter(
+    db: aiosqlite.Connection,
+    resource: dict,
+    telegram_user_id: int,
+) -> tuple[str, tuple] | None:
+    """Returns None when the resource has no role_filter (today's behavior,
+    unchanged) or the applicable where is None (unfiltered). Otherwise
+    returns (sql_fragment, params) for the caller to AND onto its own
+    query. May raise RoleFilterDenied — see _resolve_role_filter_where."""
+    role_filter = resource.get("role_filter")
+    if role_filter is None:
+        return None
+
+    where = await _resolve_role_filter_where(db, role_filter, telegram_user_id)
     if where is None:
         return None
 
@@ -572,19 +597,7 @@ async def _resolve_create_owner_column(db: aiosqlite.Connection, resource: dict,
     if role_filter is None:
         return None
 
-    viewer_roles = await _resolve_viewer_roles(db, role_filter["resolve"], telegram_user_id)
-    matched_rule = None
-    for rule in role_filter.get("rules", []):
-        if rule["role"] in viewer_roles:
-            matched_rule = rule
-            break
-
-    if matched_rule is None:
-        if role_filter.get("default_deny", True):
-            raise RoleFilterDenied()
-        return None
-
-    where = matched_rule.get("where")
+    where = await _resolve_role_filter_where(db, role_filter, telegram_user_id)
     if where is None:
         return None
 
