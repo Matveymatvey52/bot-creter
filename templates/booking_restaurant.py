@@ -230,6 +230,48 @@ def _hours_until(date_str: str, time_str: str) -> float:
     return (dt - datetime.now()).total_seconds() / 3600
 
 
+# ── mini-app config (see docs/MINIAPP_DESIGN.md) ────────────────────────────
+miniapp_config = {
+    "resources": [
+        {
+            "name": "tables",
+            "table": "tables",
+            "order_by": "active DESC, id DESC",
+            "creatable": True,
+            "title": "Столы",
+            "titleField": "name",
+            "fields": [
+                {"name": "name", "required": True, "label": "Название", "kind": "text", "list": True, "detail": True, "create": True},
+                {"name": "capacity", "required": True, "label": "Вместимость", "kind": "number", "list": True, "detail": True, "create": True},
+                {"name": "active", "label": "Активен", "kind": "status", "list": True, "detail": True, "create": False},
+            ],
+        },
+        {
+            "name": "reservations",
+            "table": "reservations",
+            "order_by": "created_at DESC",
+            "creatable": True,
+            "title": "Брони",
+            "titleField": "client_name",
+            "fields": [
+                {"name": "client_user_id", "required": True, "label": "ID клиента", "kind": "number", "list": False, "detail": True, "create": True},
+                {"name": "client_name", "label": "Имя клиента", "kind": "text", "list": True, "detail": True, "create": True},
+                {"name": "client_phone", "label": "Телефон", "kind": "text", "list": False, "detail": True, "create": True},
+                {"name": "guests_count", "required": True, "label": "Гостей", "kind": "number", "list": True, "detail": True, "create": True},
+                {"name": "date", "required": True, "label": "Дата", "kind": "date", "list": True, "detail": True, "create": True},
+                {"name": "time_window_start", "required": True, "label": "Начало окна", "kind": "text", "list": True, "detail": True, "create": True},
+                {"name": "time_window_end", "required": True, "label": "Конец окна", "kind": "text", "list": False, "detail": True, "create": True},
+                {"name": "occasion", "label": "Повод", "kind": "text", "list": False, "detail": True, "create": True},
+                {"name": "deposit_required", "label": "Требуется депозит", "kind": "status", "list": False, "detail": True, "create": False},
+                {"name": "deposit_confirmed", "label": "Депозит подтверждён", "kind": "status", "list": False, "detail": True, "create": False},
+                {"name": "status", "label": "Статус", "kind": "status", "list": True, "detail": True, "create": False},
+                {"name": "created_at", "label": "Создано", "kind": "date", "list": False, "detail": True, "create": False},
+            ],
+        },
+    ],
+}
+
+
 # ── db ────────────────────────────────────────────────────────────────────────
 
 async def init_db(db_path: str):

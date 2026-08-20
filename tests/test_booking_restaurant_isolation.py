@@ -497,6 +497,47 @@ class BookingRestaurantTableManagementTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(active, 0)
 
 
+class BookingRestaurantMiniAppConfigTests(unittest.IsolatedAsyncioTestCase):
+    """miniapp_config's declared table/field names must match init_db()'s
+    real schema — miniapp_api.py builds SQL directly off these names, so a
+    drift here would 500 at request time instead of failing a test."""
+
+    def test_miniapp_config_resource_names(self):
+        names = {r["name"] for r in booking_restaurant.miniapp_config["resources"]}
+        self.assertEqual(names, {"tables", "reservations"})
+
+    def test_tables_resource_targets_tables_table(self):
+        tables = next(r for r in booking_restaurant.miniapp_config["resources"] if r["name"] == "tables")
+        self.assertEqual(tables["table"], "tables")
+        self.assertTrue(tables["creatable"])
+
+    def test_reservations_resource_targets_reservations_table(self):
+        reservations = next(r for r in booking_restaurant.miniapp_config["resources"] if r["name"] == "reservations")
+        self.assertEqual(reservations["table"], "reservations")
+        field_names = {f["name"] for f in reservations["fields"]}
+        self.assertEqual(
+            field_names,
+            {"client_user_id", "client_name", "client_phone", "guests_count", "date",
+             "time_window_start", "time_window_end", "occasion", "deposit_required",
+             "deposit_confirmed", "status", "created_at"},
+        )
+
+    async def test_miniapp_config_fields_match_real_schema(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "schema_check.db")
+            await booking_restaurant.init_db(db_path)
+            async with aiosqlite.connect(db_path) as db:
+                for resource in booking_restaurant.miniapp_config["resources"]:
+                    cur = await db.execute(f"PRAGMA table_info({resource['table']})")
+                    real_columns = {row[1] for row in await cur.fetchall()}
+                    declared = {f["name"] for f in resource["fields"]} | {"id"}
+                    self.assertTrue(
+                        declared.issubset(real_columns),
+                        f"{resource['name']}: declared fields {declared} not all in "
+                        f"real columns {real_columns}",
+                    )
+
+
 class BookingRestaurantStandaloneSmokeTest(unittest.TestCase):
     def test_config_from_env_matches_legacy_constant_shape(self):
         config = booking_restaurant.config_from_env()
