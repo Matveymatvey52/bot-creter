@@ -30,6 +30,7 @@ from db.database import (
     set_report_schedule,
     set_report_schedule_last_sent,
 )
+from templates import channel_aggregator
 
 BOT_A = 111
 BOT_B = 222
@@ -292,3 +293,43 @@ async def test_extract_structured_returns_none_on_malformed_json(monkeypatch):
 
     result = await gemini_service.extract_structured("post", ["a"])
     assert result is None
+
+
+# ── mini-app config ──────────────────────────────────────────────────────
+# miniapp_config's declared table/field names must match init_channel_monitor
+# _tables' real schema — miniapp_api.py builds SQL directly off these names,
+# so a drift here would 500 at request time instead of failing a test.
+
+def test_miniapp_config_resource_names():
+    names = {r["name"] for r in channel_aggregator.miniapp_config["resources"]}
+    assert names == {"channels", "posts"}
+
+
+def test_channels_resource_targets_monitored_channels_table():
+    channels = next(r for r in channel_aggregator.miniapp_config["resources"] if r["name"] == "channels")
+    assert channels["table"] == "monitored_channels"
+    assert channels["creatable"] is False
+    assert "channel_title" in {f["name"] for f in channels["fields"]}
+
+
+def test_posts_resource_targets_channel_posts_table():
+    posts = next(r for r in channel_aggregator.miniapp_config["resources"] if r["name"] == "posts")
+    assert posts["table"] == "channel_posts"
+    assert posts["creatable"] is False
+    field_names = {f["name"] for f in posts["fields"]}
+    assert field_names == {"monitored_channel_id", "text", "summary", "views", "forwards", "posted_at"}
+
+
+@pytest.mark.asyncio
+async def test_miniapp_config_fields_match_real_schema(isolated_db):
+    await channel_aggregator.init_db(isolated_db)
+    import aiosqlite
+    async with aiosqlite.connect(isolated_db) as db:
+        for resource in channel_aggregator.miniapp_config["resources"]:
+            cur = await db.execute(f"PRAGMA table_info({resource['table']})")
+            real_columns = {row[1] for row in await cur.fetchall()}
+            declared = {f["name"] for f in resource["fields"]} | {"id"}
+            assert declared.issubset(real_columns), (
+                f"{resource['name']}: declared fields {declared} not all in "
+                f"real columns {real_columns}"
+            )

@@ -136,6 +136,56 @@ async def init_db(db_path: str) -> None:
             logger.warning(f"init_db: could not auto-enable channel_monitor feature for bot_id={bot_id}: {e}")
 
 
+# ── mini-app config (see docs/MINIAPP_DESIGN.md, templates/car_rental.py's
+# own miniapp_config for the authoring contract) ────────────────────────────
+# Tables come from features/channel_monitor.py's init_db() (db.database's
+# init_channel_monitor_tables), which THIS template's own init_db() calls
+# above — not created directly in this file, but this bot's own db_path ends
+# up with exactly these tables/columns, verified against real schema by
+# CHANNEL AGGREGATOR MINIAPP CONFIG TESTS. userbot_sessions/report_schedules
+# aren't exposed as resources: both are single-row-per-bot operational state
+# (auth session, one active schedule) driven entirely by dedicated FSMs
+# (UserbotAuthStates, _ScheduleState) with side effects (Telethon auth,
+# scheduler wiring) a generic mini-app CRUD form can't replicate safely.
+# channels isn't creatable either — cm_add_channel's FSM does a live Telethon
+# username resolution + schema-preset pick that a plain form field can't do.
+miniapp_config = {
+    "resources": [
+        {
+            "name": "channels",
+            "table": "monitored_channels",
+            "order_by": "added_at DESC",
+            "creatable": False,
+            "title": "Каналы",
+            "titleField": "channel_title",
+            "fields": [
+                {"name": "channel_username", "label": "Username", "kind": "text", "list": True, "detail": True, "create": False},
+                {"name": "channel_title", "label": "Название", "kind": "text", "list": True, "detail": True, "create": False},
+                {"name": "active", "label": "Активен", "kind": "status", "list": True, "detail": True, "create": False},
+                {"name": "extract_schema", "label": "Схема извлечения", "kind": "text", "list": False, "detail": True, "create": False},
+                {"name": "added_at", "label": "Добавлен", "kind": "date", "list": False, "detail": True, "create": False},
+            ],
+        },
+        {
+            "name": "posts",
+            "table": "channel_posts",
+            "order_by": "posted_at DESC",
+            "creatable": False,
+            "title": "Посты",
+            "titleField": "text",
+            "fields": [
+                {"name": "monitored_channel_id", "label": "ID канала", "kind": "number", "list": False, "detail": True, "create": False},
+                {"name": "text", "label": "Текст", "kind": "text", "list": True, "detail": True, "create": False},
+                {"name": "summary", "label": "Summary", "kind": "text", "list": True, "detail": True, "create": False},
+                {"name": "views", "label": "Просмотры", "kind": "number", "list": True, "detail": True, "create": False},
+                {"name": "forwards", "label": "Репосты", "kind": "number", "list": False, "detail": True, "create": False},
+                {"name": "posted_at", "label": "Дата", "kind": "date", "list": True, "detail": True, "create": False},
+            ],
+        },
+    ],
+}
+
+
 router = channel_monitor.router
 
 
