@@ -280,12 +280,91 @@ class TourOperatorStandaloneSmokeTest(unittest.TestCase):
         self.assertIs(app["config"], config)
 
 
+class TourOperatorMiniappMenuParityTests(unittest.TestCase):
+    """Owner requirement: every Telegram section button (main_kb()'s
+    "sec_*" callbacks) must have a matching mini-app resource — the bug
+    report this guards against is the miniapp showing only 2 of 5 domains
+    (tours/guests) while Программа/ЛиП/Отели/ДДС existed only as Telegram
+    text summaries with no mini-app screen behind them."""
+
+    def test_every_telegram_section_has_a_matching_miniapp_resource(self):
+        # sec_program/sec_lip/sec_hotels/sec_guests/sec_dds (main_kb(),
+        # cb_section) map to resource names program/locations/guests/dds by
+        # the same domain, not literal string equality — "lip" is the
+        # transliteration, the actual table/resource is "locations".
+        section_to_resource = {
+            "sec_program": "program",
+            "sec_lip": "locations",
+            "sec_hotels": "hotels",
+            "sec_guests": "guests",
+            "sec_dds": "dds",
+        }
+        resource_names = {r["name"] for r in tour_operator.miniapp_config["resources"]}
+        for section, resource in section_to_resource.items():
+            self.assertIn(
+                resource, resource_names,
+                f"Telegram section {section!r} has no matching mini-app resource {resource!r}",
+            )
+        # tours has no Telegram "sec_" button (it's the top-level "Мои
+        # туры"/"Новый тур" pair) but must still be a resource — this is
+        # the CRM's primary entity.
+        self.assertIn("tours", resource_names)
+
+    def test_miniapp_config_validates_against_real_init_db_schema(self):
+        """Every resource's table/field name must be real — this is the
+        same check services.claude_service._validate_miniapp_config_against_code
+        runs on a freshly-generated config, applied here to the hand-authored
+        one actually shipped in this file, against this file's own real
+        source (not a copy/paste that can drift).
+
+        "dds" is excluded here: its table (cashflow_entries) lives in
+        features/cashflow_ledger.py's own init_cashflow_tables(), not in
+        this file's init_db() — the validator only ever sees ONE file's
+        source, so it has no way to confirm a table defined elsewhere, the
+        same limitation _generate_miniapp_config itself has (see
+        miniapp_config's module comment). Checked separately below instead
+        of loosening the shared validator for this one resource."""
+        import inspect
+
+        from services.claude_service import _validate_miniapp_config_against_code
+
+        source = inspect.getsource(tour_operator)
+        resources_without_dds = {
+            "resources": [r for r in tour_operator.miniapp_config["resources"] if r["name"] != "dds"],
+        }
+        self.assertTrue(_validate_miniapp_config_against_code(resources_without_dds, source))
+
+    def test_dds_resource_points_at_the_real_cashflow_ledger_table(self):
+        """dds isn't backed by a table in this file's own init_db() — it's
+        features/cashflow_ledger.py's cashflow_entries, wired in via
+        init_cashflow_tables() (see init_db()). Validated against THAT
+        module's own source instead, using the same generic validator."""
+        import inspect
+
+        import features.cashflow_ledger as cashflow_ledger
+        from services.claude_service import _validate_miniapp_config_against_code
+
+        dds_resource = next(r for r in tour_operator.miniapp_config["resources"] if r["name"] == "dds")
+        source = inspect.getsource(cashflow_ledger)
+        self.assertTrue(_validate_miniapp_config_against_code({"resources": [dds_resource]}, source))
+
+
 class TourOperatorWebCrmFlagTests(unittest.IsolatedAsyncioTestCase):
-    """Owner-requested post-review fix (Phase 7): /app and the open_app
-    callback must show a clear 'unavailable' message instead of a dead link
-    when TOUR_OPERATOR_WEB_ENABLED=false — the flag runtime/registry.py sets
-    in its own environment before first loading this template, since it never
-    starts the web server there.
+    """Regression test for a real bug found in production: /app and the
+    open_app callback used to also check WEB_CRM_ENABLED (== NOT
+    TOUR_OPERATOR_WEB_ENABLED=false) before linking to /app/{bot_id}. Since
+    runtime/registry.py permanently sets TOUR_OPERATOR_WEB_ENABLED=false for
+    every webhook-mode bot (this template's OWN standalone server must never
+    start there — see the flag's docstring in templates/tour_operator.py),
+    that check made the mini-app link unreachable in the one runtime where
+    bots actually run, even though /app/{bot_id} (runtime/miniapp_api.py) has
+    nothing to do with this file's standalone server.
+
+    Fixed: WEB_CRM_ENABLED no longer gates /app/cb_open_app/cb_section at
+    all. The only real gate left is whether MINIAPP_SECRET is configured
+    (_miniapp_url()/_site_url() already return None without it, and these
+    handlers already handled that case) — this class asserts that gate is
+    independent of WEB_CRM_ENABLED in both directions.
 
     WEB_CRM_ENABLED is a module-level constant evaluated once at import time
     (same as BOT_TOKEN/PORT/BASE_URL), so patch.dict(os.environ, ...) alone
@@ -318,14 +397,18 @@ class TourOperatorWebCrmFlagTests(unittest.IsolatedAsyncioTestCase):
             if getattr(call.args[0], "text", None)
         ]
 
-    async def test_app_command_shows_unavailable_message_when_web_crm_disabled(self):
-        with patch.dict(os.environ, {"TOUR_OPERATOR_WEB_ENABLED": "false"}):
+    async def test_app_command_shows_url_when_web_crm_disabled_but_secret_configured(self):
+        """The exact production scenario (webhook runtime always sets
+        TOUR_OPERATOR_WEB_ENABLED=false): /app must still link to
+        /app/{bot_id} as long as MINIAPP_SECRET is configured — this is the
+        regression this class guards against."""
+        with patch.dict(os.environ, {"TOUR_OPERATOR_WEB_ENABLED": "false", "MINIAPP_SECRET": "test-secret"}):
             importlib.reload(tour_operator)
             self.assertFalse(tour_operator.WEB_CRM_ENABLED)
             sent_texts = await self._send_app_command()
 
-        self.assertTrue(any("недоступно" in t for t in sent_texts))
-        self.assertTrue(all("http://" not in t and "https://" not in t for t in sent_texts))
+        self.assertTrue(any("http://" in t or "https://" in t for t in sent_texts))
+        self.assertTrue(all("недоступно в этом режиме" not in t for t in sent_texts))
 
     async def test_app_command_shows_url_when_miniapp_secret_configured(self):
         # Other tests in this file's process (TourOperatorIsolationTests'
@@ -350,10 +433,10 @@ class TourOperatorWebCrmFlagTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("http://" in t or "https://" in t for t in sent_texts))
 
     async def test_app_command_shows_unavailable_message_when_miniapp_secret_missing(self):
-        """WEB_CRM_ENABLED alone is no longer sufficient — without
+        """WEB_CRM_ENABLED plays no role here at all now — without
         MINIAPP_SECRET, cmd_app can't mint a signed token and must degrade to
         the Telegram-only message rather than send an unsigned/forgeable
-        link (see _miniapp_url()'s docstring)."""
+        link (see _miniapp_url()'s docstring), regardless of WEB_CRM_ENABLED."""
         with patch.dict(os.environ):
             os.environ.pop("TOUR_OPERATOR_WEB_ENABLED", None)
             os.environ.pop("MINIAPP_SECRET", None)
