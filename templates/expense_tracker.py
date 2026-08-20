@@ -232,6 +232,39 @@ async def init_db(db_path: str):
         await db.commit()
 
 
+miniapp_config = {
+    "resources": [
+        {
+            "name": "categories",
+            "table": "categories",
+            "order_by": "name",
+            "creatable": True,
+            "title": "Категории",
+            "titleField": "name",
+            "fields": [
+                {"name": "name", "required": True, "label": "Название", "kind": "text", "list": True, "detail": True, "create": True},
+                {"name": "is_active", "label": "Активна", "kind": "status", "list": True, "detail": True, "create": False},
+            ],
+        },
+        {
+            "name": "expenses",
+            "table": "expenses",
+            "order_by": "expense_date DESC",
+            "creatable": True,
+            "title": "Расходы",
+            "titleField": "comment",
+            "fields": [
+                {"name": "category_id", "required": True, "label": "ID категории", "kind": "number", "list": False, "detail": True, "create": True},
+                {"name": "amount", "required": True, "label": "Сумма", "kind": "number", "list": True, "detail": True, "create": True},
+                {"name": "expense_date", "required": True, "label": "Дата", "kind": "date", "list": True, "detail": True, "create": True},
+                {"name": "comment", "label": "Комментарий", "kind": "text", "list": False, "detail": True, "create": True},
+                {"name": "created_by", "label": "Кем добавлено", "kind": "number", "list": False, "detail": True, "create": False},
+            ],
+        },
+    ],
+}
+
+
 async def _active_categories(db_path: str) -> list[tuple[int, str]]:
     async with aiosqlite.connect(db_path) as db:
         rows = await (await db.execute(
