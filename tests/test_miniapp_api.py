@@ -691,6 +691,26 @@ class TeamManagerRoleFilterTests(unittest.IsolatedAsyncioTestCase):
                 "VALUES (2, 1, ?, ?, 'Owner-assigned-to-self', 'general', '2099-01-01T00:00:00', 'not_taken')",
                 (self.OWNER_ID, self.OWNER_ID),
             )
+            # Task in project 2 (owned by OTHER_PROJECT_OWNER_ID) — OWNER_ID
+            # is only a 'worker' here, never 'owner'. Exists to prove OWNER_ID
+            # (owner of project 1) cannot see project 2's tasks just because
+            # they hold an 'owner' role somewhere on the bot.
+            await db.execute(
+                "INSERT INTO tasks (id, project_id, created_by, assigned_to, text, category, deadline, status) "
+                "VALUES (3, 2, ?, ?, 'Beta project task', 'general', '2099-01-01T00:00:00', 'not_taken')",
+                (self.OTHER_PROJECT_OWNER_ID, self.OTHER_PROJECT_OWNER_ID),
+            )
+            # Reports mirroring the tasks-cross-project setup: report 1 is
+            # on task 1 (project 1), report 2 is on task 3 (project 2) — used
+            # to prove owner-scoping joins through tasks correctly.
+            await db.execute(
+                "INSERT INTO reports (id, task_id, submitted_by, text) VALUES (1, 1, ?, 'Done part 1')",
+                (self.WORKER_ID,),
+            )
+            await db.execute(
+                "INSERT INTO reports (id, task_id, submitted_by, text) VALUES (2, 3, ?, 'Beta report')",
+                (self.OTHER_PROJECT_OWNER_ID,),
+            )
             await db.commit()
 
         entry = BotEntry(
@@ -733,6 +753,25 @@ class TeamManagerRoleFilterTests(unittest.IsolatedAsyncioTestCase):
         body = await resp.json()
         self.assertEqual({row["id"] for row in body["items"]}, {1, 2})
 
+    async def test_owner_does_not_see_tasks_of_project_they_are_not_owner_of(self):
+        # OWNER_ID owns project 1 and is merely a worker in project 2 — task
+        # 3 belongs to project 2 and is not assigned to OWNER_ID, so it must
+        # not appear even though OWNER_ID holds an 'owner' role on the bot.
+        resp = await self._get("/tasks", self.OWNER_ID)
+        self.assertEqual(resp.status, 200)
+        body = await resp.json()
+        self.assertNotIn(3, {row["id"] for row in body["items"]})
+
+    async def test_other_project_owner_sees_only_their_own_project_tasks(self):
+        resp = await self._get("/tasks", self.OTHER_PROJECT_OWNER_ID)
+        self.assertEqual(resp.status, 200)
+        body = await resp.json()
+        self.assertEqual({row["id"] for row in body["items"]}, {3})
+
+    async def test_owner_get_project_b_task_by_id_is_404_not_leaked(self):
+        resp = await self._get("/tasks/3", self.OWNER_ID)
+        self.assertEqual(resp.status, 404)
+
     async def test_worker_sees_only_their_own_tasks(self):
         resp = await self._get("/tasks", self.WORKER_ID)
         self.assertEqual(resp.status, 200)
@@ -763,8 +802,12 @@ class TeamManagerRoleFilterTests(unittest.IsolatedAsyncioTestCase):
     async def test_multi_role_viewer_resolves_to_first_matching_rule(self):
         # OWNER_ID is 'owner' in project 1 and 'worker' in project 2 — the
         # tasks rules list declares 'owner' first, so OWNER_ID's viewer role
-        # set {owner, worker} matches 'owner' and gets the unfiltered query,
-        # not the narrower worker predicate.
+        # set {owner, worker} matches the 'owner' rule and gets the
+        # owner-scoped predicate (project_id IN projects they own), which
+        # covers tasks 1 and 2 (both project 1) but — despite also being a
+        # worker in project 2 — the matched 'owner' rule's predicate does
+        # not fall back to the worker predicate, so task 3 (project 2,
+        # assigned to someone else) stays invisible.
         resp = await self._get("/tasks", self.OWNER_ID)
         self.assertEqual(resp.status, 200)
         body = await resp.json()
@@ -781,6 +824,21 @@ class TeamManagerRoleFilterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resp.status, 200)
         body = await resp.json()
         self.assertEqual(body["items"], [])
+
+    async def test_reports_owner_scoped_to_own_project_via_task_join(self):
+        # OWNER_ID owns project 1 only — report 1 (task 1, project 1) must
+        # be visible, report 2 (task 3, project 2) must not, even though
+        # OWNER_ID holds 'owner' somewhere on the bot.
+        resp = await self._get("/reports", self.OWNER_ID)
+        self.assertEqual(resp.status, 200)
+        body = await resp.json()
+        self.assertEqual({row["id"] for row in body["items"]}, {1})
+
+    async def test_reports_other_project_owner_scoped_to_their_project(self):
+        resp = await self._get("/reports", self.OTHER_PROJECT_OWNER_ID)
+        self.assertEqual(resp.status, 200)
+        body = await resp.json()
+        self.assertEqual({row["id"] for row in body["items"]}, {2})
 
 
 if __name__ == "__main__":

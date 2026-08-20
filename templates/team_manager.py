@@ -68,9 +68,13 @@ router = Router()
 # docs/MINIAPP_ROLE_SCOPING_DESIGN.md's role_filter addition to
 # runtime/miniapp_api.py — this is the pilot template for that feature.
 # `resolve` always points at project_members: it's the only table in this
-# schema mapping a Telegram user id to a role, and that mapping is global
-# per-bot (not per-project) — see the design doc's "Known limitation" note
-# for what that does and doesn't scope.
+# schema mapping a Telegram user id to a role. `resolve` itself returns a
+# flat per-bot role set (does this viewer hold "owner" ANYWHERE), but every
+# rule below re-scopes to specific projects via its `where` predicate — an
+# "owner" rule is never unfiltered, it's always `project_id IN (... WHERE
+# role = 'owner')` (directly, or through tasks for reports/attachments) —
+# see docs/MINIAPP_ROLE_SCOPING_DESIGN.md for why the contract doesn't need
+# resolve itself to be project-scoped to express this.
 _PROJECT_MEMBERS_RESOLVE = {
     "table": "project_members",
     "identity_column": "user_id",
@@ -125,7 +129,10 @@ miniapp_config = {
             "role_filter": {
                 "resolve": _PROJECT_MEMBERS_RESOLVE,
                 "rules": [
-                    {"role": "owner", "where": None},
+                    {
+                        "role": "owner",
+                        "where": "project_id IN (SELECT project_id FROM project_members WHERE user_id = :telegram_user_id AND role = 'owner')",
+                    },
                     {"role": "worker", "where": "assigned_to = :telegram_user_id"},
                 ],
                 "default_deny": True,
@@ -143,12 +150,15 @@ miniapp_config = {
                 {"name": "text", "label": "Отчёт", "kind": "text", "list": False, "detail": True, "create": False},
                 {"name": "submitted_at", "label": "Сдан", "kind": "date", "list": True, "detail": True, "create": False},
             ],
-            # reports has no assigned_to of its own — scoped through the
-            # owning task, same as attachments below.
+            # reports has no assigned_to/project_id of its own — scoped
+            # through the owning task, same as attachments below.
             "role_filter": {
                 "resolve": _PROJECT_MEMBERS_RESOLVE,
                 "rules": [
-                    {"role": "owner", "where": None},
+                    {
+                        "role": "owner",
+                        "where": "task_id IN (SELECT id FROM tasks WHERE project_id IN (SELECT project_id FROM project_members WHERE user_id = :telegram_user_id AND role = 'owner'))",
+                    },
                     {
                         "role": "worker",
                         "where": "task_id IN (SELECT id FROM tasks WHERE assigned_to = :telegram_user_id)",
@@ -172,7 +182,10 @@ miniapp_config = {
             "role_filter": {
                 "resolve": _PROJECT_MEMBERS_RESOLVE,
                 "rules": [
-                    {"role": "owner", "where": None},
+                    {
+                        "role": "owner",
+                        "where": "task_id IN (SELECT id FROM tasks WHERE project_id IN (SELECT project_id FROM project_members WHERE user_id = :telegram_user_id AND role = 'owner'))",
+                    },
                     {
                         "role": "worker",
                         "where": "task_id IN (SELECT id FROM tasks WHERE assigned_to = :telegram_user_id)",
