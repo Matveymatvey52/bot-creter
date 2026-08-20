@@ -47,6 +47,34 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 router = Router()
 
+# ── mini-app config (see docs/MINIAPP_DESIGN.md, templates/tour_operator.py's
+# own miniapp_config for the pilot) ─────────────────────────────────────────
+# Declarative schema read by runtime/miniapp_api.py's generic CRUD handlers —
+# NOT executable code (see that module's docstring). `table` and each field's
+# `name` must match init_db()'s CREATE TABLE columns below exactly.
+miniapp_config = {
+    "resources": [
+        {
+            "name": "repair_tickets",
+            "table": "repair_tickets",
+            "order_by": "created_at DESC",
+            "creatable": True,
+            "title": "Заявки на ремонт",
+            "titleField": "item_description",
+            "fields": [
+                {"name": "client_name", "label": "Клиент", "kind": "text", "list": True, "detail": True, "create": True},
+                {"name": "client_phone", "label": "Телефон", "kind": "text", "list": False, "detail": True, "create": True},
+                {"name": "item_description", "required": True, "label": "Устройство", "kind": "text", "list": True, "detail": True, "create": True},
+                {"name": "issue_description", "required": True, "label": "Проблема", "kind": "text", "list": False, "detail": True, "create": True},
+                {"name": "status", "label": "Статус", "kind": "status", "list": True, "detail": True, "create": False},
+                {"name": "estimated_price", "label": "Оценка стоимости", "kind": "number", "list": False, "detail": True, "create": False},
+                {"name": "actual_price", "label": "Итоговая стоимость", "kind": "number", "list": True, "detail": True, "create": False},
+                {"name": "created_at", "label": "Создана", "kind": "date", "list": False, "detail": True, "create": False},
+            ],
+        },
+    ],
+}
+
 # Explicit forward-only flow, same shape as templates/vehicle_service.py's
 # STATUS_TRANSITIONS: no backward moves. "cancelled" is reachable from any
 # non-terminal status as a side-branch (same precedent already confirmed with

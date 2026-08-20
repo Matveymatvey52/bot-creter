@@ -66,6 +66,45 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 router = Router()
 
+# ── mini-app config (see docs/MINIAPP_DESIGN.md, templates/tour_operator.py's
+# own miniapp_config for the pilot) ─────────────────────────────────────────
+# Declarative schema read by runtime/miniapp_api.py's generic CRUD handlers —
+# NOT executable code (see that module's docstring). `table` and each field's
+# `name` must match init_db()'s CREATE TABLE columns below exactly.
+miniapp_config = {
+    "resources": [
+        {
+            "name": "orders",
+            "table": "orders",
+            "order_by": "created_at DESC",
+            "creatable": True,
+            "title": "Заказы",
+            "titleField": "notes",
+            "fields": [
+                {"name": "customer_id", "required": True, "label": "ID клиента", "kind": "number", "list": False, "detail": True, "create": True},
+                {"name": "status", "label": "Статус", "kind": "status", "list": True, "detail": True, "create": False},
+                {"name": "notes", "label": "Заметки", "kind": "text", "list": True, "detail": True, "create": True},
+                {"name": "created_at", "label": "Создан", "kind": "date", "list": True, "detail": True, "create": False},
+                {"name": "updated_at", "label": "Обновлён", "kind": "date", "list": False, "detail": True, "create": False},
+            ],
+        },
+        {
+            "name": "customers",
+            "table": "customers",
+            "order_by": "created_at DESC",
+            "creatable": True,
+            "title": "Клиенты",
+            "titleField": "name",
+            "fields": [
+                {"name": "name", "required": True, "label": "Имя", "kind": "text", "list": True, "detail": True, "create": True},
+                {"name": "phone", "required": True, "label": "Телефон", "kind": "text", "list": True, "detail": True, "create": True},
+                {"name": "telegram_user_id", "label": "Telegram ID", "kind": "number", "list": False, "detail": True, "create": False},
+                {"name": "created_at", "label": "Создан", "kind": "date", "list": False, "detail": True, "create": False},
+            ],
+        },
+    ],
+}
+
 # Explicit forward-only flow, as specified in the design: no backward moves.
 # "cancelled" is reachable from any non-terminal status (see docs/STAGE2_DESIGN.md
 # "Фаза orders_tracker" — added as a side-branch, confirmed with the owner).

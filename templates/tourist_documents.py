@@ -46,6 +46,46 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 router = Router()
 
+# ── mini-app config (see docs/MINIAPP_DESIGN.md, templates/tour_operator.py's
+# own miniapp_config for the pilot) ─────────────────────────────────────────
+# Declarative schema read by runtime/miniapp_api.py's generic CRUD handlers —
+# NOT executable code (see that module's docstring). `table` and each field's
+# `name` must match init_db()'s CREATE TABLE columns below exactly.
+miniapp_config = {
+    "resources": [
+        {
+            "name": "tourists",
+            "table": "tourists",
+            "order_by": "created_at DESC",
+            "creatable": True,
+            "title": "Туристы",
+            "titleField": "full_name",
+            "fields": [
+                {"name": "full_name", "required": True, "label": "ФИО", "kind": "text", "list": True, "detail": True, "create": True},
+                {"name": "passport_number", "required": True, "label": "Номер паспорта", "kind": "text", "list": False, "detail": True, "create": True},
+                {"name": "passport_expiry", "required": True, "label": "Паспорт действителен до", "kind": "date", "list": True, "detail": True, "create": True},
+                {"name": "visa_status", "label": "Статус визы", "kind": "status", "list": True, "detail": True, "create": True},
+                {"name": "visa_expiry", "label": "Виза действительна до", "kind": "date", "list": False, "detail": True, "create": True},
+                {"name": "tour_group_id", "label": "ID группы", "kind": "number", "list": False, "detail": True, "create": True},
+                {"name": "notes", "label": "Заметки", "kind": "text", "list": False, "detail": True, "create": True},
+                {"name": "created_at", "label": "Создан", "kind": "date", "list": False, "detail": True, "create": False},
+            ],
+        },
+        {
+            "name": "tour_groups",
+            "table": "tour_groups",
+            "order_by": "id DESC",
+            "creatable": True,
+            "title": "Группы",
+            "titleField": "name",
+            "fields": [
+                {"name": "name", "required": True, "label": "Название", "kind": "text", "list": True, "detail": True, "create": True},
+                {"name": "active", "label": "Активна", "kind": "bool", "list": True, "detail": True, "create": True},
+            ],
+        },
+    ],
+}
+
 VISA_STATUS_LABELS = {
     "not_required": "🚫 Не требуется",
     "submitted":    "📤 Подана",

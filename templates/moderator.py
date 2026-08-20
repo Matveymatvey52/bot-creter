@@ -46,6 +46,36 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 router = Router()
 
+# ── mini-app config (see docs/MINIAPP_DESIGN.md, templates/tour_operator.py's
+# own miniapp_config for the pilot) ─────────────────────────────────────────
+# Declarative schema read by runtime/miniapp_api.py's generic CRUD handlers —
+# NOT executable code (see that module's docstring). `table` and each field's
+# `name` must match init_db()'s CREATE TABLE columns below exactly.
+# Only moderation_log is exposed here — every other table in this template's
+# schema (chat_settings, stopwords, warnings, known_groups, dm_fallback_sent,
+# bot_admins) uses a composite or non-`id` primary key
+# (chat_id/user_id/word), which runtime/miniapp_api.py's generic handlers
+# don't support (they SELECT/UPDATE by a single `id` column).
+miniapp_config = {
+    "resources": [
+        {
+            "name": "moderation_log",
+            "table": "moderation_log",
+            "order_by": "created_at DESC",
+            "creatable": False,
+            "title": "Журнал модерации",
+            "titleField": "action",
+            "fields": [
+                {"name": "chat_id", "label": "ID чата", "kind": "number", "list": False, "detail": True, "create": False},
+                {"name": "user_id", "label": "ID пользователя", "kind": "number", "list": True, "detail": True, "create": False},
+                {"name": "action", "label": "Действие", "kind": "status", "list": True, "detail": True, "create": False},
+                {"name": "reason", "label": "Причина", "kind": "text", "list": False, "detail": True, "create": False},
+                {"name": "created_at", "label": "Дата", "kind": "date", "list": True, "detail": True, "create": False},
+            ],
+        },
+    ],
+}
+
 # Per-chat locks guarding _replace_panel's read-delete-send-write sequence —
 # see _replace_panel's docstring. A fast double-tap on a panel button (or two
 # updates landing in the same getUpdates batch) could otherwise both read the

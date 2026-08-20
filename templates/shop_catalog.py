@@ -48,6 +48,49 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 router = Router()
 
+# ── mini-app config (see docs/MINIAPP_DESIGN.md, templates/tour_operator.py's
+# own miniapp_config for the pilot) ─────────────────────────────────────────
+# Declarative schema read by runtime/miniapp_api.py's generic CRUD handlers —
+# NOT executable code (see that module's docstring). `table` and each field's
+# `name` must match init_db()'s CREATE TABLE columns below exactly. cart_items
+# is intentionally excluded — it has no `id` column (its PK is
+# UNIQUE(user_id, product_id)), which runtime/miniapp_api.py's generic
+# handlers don't support.
+miniapp_config = {
+    "resources": [
+        {
+            "name": "products",
+            "table": "products",
+            "order_by": "id DESC",
+            "creatable": True,
+            "title": "Товары",
+            "titleField": "name",
+            "fields": [
+                {"name": "category_id", "required": True, "label": "ID категории", "kind": "number", "list": False, "detail": True, "create": True},
+                {"name": "name", "required": True, "label": "Название", "kind": "text", "list": True, "detail": True, "create": True},
+                {"name": "description", "label": "Описание", "kind": "text", "list": False, "detail": True, "create": True},
+                {"name": "price", "required": True, "label": "Цена", "kind": "number", "list": True, "detail": True, "create": True},
+                {"name": "active", "label": "Активен", "kind": "bool", "list": True, "detail": True, "create": True},
+            ],
+        },
+        {
+            "name": "orders",
+            "table": "orders",
+            "order_by": "created_at DESC",
+            "creatable": True,
+            "title": "Заказы",
+            "titleField": "client_name",
+            "fields": [
+                {"name": "client_name", "label": "Клиент", "kind": "text", "list": True, "detail": True, "create": True},
+                {"name": "client_phone", "label": "Телефон", "kind": "text", "list": False, "detail": True, "create": True},
+                {"name": "total", "required": True, "label": "Сумма", "kind": "number", "list": True, "detail": True, "create": True},
+                {"name": "status", "label": "Статус", "kind": "status", "list": True, "detail": True, "create": False},
+                {"name": "created_at", "label": "Создан", "kind": "date", "list": False, "detail": True, "create": False},
+            ],
+        },
+    ],
+}
+
 ORDER_STATUS_ORDER = ["new", "processing", "done", "cancelled"]
 ORDER_STATUS_LABELS = {
     "new": "🆕 Новый", "processing": "🔄 В обработке",

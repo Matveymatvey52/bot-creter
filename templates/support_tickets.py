@@ -73,6 +73,45 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 router = Router()
 
+# ── mini-app config (see docs/MINIAPP_DESIGN.md, templates/tour_operator.py's
+# own miniapp_config for the pilot) ─────────────────────────────────────────
+# Declarative schema read by runtime/miniapp_api.py's generic CRUD handlers —
+# NOT executable code (see that module's docstring). `table` and each field's
+# `name` must match init_db()'s CREATE TABLE columns below exactly.
+miniapp_config = {
+    "resources": [
+        {
+            "name": "tickets",
+            "table": "tickets",
+            "order_by": "created_at DESC",
+            "creatable": True,
+            "title": "Обращения",
+            "titleField": "category",
+            "fields": [
+                {"name": "client_name", "label": "Клиент", "kind": "text", "list": True, "detail": True, "create": True},
+                {"name": "category", "required": True, "label": "Категория", "kind": "text", "list": True, "detail": True, "create": True},
+                {"name": "status", "label": "Статус", "kind": "status", "list": True, "detail": True, "create": False},
+                {"name": "satisfaction_rating", "label": "Оценка", "kind": "number", "list": False, "detail": True, "create": False},
+                {"name": "created_at", "label": "Создано", "kind": "date", "list": False, "detail": True, "create": False},
+            ],
+        },
+        {
+            "name": "kb_articles",
+            "table": "kb_articles",
+            "order_by": "id DESC",
+            "creatable": True,
+            "title": "База знаний",
+            "titleField": "question",
+            "fields": [
+                {"name": "category", "required": True, "label": "Категория", "kind": "text", "list": True, "detail": True, "create": True},
+                {"name": "question", "required": True, "label": "Вопрос", "kind": "text", "list": True, "detail": True, "create": True},
+                {"name": "answer", "required": True, "label": "Ответ", "kind": "text", "list": False, "detail": True, "create": True},
+                {"name": "active", "label": "Активна", "kind": "bool", "list": False, "detail": True, "create": True},
+            ],
+        },
+    ],
+}
+
 
 # ── config ───────────────────────────────────────────────────────────────────
 # Same pattern as every other template — see docs/STAGE2_DESIGN.md.

@@ -59,6 +59,46 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 router = Router()
 
+# ── mini-app config (see docs/MINIAPP_DESIGN.md, templates/tour_operator.py's
+# own miniapp_config for the pilot) ─────────────────────────────────────────
+# Declarative schema read by runtime/miniapp_api.py's generic CRUD handlers —
+# NOT executable code (see that module's docstring). `table` and each field's
+# `name` must match init_db()'s CREATE TABLE columns below exactly.
+miniapp_config = {
+    "resources": [
+        {
+            "name": "clients",
+            "table": "clients",
+            "order_by": "created_at DESC",
+            "creatable": True,
+            "title": "Клиенты",
+            "titleField": "name",
+            "fields": [
+                {"name": "name", "required": True, "label": "Имя", "kind": "text", "list": True, "detail": True, "create": True},
+                {"name": "contact", "label": "Контакт", "kind": "text", "list": False, "detail": True, "create": True},
+                {"name": "created_at", "label": "Создан", "kind": "date", "list": False, "detail": True, "create": False},
+            ],
+        },
+        {
+            "name": "point_entries",
+            "table": "point_entries",
+            "order_by": "created_at DESC",
+            "creatable": True,
+            "title": "Начисления",
+            "titleField": "note",
+            "fields": [
+                {"name": "client_id", "required": True, "label": "ID клиента", "kind": "number", "list": False, "detail": True, "create": True},
+                {"name": "points", "required": True, "label": "Баллы", "kind": "number", "list": True, "detail": True, "create": True},
+                {"name": "kind", "required": True, "label": "Тип", "kind": "status", "list": True, "detail": True, "create": True},
+                {"name": "purchase_amount", "label": "Сумма покупки", "kind": "number", "list": False, "detail": True, "create": True},
+                {"name": "note", "label": "Заметка", "kind": "text", "list": True, "detail": True, "create": True},
+                {"name": "entry_date", "label": "Дата", "kind": "date", "list": False, "detail": True, "create": True},
+                {"name": "created_at", "label": "Создано", "kind": "date", "list": False, "detail": True, "create": False},
+            ],
+        },
+    ],
+}
+
 SORT_OPTIONS = ("name", "balance")
 SORT_LABELS = {"name": "По имени", "balance": "По баллам ↓"}
 DEFAULT_SORT = "name"

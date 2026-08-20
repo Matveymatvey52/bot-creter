@@ -53,6 +53,46 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 router = Router()
 
+# ── mini-app config (see docs/MINIAPP_DESIGN.md, templates/tour_operator.py's
+# own miniapp_config for the pilot) ─────────────────────────────────────────
+# Declarative schema read by runtime/miniapp_api.py's generic CRUD handlers —
+# NOT executable code (see that module's docstring). `table` and each field's
+# `name` must match init_db()'s CREATE TABLE columns below exactly.
+miniapp_config = {
+    "resources": [
+        {
+            "name": "employees",
+            "table": "employees",
+            "order_by": "id DESC",
+            "creatable": True,
+            "title": "Сотрудники",
+            "titleField": "name",
+            "fields": [
+                {"name": "name", "required": True, "label": "Имя", "kind": "text", "list": True, "detail": True, "create": True},
+                {"name": "position", "label": "Должность", "kind": "text", "list": True, "detail": True, "create": True},
+                {"name": "contact", "required": True, "label": "Контакт", "kind": "text", "list": False, "detail": True, "create": True},
+                {"name": "active", "label": "Активен", "kind": "bool", "list": False, "detail": True, "create": True},
+            ],
+        },
+        {
+            "name": "shifts",
+            "table": "shifts",
+            "order_by": "shift_date DESC",
+            "creatable": True,
+            "title": "Смены",
+            "titleField": "shift_date",
+            "fields": [
+                {"name": "employee_id", "required": True, "label": "ID сотрудника", "kind": "number", "list": True, "detail": True, "create": True},
+                {"name": "shift_date", "required": True, "label": "Дата", "kind": "date", "list": True, "detail": True, "create": True},
+                {"name": "start_time", "required": True, "label": "Начало", "kind": "text", "list": True, "detail": True, "create": True},
+                {"name": "end_time", "required": True, "label": "Окончание", "kind": "text", "list": True, "detail": True, "create": True},
+                {"name": "note", "label": "Заметка", "kind": "text", "list": False, "detail": True, "create": True},
+                {"name": "created_at", "label": "Создана", "kind": "date", "list": False, "detail": True, "create": False},
+            ],
+        },
+    ],
+}
+
 DAYS_RU = {0: "Пн", 1: "Вт", 2: "Ср", 3: "Чт", 4: "Пт", 5: "Сб", 6: "Вс"}
 MONTHS_RU = {1: "янв", 2: "фев", 3: "мар", 4: "апр", 5: "май", 6: "июн",
              7: "июл", 8: "авг", 9: "сен", 10: "окт", 11: "ноя", 12: "дек"}

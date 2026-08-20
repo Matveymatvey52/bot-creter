@@ -45,6 +45,51 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 router = Router()
 
+# ── mini-app config (see docs/MINIAPP_DESIGN.md, templates/tour_operator.py's
+# own miniapp_config for the pilot) ─────────────────────────────────────────
+# Declarative schema read by runtime/miniapp_api.py's generic CRUD handlers —
+# NOT executable code (see that module's docstring). `table` and each field's
+# `name` must match init_db()'s CREATE TABLE columns below exactly. user_prefs
+# is intentionally excluded — it uses `user_id` as its primary key (no `id`
+# column), which runtime/miniapp_api.py's generic handlers don't support.
+miniapp_config = {
+    "resources": [
+        {
+            "name": "trips",
+            "table": "trips",
+            "order_by": "created_at DESC",
+            "creatable": True,
+            "title": "Поездки",
+            "titleField": "name",
+            "fields": [
+                {"name": "name", "required": True, "label": "Название", "kind": "text", "list": True, "detail": True, "create": True},
+                {"name": "created_at", "label": "Создана", "kind": "date", "list": False, "detail": True, "create": False},
+            ],
+        },
+        {
+            "name": "items",
+            "table": "items",
+            "order_by": "date_start DESC",
+            "creatable": True,
+            "title": "Элементы поездки",
+            "titleField": "title",
+            "fields": [
+                {"name": "trip_id", "required": True, "label": "ID поездки", "kind": "number", "list": False, "detail": True, "create": True},
+                {"name": "item_type", "label": "Тип", "kind": "text", "list": True, "detail": True, "create": True},
+                {"name": "title", "required": True, "label": "Название", "kind": "text", "list": True, "detail": True, "create": True},
+                {"name": "destination", "label": "Куда", "kind": "text", "list": False, "detail": True, "create": True},
+                {"name": "date_start", "label": "Начало", "kind": "date", "list": True, "detail": True, "create": True},
+                {"name": "date_end", "label": "Окончание", "kind": "date", "list": False, "detail": True, "create": True},
+                {"name": "price", "label": "Цена", "kind": "number", "list": False, "detail": True, "create": True},
+                {"name": "currency", "label": "Валюта", "kind": "text", "list": False, "detail": True, "create": True},
+                {"name": "notes", "label": "Заметки", "kind": "text", "list": False, "detail": True, "create": True},
+                {"name": "status", "label": "Статус", "kind": "status", "list": True, "detail": True, "create": False},
+                {"name": "created_at", "label": "Создано", "kind": "date", "list": False, "detail": True, "create": False},
+            ],
+        },
+    ],
+}
+
 # Guards /excel (Workbook build + save + answer_document) against a double tap
 # starting a second export for the same bot before the first finishes writing
 # the same excel_path — same pattern as handlers/manage_bots.py's _busy_bots

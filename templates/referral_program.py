@@ -42,6 +42,34 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 router = Router()
 
+# ── mini-app config (see docs/MINIAPP_DESIGN.md, templates/tour_operator.py's
+# own miniapp_config for the pilot) ─────────────────────────────────────────
+# Declarative schema read by runtime/miniapp_api.py's generic CRUD handlers —
+# NOT executable code (see that module's docstring). `table` and each field's
+# `name` must match init_db()'s CREATE TABLE columns below exactly. Only
+# `referrals` is exposed — `participants` uses `user_id` as its primary key
+# (no `id` column), which runtime/miniapp_api.py's generic handlers don't
+# support (they SELECT/UPDATE by a single `id` column).
+miniapp_config = {
+    "resources": [
+        {
+            "name": "referrals",
+            "table": "referrals",
+            "order_by": "created_at DESC",
+            "creatable": False,
+            "title": "Рефералы",
+            "titleField": "status",
+            "fields": [
+                {"name": "referrer_id", "required": True, "label": "ID пригласившего", "kind": "number", "list": True, "detail": True, "create": False},
+                {"name": "referred_id", "required": True, "label": "ID приглашённого", "kind": "number", "list": True, "detail": True, "create": False},
+                {"name": "status", "label": "Статус", "kind": "status", "list": True, "detail": True, "create": False},
+                {"name": "created_at", "label": "Создано", "kind": "date", "list": False, "detail": True, "create": False},
+                {"name": "rewarded_at", "label": "Награда выдана", "kind": "date", "list": False, "detail": True, "create": False},
+            ],
+        },
+    ],
+}
+
 # Excludes 0/O/1/I/L — a code shared verbally or in a low-res screenshot must
 # not depend on the reader telling those apart.
 _CODE_ALPHABET = "23456789ABCDEFGHJKMNPQRSTUVWXYZ"

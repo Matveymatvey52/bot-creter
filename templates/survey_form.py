@@ -70,6 +70,42 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 router = Router()
 
+# ── mini-app config (see docs/MINIAPP_DESIGN.md, templates/tour_operator.py's
+# own miniapp_config for the pilot) ─────────────────────────────────────────
+# Declarative schema read by runtime/miniapp_api.py's generic CRUD handlers —
+# NOT executable code (see that module's docstring). `table` and each field's
+# `name` must match init_db()'s CREATE TABLE columns below exactly.
+miniapp_config = {
+    "resources": [
+        {
+            "name": "surveys",
+            "table": "surveys",
+            "order_by": "created_at DESC",
+            "creatable": True,
+            "title": "Опросы",
+            "titleField": "title",
+            "fields": [
+                {"name": "title", "required": True, "label": "Название", "kind": "text", "list": True, "detail": True, "create": True},
+                {"name": "is_active", "label": "Активен", "kind": "bool", "list": True, "detail": True, "create": True},
+                {"name": "created_at", "label": "Создан", "kind": "date", "list": False, "detail": True, "create": False},
+            ],
+        },
+        {
+            "name": "survey_responses",
+            "table": "survey_responses",
+            "order_by": "submitted_at DESC",
+            "creatable": False,
+            "title": "Ответы",
+            "titleField": "user_name",
+            "fields": [
+                {"name": "survey_id", "required": True, "label": "ID опроса", "kind": "number", "list": False, "detail": True, "create": False},
+                {"name": "user_name", "label": "Пользователь", "kind": "text", "list": True, "detail": True, "create": False},
+                {"name": "submitted_at", "label": "Отправлен", "kind": "date", "list": True, "detail": True, "create": False},
+            ],
+        },
+    ],
+}
+
 # Same staleness guard as templates/feedback_survey.py's FLOW_TIMEOUT_SECONDS/
 # _flow_expired: without it a client who starts a questionnaire and goes quiet
 # for a long time has their next unrelated message silently swallowed into a

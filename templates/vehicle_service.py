@@ -61,6 +61,46 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 router = Router()
 
+# ── mini-app config (see docs/MINIAPP_DESIGN.md, templates/tour_operator.py's
+# own miniapp_config for the pilot) ─────────────────────────────────────────
+# Declarative schema read by runtime/miniapp_api.py's generic CRUD handlers —
+# NOT executable code (see that module's docstring). `table` and each field's
+# `name` must match init_db()'s CREATE TABLE columns below exactly.
+miniapp_config = {
+    "resources": [
+        {
+            "name": "service_requests",
+            "table": "service_requests",
+            "order_by": "created_at DESC",
+            "creatable": True,
+            "title": "Заявки на сервис",
+            "titleField": "notes",
+            "fields": [
+                {"name": "vehicle_id", "required": True, "label": "ID автомобиля", "kind": "number", "list": False, "detail": True, "create": True},
+                {"name": "status", "label": "Статус", "kind": "status", "list": True, "detail": True, "create": False},
+                {"name": "notes", "label": "Заметки", "kind": "text", "list": True, "detail": True, "create": True},
+                {"name": "created_at", "label": "Создана", "kind": "date", "list": True, "detail": True, "create": False},
+                {"name": "updated_at", "label": "Обновлена", "kind": "date", "list": False, "detail": True, "create": False},
+            ],
+        },
+        {
+            "name": "vehicles",
+            "table": "vehicles",
+            "order_by": "created_at DESC",
+            "creatable": True,
+            "title": "Автомобили",
+            "titleField": "make_model",
+            "fields": [
+                {"name": "client_id", "required": True, "label": "ID клиента", "kind": "number", "list": False, "detail": True, "create": True},
+                {"name": "plate_number", "required": True, "label": "Госномер", "kind": "text", "list": True, "detail": True, "create": True},
+                {"name": "make_model", "required": True, "label": "Марка/модель", "kind": "text", "list": True, "detail": True, "create": True},
+                {"name": "vin", "label": "VIN", "kind": "text", "list": False, "detail": True, "create": True},
+                {"name": "created_at", "label": "Добавлен", "kind": "date", "list": False, "detail": True, "create": False},
+            ],
+        },
+    ],
+}
+
 # Explicit forward-only flow, same shape as templates/orders_tracker.py's
 # STATUS_TRANSITIONS: no backward moves. "cancelled" is reachable from any
 # non-terminal status as a side-branch, mirroring the precedent already

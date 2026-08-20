@@ -8,6 +8,9 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import Chat, Message, User
 
+import aiosqlite
+
+from templates import survey_form
 from templates.survey_form import (
     SurveyFormConfig, _create_survey, _fetch_export_rows, _get_active_survey,
     _save_response, _split_questions_locally, answer_text, init_db,
@@ -101,6 +104,31 @@ class TestSurveyFormSmoke(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rows[0]["answers"], ["answer one", "answer two"])
         final_state = await state.get_data()
         self.assertEqual(final_state, {})
+
+
+class SurveyFormMiniAppConfigTests(unittest.IsolatedAsyncioTestCase):
+    """miniapp_config's declared table/field names must match init_db()'s
+    real schema — miniapp_api.py builds SQL directly off these names, so a
+    drift here would 500 at request time instead of failing a test."""
+
+    def test_miniapp_config_resource_names(self):
+        names = {r["name"] for r in survey_form.miniapp_config["resources"]}
+        self.assertEqual(names, {"surveys", "survey_responses"})
+
+    async def test_miniapp_config_fields_match_real_schema(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "schema_check.db")
+            await survey_form.init_db(db_path)
+            async with aiosqlite.connect(db_path) as db:
+                for resource in survey_form.miniapp_config["resources"]:
+                    cur = await db.execute(f"PRAGMA table_info({resource['table']})")
+                    real_columns = {row[1] for row in await cur.fetchall()}
+                    declared = {f["name"] for f in resource["fields"]} | {"id"}
+                    self.assertTrue(
+                        declared.issubset(real_columns),
+                        f"{resource['name']}: declared fields {declared} not all in "
+                        f"real columns {real_columns}",
+                    )
 
 
 if __name__ == "__main__":

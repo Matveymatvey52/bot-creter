@@ -48,6 +48,44 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 router = Router()
 
+# ── mini-app config (see docs/MINIAPP_DESIGN.md, templates/tour_operator.py's
+# own miniapp_config for the pilot) ─────────────────────────────────────────
+# Declarative schema read by runtime/miniapp_api.py's generic CRUD handlers —
+# NOT executable code (see that module's docstring). `table` and each field's
+# `name` must match init_db()'s CREATE TABLE columns below exactly.
+miniapp_config = {
+    "resources": [
+        {
+            "name": "leads",
+            "table": "leads",
+            "order_by": "created_at DESC",
+            "creatable": True,
+            "title": "Заявки",
+            "titleField": "name",
+            "fields": [
+                {"name": "name", "label": "Имя", "kind": "text", "list": True, "detail": True, "create": True},
+                {"name": "phone", "label": "Телефон", "kind": "text", "list": True, "detail": True, "create": True},
+                {"name": "question", "label": "Вопрос", "kind": "text", "list": False, "detail": True, "create": True},
+                {"name": "status", "label": "Статус", "kind": "status", "list": True, "detail": True, "create": False},
+                {"name": "created_at", "label": "Создана", "kind": "date", "list": False, "detail": True, "create": False},
+            ],
+        },
+        {
+            "name": "faqs",
+            "table": "faqs",
+            "order_by": "sort_order ASC",
+            "creatable": True,
+            "title": "Вопросы-ответы",
+            "titleField": "question",
+            "fields": [
+                {"name": "question", "required": True, "label": "Вопрос", "kind": "text", "list": True, "detail": True, "create": True},
+                {"name": "answer", "required": True, "label": "Ответ", "kind": "text", "list": False, "detail": True, "create": True},
+                {"name": "sort_order", "label": "Порядок", "kind": "number", "list": False, "detail": True, "create": True},
+            ],
+        },
+    ],
+}
+
 
 # ── config (Stage 2 Phase 4) ────────────────────────────────────────────────────
 # Same pattern as templates/accountant.py (Stage 2 Phase 2) — see

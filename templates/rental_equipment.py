@@ -53,6 +53,47 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 router = Router()
 
+# ── mini-app config (see docs/MINIAPP_DESIGN.md, templates/tour_operator.py's
+# own miniapp_config for the pilot) ─────────────────────────────────────────
+# Declarative schema read by runtime/miniapp_api.py's generic CRUD handlers —
+# NOT executable code (see that module's docstring). `table` and each field's
+# `name` must match init_db()'s CREATE TABLE columns below exactly.
+miniapp_config = {
+    "resources": [
+        {
+            "name": "items",
+            "table": "items",
+            "order_by": "created_at DESC",
+            "creatable": True,
+            "title": "Инвентарь",
+            "titleField": "name",
+            "fields": [
+                {"name": "name", "required": True, "label": "Название", "kind": "text", "list": True, "detail": True, "create": True},
+                {"name": "tag", "required": True, "label": "Метка", "kind": "text", "list": True, "detail": True, "create": True},
+                {"name": "status", "label": "Статус", "kind": "status", "list": True, "detail": True, "create": False},
+                {"name": "created_at", "label": "Создан", "kind": "date", "list": False, "detail": True, "create": False},
+            ],
+        },
+        {
+            "name": "rentals",
+            "table": "rentals",
+            "order_by": "issued_at DESC",
+            "creatable": True,
+            "title": "Аренды",
+            "titleField": "status",
+            "fields": [
+                {"name": "item_id", "required": True, "label": "ID предмета", "kind": "number", "list": False, "detail": True, "create": True},
+                {"name": "client_id", "required": True, "label": "ID клиента", "kind": "number", "list": False, "detail": True, "create": True},
+                {"name": "issued_at", "label": "Выдано", "kind": "date", "list": True, "detail": True, "create": False},
+                {"name": "due_date", "required": True, "label": "Вернуть до", "kind": "date", "list": True, "detail": True, "create": True},
+                {"name": "deposit", "label": "Залог", "kind": "number", "list": False, "detail": True, "create": True},
+                {"name": "status", "label": "Статус", "kind": "status", "list": True, "detail": True, "create": False},
+                {"name": "returned_at", "label": "Возвращено", "kind": "date", "list": False, "detail": True, "create": False},
+            ],
+        },
+    ],
+}
+
 
 # ── config ───────────────────────────────────────────────────────────────────
 # Same pattern as every other template — see docs/STAGE2_DESIGN.md.

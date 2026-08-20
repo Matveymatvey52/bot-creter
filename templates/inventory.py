@@ -43,6 +43,58 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 router = Router()
 
+# ── mini-app config (see docs/MINIAPP_DESIGN.md, templates/tour_operator.py's
+# own miniapp_config for the pilot) ─────────────────────────────────────────
+# Declarative schema read by runtime/miniapp_api.py's generic CRUD handlers —
+# NOT executable code (see that module's docstring). `table` and each field's
+# `name` must match init_db()'s CREATE TABLE columns below exactly.
+miniapp_config = {
+    "resources": [
+        {
+            "name": "items",
+            "table": "items",
+            "order_by": "id DESC",
+            "creatable": True,
+            "title": "Товары",
+            "titleField": "name",
+            "fields": [
+                {"name": "sku", "required": True, "label": "Артикул", "kind": "text", "list": True, "detail": True, "create": True},
+                {"name": "name", "required": True, "label": "Название", "kind": "text", "list": True, "detail": True, "create": True},
+                {"name": "supplier_id", "label": "ID поставщика", "kind": "number", "list": False, "detail": True, "create": True},
+                {"name": "low_stock_threshold", "label": "Мин. остаток", "kind": "number", "list": False, "detail": True, "create": True},
+                {"name": "active", "label": "Активен", "kind": "bool", "list": True, "detail": True, "create": True},
+            ],
+        },
+        {
+            "name": "suppliers",
+            "table": "suppliers",
+            "order_by": "id DESC",
+            "creatable": True,
+            "title": "Поставщики",
+            "titleField": "name",
+            "fields": [
+                {"name": "name", "required": True, "label": "Название", "kind": "text", "list": True, "detail": True, "create": True},
+                {"name": "contact", "label": "Контакт", "kind": "text", "list": False, "detail": True, "create": True},
+            ],
+        },
+        {
+            "name": "stock_movements",
+            "table": "stock_movements",
+            "order_by": "created_at DESC",
+            "creatable": True,
+            "title": "Движения склада",
+            "titleField": "reason",
+            "fields": [
+                {"name": "item_id", "required": True, "label": "ID товара", "kind": "number", "list": True, "detail": True, "create": True},
+                {"name": "change_qty", "required": True, "label": "Изменение", "kind": "number", "list": True, "detail": True, "create": True},
+                {"name": "reason", "required": True, "label": "Причина", "kind": "text", "list": True, "detail": True, "create": True},
+                {"name": "note", "label": "Заметка", "kind": "text", "list": False, "detail": True, "create": True},
+                {"name": "created_at", "label": "Создано", "kind": "date", "list": False, "detail": True, "create": False},
+            ],
+        },
+    ],
+}
+
 
 def _esc(value, max_len: int = 500) -> str:
     """HTML-escapes AND length-bounds any user-supplied text before it goes into
