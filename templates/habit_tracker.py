@@ -208,6 +208,44 @@ async def init_db(db_path: str):
         await db.commit()
 
 
+# Every user manages their OWN habits (see "design note" above) — there is no
+# admin/client split for creation, so neither resource is creatable here. The
+# mini-app mirrors the one legitimate owner-facing view this template already
+# has via Telegram ("📊 Сводка по всем"): a read-only cross-user browse of
+# habits/check-ins, owner_user_id included so each row's owner is visible.
+miniapp_config = {
+    "resources": [
+        {
+            "name": "habits",
+            "table": "habits",
+            "order_by": "owner_user_id, id",
+            "creatable": False,
+            "title": "Привычки",
+            "titleField": "name",
+            "fields": [
+                {"name": "owner_user_id", "label": "Владелец", "kind": "number", "list": True, "detail": True, "create": False},
+                {"name": "name", "label": "Название", "kind": "text", "list": True, "detail": True, "create": False},
+                {"name": "forgiving_mode", "label": "Режим", "kind": "status", "list": False, "detail": True, "create": False},
+                {"name": "is_active", "label": "Активна", "kind": "status", "list": True, "detail": True, "create": False},
+            ],
+        },
+        {
+            "name": "habit_checkins",
+            "table": "habit_checkins",
+            "order_by": "checkin_date DESC",
+            "creatable": False,
+            "title": "Отметки",
+            "titleField": "checkin_date",
+            "fields": [
+                {"name": "habit_id", "label": "ID привычки", "kind": "number", "list": True, "detail": True, "create": False},
+                {"name": "checkin_date", "label": "Дата", "kind": "date", "list": True, "detail": True, "create": False},
+                {"name": "done", "label": "Выполнено", "kind": "status", "list": True, "detail": True, "create": False},
+            ],
+        },
+    ],
+}
+
+
 # ── streak logic ─────────────────────────────────────────────────────────────
 
 async def _checkin_map(db: aiosqlite.Connection, habit_id: int) -> dict[str, int]:
