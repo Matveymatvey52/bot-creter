@@ -439,7 +439,7 @@ class BookingFitnessMiniAppConfigTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             names,
             {"trainers", "group_schedule_templates", "slots", "bookings",
-             "subscription_plans", "subscriptions"},
+             "subscription_plans", "subscriptions", "trainer_ratings"},
         )
 
     def test_trainers_resource_targets_trainers_table(self):

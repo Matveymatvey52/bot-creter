@@ -1,5 +1,5 @@
 # FEATURE: payments
-# COMPATIBLE_WITH: accountant, booking_beauty, booking_fitness, booking_medical, booking_restaurant, campaign_tracker, car_rental, course_tracker, coworking_space, delivery_tracker, event_manager, event_rsvp, inventory, loyalty_program, manager_secretary, moderator, orders_tracker, property_rental, referral_program, repair_tracker, shop_catalog, tourist_documents, trip_manager, vehicle_service
+# COMPATIBLE_WITH: accountant, booking_beauty, booking_fitness, booking_medical, booking_restaurant, campaign_tracker, car_rental, course_tracker, coworking_space, delivery_tracker, event_manager, event_rsvp, food_delivery, inventory, loyalty_program, manager_secretary, moderator, orders_tracker, property_rental, referral_program, repair_tracker, shop_catalog, tourist_documents, trip_manager, vehicle_service
 """Reusable Telegram Payments feature module — see docs/STAGE2_DESIGN.md "Фаза
 B — services/payments.py" for the original design, and feature-modules-inventory
 for how this became the library's first feature module.
@@ -255,17 +255,21 @@ async def on_successful_payment(message: Message, config: PaymentsConfig) -> Non
     # ONE central place rather than each of the 27 payments-compatible
     # templates calling publish_event() itself: order_id/amount/currency/
     # customer_chat_id are already on hand here, right after the credit is
-    # durably committed. config.bot_id is None only in standalone/subprocess
-    # mode (no bots-table row to source it from — see PaymentsConfig's
-    # docstring); office_events has no meaning there (no live Registry either,
-    # per features/office_events.py's own no-op-without-registry behavior),
-    # so this is skipped rather than publishing with a fabricated source_bot_id.
+    # durably committed. Most templates' Config dataclasses don't actually
+    # carry a bot_id field (audit 2026-08-21 found only 4 of 23
+    # payments-compatible templates do) — getattr() avoids an AttributeError
+    # on every successful payment for the rest. bot_id is also None in
+    # standalone/subprocess mode (no bots-table row to source it from — see
+    # PaymentsConfig's docstring); office_events has no meaning there either
+    # (no live Registry, per features/office_events.py's own
+    # no-op-without-registry behavior), so this is skipped rather than
+    # publishing with a fabricated source_bot_id.
     # Deliberately best-effort: publish_event() never raises for a subscriber
     # failure, but a broken office_events call here must ALSO never turn a
     # successfully credited payment into an error response to Telegram —
     # same isolation reasoning as runtime/registry.py's
     # _load_and_include_features().
-    if config.bot_id is not None:
+    if getattr(config, "bot_id", None) is not None:
         try:
             await publish_event(
                 config.bot_id,
