@@ -38,6 +38,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
 
+import db.database as db_module
 from runtime.registry import get_template_router
 from templates import trip_manager
 
@@ -320,6 +321,127 @@ class TripManagerIsolationTests(unittest.IsolatedAsyncioTestCase):
         sent_method = reminder_calls[0].args[0]
         self.assertEqual(sent_method.chat_id, SAME_USER_ID)
         self.assertIn("Alpha Reminder Item", sent_method.text)
+
+
+class TripManagerAdminBootstrapSecurityTests(unittest.IsolatedAsyncioTestCase):
+    """Security fix regression tests, mirroring test_shop_catalog_isolation.py's
+    ShopCatalogIsolationTests admin-bootstrap tests (see commit 8cea03f).
+
+    trip_manager.py had an EXTRA bug beyond shop_catalog's: _is_admin() used
+    to re-bootstrap admins_file with whichever uid called it, on EVERY call
+    whenever the admins list was empty — not just once at /start. So if the
+    owner ever emptied the admins list via /removeadmin, the next caller of
+    ANY admin-gated command (/excel, /publish, /addadmin, /removeadmin,
+    /admins) would silently become the new admin. _is_admin() no longer has
+    that side effect; bootstrap now only happens once, explicitly, in
+    cmd_start."""
+
+    async def asyncSetUp(self):
+        self._bot_call_patcher = patch.object(Bot, "__call__", new=AsyncMock(return_value=MagicMock()))
+        self._bot_call_patcher.start()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.data_dir = Path(self._tmp.name)
+
+        # cmd_start now syncs the bootstrap admin into db.database.add_bot_admin
+        # (central bot_admins table) — must be redirected to a throwaway DB,
+        # same reasoning as test_shop_catalog_isolation.py.
+        self._central_db_path = self.data_dir / "central_bots.db"
+        self._db_path_patcher = patch.object(db_module, "DB_PATH", self._central_db_path)
+        self._db_path_patcher.start()
+        await db_module.init_db()
+
+    async def asyncTearDown(self):
+        self._db_path_patcher.stop()
+        self._tmp.cleanup()
+        self._bot_call_patcher.stop()
+
+    async def test_non_owner_messaging_first_does_not_become_admin(self):
+        """Whoever sends /start FIRST used to permanently become the bot
+        admin. When bots.owner_telegram_id is known, only that user may
+        claim the empty-admins bootstrap slot."""
+        config = trip_manager.config_from_bot_row(
+            {"bot_id": 950, "name": "tm_owned_bot", "display_name": None,
+             "group_chat_id": None, "owner_telegram_id": 12345},
+            self.data_dir,
+        )
+        await trip_manager.init_db(config.db_path)
+        bot, dp = _build_bot_dispatcher(config)
+
+        CLIENT_ID = 555  # not the owner, messages first
+        await dp.feed_webhook_update(bot, _text_update(1, CLIENT_ID, "/start"))
+        self.assertEqual(trip_manager._load_admins(config.admins_file), set())
+        self.assertFalse(trip_manager._is_admin(str(CLIENT_ID), config))
+
+        await dp.feed_webhook_update(bot, _text_update(2, 12345, "/start"))
+        self.assertTrue(trip_manager._is_admin("12345", config))
+        self.assertEqual(trip_manager._load_admins(config.admins_file), {"12345"})
+
+    async def test_owner_is_always_admin_even_with_stale_admins_file(self):
+        """Defense in depth: the DB-known owner sees admin commands even if
+        the local admins_file is empty/stale/hijacked — owner_telegram_id is
+        an unconditional admin in _is_admin, not just at bootstrap time."""
+        config = trip_manager.config_from_bot_row(
+            {"bot_id": 951, "name": "tm_owned_bot_2", "display_name": None,
+             "group_chat_id": None, "owner_telegram_id": 777},
+            self.data_dir,
+        )
+        await trip_manager.init_db(config.db_path)
+        trip_manager._save_admins(config.admins_file, {"999999"})  # some other id, not the owner
+        self.assertTrue(trip_manager._is_admin("777", config))  # owner: always admin
+        self.assertTrue(trip_manager._is_admin("999999", config))  # still honors the file's own admin
+        self.assertFalse(trip_manager._is_admin("4242", config))  # neither owner nor in the file
+
+    async def test_removeadmin_emptying_list_does_not_auto_bootstrap_next_caller(self):
+        """Reproduces the exact scenario the extra bug enabled: owner removes
+        the last admin via /removeadmin, then ANY subsequent caller of an
+        admin-gated command must NOT silently become the new admin. The
+        owner remains the only admin via the owner_telegram_id fallback."""
+        OWNER_ID = 111
+        config = trip_manager.config_from_bot_row(
+            {"bot_id": 952, "name": "tm_owned_bot_3", "display_name": None,
+             "group_chat_id": None, "owner_telegram_id": OWNER_ID},
+            self.data_dir,
+        )
+        await trip_manager.init_db(config.db_path)
+        bot, dp = _build_bot_dispatcher(config)
+
+        await dp.feed_webhook_update(bot, _text_update(1, OWNER_ID, "/start"))
+        self.assertEqual(trip_manager._load_admins(config.admins_file), {str(OWNER_ID)})
+
+        # Owner removes themself as the last admin — admins_file goes empty.
+        await dp.feed_webhook_update(bot, _text_update(2, OWNER_ID, f"/removeadmin {OWNER_ID}"))
+        self.assertEqual(trip_manager._load_admins(config.admins_file), set())
+
+        RANDOM_ID = 42424242
+        await dp.feed_webhook_update(bot, _text_update(3, RANDOM_ID, "/excel"))
+        # must NOT have been silently added as a side effect of the command above
+        self.assertEqual(trip_manager._load_admins(config.admins_file), set())
+        self.assertFalse(trip_manager._is_admin(str(RANDOM_ID), config))
+
+        # owner fallback still works even with an empty admins_file
+        self.assertTrue(trip_manager._is_admin(str(OWNER_ID), config))
+
+    async def test_addadmin_removeadmin_sync_to_central_bot_admins_table(self):
+        """The mini-app's admin gate (runtime.miniapp_api._admin_gate_ok)
+        checks db.database.get_bot_admins(), a separate table from this
+        template's local admins_file. /addadmin and /removeadmin must keep
+        both in sync, same as the bootstrap grant."""
+        OWNER_ID = 111
+        config = trip_manager.config_from_bot_row(
+            {"bot_id": 953, "name": "tm_synced_bot", "display_name": None, "group_chat_id": None},
+            self.data_dir,
+        )
+        await trip_manager.init_db(config.db_path)
+        bot, dp = _build_bot_dispatcher(config)
+
+        await dp.feed_webhook_update(bot, _text_update(1, OWNER_ID, "/start"))
+        self.assertEqual(await db_module.get_bot_admins(953), [str(OWNER_ID)])
+
+        await dp.feed_webhook_update(bot, _text_update(2, OWNER_ID, "/addadmin 321"))
+        self.assertCountEqual(await db_module.get_bot_admins(953), [str(OWNER_ID), "321"])
+
+        await dp.feed_webhook_update(bot, _text_update(3, OWNER_ID, "/removeadmin 321"))
+        self.assertEqual(await db_module.get_bot_admins(953), [str(OWNER_ID)])
 
 
 class TripManagerStandaloneSmokeTest(unittest.TestCase):

@@ -28,6 +28,8 @@ from aiogram.types import (
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 
+from db.database import add_bot_admin, remove_bot_admin
+
 # ── CUSTOMIZE ────────────────────────────────────────────────────────────────
 BOT_DESCRIPTION = "Менеджер маршрутов и путешествий. Храню перелёты, отели, трансферы, номера броней, цены и предоплаты."
 WELCOME_TEXT = (
@@ -149,6 +151,8 @@ class TripManagerConfig:
     welcome_image: Path
     display_name: str | None = None
     group_chat_id: str | None = None  # not read by this template (verified: no matches)
+    bot_id: int | None = None
+    owner_telegram_id: int | None = None
 
 
 def _paths_for(name: str, data_dir: Path) -> TripManagerConfig:
@@ -195,6 +199,8 @@ def config_from_bot_row(bot_row: dict, data_dir: Path) -> TripManagerConfig:
     )
     config.display_name = bot_row.get("display_name")
     config.group_chat_id = bot_row.get("group_chat_id")
+    config.bot_id = bot_id
+    config.owner_telegram_id = bot_row.get("owner_telegram_id")
     return config
 
 
@@ -489,14 +495,27 @@ _STEP_MAP = {s[0]: i for i, s in enumerate(_STEPS)}
 async def cmd_start(message: Message, state: FSMContext, config: TripManagerConfig):
     await state.clear()
     admins = _load_admins(config.admins_file)
-    if not admins:
-        _save_admins(config.admins_file, {str(message.from_user.id)})
+    sender_id = str(message.from_user.id)
+    # Bug fixed here: this used to grant admin to whoever sent /start FIRST,
+    # letting any stranger who messages the bot before the owner does
+    # permanently seize the admin commands. When bots.owner_telegram_id is
+    # known (webhook/production mode), only that user may claim the empty-
+    # admins bootstrap slot. In standalone/env mode (owner_telegram_id
+    # unknown) the old first-comer behavior is the only option available.
+    is_owner = config.owner_telegram_id is not None and sender_id == str(config.owner_telegram_id)
+    if not admins and (is_owner or config.owner_telegram_id is None):
+        _save_admins(config.admins_file, {sender_id})
+        if config.bot_id is not None:
+            try:
+                await add_bot_admin(config.bot_id, sender_id)
+            except Exception as e:
+                logger.warning(f"cmd_start: add_bot_admin sync failed for bot {config.bot_id}: {e}")
     if config.welcome_image.exists():
         await message.answer_photo(FSInputFile(str(config.welcome_image)),
                                    caption=WELCOME_TEXT, parse_mode="HTML", reply_markup=kb_main())
     else:
         await message.answer(WELCOME_TEXT, parse_mode="HTML", reply_markup=kb_main())
-    if str(message.from_user.id) in _load_admins(config.admins_file):
+    if _is_admin(sender_id, config):
         await message.answer(
             "🔧 <b>Команды:</b> /publish · /weblink\n"
             "/digest 08:00 — ежедневный дайджест\n"
@@ -1415,16 +1434,19 @@ async def _digest_loop(bot: Bot, db_path: str, bot_name: str):
 
 # ── EXCEL ─────────────────────────────────────────────────────────────────────
 
-def _is_admin(user_id: str, admins_file: Path) -> bool:
-    admins = _load_admins(admins_file)
-    if not admins:
-        _save_admins(admins_file, {user_id})
+def _is_admin(user_id: str, config: TripManagerConfig) -> bool:
+    # DB-known owner (bots.owner_telegram_id) is always admin, even if the
+    # local admins_file is empty/stale — mirrors shop_catalog.py's
+    # _is_bot_admin. No bootstrap side effect here: a bare rights check must
+    # never grant admin as a byproduct of being called (see cmd_start for the
+    # one-time, explicit bootstrap instead).
+    if config.owner_telegram_id is not None and user_id == str(config.owner_telegram_id):
         return True
-    return user_id in admins
+    return user_id in _load_admins(config.admins_file)
 
 @router.message(Command("excel"))
 async def cmd_excel(msg: Message, config: TripManagerConfig):
-    if not _is_admin(str(msg.from_user.id), config.admins_file):
+    if not _is_admin(str(msg.from_user.id), config):
         await msg.answer("⛔ Нет доступа"); return
     trips = await _all_trips(config.db_path)
     if not trips:
@@ -1630,7 +1652,7 @@ async def _publish_trip(db_path: str, bot_name: str, trip: dict, items: list) ->
 @router.message(F.text == "📤 Опубликовать")
 @router.message(Command("publish"))
 async def cmd_publish(msg: Message, config: TripManagerConfig):
-    if not _is_admin(str(msg.from_user.id), config.admins_file):
+    if not _is_admin(str(msg.from_user.id), config):
         await msg.answer("⛔ Нет доступа"); return
     trip = await _get_active_trip(config.db_path, str(msg.from_user.id))
     if not trip:
@@ -1666,24 +1688,34 @@ async def cmd_weblink(msg: Message, config: TripManagerConfig):
 
 @router.message(Command("addadmin"))
 async def cmd_addadmin(msg: Message, config: TripManagerConfig):
-    if not _is_admin(str(msg.from_user.id), config.admins_file): await msg.answer("⛔ Нет доступа"); return
+    if not _is_admin(str(msg.from_user.id), config): await msg.answer("⛔ Нет доступа"); return
     parts = msg.text.split()
     if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
         await msg.answer("Использование: /addadmin <id>"); return
     ids = _load_admins(config.admins_file); ids.add(parts[1]); _save_admins(config.admins_file, ids)
+    if config.bot_id is not None:
+        try:
+            await add_bot_admin(config.bot_id, parts[1])
+        except Exception as e:
+            logger.warning(f"cmd_addadmin: add_bot_admin sync failed for bot {config.bot_id}: {e}")
     await msg.answer(f"✅ <code>{parts[1]}</code> добавлен.", parse_mode="HTML")
 
 @router.message(Command("removeadmin"))
 async def cmd_removeadmin(msg: Message, config: TripManagerConfig):
-    if not _is_admin(str(msg.from_user.id), config.admins_file): await msg.answer("⛔ Нет доступа"); return
+    if not _is_admin(str(msg.from_user.id), config): await msg.answer("⛔ Нет доступа"); return
     parts = msg.text.split()
     if len(parts) < 2: await msg.answer("Использование: /removeadmin <id>"); return
     ids = _load_admins(config.admins_file); ids.discard(parts[1]); _save_admins(config.admins_file, ids)
+    if config.bot_id is not None:
+        try:
+            await remove_bot_admin(config.bot_id, parts[1])
+        except Exception as e:
+            logger.warning(f"cmd_removeadmin: remove_bot_admin sync failed for bot {config.bot_id}: {e}")
     await msg.answer(f"✅ <code>{_esc(parts[1])}</code> удалён.", parse_mode="HTML")
 
 @router.message(Command("admins"))
 async def cmd_admins(msg: Message, config: TripManagerConfig):
-    if not _is_admin(str(msg.from_user.id), config.admins_file): await msg.answer("⛔ Нет доступа"); return
+    if not _is_admin(str(msg.from_user.id), config): await msg.answer("⛔ Нет доступа"); return
     ids = _load_admins(config.admins_file)
     await msg.answer(
         "👥 " + ("\n".join(f"• <code>{i}</code>" for i in ids) or "Пусто"),
