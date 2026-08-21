@@ -34,6 +34,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import aiosqlite
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
 
@@ -317,22 +318,25 @@ class TourOperatorMiniappMenuParityTests(unittest.TestCase):
         one actually shipped in this file, against this file's own real
         source (not a copy/paste that can drift).
 
-        "dds" is excluded here: its table (cashflow_entries) lives in
-        features/cashflow_ledger.py's own init_cashflow_tables(), not in
-        this file's init_db() — the validator only ever sees ONE file's
-        source, so it has no way to confirm a table defined elsewhere, the
-        same limitation _generate_miniapp_config itself has (see
-        miniapp_config's module comment). Checked separately below instead
-        of loosening the shared validator for this one resource."""
+        "dds" and "feedback" are excluded here: their tables
+        (cashflow_entries, bot_feedback_entries) live in
+        features/cashflow_ledger.py's and features/bot_feedback_entries.py's
+        own init functions, not in this file's init_db() — the validator
+        only ever sees ONE file's source, so it has no way to confirm a
+        table defined elsewhere, the same limitation
+        _generate_miniapp_config itself has (see miniapp_config's module
+        comment). Both are checked separately below instead of loosening the
+        shared validator for these two resources."""
         import inspect
 
         from services.claude_service import _validate_miniapp_config_against_code
 
         source = inspect.getsource(tour_operator)
-        resources_without_dds = {
-            "resources": [r for r in tour_operator.miniapp_config["resources"] if r["name"] != "dds"],
+        externally_backed = {"dds", "feedback"}
+        resources_without_external = {
+            "resources": [r for r in tour_operator.miniapp_config["resources"] if r["name"] not in externally_backed],
         }
-        self.assertTrue(_validate_miniapp_config_against_code(resources_without_dds, source))
+        self.assertTrue(_validate_miniapp_config_against_code(resources_without_external, source))
 
     def test_dds_resource_points_at_the_real_cashflow_ledger_table(self):
         """dds isn't backed by a table in this file's own init_db() — it's
@@ -347,6 +351,21 @@ class TourOperatorMiniappMenuParityTests(unittest.TestCase):
         dds_resource = next(r for r in tour_operator.miniapp_config["resources"] if r["name"] == "dds")
         source = inspect.getsource(cashflow_ledger)
         self.assertTrue(_validate_miniapp_config_against_code({"resources": [dds_resource]}, source))
+
+    def test_feedback_resource_points_at_the_real_bot_feedback_entries_table(self):
+        """feedback isn't backed by a table in this file's own init_db()
+        either — it's features/bot_feedback_entries.py's
+        bot_feedback_entries, wired in via init_feedback_table() (see
+        init_db()). Validated against THAT module's own source, same generic
+        validator as the dds/cashflow_ledger case above."""
+        import inspect
+
+        import features.bot_feedback_entries as bot_feedback_entries
+        from services.claude_service import _validate_miniapp_config_against_code
+
+        feedback_resource = next(r for r in tour_operator.miniapp_config["resources"] if r["name"] == "feedback")
+        source = inspect.getsource(bot_feedback_entries)
+        self.assertTrue(_validate_miniapp_config_against_code({"resources": [feedback_resource]}, source))
 
 
 class TourOperatorWebCrmFlagTests(unittest.IsolatedAsyncioTestCase):
@@ -445,6 +464,151 @@ class TourOperatorWebCrmFlagTests(unittest.IsolatedAsyncioTestCase):
             sent_texts = await self._send_app_command()
         self.assertTrue(any("не настроен MINIAPP_SECRET" in t for t in sent_texts))
         self.assertTrue(all("http://" not in t and "https://" not in t for t in sent_texts))
+
+
+class TourOperatorClientRoleTests(unittest.IsolatedAsyncioTestCase):
+    """Owner-requested (2026-08-21): /start must no longer fully lock out
+    non-admins — real customers get a browse/book flow, staff/owner keep the
+    full CRM menu. Covers both the Telegram-side split and the tour_access
+    table role_filter reads from."""
+
+    async def asyncSetUp(self):
+        self._bot_call_mock = AsyncMock(return_value=MagicMock())
+        self._bot_call_patcher = patch.object(Bot, "__call__", new=self._bot_call_mock)
+        self._bot_call_patcher.start()
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.data_dir = Path(self._tmp.name)
+        self.config = tour_operator.config_from_bot_row(
+            {"bot_id": 301, "name": "to_role_bot", "display_name": None, "group_chat_id": None}, self.data_dir
+        )
+        await tour_operator.init_db(self.config.db_path)
+        self.bot, self.dp = _build_bot_dispatcher(self.config, 301)
+
+    async def asyncTearDown(self):
+        self._tmp.cleanup()
+        self._bot_call_patcher.stop()
+
+    async def _sent_texts_and_markups(self):
+        calls = self._bot_call_mock.call_args_list
+        out = []
+        for call in calls:
+            method = call.args[0]
+            text = getattr(method, "text", None) or getattr(method, "caption", None)
+            if text:
+                out.append((text, getattr(method, "reply_markup", None)))
+        return out
+
+    def _flat_callback_data(self, markup) -> set[str]:
+        if markup is None:
+            return set()
+        return {b.callback_data for row in markup.inline_keyboard for b in row if b.callback_data}
+
+    async def test_first_user_becomes_owner_and_gets_full_crm_menu(self):
+        OWNER_ID = 111
+        await self.dp.feed_webhook_update(self.bot, _text_update(1, OWNER_ID, "/start"))
+        sent = await self._sent_texts_and_markups()
+        self.assertTrue(sent)
+        _text, markup = sent[-1]
+        data = self._flat_callback_data(markup)
+        self.assertIn("new_tour", data)
+        self.assertIn("sec_dds", data)
+        self.assertIn("sec_guests", data)
+
+        async with aiosqlite.connect(self.config.db_path) as db:
+            row = await (await db.execute(
+                "SELECT role FROM tour_access WHERE user_id=?", (OWNER_ID,)
+            )).fetchone()
+        self.assertEqual(row[0], "owner")
+
+    async def test_second_user_gets_client_menu_without_crm_buttons(self):
+        OWNER_ID, CLIENT_ID = 111, 222
+        await self.dp.feed_webhook_update(self.bot, _text_update(1, OWNER_ID, "/start"))
+        await self.dp.feed_webhook_update(self.bot, _text_update(2, CLIENT_ID, "/start"))
+        sent = await self._sent_texts_and_markups()
+        _text, markup = sent[-1]
+        data = self._flat_callback_data(markup)
+        self.assertEqual(data, {"tours_browse", "my_booking", "open_app"})
+        self.assertNotIn("new_tour", data)
+        self.assertNotIn("sec_dds", data)
+        self.assertNotIn("sec_guests", data)
+
+        async with aiosqlite.connect(self.config.db_path) as db:
+            row = await (await db.execute(
+                "SELECT role FROM tour_access WHERE user_id=?", (CLIENT_ID,)
+            )).fetchone()
+        self.assertEqual(row[0], "client")
+
+    async def test_client_can_browse_and_book_an_active_tour(self):
+        OWNER_ID, CLIENT_ID = 111, 333
+        await self.dp.feed_webhook_update(self.bot, _text_update(1, OWNER_ID, "/start"))
+        await _create_and_activate_tour(self.dp, self.bot, OWNER_ID, "Bali Adventure", 2)
+        async with aiosqlite.connect(self.config.db_path) as db:
+            await db.execute("UPDATE tours SET status='active'")
+            await db.commit()
+            tour_id = (await (await db.execute("SELECT id FROM tours")).fetchone())[0]
+
+        await self.dp.feed_webhook_update(self.bot, _text_update(50, CLIENT_ID, "/start"))
+        await self.dp.feed_webhook_update(self.bot, _callback_update(51, CLIENT_ID, "tours_browse"))
+        await self.dp.feed_webhook_update(self.bot, _callback_update(52, CLIENT_ID, f"tour_view:{tour_id}"))
+        await self.dp.feed_webhook_update(self.bot, _callback_update(53, CLIENT_ID, f"book_tour:{tour_id}"))
+
+        async with aiosqlite.connect(self.config.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            guest = await (await db.execute(
+                "SELECT * FROM guests WHERE tour_id=? AND client_user_id=?", (tour_id, CLIENT_ID)
+            )).fetchone()
+        self.assertIsNotNone(guest)
+        self.assertEqual(guest["tour_id"], tour_id)
+
+    async def test_client_cannot_double_book_same_tour(self):
+        OWNER_ID, CLIENT_ID = 111, 444
+        await self.dp.feed_webhook_update(self.bot, _text_update(1, OWNER_ID, "/start"))
+        await _create_and_activate_tour(self.dp, self.bot, OWNER_ID, "Phuket Escape", 2)
+        async with aiosqlite.connect(self.config.db_path) as db:
+            await db.execute("UPDATE tours SET status='active'")
+            await db.commit()
+            tour_id = (await (await db.execute("SELECT id FROM tours")).fetchone())[0]
+
+        await self.dp.feed_webhook_update(self.bot, _text_update(50, CLIENT_ID, "/start"))
+        await self.dp.feed_webhook_update(self.bot, _callback_update(51, CLIENT_ID, f"book_tour:{tour_id}"))
+        await self.dp.feed_webhook_update(self.bot, _callback_update(52, CLIENT_ID, f"book_tour:{tour_id}"))
+
+        async with aiosqlite.connect(self.config.db_path) as db:
+            rows = await (await db.execute(
+                "SELECT id FROM guests WHERE tour_id=? AND client_user_id=?", (tour_id, CLIENT_ID)
+            )).fetchall()
+        self.assertEqual(len(rows), 1)
+
+    async def test_tour_access_role_updates_on_repeat_grant_not_stuck(self):
+        """Security-review fix: _grant_owner_access/_grant_client_access
+        used to be INSERT OR IGNORE, which left a stale role in tour_access
+        forever once the row existed (user_id is the PK). Now an UPSERT —
+        confirm the row actually flips both directions."""
+        uid = 777
+        await tour_operator._grant_client_access(self.config.db_path, uid)
+        async with aiosqlite.connect(self.config.db_path) as db:
+            role = (await (await db.execute("SELECT role FROM tour_access WHERE user_id=?", (uid,))).fetchone())[0]
+        self.assertEqual(role, "client")
+
+        await tour_operator._grant_owner_access(self.config.db_path, uid)
+        async with aiosqlite.connect(self.config.db_path) as db:
+            role = (await (await db.execute("SELECT role FROM tour_access WHERE user_id=?", (uid,))).fetchone())[0]
+        self.assertEqual(role, "owner")
+
+    async def test_client_cannot_trigger_owner_only_new_tour_callback(self):
+        """Defense-in-depth: even if a client somehow replays "new_tour"
+        callback_data (client_kb() never sends that button), the handler
+        itself must refuse — no FSM state change, no tour created."""
+        OWNER_ID, CLIENT_ID = 111, 555
+        await self.dp.feed_webhook_update(self.bot, _text_update(1, OWNER_ID, "/start"))
+        await self.dp.feed_webhook_update(self.bot, _text_update(2, CLIENT_ID, "/start"))
+        await self.dp.feed_webhook_update(self.bot, _callback_update(3, CLIENT_ID, "new_tour"))
+        await self.dp.feed_webhook_update(self.bot, _text_update(4, CLIENT_ID, "Forged Tour"))
+
+        async with aiosqlite.connect(self.config.db_path) as db:
+            names = [r[0] for r in await (await db.execute("SELECT name FROM tours")).fetchall()]
+        self.assertNotIn("Forged Tour", names)
 
 
 if __name__ == "__main__":

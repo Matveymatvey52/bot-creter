@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import logging
 import os
@@ -15,6 +16,7 @@ from pathlib import Path
 import aiosqlite
 from aiohttp import web
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
+from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -31,6 +33,7 @@ from features.cashflow_ledger import (
     record_entry as cashflow_record_entry,
 )
 from features import voice_intake
+from features.bot_feedback_entries import FEEDBACK_RESOURCE, init_feedback_table
 from features.voice_intake import VoiceFieldSpec, VoiceRecordType, VoiceSchema
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -96,6 +99,24 @@ router = Router()
 # by cashflow_ledger.record_entry, see that module's docstring), shown here
 # the same way "tour_id" is already shown on guests below — visible but not
 # a fill-it-yourself field.
+# tour_access resolve table for role_filter (see the helpers section near
+# _grant_owner_access/_grant_client_access above) — "owner" is granted to
+# admins.json members at /start, "client" to everyone else. Only
+# "tours_public" below declares role_filter: it's the one resource real
+# customers (non-admins) are meant to see through the mini-app, and it is
+# deliberately NOT creatable — role_filter's create-time enforcement
+# (runtime/miniapp_api.py's _resolve_create_owner_column) only recognizes a
+# single-column-ownership where-template; a bare "where: None" client rule
+# (needed here since any client may browse ANY tour, not just their own)
+# would leave POST wide open with no ownership check at all, so creation
+# stays on the separate, role_filter-less "tours" resource above, which
+# keeps requiring admins.json membership exactly as before.
+_TOUR_ACCESS_RESOLVE = {
+    "table": "tour_access",
+    "identity_column": "user_id",
+    "role_column": "role",
+}
+
 miniapp_config = {
     "resources": [
         {
@@ -114,6 +135,36 @@ miniapp_config = {
                 {"name": "status", "label": "Статус", "kind": "status", "list": True, "detail": True, "create": False},
                 {"name": "created_at", "creatable": False, "label": "Создано", "kind": "date", "list": False, "detail": False, "create": False},
             ],
+        },
+        {
+            # Read-only, all-tours view over the SAME "tours" table — the
+            # one resource clients (real customers) can see via the
+            # mini-app, per docs/MINIAPP_ROLE_SCOPING_DESIGN.md. See
+            # _TOUR_ACCESS_RESOLVE's comment above for why this is a
+            # separate resource rather than role_filter added onto "tours"
+            # itself.
+            "name": "tours_public",
+            "table": "tours",
+            "order_by": "created_at DESC",
+            "creatable": False,
+            "title": "Туры",
+            "titleField": "name",
+            "fields": [
+                {"name": "name", "label": "Название", "kind": "text", "list": True, "detail": True, "create": False},
+                {"name": "destination", "label": "Направление", "kind": "text", "list": True, "detail": True, "create": False},
+                {"name": "date_start", "label": "Начало", "kind": "date", "list": False, "detail": True, "create": False},
+                {"name": "date_end", "label": "Окончание", "kind": "date", "list": False, "detail": True, "create": False},
+                {"name": "status", "label": "Статус", "kind": "status", "list": True, "detail": True, "create": False},
+                {"name": "created_at", "label": "Создано", "kind": "date", "list": False, "detail": False, "create": False},
+            ],
+            "role_filter": {
+                "resolve": _TOUR_ACCESS_RESOLVE,
+                "rules": [
+                    {"role": "owner", "where": None},
+                    {"role": "client", "where": None},
+                ],
+                "default_deny": True,
+            },
         },
         {
             "name": "program",
@@ -222,6 +273,11 @@ miniapp_config = {
                 {"name": "created_at", "creatable": False, "label": "Создано", "kind": "date", "list": False, "detail": False, "create": False},
             ],
         },
+        # Customer reviews — features/bot_feedback_entries.py's ready-made
+        # resource dict, added as-is rather than hand-written like the other
+        # resources above (see that module's docstring for why: it's a
+        # cross-template feature, not tour_operator-specific business data).
+        FEEDBACK_RESOURCE,
     ],
 }
 
@@ -356,6 +412,15 @@ def _is_admin(uid, admins_file: str):
         return True
     return str(uid) in admins
 
+def _esc(value, max_len: int = 500) -> str:
+    """HTML-escapes AND length-bounds any user-supplied text before it goes
+    into a parse_mode="HTML" message — same helper/rationale as templates/
+    property_rental.py's _esc()."""
+    text = str(value) if value is not None else ""
+    if len(text) > max_len:
+        text = text[:max_len] + "…"
+    return html.escape(text)
+
 # ── Database ──────────────────────────────────────────────────────────────────
 async def init_db(db_path: str):
     async with aiosqlite.connect(db_path) as db:
@@ -420,23 +485,46 @@ async def init_db(db_path: str):
                 created_at   TEXT DEFAULT (datetime('now','localtime'))
             );
             CREATE TABLE IF NOT EXISTS guests (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                tour_id    INTEGER,
-                name       TEXT NOT NULL,
-                total_cost REAL DEFAULT 0,
-                prepaid    REAL DEFAULT 0,
-                our_price  REAL DEFAULT 0,
-                status     TEXT DEFAULT 'not_paid',
-                notes      TEXT,
-                created_at TEXT DEFAULT (datetime('now','localtime'))
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                tour_id        INTEGER,
+                name           TEXT NOT NULL,
+                total_cost     REAL DEFAULT 0,
+                prepaid        REAL DEFAULT 0,
+                our_price      REAL DEFAULT 0,
+                status         TEXT DEFAULT 'not_paid',
+                notes          TEXT,
+                client_user_id INTEGER,
+                created_at     TEXT DEFAULT (datetime('now','localtime'))
             );
             CREATE TABLE IF NOT EXISTS user_prefs (
                 user_id        TEXT PRIMARY KEY,
                 active_tour_id INTEGER
             );
+            CREATE TABLE IF NOT EXISTS tour_access (
+                user_id INTEGER PRIMARY KEY,
+                role    TEXT NOT NULL
+            );
         """)
+        # Defensive ALTER for DBs created before client_user_id existed —
+        # same belt-and-suspenders pattern as templates/booking_beauty.py's
+        # bookings.user_id migration: the CREATE TABLE above already covers
+        # fresh DBs, this only matters for pre-existing ones.
+        try:
+            await db.execute("ALTER TABLE guests ADD COLUMN client_user_id INTEGER")
+        except Exception:
+            pass
+        # Closes a check-then-insert race in cb_book_tour (two concurrent
+        # taps could both pass the "already booked?" SELECT before either
+        # INSERT lands): SQLite unique indexes treat every NULL
+        # client_user_id as distinct from every other, so admin-created
+        # guest rows (client_user_id IS NULL) are never affected — this
+        # only dedupes real client_user_id values per tour.
+        await db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_guests_tour_client ON guests(tour_id, client_user_id)"
+        )
         await db.commit()
     await init_cashflow_tables(db_path)
+    await init_feedback_table(db_path)
 
 async def get_active_tour(db_path: str, uid):
     async with aiosqlite.connect(db_path) as db:
@@ -454,6 +542,37 @@ async def set_active_tour(db_path: str, uid, tid):
             "INSERT INTO user_prefs(user_id,active_tour_id) VALUES(?,?)"
             " ON CONFLICT(user_id) DO UPDATE SET active_tour_id=excluded.active_tour_id",
             (str(uid), tid),
+        )
+        await db.commit()
+
+# ── Role access (mini-app role_filter resolve table) ─────────────────────────
+# admins.json stays the source of truth for gating owner-only Telegram
+# commands (same convention as every other template) — tour_access is a
+# SEPARATE table that exists only so the mini-app's role_filter has a single
+# resolve table/column pair to query, per docs/MINIAPP_ROLE_SCOPING_DESIGN.md
+# (same pattern as templates/property_rental.py's property_access). Granted
+# at /start: owner role when _is_admin() resolves true, client role
+# otherwise — see cmd_start below.
+async def _grant_owner_access(db_path: str, user_id: int) -> None:
+    # UPSERT, not INSERT OR IGNORE: user_id is the PK, so a plain IGNORE
+    # would leave a stale role in place forever if admins.json membership
+    # later changes (a demoted admin, or a client later promoted) — the
+    # comment above promises admins.json stays the source of truth, which
+    # only holds if this row is kept in sync with _is_admin()'s current
+    # answer on every /start, not just the first one.
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            "INSERT INTO tour_access (user_id, role) VALUES (?, 'owner') "
+            "ON CONFLICT(user_id) DO UPDATE SET role='owner'", (user_id,),
+        )
+        await db.commit()
+
+
+async def _grant_client_access(db_path: str, user_id: int) -> None:
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            "INSERT INTO tour_access (user_id, role) VALUES (?, 'client') "
+            "ON CONFLICT(user_id) DO UPDATE SET role='client'", (user_id,),
         )
         await db.commit()
 
@@ -477,6 +596,17 @@ def main_kb():
         [btn("📅 Программа", "sec_program"), btn("📍 ЛиП", "sec_lip")],
         [btn("🏨 Отели", "sec_hotels"),     btn("👥 Гости", "sec_guests")],
         [btn("💰 ДДС", "sec_dds")],
+    ])
+
+def client_kb():
+    """Menu for non-admin users — real customers of the tour operator, not
+    staff (see docs on tour_access above). Deliberately excludes every
+    CRM/finance button in main_kb(): browsing/booking is all a client can
+    do from Telegram."""
+    return mk([
+        [btn("🌍 Доступные туры", "tours_browse")],
+        [btn("📝 Моя бронь", "my_booking")],
+        [btn("🌐 Веб-приложение", "open_app")],
     ])
 
 # ── Voice intake schema (features/voice_intake.py) ───────────────────────────
@@ -647,25 +777,33 @@ def _build_voice_schema() -> VoiceSchema:
 # ── Bot handlers ──────────────────────────────────────────────────────────────
 @router.message(Command("start"))
 async def cmd_start(m: Message, state: FSMContext, config: TourOperatorConfig):
-    if not _is_admin(m.from_user.id, config.admins_file):
-        await m.answer("⛔ Нет доступа.")
-        return
     await state.clear()
-    tour = await get_active_tour(config.db_path, m.from_user.id)
-    tour_line = f"\n\n🌍 Активный тур: <b>{tour['name']}</b>" if tour else "\n\n⚠️ Нет тура. Создайте: /newtrip"
-    text = (
-        f"👋 {m.from_user.first_name}!\n\n"
-        "🗺️ <b>Tour Operator CRM</b>\n"
-        "Профессиональный инструмент управления коммерческими турами."
-        f"{tour_line}\n\n"
-        "🎤 Отправьте голосовое → данные добавятся автоматически\n"
-        "🌐 /app — открыть веб-приложение"
-    )
+    if _is_admin(m.from_user.id, config.admins_file):
+        await _grant_owner_access(config.db_path, m.from_user.id)
+        tour = await get_active_tour(config.db_path, m.from_user.id)
+        tour_line = f"\n\n🌍 Активный тур: <b>{tour['name']}</b>" if tour else "\n\n⚠️ Нет тура. Создайте: /newtrip"
+        text = (
+            f"👋 {m.from_user.first_name}!\n\n"
+            "🗺️ <b>Tour Operator CRM</b>\n"
+            "Профессиональный инструмент управления коммерческими турами."
+            f"{tour_line}\n\n"
+            "🎤 Отправьте голосовое → данные добавятся автоматически\n"
+            "🌐 /app — открыть веб-приложение"
+        )
+        kb = main_kb()
+    else:
+        await _grant_client_access(config.db_path, m.from_user.id)
+        text = (
+            f"👋 {m.from_user.first_name}!\n\n"
+            "🗺️ <b>Tour Operator</b>\n"
+            "Здесь можно посмотреть доступные туры и записаться на понравившийся."
+        )
+        kb = client_kb()
     if config.welcome_image.exists():
         await m.answer_photo(FSInputFile(str(config.welcome_image)), caption=text,
-                             parse_mode="HTML", reply_markup=main_kb())
+                             parse_mode="HTML", reply_markup=kb)
     else:
-        await m.answer(text, parse_mode="HTML", reply_markup=main_kb())
+        await m.answer(text, parse_mode="HTML", reply_markup=kb)
 
 @router.message(Command("newtrip"))
 async def cmd_newtrip(m: Message, state: FSMContext, config: TourOperatorConfig):
@@ -827,8 +965,15 @@ async def cmd_lip(m: Message, config: TourOperatorConfig):
     await m.answer("\n".join(lines), parse_mode="HTML")
 
 # ── Inline callbacks ──────────────────────────────────────────────────────────
+# new_tour/tours_list/sw_tour_*/sec_* are owner-only actions — client_kb()
+# never sends these buttons to a non-admin, but the handlers gate on
+# _is_admin() too (defense in depth, same as every /command counterpart
+# above) rather than relying solely on the button being absent.
 @router.callback_query(F.data == "new_tour")
-async def cb_new_tour(cb: CallbackQuery, state: FSMContext):
+async def cb_new_tour(cb: CallbackQuery, state: FSMContext, config: TourOperatorConfig):
+    if not _is_admin(cb.from_user.id, config.admins_file):
+        await cb.answer()
+        return
     await state.set_state(NewTour.name)
     await cb.message.answer("🆕 <b>Новый тур</b>\n\nВведите название:", parse_mode="HTML")
     await cb.answer()
@@ -851,11 +996,17 @@ async def cb_open_app(cb: CallbackQuery, config: TourOperatorConfig):
 
 @router.callback_query(F.data == "tours_list")
 async def cb_tours_list(cb: CallbackQuery, config: TourOperatorConfig):
+    if not _is_admin(cb.from_user.id, config.admins_file):
+        await cb.answer()
+        return
     await cmd_tours(cb.message, config)
     await cb.answer()
 
 @router.callback_query(F.data.startswith("sw_tour_"))
 async def cb_sw_tour(cb: CallbackQuery, config: TourOperatorConfig):
+    if not _is_admin(cb.from_user.id, config.admins_file):
+        await cb.answer()
+        return
     tid = int(cb.data.split("_")[-1])
     await set_active_tour(config.db_path, cb.from_user.id, tid)
     async with aiosqlite.connect(config.db_path) as db:
@@ -865,6 +1016,144 @@ async def cb_sw_tour(cb: CallbackQuery, config: TourOperatorConfig):
     if row:
         await cb.message.edit_text(f"✅ Активный тур: <b>{row['name']}</b>", parse_mode="HTML")
         await cb.answer(f"Тур: {row['name']}")
+
+# ── Client-facing browse/booking flow ────────────────────────────────────────
+# Real external customers (tour_access role 'client'), not staff — see
+# client_kb()/cmd_start above. Deliberately no FSM: booking is a single tap,
+# any phone/notes follow-up happens off-band (owner sees the new guests row
+# and reaches out), matching the "Записаться" one-tap promise in client_kb().
+_BOOKABLE_STATUSES = ("planning", "active")
+
+@router.callback_query(F.data == "client_menu")
+async def cb_client_menu(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await cb.answer()
+    await cb.message.edit_text("🗺️ <b>Tour Operator</b>", parse_mode="HTML", reply_markup=client_kb())
+
+@router.callback_query(F.data == "tours_browse")
+async def cb_tours_browse(cb: CallbackQuery, config: TourOperatorConfig):
+    await cb.answer()
+    async with aiosqlite.connect(config.db_path) as db:
+        db.row_factory = aiosqlite.Row
+        placeholders = ",".join("?" for _ in _BOOKABLE_STATUSES)
+        async with db.execute(
+            f"SELECT id, name, destination FROM tours WHERE status IN ({placeholders}) ORDER BY id DESC LIMIT 30",
+            _BOOKABLE_STATUSES,
+        ) as c:
+            rows = await c.fetchall()
+    if not rows:
+        await cb.message.edit_text(
+            "😔 Сейчас нет доступных туров.", reply_markup=mk([[btn("⬅ Назад", "client_menu")]]),
+        )
+        return
+    rows_kb = [
+        [btn(f"🌍 {r['name']}" + (f" — {r['destination']}" if r["destination"] else ""), f"tour_view:{r['id']}")]
+        for r in rows
+    ]
+    rows_kb.append([btn("⬅ Назад", "client_menu")])
+    await cb.message.edit_text("🌍 <b>Доступные туры</b>", parse_mode="HTML", reply_markup=mk(rows_kb))
+
+@router.callback_query(F.data.startswith("tour_view:"))
+async def cb_tour_view(cb: CallbackQuery, config: TourOperatorConfig):
+    await cb.answer()
+    try:
+        tid = int(cb.data.split(":", 1)[1])
+    except ValueError:
+        return
+    async with aiosqlite.connect(config.db_path) as db:
+        db.row_factory = aiosqlite.Row
+        placeholders = ",".join("?" for _ in _BOOKABLE_STATUSES)
+        async with db.execute(
+            f"SELECT * FROM tours WHERE id=? AND status IN ({placeholders})", (tid, *_BOOKABLE_STATUSES),
+        ) as c:
+            tour = await c.fetchone()
+    if not tour:
+        await cb.message.edit_text(
+            "Этот тур больше недоступен.", reply_markup=mk([[btn("⬅ Назад", "tours_browse")]]),
+        )
+        return
+    text = (
+        f"🌍 <b>{_esc(tour['name'])}</b>\n"
+        f"📍 {_esc(tour['destination']) if tour['destination'] else '—'}\n"
+        f"📅 {tour['date_start'] or '?'} — {tour['date_end'] or '?'}"
+    )
+    kb = mk([[btn("✅ Записаться", f"book_tour:{tid}")], [btn("⬅ Назад", "tours_browse")]])
+    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+
+@router.callback_query(F.data.startswith("book_tour:"))
+async def cb_book_tour(cb: CallbackQuery, config: TourOperatorConfig, bot: Bot):
+    await cb.answer()
+    try:
+        tid = int(cb.data.split(":", 1)[1])
+    except ValueError:
+        return
+    async with aiosqlite.connect(config.db_path) as db:
+        db.row_factory = aiosqlite.Row
+        placeholders = ",".join("?" for _ in _BOOKABLE_STATUSES)
+        tour = await (await db.execute(
+            f"SELECT * FROM tours WHERE id=? AND status IN ({placeholders})", (tid, *_BOOKABLE_STATUSES),
+        )).fetchone()
+        if not tour:
+            await cb.message.edit_text(
+                "Этот тур больше недоступен.", reply_markup=mk([[btn("⬅ Назад", "tours_browse")]]),
+            )
+            return
+        # INSERT OR IGNORE + rowcount, not a check-then-insert SELECT
+        # followed by INSERT: two concurrent taps could otherwise both pass
+        # the SELECT before either INSERT lands. idx_guests_tour_client
+        # (init_db) is what makes the IGNORE path fire on a real duplicate.
+        name = cb.from_user.full_name or cb.from_user.username or str(cb.from_user.id)
+        cur = await db.execute(
+            "INSERT OR IGNORE INTO guests(tour_id,name,client_user_id) VALUES(?,?,?)",
+            (tid, name[:200], cb.from_user.id),
+        )
+        if cur.rowcount == 0:
+            await db.commit()
+            await cb.message.edit_text(
+                "Вы уже записаны на этот тур ✅", reply_markup=mk([[btn("⬅ В меню", "client_menu")]]),
+            )
+            return
+        guest_id = cur.lastrowid
+        await db.commit()
+    await cb.message.edit_text(
+        f"✅ Вы записаны на тур «{_esc(tour['name'])}»! Мы свяжемся с вами для уточнения деталей.",
+        parse_mode="HTML",
+        reply_markup=mk([[btn("📝 Моя бронь", "my_booking")], [btn("⬅ В меню", "client_menu")]]),
+    )
+    admins = _load_admins(config.admins_file)
+    notify = f"📝 Новая запись на тур «{tour['name']}»\n👤 {name}"
+    for admin_id in admins:
+        try:
+            await bot.send_message(int(admin_id), notify)
+        except (TelegramAPIError, ValueError) as e:
+            logger.warning(f"tour_operator: failed to notify admin {admin_id} of booking {guest_id}: {e}")
+
+@router.callback_query(F.data == "my_booking")
+async def cb_my_booking(cb: CallbackQuery, config: TourOperatorConfig):
+    await cb.answer()
+    async with aiosqlite.connect(config.db_path) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT g.*, t.name AS tour_name, t.destination, t.date_start, t.date_end "
+            "FROM guests g JOIN tours t ON t.id = g.tour_id "
+            "WHERE g.client_user_id=? ORDER BY g.created_at DESC",
+            (cb.from_user.id,),
+        ) as c:
+            rows = await c.fetchall()
+    back_kb = mk([[btn("⬅ Назад", "client_menu")]])
+    if not rows:
+        await cb.message.edit_text("У вас пока нет записей. Загляните в «🌍 Доступные туры».", reply_markup=back_kb)
+        return
+    status_labels = {"not_paid": "⏳ Ожидает оплаты", "partial": "🟡 Частично оплачено", "paid": "✅ Оплачено", "refund": "↩️ Возврат"}
+    lines = ["📝 <b>Моя бронь</b>"]
+    for r in rows:
+        lines.append(
+            f"\n🌍 <b>{_esc(r['tour_name'])}</b>"
+            f"\n📍 {_esc(r['destination']) if r['destination'] else '—'}"
+            f"\n📅 {r['date_start'] or '?'} — {r['date_end'] or '?'}"
+            f"\n{status_labels.get(r['status'], r['status'])}"
+        )
+    await cb.message.edit_text("\n".join(lines), parse_mode="HTML", reply_markup=back_kb)
 
 async def _section_summary(sec: str, tour: dict, db_path: str) -> str:
     tid = tour["id"]
@@ -912,6 +1201,9 @@ async def _section_summary(sec: str, tour: dict, db_path: str) -> str:
 
 @router.callback_query(F.data.startswith("sec_"))
 async def cb_section(cb: CallbackQuery, state: FSMContext, config: TourOperatorConfig):
+    if not _is_admin(cb.from_user.id, config.admins_file):
+        await cb.answer()
+        return
     tour = await get_active_tour(config.db_path, cb.from_user.id)
     if not tour:
         await cb.answer("Нет активного тура! /newtrip", show_alert=True)
