@@ -24,6 +24,7 @@ from db.database import (
     create_bot_record_with_admins,
     enable_bot_feature,
     get_bot,
+    get_bot_by_token,
     set_bot_display_name,
     set_bot_miniapp_config,
     set_bot_office_hook_config,
@@ -1307,6 +1308,20 @@ async def handle_token(message: Message, state: FSMContext, bot: Bot):
     token = message.text.strip()
     if ":" not in token or len(token) < 30:
         await message.answer("Не похоже на токен Telegram. Попробуйте ещё раз.")
+        return
+
+    existing = await get_bot_by_token(token)
+    if existing is not None:
+        # A second bot row on the same token would fight the first one over
+        # getUpdates (polling) or silently steal its webhook (Telegram allows
+        # only one per token) — the first bot goes dark with no error
+        # anywhere. Caught here, before create_bot_record_with_admins, since
+        # tokens are Fernet-encrypted at rest and can't be checked with a
+        # plain SQL WHERE (see get_bot_by_token's docstring).
+        await message.answer(
+            f"⚠️ Этот токен уже используется ботом «{existing['name']}» (id={existing['id']}). "
+            "Один токен нельзя привязать к двум ботам — пришлите токен другого бота из @BotFather."
+        )
         return
 
     _pending.pop(message.from_user.id, None)

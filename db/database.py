@@ -624,6 +624,27 @@ async def get_all_bots() -> list[dict]:
             return [_decrypt_row(dict(row)) for row in rows]
 
 
+async def get_bot_by_token(token: str) -> dict | None:
+    """Finds an existing bot already registered with this exact token —
+    tokens are stored Fernet-encrypted (_encrypt_token), which is
+    non-deterministic (random nonce per call), so a plain
+    `WHERE token = ?` against the ciphertext can never match. Decrypts each
+    row's token instead; the bots table is small (factory-scale, not a
+    per-message hot path) so the O(n) scan is fine for this write-time
+    duplicate check. Called before create_bot_record_with_admins on the
+    manual-token-entry path (handlers/create_bot.py's handle_token) — a
+    duplicate token means two DB rows would race for the same Telegram
+    webhook/getUpdates, silently deactivating one of them."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT id, name, username, token FROM bots") as cursor:
+            rows = await cursor.fetchall()
+    for row in rows:
+        if _decrypt_token(row["token"]) == token:
+            return dict(row)
+    return None
+
+
 async def get_bot_by_name(name: str) -> dict | None:
     clean = name.lstrip("@").removesuffix("_bot")
     async with aiosqlite.connect(DB_PATH) as db:
