@@ -25,6 +25,7 @@ auto-enable pattern for voice_intake/cashflow_ledger.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -36,6 +37,7 @@ from aiogram.filters import Command
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import Message
 
+from db.database import add_bot_admin
 from features import channel_monitor
 from features.channel_monitor import kb_start_menu
 
@@ -67,6 +69,8 @@ class ChannelAggregatorConfig:
     bot_name: str
     db_path: str
     admins_file: Path
+    bot_id: int | None = None
+    owner_telegram_id: int | None = None
 
 
 def _paths_for(name: str, data_dir: Path) -> ChannelAggregatorConfig:
@@ -93,6 +97,8 @@ def config_from_bot_row(bot_row: dict, data_dir: Path) -> ChannelAggregatorConfi
         bot_name=bot_row["name"],
         db_path=str(data_dir / f"bot_{bot_id}_data.db"),
         admins_file=data_dir / f"admins_{bot_id}.json",
+        bot_id=bot_id,
+        owner_telegram_id=bot_row.get("owner_telegram_id"),
     )
 
 
@@ -109,6 +115,28 @@ class ConfigMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
         data["config"] = self.config
         return await handler(event, data)
+
+
+# ── admin bootstrap ──────────────────────────────────────────────────────────
+# Security fix: this template's own cmd_start (below) used to never call
+# _save_admins at all — features/channel_monitor.py's _is_bot_admin() (which
+# gates every single handler this template's router reuses, see module
+# docstring) checks config.admins_file, but nothing here ever populated it.
+# The result was the inverse of the usual "first /start becomes admin"
+# hijack bug: the admins file stayed permanently empty, so _is_bot_admin
+# returned False for EVERYONE including the real owner — the monitoring
+# button was visible but functionally dead for the whole bot. _load_admins/
+# _save_admins are intentionally duplicated here rather than imported from
+# features/channel_monitor.py, matching that module's own "no shared
+# coupling" design note on its _load_admins/_is_bot_admin.
+def _load_admins(admins_file: Path) -> set:
+    try:
+        return set(json.loads(admins_file.read_text()).get("ids", []))
+    except Exception:
+        return set()
+
+def _save_admins(admins_file: Path, ids: set) -> None:
+    admins_file.write_text(json.dumps({"ids": list(ids)}, ensure_ascii=False))
 
 
 async def init_db(db_path: str) -> None:
@@ -191,6 +219,21 @@ router = channel_monitor.router
 
 @router.message(Command("start"), F.chat.type == "private")
 async def cmd_start(message: Message, config: ChannelAggregatorConfig):
+    admins = _load_admins(config.admins_file)
+    sender_id = message.from_user.id
+    # Bootstrap: only bots.owner_telegram_id (when known) may claim the
+    # empty-admins slot — same first-comer protection as every other
+    # template's cmd_start (see e.g. templates/shop_catalog.py). In
+    # standalone/env mode (owner_telegram_id unknown) the first /start
+    # sender is the only option available.
+    is_owner = config.owner_telegram_id is not None and sender_id == config.owner_telegram_id
+    if not admins and (is_owner or config.owner_telegram_id is None):
+        _save_admins(config.admins_file, {str(sender_id)})
+        if config.bot_id is not None:
+            try:
+                await add_bot_admin(config.bot_id, str(sender_id))
+            except Exception as e:
+                logger.warning(f"cmd_start: add_bot_admin sync failed for bot {config.bot_id}: {e}")
     await message.answer(START_TEXT, parse_mode="HTML", reply_markup=kb_start_menu())
 
 
