@@ -25,6 +25,8 @@ from aiogram.types import (
     KeyboardButton, Message, ReplyKeyboardMarkup,
 )
 
+from db.database import add_bot_admin, remove_bot_admin
+
 # ── CUSTOMIZE ────────────────────────────────────────────────────────────────
 # Same status as booking_beauty.py's CUSTOMIZE block: per-file source-text
 # customization Claude edits when generating a specific bot, not per-bot
@@ -87,6 +89,8 @@ class BookingMedicalConfig:
     welcome_image: Path
     display_name: str | None = None
     group_chat_id: str | None = None
+    bot_id: int | None = None
+    owner_telegram_id: int | None = None
 
 
 def _paths_for(name: str, data_dir: Path) -> BookingMedicalConfig:
@@ -120,6 +124,8 @@ def config_from_bot_row(bot_row: dict, data_dir: Path) -> BookingMedicalConfig:
     )
     config.display_name = bot_row.get("display_name")
     config.group_chat_id = bot_row.get("group_chat_id")
+    config.bot_id = bot_id
+    config.owner_telegram_id = bot_row.get("owner_telegram_id")
     return config
 
 
@@ -145,6 +151,14 @@ def _load_admins(admins_file: Path) -> set:
 
 def _save_admins(admins_file: Path, ids: set) -> None:
     admins_file.write_text(json.dumps({"ids": list(ids)}, ensure_ascii=False))
+
+def _is_bot_admin(user_id: int, config: "BookingMedicalConfig") -> bool:
+    # The DB-known owner (bots.owner_telegram_id) is always an admin, even if
+    # the local admins_file is empty/stale/hijacked — see cmd_start below for
+    # why the file alone can't be trusted as the sole source of truth.
+    if config.owner_telegram_id is not None and str(user_id) == str(config.owner_telegram_id):
+        return True
+    return str(user_id) in _load_admins(config.admins_file)
 
 
 # ── phone validation (same as booking_beauty.py) ─────────────────────────────
@@ -428,10 +442,24 @@ class BookFlow(StatesGroup):
 @router.message(Command("start"))
 async def cmd_start(message: Message, config: BookingMedicalConfig):
     admins = _load_admins(config.admins_file)
-    first_time_admin = not admins
+    sender_id = message.from_user.id
+    # Bug fixed here: this used to grant admin to whoever sent /start FIRST,
+    # which lets any client who messages the bot before the owner does
+    # permanently seize the admin panel. When bots.owner_telegram_id is known
+    # (webhook/production mode), only that user may claim the empty-admins
+    # bootstrap slot; a non-owner sending /start first now just gets the
+    # regular client menu. In standalone/env mode (owner_telegram_id unknown)
+    # the old first-comer behavior is kept as the only option available.
+    is_owner = config.owner_telegram_id is not None and sender_id == config.owner_telegram_id
+    first_time_admin = not admins and (is_owner or config.owner_telegram_id is None)
     if first_time_admin:
-        _save_admins(config.admins_file, {str(message.from_user.id)})
-    is_admin = str(message.from_user.id) in _load_admins(config.admins_file)
+        _save_admins(config.admins_file, {str(sender_id)})
+        if config.bot_id is not None:
+            try:
+                await add_bot_admin(config.bot_id, str(sender_id))
+            except Exception as e:
+                logger.warning(f"cmd_start: add_bot_admin sync failed for bot {config.bot_id}: {e}")
+    is_admin = _is_bot_admin(sender_id, config)
     kb = kb_admin() if is_admin else kb_main()
     if config.welcome_image.exists():
         await message.answer_photo(FSInputFile(str(config.welcome_image)),
@@ -877,7 +905,7 @@ async def cb_pt_cancel(cb: CallbackQuery, config: BookingMedicalConfig):
 
 @router.message(F.text == "🗂 Все записи")
 async def all_appointments(msg: Message, config: BookingMedicalConfig):
-    if str(msg.from_user.id) not in _load_admins(config.admins_file):
+    if not _is_bot_admin(msg.from_user.id, config):
         await msg.answer("⛔ Нет доступа"); return
     async with aiosqlite.connect(config.db_path) as db:
         rows = await (await db.execute(
@@ -891,7 +919,7 @@ async def all_appointments(msg: Message, config: BookingMedicalConfig):
 
 @router.callback_query(F.data.startswith("adm_day:"))
 async def cb_adm_day(cb: CallbackQuery, config: BookingMedicalConfig):
-    if str(cb.from_user.id) not in _load_admins(config.admins_file):
+    if not _is_bot_admin(cb.from_user.id, config):
         await cb.answer("⛔ Нет доступа", show_alert=True); return
     await cb.answer()
     slot_date = cb.data.split(":", 1)[1]
@@ -928,7 +956,7 @@ async def cb_adm_day(cb: CallbackQuery, config: BookingMedicalConfig):
 
 @router.callback_query(F.data == "adm_day_back")
 async def cb_adm_day_back(cb: CallbackQuery, config: BookingMedicalConfig):
-    if str(cb.from_user.id) not in _load_admins(config.admins_file):
+    if not _is_bot_admin(cb.from_user.id, config):
         await cb.answer("⛔ Нет доступа", show_alert=True); return
     await cb.answer()
     async with aiosqlite.connect(config.db_path) as db:
@@ -945,7 +973,7 @@ async def cb_adm_day_back(cb: CallbackQuery, config: BookingMedicalConfig):
 
 @router.callback_query(F.data.startswith("adm_card:"))
 async def cb_adm_card(cb: CallbackQuery, config: BookingMedicalConfig):
-    if str(cb.from_user.id) not in _load_admins(config.admins_file):
+    if not _is_bot_admin(cb.from_user.id, config):
         await cb.answer("⛔ Нет доступа", show_alert=True); return
     await cb.answer()
     appointment_id = int(cb.data.split(":", 1)[1])
@@ -994,7 +1022,7 @@ async def cb_adm_card(cb: CallbackQuery, config: BookingMedicalConfig):
 
 @router.message(F.text == "📊 Статистика")
 async def admin_stats(msg: Message, config: BookingMedicalConfig):
-    if str(msg.from_user.id) not in _load_admins(config.admins_file):
+    if not _is_bot_admin(msg.from_user.id, config):
         await msg.answer("⛔ Нет доступа"); return
     async with aiosqlite.connect(config.db_path) as db:
         total = (await (await db.execute("SELECT COUNT(*) FROM appointments")).fetchone())[0]
@@ -1021,7 +1049,7 @@ async def admin_stats(msg: Message, config: BookingMedicalConfig):
 
 @router.message(Command("adddoctor"))
 async def cmd_adddoctor(msg: Message, config: BookingMedicalConfig):
-    if str(msg.from_user.id) not in _load_admins(config.admins_file):
+    if not _is_bot_admin(msg.from_user.id, config):
         await msg.answer("⛔ Нет доступа"); return
     parts = msg.text.split(maxsplit=1)
     if len(parts) < 2 or "|" not in parts[1]:
@@ -1042,7 +1070,7 @@ async def cmd_adddoctor(msg: Message, config: BookingMedicalConfig):
 
 @router.message(Command("removedoctor"))
 async def cmd_removedoctor(msg: Message, config: BookingMedicalConfig):
-    if str(msg.from_user.id) not in _load_admins(config.admins_file):
+    if not _is_bot_admin(msg.from_user.id, config):
         await msg.answer("⛔ Нет доступа"); return
     parts = msg.text.split()
     if len(parts) < 2 or not parts[1].isdigit():
@@ -1057,7 +1085,7 @@ async def cmd_removedoctor(msg: Message, config: BookingMedicalConfig):
 
 @router.message(Command("doctors"))
 async def cmd_doctors(msg: Message, config: BookingMedicalConfig):
-    if str(msg.from_user.id) not in _load_admins(config.admins_file):
+    if not _is_bot_admin(msg.from_user.id, config):
         await msg.answer("⛔ Нет доступа"); return
     async with aiosqlite.connect(config.db_path) as db:
         rows = await (await db.execute(
@@ -1076,23 +1104,33 @@ async def cmd_doctors(msg: Message, config: BookingMedicalConfig):
 
 @router.message(Command("addadmin"))
 async def cmd_addadmin(msg: Message, config: BookingMedicalConfig):
-    if str(msg.from_user.id) not in _load_admins(config.admins_file): await msg.answer("⛔ Нет доступа"); return
+    if not _is_bot_admin(msg.from_user.id, config): await msg.answer("⛔ Нет доступа"); return
     parts = msg.text.split()
     if len(parts) < 2 or not parts[1].lstrip("-").isdigit(): await msg.answer("Использование: /addadmin <id>"); return
     ids = _load_admins(config.admins_file); ids.add(parts[1]); _save_admins(config.admins_file, ids)
+    if config.bot_id is not None:
+        try:
+            await add_bot_admin(config.bot_id, parts[1])
+        except Exception as e:
+            logger.warning(f"cmd_addadmin: add_bot_admin sync failed for bot {config.bot_id}: {e}")
     await msg.answer(f"✅ <code>{parts[1]}</code> добавлен.", parse_mode="HTML")
 
 @router.message(Command("removeadmin"))
 async def cmd_removeadmin(msg: Message, config: BookingMedicalConfig):
-    if str(msg.from_user.id) not in _load_admins(config.admins_file): await msg.answer("⛔ Нет доступа"); return
+    if not _is_bot_admin(msg.from_user.id, config): await msg.answer("⛔ Нет доступа"); return
     parts = msg.text.split()
     if len(parts) < 2: await msg.answer("Использование: /removeadmin <id>"); return
     ids = _load_admins(config.admins_file); ids.discard(parts[1]); _save_admins(config.admins_file, ids)
+    if config.bot_id is not None:
+        try:
+            await remove_bot_admin(config.bot_id, parts[1])
+        except Exception as e:
+            logger.warning(f"cmd_removeadmin: remove_bot_admin sync failed for bot {config.bot_id}: {e}")
     await msg.answer(f"✅ <code>{_esc(parts[1])}</code> удалён.", parse_mode="HTML")
 
 @router.message(Command("admins"))
 async def cmd_admins(msg: Message, config: BookingMedicalConfig):
-    if str(msg.from_user.id) not in _load_admins(config.admins_file): await msg.answer("⛔ Нет доступа"); return
+    if not _is_bot_admin(msg.from_user.id, config): await msg.answer("⛔ Нет доступа"); return
     ids = _load_admins(config.admins_file)
     await msg.answer("👥 " + ("\n".join(f"• <code>{i}</code>" for i in ids) or "Пусто"), parse_mode="HTML")
 
