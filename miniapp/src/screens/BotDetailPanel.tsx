@@ -282,6 +282,31 @@ function BackIcon() {
   )
 }
 
+/* The maintenance endpoints answer with a short machine code, not prose (see
+   handlers/manage_bots.py's *_core functions). Rendering that code straight
+   into the panel showed the owner things like "template_backed", which says
+   nothing about what happened or what to do next. */
+const MAINTENANCE_ERRORS: Record<string, string> = {
+  template_backed:
+    'Этот бот работает на общем шаблоне, а не на своей копии кода. Перегенерация и авто-правки для него отключены: они переписали бы сам шаблон, на котором держатся все остальные боты этого типа. Остальные действия работают как обычно.',
+  no_description: 'Описание бота не сохранилось — перегенерировать не из чего. Создайте бота заново через /create.',
+  file_missing: 'Файл с кодом бота не найден на диске.',
+  stale_source: 'Код бота изменился с момента, когда была подготовлена эта правка. Сгенерируйте её заново.',
+  generation_failed: 'Claude не смог сгенерировать код (таймаут или ошибка API). Попробуйте ещё раз.',
+  fix_failed: 'Claude не смог подготовить исправление. Попробуйте ещё раз.',
+  not_found: 'Бот не найден.',
+}
+
+function maintenanceErrorText(code: string | null): string {
+  if (!code) return 'Не удалось выполнить'
+  // start_failed carries the tail of the real traceback after a colon — worth
+  // showing verbatim, it is the only diagnostic the owner gets.
+  if (code.startsWith('start_failed:')) {
+    return `Код обновлён, но бот не запустился: ${code.slice('start_failed:'.length)}`
+  }
+  return MAINTENANCE_ERRORS[code] ?? code
+}
+
 const ACTIVITY_SOURCE_LABELS: Record<BotActivityItem['source'], string> = {
   feedback: 'отзыв',
   office_event: 'офис-событие',
@@ -1168,7 +1193,7 @@ function MaintenanceTab({
     try {
       const result = await fn()
       if (!result.ok) {
-        setActionError(result.error || 'Не удалось выполнить')
+        setActionError(maintenanceErrorText(result.error))
       }
       onChanged()
     } catch (err) {
