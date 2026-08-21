@@ -19,6 +19,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
+from db.database import add_bot_admin
 from features import office_events
 
 # ── CUSTOMIZE ────────────────────────────────────────────────────────────────
@@ -68,6 +69,7 @@ class ManagerBotConfig:
     display_name: str | None = None
     group_chat_id: str | None = None
     bot_id: int | None = None
+    owner_telegram_id: int | None = None
 
 
 def _paths_for(name: str, data_dir: Path) -> ManagerBotConfig:
@@ -97,6 +99,7 @@ def config_from_bot_row(bot_row: dict, data_dir: Path) -> ManagerBotConfig:
     config.display_name = bot_row.get("display_name")
     config.group_chat_id = bot_row.get("group_chat_id")
     config.bot_id = bot_id
+    config.owner_telegram_id = bot_row.get("owner_telegram_id")
     return config
 
 
@@ -136,6 +139,12 @@ def _managers_file(config: ManagerBotConfig) -> str:
 
 
 def _is_manager(user_id: int, config: ManagerBotConfig) -> bool:
+    # The DB-known owner (bots.owner_telegram_id) is always a manager, even
+    # if the local managers file (== admins_file) is empty/stale/hijacked —
+    # see cmd_start below for why the file alone can't be trusted as the
+    # sole source of truth.
+    if config.owner_telegram_id is not None and str(user_id) == str(config.owner_telegram_id):
+        return True
     return str(user_id) in _load_managers(_managers_file(config))
 
 
@@ -264,12 +273,25 @@ def kb_back() -> InlineKeyboardMarkup:
 async def cmd_start(message: Message, state: FSMContext, config: ManagerBotConfig):
     await state.clear()
     managers = _load_managers(_managers_file(config))
-    if not managers:
-        # First-ever /start bootstraps the caller as a manager, same
-        # self-registration convention templates/tour_operator.py's
-        # _is_admin() and templates/event_rsvp.py's cmd_start use.
-        _save_managers(_managers_file(config), {str(message.from_user.id)})
-    elif str(message.from_user.id) not in managers:
+    sender_id = message.from_user.id
+    # Bug fixed here: this used to grant manager (== admin) status to
+    # whoever sent /start FIRST, which lets anyone who messages the bot
+    # before the owner does permanently seize it (manager_bot has no
+    # separate client menu — non-managers just get "Нет доступа"). When
+    # bots.owner_telegram_id is known (webhook/production mode), only that
+    # user may claim the empty-managers bootstrap slot. In standalone/env
+    # mode (owner_telegram_id unknown) the old first-comer behavior is kept
+    # as the only option available.
+    is_owner = config.owner_telegram_id is not None and sender_id == config.owner_telegram_id
+    if not managers and (is_owner or config.owner_telegram_id is None):
+        _save_managers(_managers_file(config), {str(sender_id)})
+        managers = {str(sender_id)}
+        if config.bot_id is not None:
+            try:
+                await add_bot_admin(config.bot_id, str(sender_id))
+            except Exception as e:
+                logger.warning(f"cmd_start: add_bot_admin sync failed for bot {config.bot_id}: {e}")
+    if not _is_manager(sender_id, config):
         await message.answer("⛔ Нет доступа.")
         return
     if config.welcome_image.exists():
