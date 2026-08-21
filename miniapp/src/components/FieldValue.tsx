@@ -15,6 +15,11 @@ import { isLinkValue } from '../lib/displaySchema'
 // "<resource>:<id>" — built by whoever already fetched the referenced list.
 export type RefLabels = Record<string, string>
 
+// Telegram's username rules, mirroring services/client_link.py's USERNAME_RE
+// — a contact stored in this exact shape is one the backend recognized as a
+// handle, so it is safe to offer as a t.me link.
+const TELEGRAM_HANDLE_RE = /^[a-z0-9_]{5,32}$/i
+
 export function refLabelKey(resource: string, id: unknown): string {
   return `${resource}:${String(id)}`
 }
@@ -49,19 +54,23 @@ export function FieldValue({
     )
   }
 
-  if (field.kind === 'username') {
-    // Stored bare and lowercase; the "@" goes back on for display, and the
-    // link opens the person's Telegram profile.
-    return (
-      <a
-        className="field-value-link"
-        href={`https://t.me/${text}`}
-        target="_blank"
-        rel="noopener noreferrer"
-      >
-        @{text}
-      </a>
-    )
+  if (field.kind === 'contact') {
+    // A contact is free text. Only when it is actually a Telegram handle
+    // (the same shape the backend normalized it to) does it become a link —
+    // a phone number or a name renders as-is.
+    if (TELEGRAM_HANDLE_RE.test(text)) {
+      return (
+        <a
+          className="field-value-link"
+          href={`https://t.me/${text}`}
+          target="_blank"
+          rel="noopener noreferrer"
+        >
+          @{text}
+        </a>
+      )
+    }
+    return <span>{text}</span>
   }
 
   if (field.kind === 'file') {

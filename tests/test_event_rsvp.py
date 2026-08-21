@@ -430,7 +430,7 @@ class EventRsvpMiniAppConfigTests(unittest.IsolatedAsyncioTestCase):
         field_names = {f["name"] for f in rsvps["fields"]}
         self.assertEqual(
             field_names,
-            {"client_user_id", "client_username", "client_name", "client_phone", "guests_count", "status", "created_at"},
+            {"client_user_id", "client_contact", "client_name", "client_phone", "guests_count", "status", "created_at"},
         )
 
     async def test_miniapp_config_fields_match_real_schema(self):

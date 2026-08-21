@@ -25,7 +25,7 @@ from aiogram.types import (
     KeyboardButton, Message, ReplyKeyboardMarkup,
 )
 
-from services.client_link import ensure_username_column, link_pending_by_username
+from services.client_link import ensure_contact_column, link_pending_by_username
 from db.database import add_bot_admin, remove_bot_admin
 
 # ── CUSTOMIZE ────────────────────────────────────────────────────────────────
@@ -338,11 +338,13 @@ miniapp_config = {
             "titleField": "plan_name",
             "fields": [
                 {"name": "user_id", "required": False, "label": "ID клиента", "kind": "number", "list": True, "detail": True, "create": False},
-                # The admin knows the customer by @handle, never by numeric id.
-                # Stored alongside user_id (which stays the notification
-                # target) and matched to a real id on first contact — see
-                # services/client_link.py.
-                {"name": "client_username", "label": "Клиент (@username)", "kind": "username", "list": True, "detail": True, "create": True},
+                # Who this record is about, however the admin knows them:
+                # @username, a name, or a phone. Required — a customer record
+                # with nothing identifying the customer is useless.
+                # Stored alongside the numeric id column (which stays the
+                # notification target); auto-links to a real id only when the
+                # contact IS a username — see services/client_link.py.
+                {"name": "client_contact", "required": True, "label": "Контакт клиента", "kind": "contact", "list": True, "detail": True, "create": True},
                 {"name": "plan_name", "required": True, "label": "Тариф", "kind": "text", "list": True, "detail": True, "create": True},
                 {"name": "total_visits", "required": True, "label": "Всего посещений", "kind": "number", "list": False, "detail": True, "create": True},
                 {"name": "visits_left", "required": True, "label": "Осталось посещений", "kind": "number", "list": True, "detail": True, "create": True},
@@ -509,7 +511,7 @@ async def init_db(db_path: str):
             )
         """)
         await db.execute("INSERT OR IGNORE INTO bot_settings (id) VALUES (1)")
-        await ensure_username_column(db, "subscriptions")
+        await ensure_contact_column(db, "subscriptions")
         await db.commit()
     await _ensure_group_sessions(db_path)
     await _ensure_individual_slots(db_path)

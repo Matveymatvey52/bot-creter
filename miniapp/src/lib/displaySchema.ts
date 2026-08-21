@@ -16,7 +16,8 @@ import type { SchemaChild, SchemaField, SchemaRef, SchemaResource } from './api'
 export interface FieldDisplay {
   name: string
   label: string
-  kind: 'text' | 'number' | 'date' | 'status' | 'link' | 'file' | 'username'
+  required: boolean
+  kind: 'text' | 'number' | 'date' | 'status' | 'link' | 'file' | 'contact'
   ref?: SchemaRef
 }
 
@@ -49,6 +50,7 @@ function normalizeField(field: SchemaField): FieldDisplay {
   return {
     name: field.name,
     label: field.label ?? humanizeFieldName(field.name),
+    required: field.required === true,
     kind: field.kind ?? 'text',
     ref: field.ref,
   }

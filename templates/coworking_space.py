@@ -21,7 +21,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-from services.client_link import ensure_username_column, link_pending_by_username
+from services.client_link import ensure_contact_column, link_pending_by_username
 from db.database import add_bot_admin, remove_bot_admin
 
 # ── DESIGN NOTE ────────────────────────────────────────────────────────────
@@ -282,7 +282,7 @@ async def init_db(db_path: str):
         await db.execute("CREATE INDEX IF NOT EXISTS idx_bookings_client ON bookings(client_user_id)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_guest_booking ON guest_registrations(booking_id)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_service_status ON service_requests(status)")
-        await ensure_username_column(db, "bookings")
+        await ensure_contact_column(db, "bookings")
         await db.commit()
 
 
@@ -325,11 +325,13 @@ miniapp_config = {
             "fields": [
                 {"name": "resource_id", "required": True, "label": "Ресурс", "kind": "number", "list": False, "detail": False, "create": True, "ref": {"resource": "resources", "labelField": "name"}},
                 {"name": "client_user_id", "required": False, "label": "ID клиента", "kind": "number", "list": False, "detail": False, "create": False},
-                # The admin knows the customer by @handle, never by numeric id.
-                # Stored alongside client_user_id (which stays the notification
-                # target) and matched to a real id on first contact — see
-                # services/client_link.py.
-                {"name": "client_username", "label": "Клиент (@username)", "kind": "username", "list": True, "detail": True, "create": True},
+                # Who this record is about, however the admin knows them:
+                # @username, a name, or a phone. Required — a customer record
+                # with nothing identifying the customer is useless.
+                # Stored alongside the numeric id column (which stays the
+                # notification target); auto-links to a real id only when the
+                # contact IS a username — see services/client_link.py.
+                {"name": "client_contact", "required": True, "label": "Контакт клиента", "kind": "contact", "list": True, "detail": True, "create": True},
                 {"name": "client_name", "label": "Имя клиента", "kind": "text", "list": True, "detail": True, "create": True},
                 {"name": "booking_date", "required": True, "label": "Дата", "kind": "date", "list": True, "detail": True, "create": True},
                 {"name": "time_slot_start", "required": True, "label": "Начало", "kind": "text", "list": True, "detail": True, "create": True},

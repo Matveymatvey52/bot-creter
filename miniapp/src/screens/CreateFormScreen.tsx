@@ -43,7 +43,12 @@ export function CreateFormScreen({
     }
   }, [resource])
 
-  const requiredFilled = resource.createFields.every((f) => f.name !== 'name' || values.name?.trim())
+  // Gates on the schema's own `required` flags — this used to hardcode a
+  // single "name" field, so a resource whose required field was called
+  // anything else let the user submit an empty form and get a 400 back.
+  const requiredFilled = resource.createFields.every(
+    (f) => !f.required || (values[f.name] ?? '').trim() !== '',
+  )
 
   const handleSubmit = useCallback(async () => {
     if (submitting) return
@@ -131,26 +136,21 @@ function FormInput({
     )
   }
 
-  if (field.kind === 'username') {
-    // The "@" is decoration, not part of the value — the backend strips and
-    // lowercases whatever arrives (services/client_link.py), so typing it or
-    // not both work; showing it just makes the expected format obvious.
+  if (field.kind === 'contact') {
+    // Free text on purpose: whatever the admin actually knows about this
+    // person. Only an "@…" entry is held to Telegram's username rules by the
+    // backend — a name or a phone is a perfectly good contact.
     return (
-      <div className="input-prefixed">
-        <span className="input-prefix" aria-hidden="true">
-          @
-        </span>
-        <input
-          id={field.name}
-          type="text"
-          autoCapitalize="none"
-          autoCorrect="off"
-          spellCheck={false}
-          placeholder="username"
-          value={value}
-          onChange={(e) => onChange(e.target.value)}
-        />
-      </div>
+      <input
+        id={field.name}
+        type="text"
+        autoCapitalize="none"
+        autoCorrect="off"
+        spellCheck={false}
+        placeholder="@username, имя или телефон"
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+      />
     )
   }
 

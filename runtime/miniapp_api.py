@@ -55,9 +55,9 @@ from db.database import (
     get_bot_office_hook_config,
 )
 from features.excel_export import MAX_FILE_SIZE, build_workbook, fetch_export_rows
-from services.client_link import normalize_username
 from features.sales_analytics import Period, compute_metrics
 from runtime.registry import FACTORY_BOT_ID, Registry, _load_template_module_async
+from services.client_link import ContactFormatError, parse_contact
 
 logger = logging.getLogger(__name__)
 
@@ -772,21 +772,32 @@ async def create_resource_handler(request: web.Request) -> web.Response:
     if not values:
         return web.json_response({"error": "no valid fields in payload"}, status=400)
 
-    # A "username" field identifies a person the admin knows only by @handle.
-    # Normalized here (bare + lowercase) so the row can be matched against an
-    # incoming update's from_user later, and rejected outright when malformed
-    # — a typo'd handle would otherwise produce a record that can never link
-    # to anybody. See services/client_link.py for the full linking story.
+    # A "contact" field identifies the person a record is about, however the
+    # admin actually knows them: "@ivanov", "Иван Петров", "+7 999 123-45-67".
+    # Only @-prefixed input is held to Telegram's username rules — a phone or
+    # a name is a perfectly good contact and must not be rejected for failing
+    # rules that were never meant to apply to it. A contact that IS a username
+    # is normalized (bare + lowercase) so an incoming update can be matched
+    # against it later. See services/client_link.py for the whole rule.
     for field in resource["fields"]:
-        if field.get("kind") != "username" or field["name"] not in values:
+        if field.get("kind") != "contact" or field["name"] not in values:
             continue
-        handle = normalize_username(values[field["name"]])
-        if handle is None:
+        label = field.get("label", field["name"])
+        try:
+            contact = parse_contact(values[field["name"]])
+        except ContactFormatError:
             return web.json_response(
-                {"error": f"{field.get('label', field['name'])}: неверный формат username"},
+                {"error": f"{label}: «@…» должен быть корректным Telegram-username"},
                 status=400,
             )
-        values[field["name"]] = handle
+        if contact is None:
+            # Reaches here only for a blank string, which the required-field
+            # check above can't catch (the key IS present, it's just empty).
+            if field.get("required", False):
+                return web.json_response({"error": f"{label}: обязательное поле"}, status=400)
+            del values[field["name"]]
+            continue
+        values[field["name"]] = contact.value
 
     db_path = entry.config.get("db_path") if isinstance(entry.config, dict) else None
     if not db_path:
