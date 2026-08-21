@@ -270,6 +270,28 @@ class FactoryAnalyticsApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ledger_item["state"], "off")
         self.assertFalse(ledger_item["no_free_text"])
 
+    async def test_bot_detail_running_matches_list_for_webhook_served_bot(self):
+        """A bot with status="running" in the DB but no locally-spawned polling
+        subprocess (the normal case for webhook-served bots on Railway — see
+        main.py's restore_bots, which never spawns a subprocess for those)
+        must report running=True here, matching what list_bots_handler's
+        FactoryBotItem.status already implies via isBotActive() on the
+        frontend (FactoryDashboardScreen.tsx / OwnerRegistryScreen.tsx).
+        Regression test for the detail panel showing "На паузе" for a bot the
+        list showed as "Активен"."""
+        await db_module.update_bot_status(self.bot_id, "running")
+        qs = await self._owner_qs()
+        with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):
+            list_resp = await self.client.get(f"/api/factory/bots?{qs}")
+            detail_resp = await self.client.get(f"/api/factory/bots/{self.bot_id}?{qs}")
+        self.assertEqual(list_resp.status, 200)
+        self.assertEqual(detail_resp.status, 200)
+        list_body = await list_resp.json()
+        detail_body = await detail_resp.json()
+        list_item = next(i for i in list_body["items"] if i["id"] == self.bot_id)
+        self.assertEqual(list_item["status"], "running")
+        self.assertTrue(detail_body["running"])
+
     async def test_bot_detail_unknown_bot_returns_404(self):
         qs = await self._owner_qs()
         with patch.dict(os.environ, {"MINIAPP_SECRET": "s3cret"}):

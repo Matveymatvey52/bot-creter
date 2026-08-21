@@ -275,7 +275,7 @@ export function FactoryDashboardScreen() {
               <span className="bot-card-icon">{iconForTemplate(bot.template)}</span>
               <span className="bot-card-id">
                 <span className="bot-card-name">{bot.display_name || bot.name}</span>
-                {bot.template && <span className="bot-card-template">{bot.template}</span>}
+                {bot.template && <span className="bot-card-template">⚙ {bot.template}</span>}
               </span>
               <span className={`status-pill ${active ? 'status-pill-active' : 'status-pill-paused'}`}>
                 {active ? (

@@ -186,7 +186,7 @@ export function BotDetailPanel({
           <span className="bot-card-id">
             <span className="bot-card-name">{detail.display_name || detail.name}</span>
             <span className="bot-card-template">
-              {detail.template || 'from-scratch'}
+              ⚙ {detail.template || 'from-scratch'}
               {detail.username ? ` · @${detail.username}` : ''}
             </span>
           </span>

@@ -650,7 +650,17 @@ async def bot_detail_handler(request: web.Request) -> web.Response:
             "username": b.get("username"),
             "display_name": b.get("display_name"),
             "status": b.get("status"),
-            "running": is_running(bot_id),
+            # "running" must agree with the list screen's isBotActive(bot.status)
+            # (FactoryDashboardScreen.tsx / OwnerRegistryScreen.tsx), which reads
+            # the DB status column. is_running() alone is NOT a valid stand-in:
+            # it only tracks polling subprocesses this server process spawned
+            # (services/bot_runner._processes), so it's always False for
+            # webhook-served bots (the normal Railway deployment — see main.py's
+            # restore_bots, which deliberately never spawns a subprocess for
+            # those) even though they're live and dispatching via the registry.
+            # Using it here made the detail panel wrongly show "На паузе" for
+            # bots the list correctly showed as "Активен".
+            "running": b.get("status") == "running" or is_running(bot_id),
             "template": template_id,
             "created_at": b.get("created_at"),
             "creation_prompt": b.get("creation_prompt"),
