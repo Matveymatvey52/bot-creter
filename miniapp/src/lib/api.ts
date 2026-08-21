@@ -95,11 +95,42 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
 
 export interface ResourceItem {
   id: number
+  // The name of the row's parent, resolved server-side. Present only on
+  // scoped resources; null when the row has no parent, which the screen
+  // shows as its own "Не привязано" group rather than guessing an owner.
+  parent_label?: string | null
   [key: string]: unknown
 }
 
-export function listResource(resource: string): Promise<{ resource: string; items: ResourceItem[] }> {
-  return request(`/${resource}`)
+// What a scoped list came back scoped BY. Absent on a global resource — the
+// engine omits the whole block rather than sending an empty one, so there is
+// no shape here that could tempt a screen into rendering a parent for a
+// resource that has none (runtime/miniapp_api.py, resource_scope).
+export interface ListScope {
+  parent: string
+  via: string
+  parentTitle: string
+  // null in summary mode: every parent's rows at once, told apart by each
+  // row's own parent_label.
+  parentId: string | null
+  // Every parent this section could switch to, resolved server-side. The
+  // client never has to know which column carries a parent's name — that
+  // knowledge lives in the scope declaration and stays there.
+  options: Array<{ id: string; label: string }>
+}
+
+// `parent` selects one parent's rows; PARENT_ALL asks for every parent at
+// once and PARENT_NONE for the rows that belong to none. Passing it for a
+// global resource is refused by the backend with a 400 rather than ignored.
+export const PARENT_ALL = 'all'
+export const PARENT_NONE = 'none'
+
+export function listResource(
+  resource: string,
+  parent?: string | null,
+): Promise<{ resource: string; items: ResourceItem[]; scope?: ListScope }> {
+  const query = parent == null ? '' : `?parent=${encodeURIComponent(parent)}`
+  return request(`/${resource}${query}`)
 }
 
 // Sub-records the backend joined onto a detail response — a record's own
@@ -180,6 +211,9 @@ export interface SchemaResource {
   totals?: SchemaTotal[]
   addLabel?: string
   children?: SchemaChild[]
+  // Declared by the template, echoed here so the screen knows whether this
+  // resource has a parent at all before it fetches anything.
+  scope?: { type: 'scoped'; parent: string; via: string } | { type: 'global' }
   fields: SchemaField[]
 }
 
