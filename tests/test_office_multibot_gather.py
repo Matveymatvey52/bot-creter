@@ -33,6 +33,10 @@ def _message() -> MagicMock:
     message = MagicMock()
     message.from_user.id = USER_ID
     message.answer = AsyncMock(return_value=MagicMock(delete=AsyncMock()))
+    # _process_gathering_content routes its Claude-call response through
+    # message.bot.send_message (not message.answer) so the same code path can
+    # be re-entered from a callback's retry button — see cb_retry_gather.
+    message.bot.send_message = AsyncMock(return_value=MagicMock(delete=AsyncMock()))
     return message
 
 
@@ -92,8 +96,8 @@ class ProcessGatheringContentOfficeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(data["office_bots"]), 2)
         self.assertEqual(data["office_index"], 0)
         self.assertEqual(data["bot_summary"], "orders bot")
-        final_call = message.answer.await_args_list[-1]
-        self.assertIn("офис из 2 ботов", final_call.args[0])
+        final_call = message.bot.send_message.await_args_list[-1]
+        self.assertIn("офис из 2 ботов", final_call.args[1])
 
 
 class ContinueOfficeQueueTests(unittest.IsolatedAsyncioTestCase):

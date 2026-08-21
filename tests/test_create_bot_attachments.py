@@ -45,6 +45,10 @@ def _message(**overrides) -> MagicMock:
     message = MagicMock()
     message.from_user.id = USER_ID
     message.answer = AsyncMock(return_value=MagicMock(delete=AsyncMock()))
+    # _process_gathering_content routes its Claude-call response through
+    # message.bot.send_message (not message.answer) so the same code path can
+    # be re-entered from a callback's retry button — see cb_retry_gather.
+    message.bot.send_message = AsyncMock(return_value=MagicMock(delete=AsyncMock()))
     for k, v in overrides.items():
         setattr(message, k, v)
     return message
@@ -191,8 +195,8 @@ class ProcessGatheringContentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(data["bot_name"], "reminders_bot")
         self.assertIn("A reminders bot", data["bot_summary"])
 
-        final_call = message.answer.await_args_list[-1]
-        self.assertIn("Я готов создавать бота", final_call.args[0])
+        final_call = message.bot.send_message.await_args_list[-1]
+        self.assertIn("Я готов создавать бота", final_call.args[1])
         self.assertIn("reply_markup", final_call.kwargs)
 
     async def test_no_op_when_no_text_and_no_pending_attachments(self):
@@ -204,7 +208,7 @@ class ProcessGatheringContentTests(unittest.IsolatedAsyncioTestCase):
             await create_bot_module._process_gathering_content(message, state, None)
 
         mock_chat.assert_not_awaited()
-        message.answer.assert_not_awaited()
+        message.bot.send_message.assert_not_awaited()
 
 
 class ConfirmingStateTests(unittest.IsolatedAsyncioTestCase):
@@ -236,6 +240,7 @@ class ConfirmingStateTests(unittest.IsolatedAsyncioTestCase):
         callback.from_user.id = USER_ID
         callback.answer = AsyncMock()
         callback.message.answer = AsyncMock(return_value=MagicMock(delete=AsyncMock()))
+        callback.message.bot.send_message = AsyncMock(return_value=MagicMock(delete=AsyncMock()))
 
         with patch.object(create_bot_module, "chat_gather_requirements", AsyncMock(return_value="What's this for?")):
             await create_bot_module.cb_gathering_continue(callback, state)

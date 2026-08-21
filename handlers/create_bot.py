@@ -446,7 +446,21 @@ async def _recognize_voice(message: Message, bot: Bot) -> str | None:
     try:
         file = await bot.get_file(message.voice.file_id)
         await bot.download_file(file.file_path, destination=tmp_path)
-        text = await transcribe_voice(tmp_path)
+        # transcribe_voice runs AssemblyAI's synchronous SDK (its own internal
+        # polling, no timeout of its own) in a default-executor thread — a
+        # stalled poll would otherwise hang this handler (and leak the
+        # executor thread) forever. The wait_for gives the *caller* a bound;
+        # the leaked thread itself is a separate, harder fix (SDK has no
+        # cancellation hook), out of scope here.
+        text = await asyncio.wait_for(transcribe_voice(tmp_path), timeout=120.0)
+    except asyncio.TimeoutError:
+        logger.error("Voice transcription timed out after 120s")
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+        await message.answer("Не удалось распознать голосовое (слишком долго) 😔 Попробуйте текстом.")
+        return None
     except Exception as e:
         logger.error(f"Voice transcription failed: {e}")
         try:
@@ -632,10 +646,57 @@ async def _process_gathering_content(message: Message, state: FSMContext, text: 
         return
 
     conversation.append({"role": "user", "content": blocks})
-    await state.update_data(pending_attachments=[])
+    # Persisted BEFORE the Claude call (not just on success) so a failed call
+    # can be retried from state without re-sending the user's message — same
+    # reasoning as _run_generation storing bot_summary/bot_name ahead of its
+    # own asyncio.wait_for call.
+    await state.update_data(pending_attachments=[], conversation=conversation)
 
-    analyzing_msg = await message.answer("Анализирую... ⏳")
-    response = await chat_gather_requirements(conversation)
+    await _call_gather_requirements(message.bot, message.chat.id, state)
+
+
+async def _call_gather_requirements(bot: Bot, chat_id: int, state: FSMContext) -> None:
+    """Calls chat_gather_requirements on the conversation already persisted in
+    state and routes the result, same asyncio.wait_for + try/except + retry
+    button shape as _run_generation's generate_bot_code call — this was
+    previously the one Claude call in the /create flow with no error handling
+    at all, leaving the FSM stuck in `gathering` on any API failure."""
+    data = await state.get_data()
+    conversation: list[dict] = data.get("conversation", [])
+
+    analyzing_msg = await bot.send_message(chat_id, "Анализирую... ⏳")
+    try:
+        response = await asyncio.wait_for(chat_gather_requirements(conversation), timeout=120.0)
+    except asyncio.TimeoutError:
+        logger.error("chat_gather_requirements timed out after 120s")
+        try:
+            await analyzing_msg.delete()
+        except Exception:
+            pass
+        await bot.send_message(
+            chat_id,
+            "⏱ Не получилось обработать сообщение (слишком долго). Попробуй ещё раз.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="🔄 Попробовать снова", callback_data="retry_gather")
+            ]]),
+        )
+        return
+    except Exception as e:
+        logger.error(f"chat_gather_requirements failed: {type(e).__name__}: {e}")
+        try:
+            await analyzing_msg.delete()
+        except Exception:
+            pass
+        await bot.send_message(
+            chat_id,
+            f"⚠️ Не удалось обработать сообщение ({type(e).__name__}).\n\n"
+            "Нажми кнопку чтобы попробовать снова.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="🔄 Попробовать снова", callback_data="retry_gather")
+            ]]),
+        )
+        return
+
     conversation.append({"role": "assistant", "content": response})
     try:
         await analyzing_msg.delete()
@@ -648,7 +709,7 @@ async def _process_gathering_content(message: Message, state: FSMContext, text: 
         plan = parse_gather_result(raw_payload)
         if plan is None:
             await state.update_data(conversation=conversation)
-            await message.answer(response)
+            await bot.send_message(chat_id, response)
             return
 
         office_bots = plan["bots"]
@@ -676,21 +737,33 @@ async def _process_gathering_content(message: Message, state: FSMContext, text: 
                 for link in office_links
             ]
             links_note = f"\n🔗 Свяжу их через: {', '.join(link_descriptions)}" if link_descriptions else ""
-            await message.answer(
+            await bot.send_message(
+                chat_id,
                 f"Я готов создавать офис из {len(office_bots)} ботов: {roles}.{links_note}\n\n"
                 f"Начнём с первого («{office_bots[0]['role_hint']}»). Вам есть ещё что добавить "
                 "по всему офису: какие-нибудь детали, нюансы, пожелания?🤗",
                 reply_markup=_confirm_keyboard(),
             )
         else:
-            await message.answer(
+            await bot.send_message(
+                chat_id,
                 "Я готов создавать бота по вашему запросу. Вам есть ещё что добавить: "
                 "какие-нибудь детали, нюансы, пожелания?🤗",
                 reply_markup=_confirm_keyboard(),
             )
     else:
         await state.update_data(conversation=conversation)
-        await message.answer(response)
+        await bot.send_message(chat_id, response)
+
+
+@router.callback_query(F.data == "retry_gather")
+async def cb_retry_gather(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+    await _call_gather_requirements(callback.bot, callback.message.chat.id, state)
 
 
 def _office_progress_prefix(data: dict) -> str:
