@@ -561,7 +561,7 @@ class CoworkingSpaceMiniAppConfigTests(unittest.IsolatedAsyncioTestCase):
         field_names = {f["name"] for f in bookings["fields"]}
         self.assertEqual(
             field_names,
-            {"resource_id", "client_user_id", "client_name", "booking_date",
+            {"resource_id", "client_user_id", "client_contact", "client_name", "booking_date",
              "time_slot_start", "time_slot_end", "tariff", "status"},
         )
 

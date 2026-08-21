@@ -217,7 +217,7 @@ miniapp_config = {
             "title": "Операции",
             "titleField": "category",
             "fields": [
-                {"name": "project_id", "required": True, "label": "ID проекта", "kind": "number", "list": False, "detail": True, "create": True},
+                {"name": "project_id", "required": True, "label": "Проект", "kind": "number", "list": False, "detail": True, "create": True, "ref": {"resource": "projects", "labelField": "name"}},
                 {"name": "kind", "required": True, "label": "Тип", "kind": "status", "list": True, "detail": True, "create": True},
                 {"name": "amount", "required": True, "label": "Сумма", "kind": "number", "list": True, "detail": True, "create": True},
                 {"name": "currency", "label": "Валюта", "kind": "text", "list": False, "detail": True, "create": False},

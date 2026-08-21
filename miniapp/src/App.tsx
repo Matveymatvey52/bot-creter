@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import './components/ui.css'
-import { getSchema, listResource, ApiError, type SchemaBot } from './lib/api'
+import { getSchema, getFeatures, listResource, ApiError, type SchemaBot } from './lib/api'
 import { AppHeader } from './components/AppHeader'
 import { normalizeResources, type ResourceDisplay } from './lib/displaySchema'
 import { getTelegramWebApp } from './lib/telegram'
@@ -61,8 +61,16 @@ export default function App() {
 // the schema fetch below — bot_id=0 has no miniapp_config/GET /schema route
 // (see runtime/miniapp_api.py's serve_app_shell docstring on the same
 // special-case), so nothing here should even try.
+// Sections beyond the bot's own resources are opt-in: each is listed here
+// with the feature that must be enabled for the bot before it appears in the
+// navigation at all. Analytics used to be an unconditional tab on every bot,
+// which put a cross-customer sales screen in front of every client of every
+// template whether or not the owner ever asked for one.
+const ANALYTICS_FEATURE = 'sales_analytics'
+
 function TenantApp() {
   const [resources, setResources] = useState<Record<string, ResourceDisplay> | null>(null)
+  const [features, setFeatures] = useState<string[]>([])
   const [error, setError] = useState<string | null>(null)
   const [route, setRoute] = useState<Route | null>(null)
   // Счётчик записей под названием раздела в ленте (вариант I). Схема их не
@@ -73,6 +81,20 @@ function TenantApp() {
   // Кто этот бот — для шапки (вариант I). Приходит тем же /schema,
   // отдельного запроса не нужно.
   const [bot, setBot] = useState<SchemaBot | null>(null)
+
+  useEffect(() => {
+    let cancelled = false
+    getFeatures()
+      .then((data) => {
+        if (!cancelled) setFeatures(data.features)
+      })
+      // A failed feature lookup means "no optional sections", never a broken
+      // app — the resource tabs below don't depend on it.
+      .catch(() => undefined)
+    return () => {
+      cancelled = true
+    }
+  }, [])
 
   useEffect(() => {
     let cancelled = false
@@ -136,6 +158,11 @@ function TenantApp() {
 
   const activeResource = route.kind === 'analytics' ? null : route.resource
 
+  // «Аналитика» показывается, только если владелец реально подключил фичу
+  // этому боту. analytics_handler по-прежнему сам решает, кому отдавать
+  // данные (только владельцу) — здесь решается лишь навигация.
+  const analyticsEnabled = features.includes(ANALYTICS_FEATURE)
+
   return (
     <>
       <AppHeader bot={bot} />
@@ -158,20 +185,16 @@ function TenantApp() {
               </div>
             </button>
           ))}
-          {/* Always rendered — analytics_handler is the one that decides per-
-              bot/per-viewer availability (owner-only, needs office_hook_config);
-              AnalyticsScreen renders nothing (returns null) when it 403s/404s,
-              so a non-owner or unsupported bot just sees an inert tab that
-              opens an empty screen rather than a tab that's conspicuously
-              missing (which would itself leak "you're not the owner"). */}
-          <button
-            className={`sol-lane-item${route.kind === 'analytics' ? ' is-on' : ''}`}
-            onClick={() => setRoute({ kind: 'analytics' })}
-          >
-            <Icon name="chart" size={17} />
-            <div className="sol-lane-name">Аналитика</div>
-            <div className="sol-lane-count">&nbsp;</div>
-          </button>
+          {analyticsEnabled && (
+            <button
+              className={`sol-lane-item${route.kind === 'analytics' ? ' is-on' : ''}`}
+              onClick={() => setRoute({ kind: 'analytics' })}
+            >
+              <Icon name="chart" size={17} />
+              <div className="sol-lane-name">Аналитика</div>
+              <div className="sol-lane-count">&nbsp;</div>
+            </button>
+          )}
         </div>
       )}
 
@@ -186,12 +209,16 @@ function TenantApp() {
       {route.kind === 'detail' && (
         <DetailScreen
           resource={resources[route.resource]}
+          resources={resources}
           itemId={route.itemId}
           onBack={() => setRoute({ kind: 'list', resource: route.resource })}
         />
       )}
 
-      {route.kind === 'create' && (
+      {/* Second half of the read-only rule: even if a create route is reached
+          some other way, a resource this viewer cannot write never renders a
+          form. The list screen already hides the button that leads here. */}
+      {route.kind === 'create' && resources[route.resource].canCreate && (
         <CreateFormScreen
           resource={resources[route.resource]}
           onCreated={(itemId) => setRoute({ kind: 'detail', resource: route.resource, itemId })}
@@ -213,13 +240,15 @@ function TenantApp() {
               <span>{resources[name].title}</span>
             </button>
           ))}
-          <button
-            className={`sol-nv${route.kind === 'analytics' ? ' is-on' : ''}`}
-            onClick={() => setRoute({ kind: 'analytics' })}
-          >
-            <Icon name="chart" size={18} />
-            <span>Аналитика</span>
-          </button>
+          {analyticsEnabled && (
+            <button
+              className={`sol-nv${route.kind === 'analytics' ? ' is-on' : ''}`}
+              onClick={() => setRoute({ kind: 'analytics' })}
+            >
+              <Icon name="chart" size={18} />
+              <span>Аналитика</span>
+            </button>
+          )}
         </nav>
       )}
     </>

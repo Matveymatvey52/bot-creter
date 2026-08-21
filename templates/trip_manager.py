@@ -76,7 +76,7 @@ miniapp_config = {
             "title": "Элементы поездки",
             "titleField": "title",
             "fields": [
-                {"name": "trip_id", "required": True, "label": "ID поездки", "kind": "number", "list": False, "detail": True, "create": True},
+                {"name": "trip_id", "required": True, "label": "Поездка", "kind": "number", "list": False, "detail": True, "create": True, "ref": {"resource": "trips", "labelField": "name"}},
                 {"name": "item_type", "label": "Тип", "kind": "text", "list": True, "detail": True, "create": True},
                 {"name": "title", "required": True, "label": "Название", "kind": "text", "list": True, "detail": True, "create": True},
                 {"name": "destination", "label": "Куда", "kind": "text", "list": False, "detail": True, "create": True},

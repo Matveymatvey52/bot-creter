@@ -129,7 +129,6 @@
   gap: 16px;
   padding: 16px;
   padding-bottom: calc(16px + env(safe-area-inset-bottom, 0px));
-  max-width: 600px;
   margin: 0 auto;
   width: 100%;
 }
@@ -1506,4 +1505,108 @@
   .screen > .sol-top,
   .screen > .sol-nav { grid-column: 1 / -1; }
   .sol-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 12px; }
+}
+/* ── Data table ───────────────────────────────────────────────────────────
+   The wrapper is what scrolls when a table is wider than the viewport, so a
+   wide table never makes the PAGE scroll sideways. */
+.data-table-wrap {
+  width: 100%;
+  overflow-x: auto;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  -webkit-overflow-scrolling: touch;
+}
+
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 14px;
+}
+
+.data-table th,
+.data-table td {
+  text-align: left;
+  padding: 10px 14px;
+  white-space: nowrap;
+  border-bottom: 1px solid var(--border-hair);
+}
+
+.data-table th {
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  background: var(--surface-inset);
+  position: sticky;
+  top: 0;
+}
+
+.data-table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.data-table-row-clickable {
+  cursor: pointer;
+}
+
+.data-table-row-clickable:hover td {
+  background: var(--accent-soft);
+}
+
+/* ── Related sub-records rendered as a list rather than a table ──────────── */
+.related-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.related-list-row {
+  background: var(--surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  padding: 12px 14px;
+}
+
+.related-list-title {
+  font-weight: 600;
+}
+
+.related-list-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  margin-top: 6px;
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+/* ── Field values ─────────────────────────────────────────────────────────
+   A stored URL is tappable wherever it appears; an absent value reads as a
+   dash rather than as literal "null". */
+.field-value-link {
+  color: var(--accent);
+  text-decoration: none;
+  word-break: break-all;
+}
+
+.field-value-link:hover {
+  text-decoration: underline;
+}
+
+.field-value-file {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.field-value-empty {
+  color: var(--text-secondary);
+}
+
+.screen-section {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
 }

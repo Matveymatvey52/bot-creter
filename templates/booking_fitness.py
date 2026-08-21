@@ -25,6 +25,7 @@ from aiogram.types import (
     KeyboardButton, Message, ReplyKeyboardMarkup,
 )
 
+from services.client_link import ensure_contact_column, link_pending_by_username
 from db.database import add_bot_admin, remove_bot_admin
 
 # ── CUSTOMIZE ────────────────────────────────────────────────────────────────
@@ -269,7 +270,7 @@ miniapp_config = {
             "fields": [
                 {"name": "day_of_week", "required": True, "label": "День недели", "kind": "number", "list": True, "detail": True, "create": True},
                 {"name": "slot_time", "required": True, "label": "Время", "kind": "text", "list": True, "detail": True, "create": True},
-                {"name": "trainer_id", "label": "ID тренера", "kind": "number", "list": False, "detail": True, "create": True},
+                {"name": "trainer_id", "label": "Тренер", "kind": "number", "list": False, "detail": True, "create": True, "ref": {"resource": "trainers", "labelField": "name"}},
                 {"name": "class_name", "required": True, "label": "Занятие", "kind": "text", "list": True, "detail": True, "create": True},
                 {"name": "capacity", "required": True, "label": "Вместимость", "kind": "number", "list": True, "detail": True, "create": True},
                 {"name": "duration_min", "label": "Длительность (мин)", "kind": "number", "list": False, "detail": True, "create": True},
@@ -285,7 +286,7 @@ miniapp_config = {
             "titleField": "class_name",
             "fields": [
                 {"name": "session_type", "label": "Тип", "kind": "status", "list": True, "detail": True, "create": False},
-                {"name": "trainer_id", "label": "ID тренера", "kind": "number", "list": False, "detail": True, "create": False},
+                {"name": "trainer_id", "label": "Тренер", "kind": "number", "list": False, "detail": True, "create": False, "ref": {"resource": "trainers", "labelField": "name"}},
                 {"name": "slot_date", "label": "Дата", "kind": "date", "list": True, "detail": True, "create": False},
                 {"name": "slot_time", "label": "Время", "kind": "text", "list": True, "detail": True, "create": False},
                 {"name": "duration_min", "label": "Длительность (мин)", "kind": "number", "list": False, "detail": True, "create": False},
@@ -329,10 +330,21 @@ miniapp_config = {
             "table": "subscriptions",
             "order_by": "purchased_at DESC",
             "creatable": True,
+            # 0 = "not linked to a Telegram account yet". Filled with the
+            # real id by services/client_link.py the first time this
+            # customer messages the bot.
+            "on_create": {"set": {"user_id": 0}},
             "title": "Абонементы клиентов",
             "titleField": "plan_name",
             "fields": [
-                {"name": "user_id", "required": True, "label": "ID клиента", "kind": "number", "list": True, "detail": True, "create": True},
+                {"name": "user_id", "required": False, "label": "ID клиента", "kind": "number", "list": True, "detail": True, "create": False},
+                # Who this record is about, however the admin knows them:
+                # @username, a name, or a phone. Required — a customer record
+                # with nothing identifying the customer is useless.
+                # Stored alongside the numeric id column (which stays the
+                # notification target); auto-links to a real id only when the
+                # contact IS a username — see services/client_link.py.
+                {"name": "client_contact", "required": True, "label": "Контакт клиента", "kind": "contact", "list": True, "detail": True, "create": True},
                 {"name": "plan_name", "required": True, "label": "Тариф", "kind": "text", "list": True, "detail": True, "create": True},
                 {"name": "total_visits", "required": True, "label": "Всего посещений", "kind": "number", "list": False, "detail": True, "create": True},
                 {"name": "visits_left", "required": True, "label": "Осталось посещений", "kind": "number", "list": True, "detail": True, "create": True},
@@ -353,7 +365,7 @@ miniapp_config = {
             "title": "Оценки тренеров",
             "titleField": "comment",
             "fields": [
-                {"name": "trainer_id", "label": "ID тренера", "kind": "number", "list": True, "detail": True, "create": False},
+                {"name": "trainer_id", "label": "Тренер", "kind": "number", "list": True, "detail": True, "create": False, "ref": {"resource": "trainers", "labelField": "name"}},
                 {"name": "user_id", "label": "ID клиента", "kind": "number", "list": False, "detail": True, "create": False},
                 {"name": "booking_id", "label": "ID записи", "kind": "number", "list": False, "detail": True, "create": False},
                 {"name": "rating", "label": "Оценка", "kind": "number", "list": True, "detail": True, "create": False},
@@ -499,6 +511,7 @@ async def init_db(db_path: str):
             )
         """)
         await db.execute("INSERT OR IGNORE INTO bot_settings (id) VALUES (1)")
+        await ensure_contact_column(db, "subscriptions")
         await db.commit()
     await _ensure_group_sessions(db_path)
     await _ensure_individual_slots(db_path)
@@ -1178,6 +1191,14 @@ def kb_remove_admins(ids: list[str]) -> InlineKeyboardMarkup:
 
 @router.message(Command("start"), F.chat.type == "private")
 async def cmd_start(message: Message, state: FSMContext, config: BookingFitnessConfig):
+    # Claim any record an admin pre-filled for this person's @username
+    # from the mini-app: until now it carried the "not linked yet"
+    # sentinel in user_id and so could not be notified. Opportunistic —
+    # never blocks the menu below (see services/client_link.py).
+    await link_pending_by_username(
+        config.db_path, "subscriptions", message.from_user.id,
+        message.from_user.username, id_column="user_id",
+    )
     # Same reasoning as moderator.py/inventory.py's cmd_start: /start must
     # reset any dangling mid-flow FSM state.
     await state.clear()

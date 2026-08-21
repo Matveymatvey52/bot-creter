@@ -87,11 +87,37 @@ miniapp_config = {
             "name": "projects",
             "table": "projects",
             "order_by": "created_at DESC",
-            "creatable": False,
+            "creatable": True,
+            # Reads stay membership-scoped by role_filter below, but the FIRST
+            # project can't be created by a member (nobody is a member of a
+            # project that doesn't exist yet) — so the write is authorized by
+            # factory-level bot admin instead. See runtime/miniapp_api.py's
+            # create_resource_handler for the full reasoning.
+            "create_requires": "bot_admin",
+            # The two NOT NULL columns the client must never supply: identity
+            # comes from the authenticated session, and the invite code is
+            # generated rather than typed. The link row is what makes the new
+            # project visible to its creator at all — without it, role_filter
+            # below would scope the creator right back out of their own
+            # project.
+            "on_create": {
+                "set": {"created_by": "telegram_user_id", "code": "random_code"},
+                "link": {
+                    "table": "project_members",
+                    "columns": {
+                        "project_id": "new_id",
+                        "user_id": "telegram_user_id",
+                        "role": "owner",
+                    },
+                },
+            },
             "title": "Проекты",
             "titleField": "name",
+            "children": [
+                {"resource": "tasks", "via": "project_id", "title": "Задания", "as": "table"},
+            ],
             "fields": [
-                {"name": "name", "label": "Название", "kind": "text", "list": True, "detail": True, "create": False},
+                {"name": "name", "required": True, "label": "Название", "kind": "text", "list": True, "detail": True, "create": True},
                 {"name": "code", "label": "Код приглашения", "kind": "text", "list": False, "detail": True, "create": False},
                 {"name": "created_at", "label": "Создан", "kind": "date", "list": False, "detail": True, "create": False},
             ],
@@ -120,7 +146,16 @@ miniapp_config = {
             "creatable": False,
             "title": "Задания",
             "titleField": "text",
+            "children": [
+                {"resource": "reports", "via": "task_id", "title": "Отчёты", "as": "table"},
+                {"resource": "attachments", "via": "task_id", "title": "Вложения", "as": "table"},
+            ],
             "fields": [
+                # Declared so the projects resource can join its tasks through
+                # it (runtime/miniapp_api.py's `children`/`via` contract only
+                # joins on a column the child actually declares). Shown as the
+                # project's name, never as a bare id.
+                {"name": "project_id", "label": "Проект", "kind": "number", "list": False, "detail": True, "create": False, "ref": {"resource": "projects", "labelField": "name"}},
                 {"name": "text", "label": "Задание", "kind": "text", "list": True, "detail": True, "create": False},
                 {"name": "category", "label": "Категория", "kind": "text", "list": True, "detail": True, "create": False},
                 {"name": "deadline", "label": "Дедлайн", "kind": "date", "list": True, "detail": True, "create": False},
@@ -146,7 +181,7 @@ miniapp_config = {
             "title": "Отчёты",
             "titleField": "text",
             "fields": [
-                {"name": "task_id", "label": "ID задания", "kind": "number", "list": True, "detail": True, "create": False},
+                {"name": "task_id", "label": "Задание", "kind": "number", "list": True, "detail": True, "create": False, "ref": {"resource": "tasks", "labelField": "text"}},
                 {"name": "text", "label": "Отчёт", "kind": "text", "list": False, "detail": True, "create": False},
                 {"name": "submitted_at", "label": "Сдан", "kind": "date", "list": True, "detail": True, "create": False},
             ],
@@ -175,7 +210,7 @@ miniapp_config = {
             "title": "Вложения",
             "titleField": "name",
             "fields": [
-                {"name": "task_id", "label": "ID задания", "kind": "number", "list": True, "detail": True, "create": False},
+                {"name": "task_id", "label": "Задание", "kind": "number", "list": True, "detail": True, "create": False, "ref": {"resource": "tasks", "labelField": "text"}},
                 {"name": "name", "label": "Файл", "kind": "text", "list": True, "detail": True, "create": False},
                 {"name": "type", "label": "Тип", "kind": "text", "list": False, "detail": True, "create": False},
             ],

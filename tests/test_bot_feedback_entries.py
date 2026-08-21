@@ -170,12 +170,26 @@ class BotFeedbackEntriesEndToEndTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rows[0]["rating"], 5)
 
     async def test_customer_cannot_spoof_another_users_telegram_id(self):
+        # An explicit mismatched owner column is now REJECTED rather than
+        # silently overwritten with the caller's id: miniapp_api.py's
+        # create_resource_handler checks the RAW payload, so the guard fires
+        # even though telegram_user_id is create:False and would otherwise be
+        # dropped by allowed_fields before the check could see it. Same
+        # guarantee as before — nobody's review can be attributed to someone
+        # else — but the attempt surfaces instead of being quietly corrected.
         token = self._customer_token(CUSTOMER_A_ID)
         resp = await self.client.post(
             f"/api/{self.bot_id}/feedback?token={token}",
             json={"telegram_user_id": CUSTOMER_B_ID, "rating": 5},
         )
-        self.assertEqual(resp.status, 201)
+        self.assertEqual(resp.status, 400)
+        self.assertEqual(await list_feedback(self.bot_db_path), [])
+
+        # The honest create still works and is attributed to the caller.
+        ok = await self.client.post(
+            f"/api/{self.bot_id}/feedback?token={token}", json={"rating": 5}
+        )
+        self.assertEqual(ok.status, 201)
         rows = await list_feedback(self.bot_db_path)
         self.assertEqual(rows[0]["telegram_user_id"], CUSTOMER_A_ID)
 

@@ -23,7 +23,7 @@ from templates import vehicle_service
 class VehicleServiceMiniAppConfigTests(unittest.IsolatedAsyncioTestCase):
     def test_miniapp_config_resource_names(self):
         names = {r["name"] for r in vehicle_service.miniapp_config["resources"]}
-        self.assertEqual(names, {"service_requests", "vehicles"})
+        self.assertEqual(names, {"service_requests", "vehicles", "clients"})
 
     async def test_miniapp_config_fields_match_real_schema(self):
         with tempfile.TemporaryDirectory() as tmp:

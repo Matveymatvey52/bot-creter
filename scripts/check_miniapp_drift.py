@@ -162,6 +162,21 @@ def _fold_in_alter_table_columns(tables: dict[str, set[str]], source: str) -> No
         for col_literal in re.finditer(r'["\']([\w]+)\s+\w+', col_tuple_src):
             tables[table].add(col_literal.group(1))
 
+    # services/client_link.py's ensure_contact_column() is the same kind of
+    # ALTER-guarded migration as the loop above, just factored into a shared
+    # helper because five templates need it (see that module's docstring for
+    # why the username lives beside the numeric id rather than replacing it).
+    # There is no literal "ALTER TABLE" text in the template to match, so the
+    # call itself is what declares the column here.
+    for call in re.finditer(
+        r'ensure_contact_column\(\s*db\s*,\s*["\'](\w+)["\']'
+        r'(?:\s*,\s*(?:contact_column\s*=\s*)?["\'](\w+)["\'])?',
+        source,
+    ):
+        table, column = call.group(1), call.group(2) or "client_contact"
+        if table in tables:
+            tables[table].add(column)
+
 
 def _tables_from_imported_features(source: str) -> dict[str, set[str]]:
     """Some templates (e.g. channel_aggregator.py) don't own their own

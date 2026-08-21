@@ -61,6 +61,21 @@ router = Router()
 miniapp_config = {
     "resources": [
         {
+            # Exposed so products.category_id renders as a picker over
+            # category NAMES instead of a raw id. Read-only here: categories
+            # are managed through the bot's own admin flow.
+            "name": "categories",
+            "table": "categories",
+            "order_by": "name ASC",
+            "creatable": False,
+            "title": "Категории",
+            "titleField": "name",
+            "fields": [
+                {"name": "name", "label": "Название", "kind": "text", "list": True, "detail": True, "create": False},
+                {"name": "active", "label": "Активна", "kind": "number", "list": False, "detail": True, "create": False},
+            ],
+        },
+        {
             "name": "products",
             "table": "products",
             "order_by": "id DESC",
@@ -68,7 +83,7 @@ miniapp_config = {
             "title": "Товары",
             "titleField": "name",
             "fields": [
-                {"name": "category_id", "required": True, "label": "ID категории", "kind": "number", "list": False, "detail": True, "create": True},
+                {"name": "category_id", "required": True, "label": "Категория", "kind": "number", "list": False, "detail": True, "create": True, "ref": {"resource": "categories", "labelField": "name"}},
                 {"name": "name", "required": True, "label": "Название", "kind": "text", "list": True, "detail": True, "create": True},
                 {"name": "description", "label": "Описание", "kind": "text", "list": False, "detail": True, "create": True},
                 {"name": "price", "required": True, "label": "Цена", "kind": "number", "list": True, "detail": True, "create": True},

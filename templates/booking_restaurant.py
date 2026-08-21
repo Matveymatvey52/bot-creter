@@ -25,6 +25,7 @@ from aiogram.types import (
     CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message,
 )
 
+from services.client_link import ensure_contact_column, link_pending_by_username
 from db.database import add_bot_admin, remove_bot_admin
 
 # ── CUSTOMIZE ────────────────────────────────────────────────────────────────
@@ -262,10 +263,21 @@ miniapp_config = {
             "table": "reservations",
             "order_by": "created_at DESC",
             "creatable": True,
+            # 0 = "not linked to a Telegram account yet". Filled with the
+            # real id by services/client_link.py the first time this
+            # customer messages the bot.
+            "on_create": {"set": {"client_user_id": 0}},
             "title": "Брони",
             "titleField": "client_name",
             "fields": [
-                {"name": "client_user_id", "required": True, "label": "ID клиента", "kind": "number", "list": False, "detail": True, "create": True},
+                {"name": "client_user_id", "required": False, "label": "ID клиента", "kind": "number", "list": False, "detail": True, "create": False},
+                # Who this record is about, however the admin knows them:
+                # @username, a name, or a phone. Required — a customer record
+                # with nothing identifying the customer is useless.
+                # Stored alongside the numeric id column (which stays the
+                # notification target); auto-links to a real id only when the
+                # contact IS a username — see services/client_link.py.
+                {"name": "client_contact", "required": True, "label": "Контакт клиента", "kind": "contact", "list": True, "detail": True, "create": True},
                 {"name": "client_name", "label": "Имя клиента", "kind": "text", "list": True, "detail": True, "create": True},
                 {"name": "client_phone", "label": "Телефон", "kind": "text", "list": False, "detail": True, "create": True},
                 {"name": "guests_count", "required": True, "label": "Гостей", "kind": "number", "list": True, "detail": True, "create": True},
@@ -315,6 +327,7 @@ async def init_db(db_path: str):
         """)
         await db.execute("CREATE INDEX IF NOT EXISTS idx_reservations_date ON reservations(date)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_reservations_client ON reservations(client_user_id)")
+        await ensure_contact_column(db, "reservations")
         await db.commit()
 
 
@@ -612,6 +625,14 @@ async def _edit_text_safe(message: Message, text: str, **kwargs) -> None:
 
 @router.message(Command("start"), F.chat.type == "private")
 async def cmd_start(message: Message, state: FSMContext, config: BookingRestaurantConfig):
+    # Claim any record an admin pre-filled for this person's @username
+    # from the mini-app: until now it carried the "not linked yet"
+    # sentinel in client_user_id and so could not be notified. Opportunistic —
+    # never blocks the menu below (see services/client_link.py).
+    await link_pending_by_username(
+        config.db_path, "reservations", message.from_user.id,
+        message.from_user.username, id_column="client_user_id",
+    )
     # Same reasoning as every other template's cmd_start: /start must reset
     # any dangling mid-flow FSM state before showing a menu.
     await state.clear()

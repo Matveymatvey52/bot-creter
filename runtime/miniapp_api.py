@@ -39,6 +39,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import time
 from pathlib import Path
 from typing import Any
@@ -50,12 +51,14 @@ from aiohttp import web
 from db.database import (
     get_bot,
     get_bot_admins,
+    get_bot_features,
     get_bot_miniapp_config,
     get_bot_office_hook_config,
 )
 from features.excel_export import MAX_FILE_SIZE, build_workbook, fetch_export_rows
 from features.sales_analytics import Period, compute_metrics
 from runtime.registry import FACTORY_BOT_ID, Registry, _load_template_module_async
+from services.client_link import ContactFormatError, parse_contact
 
 logger = logging.getLogger(__name__)
 
@@ -270,8 +273,16 @@ async def me_handler(request: web.Request) -> web.Response:
 # client for no reason. The frontend used to hardcode this exact shape by
 # hand in miniapp/src/lib/resources.ts (Phase 2 design doc §2.4); this
 # endpoint is what replaces that file.
-_SCHEMA_RESOURCE_KEYS = ("name", "creatable", "title", "titleField")
-_SCHEMA_FIELD_KEYS = ("name", "required", "creatable", "label", "kind", "list", "detail", "create")
+#
+# "children" and "ref" are the detail-card metadata: `children` declares
+# sub-records to inline in the PARENT's detail screen (so a tour's
+# program/hotels/guests/cashflow live on the tour itself, not in far-away
+# tabs), and a field's `ref` declares it a foreign key so the form renders a
+# picker over that resource's human-readable titles instead of a raw ID
+# input. Both are display metadata only — neither can widen what the role
+# filter and admin gate already allow (see _related_for_item).
+_SCHEMA_RESOURCE_KEYS = ("name", "creatable", "title", "titleField", "children", "tableView")
+_SCHEMA_FIELD_KEYS = ("name", "required", "creatable", "label", "kind", "list", "detail", "create", "ref")
 
 
 def _resource_display_schema(resource: dict) -> dict:
@@ -305,7 +316,20 @@ async def schema_handler(request: web.Request) -> web.Response:
     if telegram_user_id is None:
         return web.json_response({"error": "forbidden"}, status=403)
 
-    resources = [_resource_display_schema(r) for r in miniapp_config.get("resources", [])]
+    specs = miniapp_config.get("resources", [])
+    resources = [_resource_display_schema(r) for r in specs]
+
+    # canCreate is the ONE thing the SPA cannot work out for itself: whether
+    # POST /{resource} would actually succeed for THIS viewer. Without it the
+    # list screen showed a "Добавить" button on every resource and the create
+    # form rendered an empty body for read-only ones, ending in a 403
+    # "resource is read-only" — a form nobody could ever submit. Mirrors
+    # create_resource_handler's own gates exactly (creatable flag → admin gate
+    # → role filter), so a true here means the POST is genuinely allowed.
+    db_path = entry.config.get("db_path") if isinstance(entry.config, dict) else None
+    for out, spec in zip(resources, specs):
+        out["canCreate"] = await _can_create(bot_id, spec, telegram_user_id, db_path)
+
     return web.json_response({"resources": resources, "bot": await _bot_identity(bot_id)})
 
 
@@ -325,6 +349,66 @@ async def _bot_identity(bot_id: int) -> dict:
     name = (row.get("display_name") or row.get("name") or "").strip()
     subtitle = (row.get("description") or "").strip()
     return {"name": name or None, "subtitle": subtitle or None}
+
+
+async def _can_create(bot_id: int, resource: dict, telegram_user_id: int, db_path: str | None) -> bool:
+    """Predicts create_resource_handler's verdict for this viewer without
+    performing a write. Fails closed on any error: an unreadable DB or a
+    malformed role_filter hides the create affordance rather than offering a
+    button whose POST would 500."""
+    if not resource.get("creatable", False):
+        return False
+    if resource.get("create_requires") == "bot_admin":
+        return str(telegram_user_id) in await get_bot_admins(bot_id)
+    if not await _admin_gate_ok(bot_id, resource, telegram_user_id):
+        return False
+    if resource.get("role_filter") is None:
+        return True
+    if not db_path:
+        return False
+    try:
+        async with aiosqlite.connect(db_path) as db:
+            await _resolve_role_filter_where(db, resource["role_filter"], telegram_user_id)
+    except RoleFilterDenied:
+        return False
+    except Exception:
+        logger.exception(
+            "_can_create: bot_id=%s resource=%s — role_filter evaluation failed, hiding create",
+            bot_id,
+            resource.get("name"),
+        )
+        return False
+    return True
+
+
+async def features_handler(request: web.Request) -> web.Response:
+    """GET /api/{bot_id}/features — which optional features the owner actually
+    switched on for this bot (db.database.bot_features, the same table
+    combined_app.py's reminder sweep and userbot_worker.py gate on).
+
+    The SPA needs this because a section like "Аналитика" is no longer part of
+    every bot's default navigation: it appears only when its feature is
+    enabled here. Returns the raw enablement list, NOT a per-viewer verdict —
+    analytics_handler stays the one place that decides owner-only access, so a
+    non-owner learning that the feature exists reveals nothing they could not
+    already infer from the bot's own menu."""
+    resolved = await _resolve_entry_and_config(request)
+    if isinstance(resolved, web.Response):
+        return resolved
+    bot_id, entry, _config = resolved
+
+    telegram_user_id = await _authenticate(request, bot_id, entry.bot.token)
+    if telegram_user_id is None:
+        return web.json_response({"error": "forbidden"}, status=403)
+
+    try:
+        features = await get_bot_features(bot_id)
+    except Exception:
+        # Degrade to "no optional sections" rather than blank-screening the
+        # whole app over a feature list that is purely additive navigation.
+        logger.exception("features_handler: bot_id=%s — failed to read bot_features", bot_id)
+        features = []
+    return web.json_response({"features": features})
 
 
 def _resource_spec(miniapp_config: dict, resource_name: str) -> dict | None:
@@ -571,7 +655,86 @@ async def get_resource_handler(request: web.Request) -> web.Response:
             row = await cursor.fetchone()
     if row is None:
         return web.json_response({"error": "not found"}, status=404)
-    return web.json_response({"resource": resource_name, "item": dict(row)})
+
+    related = await _related_for_item(
+        bot_id, miniapp_config, resource, int(item_id_raw), telegram_user_id, db_path
+    )
+    return web.json_response({"resource": resource_name, "item": dict(row), "related": related})
+
+
+async def _related_for_item(
+    bot_id: int,
+    miniapp_config: dict,
+    resource: dict,
+    item_id: int,
+    telegram_user_id: int,
+    db_path: str,
+) -> list[dict]:
+    """Loads the sub-records a resource declares via `children`, so the detail
+    screen can show a record's program/guests/attachments/payments inline
+    instead of scattering them across sibling tabs the user has to find and
+    cross-reference by ID.
+
+    Each child goes through the SAME admin gate and role filter as a direct
+    GET /{child} would — this endpoint is a convenience join, never a way to
+    read rows the child resource itself would refuse. A child that denies or
+    errors is omitted from the response rather than failing the whole detail
+    view.
+    """
+    out: list[dict] = []
+    for child in resource.get("children", []):
+        child_spec = _resource_spec(miniapp_config, child.get("resource", ""))
+        if child_spec is None:
+            continue
+        via = child.get("via", "")
+        # `via` is interpolated as a column name, so it must be a column the
+        # child resource already declares — not just any identifier-shaped
+        # string that happens to be in the config.
+        if via not in {f["name"] for f in child_spec.get("fields", [])}:
+            logger.warning(
+                "_related_for_item: bot_id=%s child=%s — 'via' column %r is not a declared field, skipped",
+                bot_id,
+                child.get("resource"),
+                via,
+            )
+            continue
+        if not await _admin_gate_ok(bot_id, child_spec, telegram_user_id):
+            continue
+
+        columns = ", ".join(f["name"] for f in child_spec["fields"])
+        try:
+            async with aiosqlite.connect(db_path) as db:
+                db.row_factory = aiosqlite.Row
+                try:
+                    role_clause = await _apply_role_filter(db, child_spec, telegram_user_id)
+                except RoleFilterDenied:
+                    continue
+                sql = f"SELECT id, {columns} FROM {child_spec['table']} WHERE {via} = ?"
+                params: tuple = (item_id,)
+                if role_clause is not None:
+                    where_sql, where_params = role_clause
+                    sql += f" AND ({where_sql})"
+                    params = params + where_params
+                sql += f" ORDER BY {child_spec.get('order_by', 'id DESC')} LIMIT 200"
+                async with db.execute(sql, params) as cursor:
+                    rows = [dict(r) for r in await cursor.fetchall()]
+        except Exception:
+            logger.exception(
+                "_related_for_item: bot_id=%s child=%s — query failed, section omitted",
+                bot_id,
+                child.get("resource"),
+            )
+            continue
+
+        out.append(
+            {
+                "resource": child_spec["name"],
+                "title": child.get("title") or child_spec.get("title") or child_spec["name"],
+                "as": child.get("as", "table"),
+                "items": rows,
+            }
+        )
+    return out
 
 
 # Same shape as runtime/registry.py's _BOT_COMMAND_NAME_RE-style validation —
@@ -582,6 +745,14 @@ async def get_resource_handler(request: web.Request) -> web.Response:
 # unintended columns, not string-escaping the SQL text itself (values are
 # always bound as aiosqlite parameters, never interpolated).
 async def create_resource_handler(request: web.Request) -> web.Response:
+    """POST /api/{bot_id}/{resource} — see allowed_fields below: it checks
+    each field dict's "create" key (the one _SCHEMA_FIELD_KEYS/every
+    template's miniapp_config actually sets, e.g. tour_operator's "status"
+    field is "create": False), not "creatable" (that key only exists at the
+    RESOURCE level, checked separately just below). A prior version of this
+    line checked "creatable" here too, which never matched anything on a
+    field dict and so silently allowed writes to every "create": False
+    field regardless of its declared intent."""
     resolved = await _resolve_entry_and_config(request)
     if isinstance(resolved, web.Response):
         return resolved
@@ -598,7 +769,18 @@ async def create_resource_handler(request: web.Request) -> web.Response:
     if not resource.get("creatable", False):
         return web.json_response({"error": "resource is read-only"}, status=403)
 
-    if not await _admin_gate_ok(bot_id, resource, telegram_user_id):
+    # "create_requires": "bot_admin" resolves the bootstrap deadlock a
+    # membership-based role_filter otherwise creates: a role_filter that scopes
+    # rows to "projects you are a member of" denies the very first create,
+    # because the creator holds no membership until the project exists. For
+    # such resources the write is authorized by factory-level bot admin
+    # instead — the boss who owns the bot creates projects, workers join one
+    # by code. Reads stay role-filtered exactly as before.
+    admin_authorized = resource.get("create_requires") == "bot_admin"
+    if admin_authorized:
+        if str(telegram_user_id) not in await get_bot_admins(bot_id):
+            return web.json_response({"error": "forbidden"}, status=403)
+    elif not await _admin_gate_ok(bot_id, resource, telegram_user_id):
         return web.json_response({"error": "forbidden"}, status=403)
 
     try:
@@ -608,7 +790,7 @@ async def create_resource_handler(request: web.Request) -> web.Response:
     if not isinstance(payload, dict):
         return web.json_response({"error": "invalid JSON body"}, status=400)
 
-    allowed_fields = {f["name"] for f in resource["fields"] if f.get("creatable", True)}
+    allowed_fields = {f["name"] for f in resource["fields"] if f.get("create", True)}
     required_fields = {f["name"] for f in resource["fields"] if f.get("required", False)}
     values = {k: v for k, v in payload.items() if k in allowed_fields}
     missing = required_fields - values.keys()
@@ -617,21 +799,71 @@ async def create_resource_handler(request: web.Request) -> web.Response:
     if not values:
         return web.json_response({"error": "no valid fields in payload"}, status=400)
 
+    # A "contact" field identifies the person a record is about, however the
+    # admin actually knows them: "@ivanov", "Иван Петров", "+7 999 123-45-67".
+    # Only @-prefixed input is held to Telegram's username rules — a phone or
+    # a name is a perfectly good contact and must not be rejected for failing
+    # rules that were never meant to apply to it. A contact that IS a username
+    # is normalized (bare + lowercase) so an incoming update can be matched
+    # against it later. See services/client_link.py for the whole rule.
+    for field in resource["fields"]:
+        if field.get("kind") != "contact" or field["name"] not in values:
+            continue
+        label = field.get("label", field["name"])
+        try:
+            contact = parse_contact(values[field["name"]])
+        except ContactFormatError:
+            return web.json_response(
+                {"error": f"{label}: «@…» должен быть корректным Telegram-username"},
+                status=400,
+            )
+        if contact is None:
+            # Reaches here only for a blank string, which the required-field
+            # check above can't catch (the key IS present, it's just empty).
+            if field.get("required", False):
+                return web.json_response({"error": f"{label}: обязательное поле"}, status=400)
+            del values[field["name"]]
+            continue
+        values[field["name"]] = contact.value
+
     db_path = entry.config.get("db_path") if isinstance(entry.config, dict) else None
     if not db_path:
         return web.json_response({"error": "bot has no database configured"}, status=500)
 
     async with aiosqlite.connect(db_path) as db:
         try:
-            owner_column = await _resolve_create_owner_column(db, resource, telegram_user_id)
+            # Skipped for the bot-admin path: that path exists precisely for
+            # resources whose role_filter denies a viewer holding no
+            # membership yet, so asking the role filter to name an owner
+            # column here would raise RoleFilterDenied and 403 the very
+            # bootstrap create it was meant to permit. Identity for those
+            # resources comes from on_create.set instead, which is just as
+            # server-controlled.
+            owner_column = (
+                None if admin_authorized
+                else await _resolve_create_owner_column(db, resource, telegram_user_id)
+            )
         except RoleFilterDenied:
             return web.json_response({"error": "forbidden"}, status=403)
         if owner_column is not None:
-            if owner_column in values and values[owner_column] != telegram_user_id:
+            # Checked against the RAW payload, not the filtered `values`: a
+            # template that correctly marks its owner column create:False
+            # (identity belongs to the session, not to a form field) would
+            # otherwise have a spoofed value silently dropped by
+            # allowed_fields — turning an explicit rejection into a quiet
+            # correction and losing the signal that someone tried it.
+            if owner_column in payload and payload[owner_column] != telegram_user_id:
                 return web.json_response(
                     {"error": f"{owner_column} must match the authenticated user"}, status=400
                 )
             values[owner_column] = telegram_user_id
+
+        on_create = resource.get("on_create") or {}
+        try:
+            values.update(_on_create_values(on_create.get("set", {}), telegram_user_id))
+        except OnCreateError:
+            logger.exception("create: bot_id=%s resource=%s — bad on_create.set", bot_id, resource_name)
+            return web.json_response({"error": "server misconfigured"}, status=500)
 
         columns = ", ".join(values.keys())
         placeholders = ", ".join("?" for _ in values)
@@ -639,9 +871,92 @@ async def create_resource_handler(request: web.Request) -> web.Response:
             f"INSERT INTO {resource['table']} ({columns}) VALUES ({placeholders})",
             tuple(values.values()),
         )
-        await db.commit()
         new_id = cursor.lastrowid
+
+        try:
+            await _apply_on_create_link(db, on_create.get("link"), new_id, telegram_user_id)
+        except OnCreateError:
+            # Committing the parent row without its link row would leave a
+            # record its own creator cannot see (the read-side role filter
+            # scopes by that link) — roll back instead of writing an orphan.
+            await db.rollback()
+            logger.exception("create: bot_id=%s resource=%s — on_create.link failed", bot_id, resource_name)
+            return web.json_response({"error": "server misconfigured"}, status=500)
+
+        await db.commit()
     return web.json_response({"resource": resource_name, "id": new_id}, status=201)
+
+
+class OnCreateError(ValueError):
+    """An `on_create` block references an unsupported token or a
+    non-identifier table/column name — surfaced as a 500 rather than executing
+    a shape nobody reviewed."""
+
+
+_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+# Server-derived values an `on_create` block may request. Deliberately tiny:
+# these are the only things the engine knows that the client must NOT be
+# trusted to supply. Anything else in a `set` map is treated as a literal.
+_ON_CREATE_TOKENS = frozenset({"telegram_user_id", "new_id", "random_code"})
+
+
+def _on_create_token_value(token: Any, telegram_user_id: int, new_id: int | None) -> Any:
+    if not isinstance(token, str) or token not in _ON_CREATE_TOKENS:
+        return token  # literal, e.g. the string "owner"
+    if token == "telegram_user_id":
+        return telegram_user_id
+    if token == "new_id":
+        if new_id is None:
+            raise OnCreateError("'new_id' is only meaningful in on_create.link")
+        return new_id
+    # A short, unambiguous invite/join code — templates that need one declare
+    # it here rather than making a human type a unique string into a form.
+    return secrets.token_hex(3).upper()
+
+
+def _on_create_values(spec: Any, telegram_user_id: int) -> dict:
+    """Columns the SERVER fills in on insert, overriding anything the client
+    sent for them — identity columns, generated codes, fixed literals."""
+    if not isinstance(spec, dict):
+        raise OnCreateError(f"on_create.set must be a mapping, got {type(spec).__name__}")
+    out = {}
+    for column, token in spec.items():
+        if not _IDENTIFIER_RE.match(str(column)):
+            raise OnCreateError(f"on_create.set column is not an identifier: {column!r}")
+        out[column] = _on_create_token_value(token, telegram_user_id, None)
+    return out
+
+
+async def _apply_on_create_link(
+    db: aiosqlite.Connection,
+    spec: Any,
+    new_id: int,
+    telegram_user_id: int,
+) -> None:
+    """Inserts the membership/link row that makes a just-created record
+    visible to its creator. Runs inside the caller's open transaction, so the
+    parent row and its link commit together or not at all."""
+    if spec is None:
+        return
+    if not isinstance(spec, dict) or not isinstance(spec.get("columns"), dict):
+        raise OnCreateError("on_create.link needs a 'table' and a 'columns' mapping")
+    table = spec.get("table")
+    if not _IDENTIFIER_RE.match(str(table)):
+        raise OnCreateError(f"on_create.link table is not an identifier: {table!r}")
+
+    values = {}
+    for column, token in spec["columns"].items():
+        if not _IDENTIFIER_RE.match(str(column)):
+            raise OnCreateError(f"on_create.link column is not an identifier: {column!r}")
+        values[column] = _on_create_token_value(token, telegram_user_id, new_id)
+
+    columns = ", ".join(values.keys())
+    placeholders = ", ".join("?" for _ in values)
+    await db.execute(
+        f"INSERT INTO {table} ({columns}) VALUES ({placeholders})",
+        tuple(values.values()),
+    )
 
 
 async def _resolve_create_owner_column(db: aiosqlite.Connection, resource: dict, telegram_user_id: int) -> str | None:
@@ -1016,6 +1331,9 @@ def register_routes(app: web.Application) -> None:
     # /schema above — "analytics" would otherwise be swallowed as a resource
     # name, and is reserved the same way "schema" already is.
     app.router.add_get("/api/{bot_id}/analytics", analytics_handler)
+    # Reserved before the generic {resource} route for the same reason as
+    # /schema and /analytics above.
+    app.router.add_get("/api/{bot_id}/features", features_handler)
     # Registered before the generic {resource} route for the same reason as
     # /schema and /analytics above — "export.xlsx" would otherwise be
     # swallowed as a resource name.

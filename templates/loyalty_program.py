@@ -89,7 +89,7 @@ miniapp_config = {
             "title": "Начисления",
             "titleField": "note",
             "fields": [
-                {"name": "client_id", "required": True, "label": "ID клиента", "kind": "number", "list": False, "detail": True, "create": True},
+                {"name": "client_id", "required": True, "label": "Клиент", "kind": "number", "list": False, "detail": True, "create": True, "ref": {"resource": "clients", "labelField": "name"}},
                 {"name": "points", "required": True, "label": "Баллы", "kind": "number", "list": True, "detail": True, "create": True},
                 {"name": "kind", "required": True, "label": "Тип", "kind": "status", "list": True, "detail": True, "create": True},
                 {"name": "purchase_amount", "label": "Сумма покупки", "kind": "number", "list": False, "detail": True, "create": True},

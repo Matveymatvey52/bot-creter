@@ -126,6 +126,16 @@ miniapp_config = {
             "table": "tours",
             "order_by": "created_at DESC",
             "creatable": True,
+            # Everything that belongs to a tour renders inside that tour's own
+            # detail card (runtime/miniapp_api.py's `related`) instead of
+            # forcing the user into a sibling tab and a match-by-id hunt.
+            "children": [
+                {"resource": "program", "via": "tour_id", "title": "Программа по дням", "as": "table"},
+                {"resource": "hotels", "via": "tour_id", "title": "Отели", "as": "table"},
+                {"resource": "locations", "via": "tour_id", "title": "Локации и подрядчики", "as": "table"},
+                {"resource": "guests", "via": "tour_id", "title": "Гости", "as": "table"},
+                {"resource": "dds", "via": "parent_id", "title": "ДДС", "as": "table"},
+            ],
             "title": "Туры",
             "titleField": "name",
             "fields": [
@@ -176,7 +186,7 @@ miniapp_config = {
             "title": "Программа",
             "titleField": "title",
             "fields": [
-                {"name": "tour_id", "required": True, "label": "ID тура", "kind": "number", "list": False, "detail": False, "create": True},
+                {"name": "tour_id", "required": True, "label": "Тур", "kind": "number", "list": False, "detail": True, "create": True, "ref": {"resource": "tours", "labelField": "name"}},
                 {"name": "day_num", "label": "День", "kind": "number", "list": True, "detail": True, "create": True},
                 {"name": "date", "label": "Дата", "kind": "date", "list": False, "detail": True, "create": True},
                 {"name": "time", "label": "Время", "kind": "text", "list": False, "detail": True, "create": True},
@@ -199,7 +209,7 @@ miniapp_config = {
             "title": "ЛиП",
             "titleField": "name",
             "fields": [
-                {"name": "tour_id", "required": True, "label": "ID тура", "kind": "number", "list": False, "detail": False, "create": True},
+                {"name": "tour_id", "required": True, "label": "Тур", "kind": "number", "list": False, "detail": True, "create": True, "ref": {"resource": "tours", "labelField": "name"}},
                 {"name": "region", "label": "Регион", "kind": "text", "list": True, "detail": True, "create": True},
                 {"name": "category", "label": "Категория", "kind": "text", "list": False, "detail": True, "create": True},
                 {"name": "status", "label": "Статус", "kind": "status", "list": True, "detail": True, "create": True},
@@ -223,7 +233,7 @@ miniapp_config = {
             "title": "Отели",
             "titleField": "name",
             "fields": [
-                {"name": "tour_id", "required": True, "label": "ID тура", "kind": "number", "list": False, "detail": False, "create": True},
+                {"name": "tour_id", "required": True, "label": "Тур", "kind": "number", "list": False, "detail": True, "create": True, "ref": {"resource": "tours", "labelField": "name"}},
                 {"name": "region", "label": "Регион", "kind": "text", "list": True, "detail": True, "create": True},
                 {"name": "name", "required": True, "label": "Название", "kind": "text", "list": False, "detail": False, "create": True},
                 {"name": "rating", "label": "Рейтинг", "kind": "number", "list": False, "detail": True, "create": True},
@@ -246,7 +256,7 @@ miniapp_config = {
             "title": "Гости",
             "titleField": "name",
             "fields": [
-                {"name": "tour_id", "required": True, "label": "ID тура", "kind": "number", "list": False, "detail": False, "create": True},
+                {"name": "tour_id", "required": True, "label": "Тур", "kind": "number", "list": False, "detail": True, "create": True, "ref": {"resource": "tours", "labelField": "name"}},
                 {"name": "name", "required": True, "label": "Имя гостя", "kind": "text", "list": False, "detail": False, "create": True},
                 {"name": "total_cost", "label": "Стоимость", "kind": "number", "list": True, "detail": True, "create": True},
                 {"name": "prepaid", "label": "Предоплата", "kind": "number", "list": False, "detail": True, "create": True},
@@ -264,7 +274,7 @@ miniapp_config = {
             "title": "ДДС",
             "titleField": "description",
             "fields": [
-                {"name": "parent_id", "label": "ID тура", "kind": "text", "list": False, "detail": False, "create": True},
+                {"name": "parent_id", "label": "Тур", "kind": "text", "list": False, "detail": True, "create": True, "ref": {"resource": "tours", "labelField": "name"}},
                 {"name": "type", "required": True, "label": "Тип (in/out)", "kind": "status", "list": True, "detail": True, "create": True},
                 {"name": "amount_rub", "label": "Сумма ₽", "kind": "number", "list": True, "detail": True, "create": True},
                 {"name": "amount_usd", "label": "Сумма $", "kind": "number", "list": False, "detail": True, "create": True},

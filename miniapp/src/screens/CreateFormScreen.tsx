@@ -1,6 +1,6 @@
-import { useCallback, useState } from 'react'
-import { createResource, ApiError } from '../lib/api'
-import type { ResourceDisplay } from '../lib/displaySchema'
+import { useCallback, useEffect, useState } from 'react'
+import { createResource, listResource, ApiError, type ResourceItem } from '../lib/api'
+import type { FieldDisplay, ResourceDisplay } from '../lib/displaySchema'
 import { useTelegramMainButton } from '../lib/useMainButton'
 import { isInTelegram } from '../lib/telegram'
 import { CTAButton } from '../components/CTAButton'
@@ -17,8 +17,38 @@ export function CreateFormScreen({
   const [values, setValues] = useState<Record<string, string>>({})
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  // Options for foreign-key fields, keyed by referenced resource name. A
+  // field like `tour_id` must offer "Сочи, ноябрь", never ask for the number 7.
+  const [refOptions, setRefOptions] = useState<Record<string, ResourceItem[]>>({})
 
-  const requiredFilled = resource.createFields.every((f) => f.name !== 'name' || values.name?.trim())
+  useEffect(() => {
+    let cancelled = false
+    const targets = new Set(resource.createFields.filter((f) => f.ref).map((f) => f.ref!.resource))
+    if (targets.size === 0) return
+
+    Promise.all(
+      [...targets].map((refResource) =>
+        listResource(refResource)
+          .then((data) => [refResource, data.items] as const)
+          // An unreadable referenced list leaves the picker empty rather than
+          // silently degrading back to a raw id input.
+          .catch(() => [refResource, [] as ResourceItem[]] as const),
+      ),
+    ).then((results) => {
+      if (cancelled) return
+      setRefOptions(Object.fromEntries(results))
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [resource])
+
+  // Gates on the schema's own `required` flags — this used to hardcode a
+  // single "name" field, so a resource whose required field was called
+  // anything else let the user submit an empty form and get a 400 back.
+  const requiredFilled = resource.createFields.every(
+    (f) => !f.required || (values[f.name] ?? '').trim() !== '',
+  )
 
   const handleSubmit = useCallback(async () => {
     if (submitting) return
@@ -29,7 +59,7 @@ export function CreateFormScreen({
       for (const f of resource.createFields) {
         const raw = values[f.name]
         if (raw === undefined || raw === '') continue
-        payload[f.name] = f.kind === 'number' ? Number(raw) : raw
+        payload[f.name] = f.kind === 'number' || f.ref ? Number(raw) : raw
       }
       const result = await createResource(resource.name, payload)
       onCreated(result.id)
@@ -41,6 +71,8 @@ export function CreateFormScreen({
   }, [resource, submitting, values, onCreated])
 
   useTelegramMainButton('Создать', handleSubmit, requiredFilled && !submitting)
+
+  const setValue = (name: string, value: string) => setValues((prev) => ({ ...prev, [name]: value }))
 
   return (
     <div className="screen">
@@ -59,11 +91,11 @@ export function CreateFormScreen({
       {resource.createFields.map((f) => (
         <div className="field" key={f.name}>
           <label htmlFor={f.name}>{f.label}</label>
-          <input
-            id={f.name}
-            type={f.kind === 'number' ? 'number' : f.kind === 'date' ? 'date' : 'text'}
+          <FormInput
+            field={f}
             value={values[f.name] ?? ''}
-            onChange={(e) => setValues((prev) => ({ ...prev, [f.name]: e.target.value }))}
+            options={f.ref ? (refOptions[f.ref.resource] ?? []) : []}
+            onChange={(value) => setValue(f.name, value)}
           />
         </div>
       ))}
@@ -76,5 +108,58 @@ export function CreateFormScreen({
         </div>
       )}
     </div>
+  )
+}
+
+function FormInput({
+  field,
+  value,
+  options,
+  onChange,
+}: {
+  field: FieldDisplay
+  value: string
+  options: ResourceItem[]
+  onChange: (value: string) => void
+}) {
+  if (field.ref) {
+    const labelField = field.ref.labelField
+    return (
+      <select id={field.name} value={value} onChange={(e) => onChange(e.target.value)}>
+        <option value="">— выберите —</option>
+        {options.map((option) => (
+          <option key={option.id} value={String(option.id)}>
+            {String(option[labelField] ?? `#${option.id}`)}
+          </option>
+        ))}
+      </select>
+    )
+  }
+
+  if (field.kind === 'contact') {
+    // Free text on purpose: whatever the admin actually knows about this
+    // person. Only an "@…" entry is held to Telegram's username rules by the
+    // backend — a name or a phone is a perfectly good contact.
+    return (
+      <input
+        id={field.name}
+        type="text"
+        autoCapitalize="none"
+        autoCorrect="off"
+        spellCheck={false}
+        placeholder="@username, имя или телефон"
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+      />
+    )
+  }
+
+  return (
+    <input
+      id={field.name}
+      type={field.kind === 'number' ? 'number' : field.kind === 'date' ? 'date' : 'text'}
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+    />
   )
 }

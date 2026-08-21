@@ -84,7 +84,7 @@ miniapp_config = {
             "title": "Смены",
             "titleField": "shift_date",
             "fields": [
-                {"name": "employee_id", "required": True, "label": "ID сотрудника", "kind": "number", "list": True, "detail": True, "create": True},
+                {"name": "employee_id", "required": True, "label": "Сотрудник", "kind": "number", "list": True, "detail": True, "create": True, "ref": {"resource": "employees", "labelField": "name"}},
                 {"name": "shift_date", "required": True, "label": "Дата", "kind": "date", "list": True, "detail": True, "create": True},
                 {"name": "start_time", "required": True, "label": "Начало", "kind": "text", "list": True, "detail": True, "create": True},
                 {"name": "end_time", "required": True, "label": "Окончание", "kind": "text", "list": True, "detail": True, "create": True},

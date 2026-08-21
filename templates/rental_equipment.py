@@ -63,6 +63,22 @@ router = Router()
 miniapp_config = {
     "resources": [
         {
+            # Exposed so rentals.client_id renders as a picker over client
+            # NAMES instead of asking an admin to know a row id. Read-only
+            # here: clients are registered through the bot's own flow.
+            "name": "clients",
+            "table": "clients",
+            "order_by": "name ASC",
+            "creatable": False,
+            "title": "Клиенты",
+            "titleField": "name",
+            "fields": [
+                {"name": "name", "label": "Имя", "kind": "text", "list": True, "detail": True, "create": False},
+                {"name": "contact", "label": "Контакт", "kind": "text", "list": True, "detail": True, "create": False},
+                {"name": "created_at", "label": "Добавлен", "kind": "date", "list": False, "detail": True, "create": False},
+            ],
+        },
+        {
             "name": "items",
             "table": "items",
             "order_by": "created_at DESC",
@@ -84,8 +100,8 @@ miniapp_config = {
             "title": "Аренды",
             "titleField": "status",
             "fields": [
-                {"name": "item_id", "required": True, "label": "ID предмета", "kind": "number", "list": False, "detail": True, "create": True},
-                {"name": "client_id", "required": True, "label": "ID клиента", "kind": "number", "list": False, "detail": True, "create": True},
+                {"name": "item_id", "required": True, "label": "Позиция", "kind": "number", "list": False, "detail": True, "create": True, "ref": {"resource": "items", "labelField": "name"}},
+                {"name": "client_id", "required": True, "label": "Клиент", "kind": "number", "list": False, "detail": True, "create": True, "ref": {"resource": "clients", "labelField": "name"}},
                 {"name": "issued_at", "label": "Выдано", "kind": "date", "list": True, "detail": True, "create": False},
                 {"name": "due_date", "required": True, "label": "Вернуть до", "kind": "date", "list": True, "detail": True, "create": True},
                 {"name": "deposit", "label": "Залог", "kind": "number", "list": False, "detail": True, "create": True},

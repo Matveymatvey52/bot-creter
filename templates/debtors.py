@@ -306,7 +306,7 @@ miniapp_config = {
             "creatable": True,
             "title": "Записи",
             "fields": [
-                {"name": "debtor_id", "required": True, "label": "ID должника", "kind": "number", "list": True, "detail": True, "create": True},
+                {"name": "debtor_id", "required": True, "label": "Должник", "kind": "number", "list": True, "detail": True, "create": True, "ref": {"resource": "debtors", "labelField": "name"}},
                 {"name": "amount", "required": True, "label": "Сумма", "kind": "number", "list": True, "detail": True, "create": True},
                 {"name": "description", "label": "Описание", "kind": "text", "list": False, "detail": True, "create": True},
                 {"name": "entry_date", "label": "Дата", "kind": "date", "list": True, "detail": True, "create": False},

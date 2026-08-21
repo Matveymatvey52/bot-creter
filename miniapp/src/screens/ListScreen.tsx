@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { listResource, ApiError, type ResourceItem } from '../lib/api'
 import { statusToneRich, type FieldDisplay, type ResourceDisplay } from '../lib/displaySchema'
+import { DataTable, type TableColumn } from '../components/DataTable'
 import { Icon } from '../components/Icon'
 
 /* Раскладка карточки — вариант I (утверждён владельцем 2026-08-21,
@@ -11,10 +12,14 @@ import { Icon } from '../components/Icon'
    miniapp_config, а не по именам полей:
      date   → подпись под заголовком
      number → значение справа
-     прочие → до трёх ячеек в полосе фактов */
+     прочие → до трёх ячеек в полосе фактов
+
+   Поля-ссылки (`ref`) сюда не попадают вообще: они хранят чужой id, и в
+   карточке это выглядело бы как голое число. Человекочитаемое название
+   такой связи показывает детальный экран, который умеет его разрешить. */
 function splitFields(fields: FieldDisplay[], item: ResourceItem) {
   const filled = fields.filter(
-    (f) => f.name !== 'status' && item[f.name] != null && item[f.name] !== '',
+    (f) => f.name !== 'status' && !f.ref && item[f.name] != null && item[f.name] !== '',
   )
   const sub = filled.find((f) => f.kind === 'date')
   const amount = filled.find((f) => f.kind === 'number')
@@ -51,6 +56,13 @@ export function ListScreen({
     }
   }, [resource.name])
 
+  const tableColumns: TableColumn[] = [
+    { name: resource.titleField, label: resource.title },
+    ...resource.listFields
+      .filter((f) => f.name !== resource.titleField && !f.ref)
+      .map((f) => ({ name: f.name, label: f.label })),
+  ]
+
   return (
     <div className="screen">
       <div className="sol-head">
@@ -60,17 +72,28 @@ export function ListScreen({
             {items === null ? 'загрузка…' : `записей: ${items.length}`}
           </div>
         </div>
-        <button className="sol-add" onClick={onCreateNew} aria-label="Добавить">
-          <Icon name="plus" />
-        </button>
+        {/* Кнопка создания появляется, только если бэкенд подтвердил, что POST
+            этого зрителя действительно пройдёт (canCreate). Показывать форму,
+            которая ответит 403 «resource is read-only», — ровно тот баг, ради
+            которого эта проверка и заведена. */}
+        {resource.canCreate && (
+          <button className="sol-add" onClick={onCreateNew} aria-label="Добавить">
+            <Icon name="plus" />
+          </button>
+        )}
       </div>
 
       {error && <div className="state-message">{error}</div>}
+      {!error && items === null && <div className="state-message">Загрузка…</div>}
       {!error && items !== null && items.length === 0 && (
         <div className="state-message">Пока пусто</div>
       )}
 
-      {items !== null && items.length > 0 && (
+      {items !== null && items.length > 0 && resource.tableView && (
+        <DataTable columns={tableColumns} rows={items} onRowClick={(row) => onOpenItem(row.id)} />
+      )}
+
+      {items !== null && items.length > 0 && !resource.tableView && (
         <div className="sol-list">
           {items.map((item) => {
             const { sub, amount, facts } = splitFields(resource.listFields, item)

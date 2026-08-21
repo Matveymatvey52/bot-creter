@@ -21,6 +21,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
+from services.client_link import ensure_contact_column, link_pending_by_username
 from db.database import add_bot_admin, remove_bot_admin
 
 # ── DESIGN NOTE ────────────────────────────────────────────────────────────
@@ -281,6 +282,7 @@ async def init_db(db_path: str):
         await db.execute("CREATE INDEX IF NOT EXISTS idx_bookings_client ON bookings(client_user_id)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_guest_booking ON guest_registrations(booking_id)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_service_status ON service_requests(status)")
+        await ensure_contact_column(db, "bookings")
         await db.commit()
 
 
@@ -314,11 +316,22 @@ miniapp_config = {
             "table": "bookings",
             "order_by": "created_at DESC",
             "creatable": True,
+            # 0 = "not linked to a Telegram account yet". Filled with the
+            # real id by services/client_link.py the first time this
+            # customer messages the bot.
+            "on_create": {"set": {"client_user_id": 0}},
             "title": "Брони",
             "titleField": "client_name",
             "fields": [
-                {"name": "resource_id", "required": True, "label": "ID ресурса", "kind": "number", "list": False, "detail": False, "create": True},
-                {"name": "client_user_id", "required": True, "label": "ID клиента", "kind": "number", "list": False, "detail": False, "create": True},
+                {"name": "resource_id", "required": True, "label": "Ресурс", "kind": "number", "list": False, "detail": False, "create": True, "ref": {"resource": "resources", "labelField": "name"}},
+                {"name": "client_user_id", "required": False, "label": "ID клиента", "kind": "number", "list": False, "detail": False, "create": False},
+                # Who this record is about, however the admin knows them:
+                # @username, a name, or a phone. Required — a customer record
+                # with nothing identifying the customer is useless.
+                # Stored alongside the numeric id column (which stays the
+                # notification target); auto-links to a real id only when the
+                # contact IS a username — see services/client_link.py.
+                {"name": "client_contact", "required": True, "label": "Контакт клиента", "kind": "contact", "list": True, "detail": True, "create": True},
                 {"name": "client_name", "label": "Имя клиента", "kind": "text", "list": True, "detail": True, "create": True},
                 {"name": "booking_date", "required": True, "label": "Дата", "kind": "date", "list": True, "detail": True, "create": True},
                 {"name": "time_slot_start", "required": True, "label": "Начало", "kind": "text", "list": True, "detail": True, "create": True},
@@ -630,6 +643,14 @@ def kb_remove_admins(ids: list[str]) -> InlineKeyboardMarkup:
 
 @router.message(Command("start"), F.chat.type == "private")
 async def cmd_start(message: Message, state: FSMContext, config: CoworkingSpaceConfig):
+    # Claim any record an admin pre-filled for this person's @username
+    # from the mini-app: until now it carried the "not linked yet"
+    # sentinel in client_user_id and so could not be notified. Opportunistic —
+    # never blocks the menu below (see services/client_link.py).
+    await link_pending_by_username(
+        config.db_path, "bookings", message.from_user.id,
+        message.from_user.username, id_column="client_user_id",
+    )
     await state.clear()
     admins = _load_admins(config.admins_file)
     sender_id = message.from_user.id

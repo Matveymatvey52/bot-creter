@@ -524,7 +524,7 @@ class BookingRestaurantMiniAppConfigTests(unittest.IsolatedAsyncioTestCase):
         field_names = {f["name"] for f in reservations["fields"]}
         self.assertEqual(
             field_names,
-            {"client_user_id", "client_name", "client_phone", "guests_count", "date",
+            {"client_user_id", "client_contact", "client_name", "client_phone", "guests_count", "date",
              "time_window_start", "time_window_end", "occasion", "deposit_required",
              "deposit_confirmed", "status", "created_at"},
         )
