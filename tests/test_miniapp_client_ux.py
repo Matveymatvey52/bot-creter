@@ -623,3 +623,65 @@ class ContactTemplateWiringTests(unittest.IsolatedAsyncioTestCase):
                     async with db.execute(f"PRAGMA table_info({table})") as cur:
                         cols = {r[1] for r in await cur.fetchall()}
             self.assertIn("client_contact", cols, tpl)
+
+
+class OwnerColumnSpoofTests(_TeamManagerHarness):
+    """Regression guard for an interaction between two correct changes.
+
+    allowed_fields honours each field's `create` flag, and templates rightly
+    mark their owner column create:False (identity comes from the session, not
+    from a form field). Together that silently DROPPED a spoofed owner column
+    before the mismatch check could see it — turning an explicit 400 into a
+    quiet correction, and losing the signal that somebody tried. The check
+    therefore reads the raw payload, not the filtered values."""
+
+    async def test_spoofed_owner_column_is_rejected_even_when_not_creatable(self):
+        # projects is the bot_admin-create path, so build a resource whose
+        # role_filter uses the single-column ownership shape the spoof guard
+        # actually keys off.
+        spoofable = {
+            "resources": [
+                {
+                    "name": "notes",
+                    "table": "notes",
+                    "creatable": True,
+                    "title": "Заметки",
+                    "titleField": "text",
+                    "fields": [
+                        {"name": "text", "required": True, "kind": "text", "create": True},
+                        # create:False is the CORRECT declaration here — the
+                        # owner must come from the session.
+                        {"name": "owner_id", "kind": "number", "create": False},
+                    ],
+                    "role_filter": {"where": "owner_id = :telegram_user_id"},
+                }
+            ]
+        }
+        async with aiosqlite.connect(self.db_a) as db:
+            await db.execute(
+                "CREATE TABLE notes (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                " text TEXT NOT NULL, owner_id INTEGER NOT NULL)"
+            )
+            await db.commit()
+
+        with patch(
+            "runtime.miniapp_api._load_template_module_async",
+            AsyncMock(return_value=_FakeModule(spoofable)),
+        ):
+            spoof = await self.client.post(
+                f"/api/{BOT_A}/notes?{self.auth(BOT_A, WORKER_ID)}",
+                json={"text": "чужая", "owner_id": BOSS_ID},
+            )
+            self.assertEqual(spoof.status, 400, await spoof.text())
+
+            # The honest create still works and is owned by the caller.
+            ok = await self.client.post(
+                f"/api/{BOT_A}/notes?{self.auth(BOT_A, WORKER_ID)}",
+                json={"text": "своя"},
+            )
+            self.assertEqual(ok.status, 201, await ok.text())
+
+        async with aiosqlite.connect(self.db_a) as db:
+            async with db.execute("SELECT text, owner_id FROM notes") as cur:
+                rows = await cur.fetchall()
+        self.assertEqual(rows, [("своя", WORKER_ID)])

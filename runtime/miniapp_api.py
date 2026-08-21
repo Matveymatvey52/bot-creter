@@ -726,6 +726,14 @@ async def _related_for_item(
 # unintended columns, not string-escaping the SQL text itself (values are
 # always bound as aiosqlite parameters, never interpolated).
 async def create_resource_handler(request: web.Request) -> web.Response:
+    """POST /api/{bot_id}/{resource} — see allowed_fields below: it checks
+    each field dict's "create" key (the one _SCHEMA_FIELD_KEYS/every
+    template's miniapp_config actually sets, e.g. tour_operator's "status"
+    field is "create": False), not "creatable" (that key only exists at the
+    RESOURCE level, checked separately just below). A prior version of this
+    line checked "creatable" here too, which never matched anything on a
+    field dict and so silently allowed writes to every "create": False
+    field regardless of its declared intent."""
     resolved = await _resolve_entry_and_config(request)
     if isinstance(resolved, web.Response):
         return resolved
@@ -763,7 +771,7 @@ async def create_resource_handler(request: web.Request) -> web.Response:
     if not isinstance(payload, dict):
         return web.json_response({"error": "invalid JSON body"}, status=400)
 
-    allowed_fields = {f["name"] for f in resource["fields"] if f.get("creatable", True)}
+    allowed_fields = {f["name"] for f in resource["fields"] if f.get("create", True)}
     required_fields = {f["name"] for f in resource["fields"] if f.get("required", False)}
     values = {k: v for k, v in payload.items() if k in allowed_fields}
     missing = required_fields - values.keys()
@@ -819,7 +827,13 @@ async def create_resource_handler(request: web.Request) -> web.Response:
         except RoleFilterDenied:
             return web.json_response({"error": "forbidden"}, status=403)
         if owner_column is not None:
-            if owner_column in values and values[owner_column] != telegram_user_id:
+            # Checked against the RAW payload, not the filtered `values`: a
+            # template that correctly marks its owner column create:False
+            # (identity belongs to the session, not to a form field) would
+            # otherwise have a spoofed value silently dropped by
+            # allowed_fields — turning an explicit rejection into a quiet
+            # correction and losing the signal that someone tried it.
+            if owner_column in payload and payload[owner_column] != telegram_user_id:
                 return web.json_response(
                     {"error": f"{owner_column} must match the authenticated user"}, status=400
                 )
