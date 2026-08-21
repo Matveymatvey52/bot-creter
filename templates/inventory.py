@@ -23,6 +23,8 @@ from aiogram.types import (
     KeyboardButton, Message, ReplyKeyboardMarkup,
 )
 
+from db.database import add_bot_admin, remove_bot_admin
+
 # ── CUSTOMIZE ────────────────────────────────────────────────────────────────
 # Same status as every other template's CUSTOMIZE block: per-file source-text
 # customization Claude edits when generating a specific bot, not per-bot
@@ -136,6 +138,8 @@ class InventoryConfig:
     welcome_image: Path
     display_name: str | None = None
     group_chat_id: str | None = None
+    bot_id: int | None = None
+    owner_telegram_id: int | None = None
 
 
 def _paths_for(name: str, data_dir: Path) -> InventoryConfig:
@@ -169,6 +173,8 @@ def config_from_bot_row(bot_row: dict, data_dir: Path) -> InventoryConfig:
     )
     config.display_name = bot_row.get("display_name")
     config.group_chat_id = bot_row.get("group_chat_id")
+    config.bot_id = bot_id
+    config.owner_telegram_id = bot_row.get("owner_telegram_id")
     return config
 
 
@@ -194,6 +200,14 @@ def _load_admins(admins_file: Path) -> set:
 
 def _save_admins(admins_file: Path, ids: set) -> None:
     admins_file.write_text(json.dumps({"ids": list(ids)}, ensure_ascii=False))
+
+def _is_bot_admin(user_id: int, config: InventoryConfig) -> bool:
+    # The DB-known owner (bots.owner_telegram_id) is always an admin, even if
+    # the local admins_file is empty/stale/hijacked — same defense-in-depth
+    # rationale as templates/shop_catalog.py's _is_bot_admin.
+    if config.owner_telegram_id is not None and str(user_id) == str(config.owner_telegram_id):
+        return True
+    return str(user_id) in _load_admins(config.admins_file)
 
 
 # ── db ────────────────────────────────────────────────────────────────────────
@@ -298,9 +312,22 @@ async def cmd_start(message: Message, state: FSMContext, config: InventoryConfig
     # movement they believed they'd left.
     await state.clear()
     admins = _load_admins(config.admins_file)
-    first_time_admin = not admins
+    sender_id = message.from_user.id
+    # Security fix: this used to grant admin to whoever sent /start FIRST,
+    # letting any client who messages the bot before its owner does
+    # permanently seize the admin commands below (/additem, /addadmin, ...).
+    # When bots.owner_telegram_id is known, only that user may claim the
+    # empty-admins bootstrap slot; in standalone/env mode (owner_telegram_id
+    # unknown) the old first-comer behavior is kept as the only option.
+    is_owner = config.owner_telegram_id is not None and sender_id == config.owner_telegram_id
+    first_time_admin = not admins and (is_owner or config.owner_telegram_id is None)
     if first_time_admin:
-        _save_admins(config.admins_file, {str(message.from_user.id)})
+        _save_admins(config.admins_file, {str(sender_id)})
+        if config.bot_id is not None:
+            try:
+                await add_bot_admin(config.bot_id, str(sender_id))
+            except Exception as e:
+                logger.warning(f"cmd_start: add_bot_admin sync failed for bot {config.bot_id}: {e}")
     if config.welcome_image.exists():
         await message.answer_photo(FSInputFile(str(config.welcome_image)),
                                    caption=WELCOME_TEXT, parse_mode="HTML", reply_markup=kb_main())
@@ -598,7 +625,7 @@ async def cb_history(cb: CallbackQuery, config: InventoryConfig):
 
 @router.message(Command("additem"))
 async def cmd_additem(msg: Message, config: InventoryConfig):
-    if str(msg.from_user.id) not in _load_admins(config.admins_file):
+    if not _is_bot_admin(msg.from_user.id, config):
         await msg.answer("⛔ Нет доступа"); return
     parts = msg.text.split(maxsplit=1)
     if len(parts) < 2 or "|" not in parts[1]:
@@ -643,7 +670,7 @@ async def cmd_additem(msg: Message, config: InventoryConfig):
 
 @router.message(Command("removeitem"))
 async def cmd_removeitem(msg: Message, config: InventoryConfig):
-    if str(msg.from_user.id) not in _load_admins(config.admins_file):
+    if not _is_bot_admin(msg.from_user.id, config):
         await msg.answer("⛔ Нет доступа"); return
     parts = msg.text.split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
@@ -658,7 +685,7 @@ async def cmd_removeitem(msg: Message, config: InventoryConfig):
 
 @router.message(Command("items"))
 async def cmd_items(msg: Message, config: InventoryConfig):
-    if str(msg.from_user.id) not in _load_admins(config.admins_file):
+    if not _is_bot_admin(msg.from_user.id, config):
         await msg.answer("⛔ Нет доступа"); return
     async with aiosqlite.connect(config.db_path) as db:
         db.row_factory = aiosqlite.Row
@@ -680,7 +707,7 @@ async def cmd_items(msg: Message, config: InventoryConfig):
 
 @router.message(Command("addsupplier"))
 async def cmd_addsupplier(msg: Message, config: InventoryConfig):
-    if str(msg.from_user.id) not in _load_admins(config.admins_file):
+    if not _is_bot_admin(msg.from_user.id, config):
         await msg.answer("⛔ Нет доступа"); return
     parts = msg.text.split(maxsplit=1)
     if len(parts) < 2 or "|" not in parts[1]:
@@ -697,7 +724,7 @@ async def cmd_addsupplier(msg: Message, config: InventoryConfig):
 
 @router.message(Command("suppliers"))
 async def cmd_suppliers(msg: Message, config: InventoryConfig):
-    if str(msg.from_user.id) not in _load_admins(config.admins_file):
+    if not _is_bot_admin(msg.from_user.id, config):
         await msg.answer("⛔ Нет доступа"); return
     async with aiosqlite.connect(config.db_path) as db:
         rows = await (await db.execute("SELECT name, contact FROM suppliers ORDER BY name")).fetchall()
@@ -713,23 +740,33 @@ async def cmd_suppliers(msg: Message, config: InventoryConfig):
 
 @router.message(Command("addadmin"))
 async def cmd_addadmin(msg: Message, config: InventoryConfig):
-    if str(msg.from_user.id) not in _load_admins(config.admins_file): await msg.answer("⛔ Нет доступа"); return
+    if not _is_bot_admin(msg.from_user.id, config): await msg.answer("⛔ Нет доступа"); return
     parts = msg.text.split()
     if len(parts) < 2 or not parts[1].lstrip("-").isdigit(): await msg.answer("Использование: /addadmin <id>"); return
     ids = _load_admins(config.admins_file); ids.add(parts[1]); _save_admins(config.admins_file, ids)
+    if config.bot_id is not None:
+        try:
+            await add_bot_admin(config.bot_id, parts[1])
+        except Exception as e:
+            logger.warning(f"cmd_addadmin: add_bot_admin sync failed for bot {config.bot_id}: {e}")
     await msg.answer(f"✅ <code>{parts[1]}</code> добавлен.", parse_mode="HTML")
 
 @router.message(Command("removeadmin"))
 async def cmd_removeadmin(msg: Message, config: InventoryConfig):
-    if str(msg.from_user.id) not in _load_admins(config.admins_file): await msg.answer("⛔ Нет доступа"); return
+    if not _is_bot_admin(msg.from_user.id, config): await msg.answer("⛔ Нет доступа"); return
     parts = msg.text.split()
     if len(parts) < 2: await msg.answer("Использование: /removeadmin <id>"); return
     ids = _load_admins(config.admins_file); ids.discard(parts[1]); _save_admins(config.admins_file, ids)
+    if config.bot_id is not None:
+        try:
+            await remove_bot_admin(config.bot_id, parts[1])
+        except Exception as e:
+            logger.warning(f"cmd_removeadmin: remove_bot_admin sync failed for bot {config.bot_id}: {e}")
     await msg.answer(f"✅ <code>{_esc(parts[1])}</code> удалён.", parse_mode="HTML")
 
 @router.message(Command("admins"))
 async def cmd_admins(msg: Message, config: InventoryConfig):
-    if str(msg.from_user.id) not in _load_admins(config.admins_file): await msg.answer("⛔ Нет доступа"); return
+    if not _is_bot_admin(msg.from_user.id, config): await msg.answer("⛔ Нет доступа"); return
     ids = _load_admins(config.admins_file)
     await msg.answer("👥 " + ("\n".join(f"• <code>{i}</code>" for i in ids) or "Пусто"), parse_mode="HTML")
 
