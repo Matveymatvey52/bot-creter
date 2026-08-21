@@ -564,6 +564,14 @@ async def recreate_bot_core(bot_id: int, creator_user_id: int) -> dict:
             await enable_bot_feature(bot_id, "voice_intake")
         if voice_cashflow_config.get("cashflow_ledger"):
             await enable_bot_feature(bot_id, "cashflow_ledger")
+        # Unlike cb_toggle_feature's manual path (enable_feature_and_reload),
+        # enable_bot_feature here was called directly — the live webhook
+        # Registry's in-memory Dispatcher for this bot_id would otherwise keep
+        # running without the new feature's router until something else
+        # (a manual toggle) triggers a reload. start_bot() below only spawns
+        # a polling subprocess; it doesn't touch the Registry entry actually
+        # serving this bot's webhook traffic.
+        await _reload_registry(bot_id)
     if fallback_info:
         await add_template_candidate(
             creator_user_id=creator_user_id,
@@ -2242,6 +2250,9 @@ async def cb_recreate(callback: CallbackQuery):
                 await enable_bot_feature(bot_id, "voice_intake")
             if voice_cashflow_config.get("cashflow_ledger"):
                 await enable_bot_feature(bot_id, "cashflow_ledger")
+            # See recreate_bot_core's identical comment — enable_bot_feature
+            # was called directly here too, bypassing enable_feature_and_reload.
+            await _reload_registry(bot_id)
         if fallback_info:
             await add_template_candidate(
                 creator_user_id=callback.from_user.id,
