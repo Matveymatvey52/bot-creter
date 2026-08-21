@@ -136,6 +136,8 @@ class ModeratorConfig:
     welcome_image: Path
     display_name: str | None = None
     group_chat_id: str | None = None
+    bot_id: int | None = None
+    owner_telegram_id: int | None = None
 
 
 def _paths_for(name: str, data_dir: Path) -> ModeratorConfig:
@@ -169,6 +171,8 @@ def config_from_bot_row(bot_row: dict, data_dir: Path) -> ModeratorConfig:
     )
     config.display_name = bot_row.get("display_name")
     config.group_chat_id = bot_row.get("group_chat_id")
+    config.bot_id = bot_id
+    config.owner_telegram_id = bot_row.get("owner_telegram_id")
     return config
 
 
@@ -1269,12 +1273,19 @@ async def cmd_mod_cancel(msg: Message, state: FSMContext):
 
 # ── private: /start, /modlog, admins_file management ──────────────────────────
 
-def kb_start_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⚙️ Настроить группу", callback_data="mod_pick_group")],
-        [InlineKeyboardButton(text="👥 Админы", callback_data="mod_admins")],
-        [InlineKeyboardButton(text="📜 Журнал модерации", callback_data="mod_modlog")],
-    ])
+def kb_start_menu(is_admin: bool = False) -> InlineKeyboardMarkup:
+    # Security fix: "👥 Админы" and "📜 Журнал модерации" used to be shown to
+    # EVERY private-chat user unconditionally — the handlers behind them
+    # (cb_mod_admins/cb_mod_modlog) already re-check _is_bot_admin, but the
+    # buttons themselves were visible and tappable by non-admins first. Only
+    # group-scoped moderation is unaffected by this — that stays gated by
+    # live Telegram admin status (_is_group_admin), never admins_file/
+    # bot_admins.
+    rows = [[InlineKeyboardButton(text="⚙️ Настроить группу", callback_data="mod_pick_group")]]
+    if is_admin:
+        rows.append([InlineKeyboardButton(text="👥 Админы", callback_data="mod_admins")])
+        rows.append([InlineKeyboardButton(text="📜 Журнал модерации", callback_data="mod_modlog")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 # "⚙️ Настроить группу" lists known_groups (populated by
 # on_bot_membership_changed) and, once a SPECIFIC group is picked and the
@@ -1463,14 +1474,27 @@ async def cmd_start(message: Message, state: FSMContext, config: ModeratorConfig
     # otherwise the user's very next plain-text message gets silently
     # captured as an admin ID for a flow they believed they'd left.
     await state.clear()
-    first_time_admin = await _claim_first_bot_admin(config.db_path, str(message.from_user.id))
+    sender_id = message.from_user.id
+    # Security fix: _claim_first_bot_admin was already race-free (BEGIN
+    # IMMEDIATE), but "whoever /start-s the empty bot first wins" was still
+    # the rule — a client DMing the bot before its owner does could
+    # permanently seize the bot-admin role (journal access, /addadmin,
+    # /removeadmin). When bots.owner_telegram_id is known, only that user's
+    # /start is allowed to attempt the atomic claim; in standalone/env mode
+    # (owner_telegram_id unknown) the old first-comer behavior is kept as
+    # the only option available.
+    is_owner = config.owner_telegram_id is not None and sender_id == config.owner_telegram_id
+    first_time_admin = False
+    if is_owner or config.owner_telegram_id is None:
+        first_time_admin = await _claim_first_bot_admin(config.db_path, str(sender_id))
+    is_admin_now = await _is_bot_admin(sender_id, config)
     if config.welcome_image.exists():
         await message.answer_photo(
             FSInputFile(str(config.welcome_image)), caption=WELCOME_TEXT, parse_mode="HTML",
-            reply_markup=kb_start_menu(),
+            reply_markup=kb_start_menu(is_admin_now),
         )
     else:
-        await message.answer(WELCOME_TEXT, parse_mode="HTML", reply_markup=kb_start_menu())
+        await message.answer(WELCOME_TEXT, parse_mode="HTML", reply_markup=kb_start_menu(is_admin_now))
     if first_time_admin:
         await message.answer(
             "👑 <b>Вы — администратор этого бота.</b>\n\n"
