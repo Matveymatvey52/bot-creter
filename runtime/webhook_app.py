@@ -91,6 +91,17 @@ def _admin_secret_ok(request: web.Request) -> bool:
 
 
 async def admin_reload_one(request: web.Request) -> web.Response:
+    """WARNING for one-off provision/repair scripts: this endpoint only updates
+    the Registry of the process that receives the HTTP request. If you call it
+    as `http://localhost:{PORT}/admin/reload/{bot_id}`, that only reaches the
+    live app when the script itself runs INSIDE the Railway container (e.g.
+    via `railway ssh`) — a script run on the operator's local machine (even
+    one using Railway's public DB URL to read/write bot rows directly) has its
+    own `localhost`, which is not the container's. The DB writes still land,
+    but the running process's in-memory Registry silently never sees them
+    until its next natural restart — producing "unknown bot" in the mini-app
+    for a bot the DB says is active. Hit the service's public domain instead,
+    or run from inside the container. (Root-caused 2026-08-21 for bots 12/13/14.)"""
     if not _admin_secret_ok(request):
         return web.json_response({"error": "forbidden"}, status=403)
     bot_id_raw = request.match_info.get("bot_id", "")

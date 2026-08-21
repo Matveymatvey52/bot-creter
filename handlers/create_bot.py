@@ -112,7 +112,21 @@ async def _register_new_bot_in_registry(bot_id: int, bot_name: str) -> None:
     here must not abort bot creation, since services.bot_runner.start_bot()
     (subprocess model) is what actually makes the bot respond today regardless
     of registry state; a bot present in the DB but missing from the registry
-    is recoverable later via a manual reload, not a data-loss scenario."""
+    is recoverable later via a manual reload, not a data-loss scenario.
+
+    This is exactly why this function calls add_or_replace() in-process rather
+    than over HTTP: an in-process call can't suffer the failure mode a one-off
+    provision/repair script hit on 2026-08-21 (bots 12/13/14) — that script
+    wrote bot rows to the DB directly, then tried to hot-register them by
+    POSTing to `http://localhost:{PORT}/admin/reload/{bot_id}` from the
+    operator's LOCAL machine. `localhost` there is the operator's machine, not
+    the Railway container, so the reload silently never reached the live
+    process — the DB said the bot was active, but its Registry didn't know,
+    and the mini-app returned "unknown bot" until the next unrelated restart
+    rebuilt the Registry from the DB and picked it up. Any script that
+    provisions a bot outside this normal /create path must either run its
+    /admin/reload call from INSIDE the container (e.g. via `railway ssh`) or
+    hit the service's public domain — never `localhost` from a local machine."""
     if _registry_handle.value is None:
         logger.debug(
             f"No live registry available (polling-only process) — bot id={bot_id} "
