@@ -19,6 +19,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
+from db.database import add_bot_admin
 from features import office_events, voice_intake
 from features.office_events import TaskAssignedEvent, TaskCompletedEvent
 from features.voice_intake import VoiceFieldSpec, VoiceRecordType, VoiceSchema
@@ -100,6 +101,7 @@ class BossBotConfig:
     display_name: str | None = None
     group_chat_id: str | None = None
     bot_id: int | None = None
+    owner_telegram_id: int | None = None
 
 
 def _paths_for(name: str, data_dir: Path) -> BossBotConfig:
@@ -138,6 +140,7 @@ def config_from_bot_row(bot_row: dict, data_dir: Path) -> BossBotConfig:
     config.display_name = bot_row.get("display_name")
     config.group_chat_id = bot_row.get("group_chat_id")
     config.bot_id = bot_id
+    config.owner_telegram_id = bot_row.get("owner_telegram_id")
     voice_intake.register_schema(bot_id, _build_voice_schema(bot_id))
     return config
 
@@ -169,8 +172,13 @@ def _save_admins(admins_file: str, ids: set) -> None:
         json.dump({"ids": list(ids)}, f)
 
 
-def _is_admin(user_id: int, admins_file: str) -> bool:
-    return str(user_id) in _load_admins(admins_file)
+def _is_admin(user_id: int, config: BossBotConfig) -> bool:
+    # The DB-known owner (bots.owner_telegram_id) is always an admin, even if
+    # the local admins_file is empty/stale/hijacked — see cmd_start below for
+    # why the file alone can't be trusted as the sole source of truth.
+    if config.owner_telegram_id is not None and str(user_id) == str(config.owner_telegram_id):
+        return True
+    return str(user_id) in _load_admins(config.admins_file)
 
 
 # ── db ────────────────────────────────────────────────────────────────────────
@@ -315,9 +323,25 @@ def kb_back() -> InlineKeyboardMarkup:
 async def cmd_start(message: Message, state: FSMContext, config: BossBotConfig):
     await state.clear()
     admins = _load_admins(config.admins_file)
-    if not admins:
-        _save_admins(config.admins_file, {str(message.from_user.id)})
-    elif str(message.from_user.id) not in admins:
+    sender_id = message.from_user.id
+    # Bug fixed here: this used to grant admin to whoever sent /start FIRST,
+    # which lets anyone who messages the bot before the owner does
+    # permanently seize the admin panel (boss_bot has no separate client
+    # menu — non-admins just get "Нет доступа"). When bots.owner_telegram_id
+    # is known (webhook/production mode), only that user may claim the
+    # empty-admins bootstrap slot. In standalone/env mode (owner_telegram_id
+    # unknown) the old first-comer behavior is kept as the only option
+    # available.
+    is_owner = config.owner_telegram_id is not None and sender_id == config.owner_telegram_id
+    if not admins and (is_owner or config.owner_telegram_id is None):
+        _save_admins(config.admins_file, {str(sender_id)})
+        admins = {str(sender_id)}
+        if config.bot_id is not None:
+            try:
+                await add_bot_admin(config.bot_id, str(sender_id))
+            except Exception as e:
+                logger.warning(f"cmd_start: add_bot_admin sync failed for bot {config.bot_id}: {e}")
+    if not _is_admin(sender_id, config):
         await message.answer("⛔ Нет доступа.")
         return
     if config.welcome_image.exists():
@@ -345,7 +369,7 @@ def _miniapp_url(bot_id: int, telegram_user_id: int) -> str | None:
 @router.callback_query(F.data == "bb_main")
 async def cb_main(cb, state: FSMContext, config: BossBotConfig):
     await cb.answer()
-    if not _is_admin(cb.from_user.id, config.admins_file):
+    if not _is_admin(cb.from_user.id, config):
         return
     await state.clear()
     await cb.message.edit_text(WELCOME_TEXT, parse_mode="HTML", reply_markup=kb_main_menu())
@@ -354,7 +378,7 @@ async def cb_main(cb, state: FSMContext, config: BossBotConfig):
 @router.callback_query(F.data == "bb_app")
 async def cb_app(cb, config: BossBotConfig):
     await cb.answer()
-    if not _is_admin(cb.from_user.id, config.admins_file):
+    if not _is_admin(cb.from_user.id, config):
         return
     url = _miniapp_url(config.bot_id, cb.from_user.id) if config.bot_id is not None else None
     if not url:
@@ -391,7 +415,7 @@ def _office_dashboard_url(bot_id: int, telegram_user_id: int) -> str | None:
 @router.callback_query(F.data == "bb_office")
 async def cb_office(cb, config: BossBotConfig):
     await cb.answer()
-    if not _is_admin(cb.from_user.id, config.admins_file):
+    if not _is_admin(cb.from_user.id, config):
         return
     url = _office_dashboard_url(config.bot_id, cb.from_user.id) if config.bot_id is not None else None
     if not url:
@@ -413,7 +437,7 @@ MAX_LIST_ROWS = 40
 @router.callback_query(F.data == "bb_tasks")
 async def cb_tasks(cb, config: BossBotConfig):
     await cb.answer()
-    if not _is_admin(cb.from_user.id, config.admins_file):
+    if not _is_admin(cb.from_user.id, config):
         return
     async with aiosqlite.connect(config.db_path) as db:
         db.row_factory = aiosqlite.Row
