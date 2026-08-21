@@ -580,10 +580,11 @@ function FeatureConfigureSubpanel({
       ))}
       {error && <div className="thread-turn claude">{error}</div>}
       <textarea
+        className="feature-config-textarea"
         value={message}
         onChange={(e) => setMessage(e.target.value)}
         placeholder={FEATURE_QUESTION[feature.name] || 'Опиши, что нужно настроить'}
-        rows={2}
+        rows={4}
         style={{ width: '100%' }}
       />
       <div className="row">
