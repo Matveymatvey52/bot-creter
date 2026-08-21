@@ -1,6 +1,6 @@
 """habit_tracker template — streak-logic correctness, per-user data isolation
-WITHIN one bot, cross-bot isolation, admin-only aggregate gating, and archive
-(soft-delete) tests.
+WITHIN one bot, cross-bot isolation, admin-only aggregate gating, archive
+(soft-delete), and admin-hijack security fix tests.
 
 Design recap (see templates/habit_tracker.py's own module docstring for the
 full reasoning): unlike every other template in this repo, habit_tracker has
@@ -20,6 +20,14 @@ Streak semantics under test (the trickiest part of this template):
 - best/longest streak must persist correctly after a break-then-rebuild,
   computed by a full forward scan rather than incremental tracking.
 
+Admin-hijack security fix (same pattern/criterion as
+tests/test_shop_catalog_isolation.py's isolation tests): whoever sent /start
+FIRST used to permanently become the bot's admin. Now the empty-admins
+bootstrap slot can only be claimed by bots.owner_telegram_id when it's known;
+the DB-known owner is always treated as admin regardless of the local
+admins_file state; and standalone mode (owner_telegram_id=None) keeps the old
+first-comer behavior as the only option available.
+
 No real Telegram network calls, no real tokens.
 
 Run with: python -m unittest tests.test_habit_tracker_isolation
@@ -37,6 +45,7 @@ import aiosqlite
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
 
+import db.database as db_module
 from runtime.registry import get_template_router
 from templates import habit_tracker
 
@@ -365,6 +374,97 @@ class HabitTrackerFlowTests(unittest.IsolatedAsyncioTestCase):
                 "SELECT COUNT(*) FROM habit_checkins WHERE habit_id=?", (habit_id,)
             )).fetchone()
         self.assertEqual(count[0], 1)
+
+
+class HabitTrackerAdminHijackTests(unittest.IsolatedAsyncioTestCase):
+    """Security fix: whoever sent /start FIRST used to permanently become the
+    bot's admin (able to see "📊 Сводка по всем" and manage admins) — a
+    client who messaged the bot before the owner tested it could hijack that
+    role. Same criterion/pattern as
+    tests/test_shop_catalog_isolation.py's admin-hijack tests."""
+
+    async def asyncSetUp(self):
+        self._bot_call_patcher = patch.object(Bot, "__call__", new=AsyncMock(return_value=MagicMock()))
+        self._bot_call_patcher.start()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.data_dir = Path(self._tmp.name)
+
+        # cmd_start now syncs the bootstrap admin into db.database.add_bot_admin
+        # (central bot_admins table) -- must be redirected to a throwaway DB.
+        self._central_db_path = self.data_dir / "central_bots.db"
+        self._db_path_patcher = patch.object(db_module, "DB_PATH", self._central_db_path)
+        self._db_path_patcher.start()
+        await db_module.init_db()
+
+    async def asyncTearDown(self):
+        self._db_path_patcher.stop()
+        self._tmp.cleanup()
+        self._bot_call_patcher.stop()
+
+    async def test_non_owner_messaging_first_does_not_become_admin(self):
+        config = habit_tracker.config_from_bot_row(
+            {"bot_id": 401, "name": "habit_bot_owned", "display_name": None,
+             "group_chat_id": None, "owner_telegram_id": 12345},
+            self.data_dir,
+        )
+        await habit_tracker.init_db(config.db_path)
+        bot, dp = _build_bot_dispatcher(config)
+
+        CLIENT_ID = 555  # not the owner, messages first
+        await dp.feed_webhook_update(bot, _text_update(1, CLIENT_ID, "/start"))
+        self.assertEqual(habit_tracker._load_admins(config.admins_file), set())
+        self.assertFalse(habit_tracker._is_admin(CLIENT_ID, config))
+
+    async def test_owner_start_becomes_admin(self):
+        config = habit_tracker.config_from_bot_row(
+            {"bot_id": 402, "name": "habit_bot_owned2", "display_name": None,
+             "group_chat_id": None, "owner_telegram_id": 12345},
+            self.data_dir,
+        )
+        await habit_tracker.init_db(config.db_path)
+        bot, dp = _build_bot_dispatcher(config)
+
+        await dp.feed_webhook_update(bot, _text_update(1, 12345, "/start"))
+        self.assertTrue(habit_tracker._is_admin(12345, config))
+        self.assertEqual(habit_tracker._load_admins(config.admins_file), {"12345"})
+
+    async def test_owner_is_always_admin_even_with_stale_admins_file(self):
+        config = habit_tracker.config_from_bot_row(
+            {"bot_id": 403, "name": "habit_bot_owned3", "display_name": None,
+             "group_chat_id": None, "owner_telegram_id": 777},
+            self.data_dir,
+        )
+        await habit_tracker.init_db(config.db_path)
+        habit_tracker._save_admins(config.admins_file, {"999999"})
+        self.assertTrue(habit_tracker._is_admin(777, config))  # owner: always admin
+        self.assertTrue(habit_tracker._is_admin(999999, config))  # still honors the file's own admin
+        self.assertFalse(habit_tracker._is_admin(4242, config))  # neither owner nor in the file
+
+    async def test_standalone_mode_keeps_first_comer_behavior(self):
+        """owner_telegram_id unknown (standalone/env mode) -- the old
+        first-comer bootstrap is the only option available, so it's kept."""
+        config = habit_tracker.config_from_bot_row(
+            {"bot_id": 404, "name": "habit_bot_standalone", "display_name": None, "group_chat_id": None},
+            self.data_dir,
+        )
+        await habit_tracker.init_db(config.db_path)
+        bot, dp = _build_bot_dispatcher(config)
+
+        await dp.feed_webhook_update(bot, _text_update(1, 111, "/start"))
+        self.assertEqual(habit_tracker._load_admins(config.admins_file), {"111"})
+        self.assertTrue(habit_tracker._is_admin(111, config))
+
+    async def test_bootstrap_admin_syncs_to_central_bot_admins_table(self):
+        config = habit_tracker.config_from_bot_row(
+            {"bot_id": 405, "name": "habit_bot_synced", "display_name": None, "group_chat_id": None},
+            self.data_dir,
+        )
+        await habit_tracker.init_db(config.db_path)
+        bot, dp = _build_bot_dispatcher(config)
+        await dp.feed_webhook_update(bot, _text_update(1, 321, "/start"))
+
+        central_admins = await db_module.get_bot_admins(405)
+        self.assertEqual(central_admins, ["321"])
 
 
 if __name__ == "__main__":
