@@ -60,7 +60,13 @@ from features.office_events import _EVENT_TYPES, EVENT_TYPE_LABELS
 from features.sheets import get_service_account_email, verify_access
 from handlers.admin_manager import _can_manage_bot, _is_owner
 from handlers.create_bot import cancel_keyboard
-from runtime.registry import _CUSTOM_FEATURES_DIR, discover_features, infer_template_id, invalidate_custom_feature_cache
+from runtime.registry import (
+    _CUSTOM_FEATURES_DIR,
+    discover_features,
+    infer_template_id,
+    invalidate_custom_feature_cache,
+    is_template_backed,
+)
 from runtime.registry_holder import RegistryHandle
 from runtime.webhook_setup import set_miniapp_menu_button
 from services.bot_runner import _make_extra_env, get_bot_logs, is_running, start_bot, stop_bot
@@ -540,6 +546,42 @@ async def disable_feature_and_reload(bot_id: int, feature_name: str) -> None:
 # apply_fix_core's docstring). Callers are responsible for the _busy_bots
 # guard — these functions assume the caller already holds it.
 
+class TemplateBackedBotError(RuntimeError):
+    """A code-rewrite path tried to overwrite a shared templates/<id>.py."""
+
+
+TEMPLATE_BACKED_DENIED = (
+    "🔒 Этот бот работает на общем шаблоне, а не на своей копии кода.\n\n"
+    "Перегенерация и авто-правки для него отключены: они переписали бы сам "
+    "шаблон, на котором держатся все остальные боты этого типа, и отправили "
+    "бы эту версию в GitHub.\n\n"
+    "Остальные действия — фичи, доработки, настройки — работают как обычно."
+)
+
+
+async def write_bot_code(bot: dict, code: str) -> None:
+    """The ONE place a bot's source is written to disk and pushed to GitHub.
+
+    Refuses outright for a template-backed bot. Every rewrite path here runs
+    LLM output through this: /recreate, autofix, and both halves of fixbug.
+    For a bot whose file IS templates/<id>.py that output would replace the
+    hand-authored template — for every bot built on it, not just this one —
+    and push the replacement (see the "🔍 Авто-диагностика" path, which can
+    fire off a crashed bot without anyone pressing "regenerate").
+
+    Raises rather than returning a flag on purpose: six callers with three
+    different return conventions (dict / tuple / message edit) share this, and
+    a forgotten flag check would silently let the write through. An exception
+    cannot be ignored by accident. Callers each translate it into their own
+    shape — and each also refuses EARLY, before spending a Claude call, so
+    this raise is the safety net rather than the working path.
+    """
+    if is_template_backed(bot.get("file_path")):
+        raise TemplateBackedBotError(bot.get("name"))
+    Path(bot["file_path"]).write_text(code, encoding="utf-8")
+    asyncio.create_task(push_bot_to_github(bot["name"], code))
+
+
 async def recreate_bot_core(bot_id: int, creator_user_id: int) -> dict:
     """Returns {"ok": bool, "error": str|None, "bot_name": str|None}. Mirrors
     cb_recreate's full sequence: improve existing code or generate from
@@ -550,6 +592,11 @@ async def recreate_bot_core(bot_id: int, creator_user_id: int) -> dict:
         return {"ok": False, "error": "not_found", "bot_name": None}
     if not b.get("description"):
         return {"ok": False, "error": "no_description", "bot_name": b["name"]}
+    # Refused here rather than at write_bot_code below: otherwise we would burn
+    # a 240s Claude call and its tokens to produce code we are going to throw
+    # away. write_bot_code stays as the guarantee.
+    if is_template_backed(b.get("file_path")):
+        return {"ok": False, "error": "template_backed", "bot_name": b["name"]}
 
     current_code = ""
     if b.get("file_path"):
@@ -583,8 +630,7 @@ async def recreate_bot_core(bot_id: int, creator_user_id: int) -> dict:
     await stop_bot(bot_id)
     code = append_from_scratch_registry_wiring(code)
     bot_file = Path(b["file_path"])
-    bot_file.write_text(code, encoding="utf-8")
-    asyncio.create_task(push_bot_to_github(b["name"], code))
+    await write_bot_code(b, code)
 
     if office_hook_config:
         await set_bot_office_hook_config(bot_id, office_hook_config)
@@ -650,6 +696,11 @@ async def autofix_bot_core(bot_id: int) -> dict:
     b = await get_bot(bot_id)
     if not b or not b.get("file_path") or not Path(b["file_path"]).exists():
         return {"ok": False, "error": "file_missing", "bot_name": b["name"] if b else None}
+    # This path can fire automatically off a crashed bot — nobody presses
+    # anything — so refusing before the Claude call matters more here than
+    # anywhere else.
+    if is_template_backed(b.get("file_path")):
+        return {"ok": False, "error": "template_backed", "bot_name": b["name"]}
 
     current_code = Path(b["file_path"]).read_text(encoding="utf-8")
     error_log = get_bot_logs(bot_id) or ""
@@ -670,8 +721,7 @@ async def autofix_bot_core(bot_id: int) -> dict:
 
     await stop_bot(bot_id)
     fixed_code = append_from_scratch_registry_wiring(fixed_code)
-    Path(b["file_path"]).write_text(fixed_code, encoding="utf-8")
-    asyncio.create_task(push_bot_to_github(b["name"], fixed_code))
+    await write_bot_code(b, fixed_code)
 
     try:
         pid = await start_bot(bot_id, b["file_path"], b["token"], extra_env=_make_extra_env(b))
@@ -737,6 +787,8 @@ async def apply_fix_core(bot_id: int, fixed_code: str, main_code_hash: str | Non
         return {"ok": False, "error": "not_found", "bot_name": None}
     if not b.get("file_path") or not Path(b["file_path"]).exists():
         return {"ok": False, "error": "file_missing", "bot_name": b["name"]}
+    if is_template_backed(b.get("file_path")):
+        return {"ok": False, "error": "template_backed", "bot_name": b["name"]}
 
     current_code = Path(b["file_path"]).read_text(encoding="utf-8")
     if main_code_hash is not None and _hash_bot_code(current_code) != main_code_hash:
@@ -744,8 +796,7 @@ async def apply_fix_core(bot_id: int, fixed_code: str, main_code_hash: str | Non
 
     await stop_bot(bot_id)
     fixed_code = append_from_scratch_registry_wiring(fixed_code)
-    Path(b["file_path"]).write_text(fixed_code, encoding="utf-8")
-    asyncio.create_task(push_bot_to_github(b["name"], fixed_code))
+    await write_bot_code(b, fixed_code)
 
     try:
         pid = await start_bot(bot_id, b["file_path"], b["token"], extra_env=_make_extra_env(b))
@@ -2201,6 +2252,38 @@ async def cb_delete(callback: CallbackQuery):
 
 
 @router.callback_query(F.data.startswith("recreate:"))
+async def cb_recreate_confirm(callback: CallbackQuery):
+    """Confirmation gate in front of cb_recreate_go below.
+
+    /recreate rewrites the bot's whole source with an LLM pass and pushes the
+    result to GitHub — the most destructive thing this panel can do to a
+    working bot, and previously one tap away. The other rewrite path (fixbug)
+    already shows a diff preview before its "✅ Применить", so it has an
+    equivalent step; this one had none.
+    """
+    bot_id = int(callback.data.split(":")[1])
+    b = await get_bot(bot_id)
+    if not b or not _can_manage_bot(callback.from_user.id, b):
+        await _deny_callback(callback)
+        return
+    await callback.answer()
+    if is_template_backed(b.get("file_path")):
+        await callback.message.edit_text(TEMPLATE_BACKED_DENIED)
+        return
+    await callback.message.edit_text(
+        f"🔄 Перегенерировать код бота <b>{b['name']}</b>?\n\n"
+        "Claude перепишет весь файл бота заново по его описанию, старая версия "
+        "будет заменена, а новая — отправлена в GitHub. Данные бота "
+        "(записи, настройки) не тронутся.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Да, перегенерировать", callback_data=f"recreate_go:{bot_id}")],
+            [InlineKeyboardButton(text="↩️ Отмена", callback_data=f"info:{bot_id}")],
+        ]),
+    )
+
+
+@router.callback_query(F.data.startswith("recreate_go:"))
 async def cb_recreate(callback: CallbackQuery):
     bot_id = int(callback.data.split(":")[1])
     if bot_id in _busy_bots:
@@ -2217,6 +2300,9 @@ async def cb_recreate(callback: CallbackQuery):
             await callback.message.edit_text(
                 "❌ Не могу пересоздать — описание бота не сохранилось.\n\nСоздай заново через /create.",
             )
+            return
+        if is_template_backed(b.get("file_path")):
+            await callback.message.edit_text(TEMPLATE_BACKED_DENIED)
             return
 
         current_code = ""
@@ -2269,8 +2355,7 @@ async def cb_recreate(callback: CallbackQuery):
         code = append_from_scratch_registry_wiring(code)
 
         bot_file = Path(b["file_path"])
-        bot_file.write_text(code, encoding="utf-8")
-        asyncio.create_task(push_bot_to_github(b["name"], code))
+        await write_bot_code(b, code)
 
         if office_hook_config:
             await set_bot_office_hook_config(bot_id, office_hook_config)
@@ -2352,6 +2437,12 @@ async def _perform_autofix(bot_id: int, b: dict) -> tuple[bool, str]:
     _AutofixAnalyzeError if the Claude call itself fails; otherwise returns
     (success, human-readable outcome) for the restart-after-fix step, same
     shape as _perform_start/_perform_restart above."""
+    # Before the Claude call, not at the write: this runs off a crashed bot
+    # (button, or the AI dialog's run_autofix tool) without an explicit
+    # "rewrite my code" from anyone.
+    if is_template_backed(b.get("file_path")):
+        return False, TEMPLATE_BACKED_DENIED
+
     current_code = Path(b["file_path"]).read_text(encoding="utf-8")
     error_log = get_bot_logs(bot_id) or ""
 
@@ -2375,8 +2466,7 @@ async def _perform_autofix(bot_id: int, b: dict) -> tuple[bool, str]:
     # Same re-append as cb_recreate above — fix_bot_code() is also a
     # whole-file LLM rewrite that can drop the appended office-hook wiring.
     fixed_code = append_from_scratch_registry_wiring(fixed_code)
-    Path(b["file_path"]).write_text(fixed_code, encoding="utf-8")
-    asyncio.create_task(push_bot_to_github(b["name"], fixed_code))
+    await write_bot_code(b, fixed_code)
 
     try:
         pid = await start_bot(bot_id, b["file_path"], b["token"], extra_env=_make_extra_env(b))
@@ -2619,6 +2709,10 @@ async def cb_apply_fix(callback: CallbackQuery, state: FSMContext):
     if not b or not _can_manage_bot(callback.from_user.id, b):
         await _deny_callback(callback)
         return
+    if is_template_backed(b.get("file_path")):
+        await callback.answer()
+        await callback.message.edit_text(TEMPLATE_BACKED_DENIED)
+        return
     # Check-then-add with no await in between — same double-tap race guard
     # as cb_recreate/cb_apply_custom_feature.
     if bot_id in _busy_bots:
@@ -2658,8 +2752,7 @@ async def cb_apply_fix(callback: CallbackQuery, state: FSMContext):
         # Same re-append as cb_recreate — fix_bot_code() is a whole-file LLM
         # rewrite that can drop the appended office-hook wiring.
         fixed_code = append_from_scratch_registry_wiring(fixed_code)
-        Path(b["file_path"]).write_text(fixed_code, encoding="utf-8")
-        asyncio.create_task(push_bot_to_github(b["name"], fixed_code))
+        await write_bot_code(b, fixed_code)
 
         try:
             pid = await start_bot(bot_id, b["file_path"], b["token"], extra_env=_make_extra_env(b))
