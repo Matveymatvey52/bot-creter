@@ -22,6 +22,8 @@ from aiogram.types import (
     KeyboardButton, Message, ReplyKeyboardMarkup,
 )
 
+from db.database import add_bot_admin, remove_bot_admin
+
 # ── CUSTOMIZE ────────────────────────────────────────────────────────────────
 # Same status as every other template's CUSTOMIZE block: per-file source-text
 # customization Claude edits when generating a specific bot, not per-bot
@@ -98,6 +100,8 @@ class ReferralConfig:
     welcome_image: Path
     display_name: str | None = None
     group_chat_id: str | None = None
+    bot_id: int | None = None
+    owner_telegram_id: int | None = None
 
 
 def _paths_for(name: str, data_dir: Path) -> ReferralConfig:
@@ -131,6 +135,8 @@ def config_from_bot_row(bot_row: dict, data_dir: Path) -> ReferralConfig:
     )
     config.display_name = bot_row.get("display_name")
     config.group_chat_id = bot_row.get("group_chat_id")
+    config.bot_id = bot_id
+    config.owner_telegram_id = bot_row.get("owner_telegram_id")
     return config
 
 
@@ -156,6 +162,14 @@ def _load_admins(admins_file: Path) -> set:
 
 def _save_admins(admins_file: Path, ids: set) -> None:
     admins_file.write_text(json.dumps({"ids": list(ids)}, ensure_ascii=False))
+
+def _is_admin(user_id: int, config: ReferralConfig) -> bool:
+    # The DB-known owner (bots.owner_telegram_id) is always an admin, even if
+    # the local admins_file is empty/stale/hijacked — see cmd_start below for
+    # why the file alone can't be trusted as the sole source of truth.
+    if config.owner_telegram_id is not None and str(user_id) == str(config.owner_telegram_id):
+        return True
+    return str(user_id) in _load_admins(config.admins_file)
 
 
 # ── db ────────────────────────────────────────────────────────────────────────
@@ -221,11 +235,24 @@ def kb_main() -> ReplyKeyboardMarkup:
 @router.message(Command("start"))
 async def cmd_start(message: Message, command: CommandObject, config: ReferralConfig):
     admins = _load_admins(config.admins_file)
-    first_time_admin = not admins
-    if first_time_admin:
-        _save_admins(config.admins_file, {str(message.from_user.id)})
-
     user_id = message.from_user.id
+    # Bug fixed here: this used to grant admin to whoever sent /start FIRST,
+    # which lets any client who messages the bot before the owner does
+    # permanently seize the admin panel. When bots.owner_telegram_id is known
+    # (webhook/production mode), only that user may claim the empty-admins
+    # bootstrap slot; a non-owner sending /start first now just gets the
+    # regular participant flow. In standalone/env mode (owner_telegram_id
+    # unknown) the old first-comer behavior is kept as the only option
+    # available.
+    is_owner = config.owner_telegram_id is not None and user_id == config.owner_telegram_id
+    first_time_admin = not admins and (is_owner or config.owner_telegram_id is None)
+    if first_time_admin:
+        _save_admins(config.admins_file, {str(user_id)})
+        if config.bot_id is not None:
+            try:
+                await add_bot_admin(config.bot_id, str(user_id))
+            except Exception as e:
+                logger.warning(f"cmd_start: add_bot_admin sync failed for bot {config.bot_id}: {e}")
     async with aiosqlite.connect(config.db_path) as db:
         existing = await (await db.execute(
             "SELECT 1 FROM participants WHERE user_id=?", (user_id,)
@@ -339,7 +366,7 @@ async def show_leaderboard(msg: Message, config: ReferralConfig):
 
 @router.message(Command("pending"))
 async def cmd_pending(msg: Message, config: ReferralConfig):
-    if str(msg.from_user.id) not in _load_admins(config.admins_file):
+    if not _is_admin(msg.from_user.id, config):
         await msg.answer("⛔ Нет доступа"); return
     async with aiosqlite.connect(config.db_path) as db:
         db.row_factory = aiosqlite.Row
@@ -368,7 +395,7 @@ async def cmd_pending(msg: Message, config: ReferralConfig):
 
 @router.callback_query(F.data.startswith("ref_confirm:"))
 async def cb_confirm(cb: CallbackQuery, bot: Bot, config: ReferralConfig):
-    if str(cb.from_user.id) not in _load_admins(config.admins_file):
+    if not _is_admin(cb.from_user.id, config):
         await cb.answer("⛔ Нет доступа", show_alert=True); return
     await cb.answer()
     try:
@@ -441,15 +468,20 @@ async def cb_confirm(cb: CallbackQuery, bot: Bot, config: ReferralConfig):
 
 @router.message(Command("addadmin"))
 async def cmd_addadmin(msg: Message, config: ReferralConfig):
-    if str(msg.from_user.id) not in _load_admins(config.admins_file): await msg.answer("⛔ Нет доступа"); return
+    if not _is_admin(msg.from_user.id, config): await msg.answer("⛔ Нет доступа"); return
     parts = msg.text.split()
     if len(parts) < 2 or not parts[1].lstrip("-").isdigit(): await msg.answer("Использование: /addadmin <id>"); return
     ids = _load_admins(config.admins_file); ids.add(parts[1]); _save_admins(config.admins_file, ids)
+    if config.bot_id is not None:
+        try:
+            await add_bot_admin(config.bot_id, parts[1])
+        except Exception as e:
+            logger.warning(f"cmd_addadmin: add_bot_admin sync failed for bot {config.bot_id}: {e}")
     await msg.answer(f"✅ <code>{parts[1]}</code> добавлен.", parse_mode="HTML")
 
 @router.message(Command("removeadmin"))
 async def cmd_removeadmin(msg: Message, config: ReferralConfig):
-    if str(msg.from_user.id) not in _load_admins(config.admins_file): await msg.answer("⛔ Нет доступа"); return
+    if not _is_admin(msg.from_user.id, config): await msg.answer("⛔ Нет доступа"); return
     parts = msg.text.split()
     if len(parts) < 2: await msg.answer("Использование: /removeadmin <id>"); return
     ids = _load_admins(config.admins_file)
@@ -459,11 +491,16 @@ async def cmd_removeadmin(msg: Message, config: ReferralConfig):
         # would hand admin rights to whoever sends /start next.
         await msg.answer("⚠️ Нельзя удалить последнего администратора."); return
     ids.discard(parts[1]); _save_admins(config.admins_file, ids)
+    if config.bot_id is not None:
+        try:
+            await remove_bot_admin(config.bot_id, parts[1])
+        except Exception as e:
+            logger.warning(f"cmd_removeadmin: remove_bot_admin sync failed for bot {config.bot_id}: {e}")
     await msg.answer(f"✅ <code>{_esc(parts[1])}</code> удалён.", parse_mode="HTML")
 
 @router.message(Command("admins"))
 async def cmd_admins(msg: Message, config: ReferralConfig):
-    if str(msg.from_user.id) not in _load_admins(config.admins_file): await msg.answer("⛔ Нет доступа"); return
+    if not _is_admin(msg.from_user.id, config): await msg.answer("⛔ Нет доступа"); return
     ids = _load_admins(config.admins_file)
     await msg.answer("👥 " + ("\n".join(f"• <code>{i}</code>" for i in ids) or "Пусто"), parse_mode="HTML")
 
