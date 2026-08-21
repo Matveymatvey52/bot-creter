@@ -123,17 +123,17 @@ class DiscoverTemplatesRegressionOnRealTemplates(unittest.TestCase):
     event_manager, debtors, vehicle_service, rental_equipment,
     loyalty_program, feedback_survey, staff_scheduler, support_tickets,
     booking_restaurant, repair_tracker, habit_tracker, coworking_space,
-    delivery_tracker, survey_form, and property_rental were each added after
-    this test was first written — every new template added purely by
-    dropping a file into templates/, with zero changes to claude_service.py,
-    needs this set updated to match."""
+    delivery_tracker, survey_form, property_rental, and food_delivery were
+    each added after this test was first written — every new template added
+    purely by dropping a file into templates/, with zero changes to
+    claude_service.py, needs this set updated to match."""
 
     def test_all_real_templates_are_discovered(self):
         found = claude_service.discover_templates()
         names = {t["name"] for t in found}
         self.assertEqual(
             names,
-            {"accountant", "booking_beauty", "booking_fitness", "booking_medical", "booking_restaurant", "boss_bot", "campaign_tracker", "car_rental", "channel_aggregator", "course_tracker", "coworking_space", "debtors", "delivery_tracker", "event_manager", "event_rsvp", "expense_tracker", "feedback_survey", "habit_tracker", "inventory", "loyalty_program", "manager_bot", "manager_secretary", "moderator", "orders_tracker", "property_rental", "referral_program", "rental_equipment", "repair_tracker", "shop_catalog", "staff_scheduler", "support_tickets", "survey_form", "team_manager", "tour_operator", "tourist_documents", "trip_manager", "vehicle_service"},
+            {"accountant", "booking_beauty", "booking_fitness", "booking_medical", "booking_restaurant", "boss_bot", "campaign_tracker", "car_rental", "channel_aggregator", "course_tracker", "coworking_space", "debtors", "delivery_tracker", "event_manager", "event_rsvp", "expense_tracker", "feedback_survey", "food_delivery", "habit_tracker", "inventory", "loyalty_program", "manager_bot", "manager_secretary", "moderator", "orders_tracker", "property_rental", "referral_program", "rental_equipment", "repair_tracker", "shop_catalog", "staff_scheduler", "support_tickets", "survey_form", "team_manager", "tour_operator", "tourist_documents", "trip_manager", "vehicle_service"},
         )
 
     def test_tour_operator_use_for_is_parsed_despite_missing_customize_line(self):
