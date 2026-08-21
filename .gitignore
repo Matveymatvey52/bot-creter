@@ -11,3 +11,4 @@ generated_bots/*.py
 .claude/scheduled_tasks.lock
 miniapp/node_modules/
 miniapp/dist/
+
