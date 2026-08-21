@@ -14,7 +14,7 @@ from __future__ import annotations
 import sqlite3
 import tempfile
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from aiogram.filters import CommandObject
@@ -22,6 +22,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.base import StorageKey
 from aiogram.fsm.storage.memory import MemoryStorage
 
+import db.database as db_module
 from templates import course_tracker
 
 ADMIN_ID = 111
@@ -113,7 +114,7 @@ async def test_cmd_start_bootstraps_first_user_as_admin(db_path):
 
     await course_tracker.cmd_start(message, command, state, config)
 
-    assert course_tracker._is_admin(ADMIN_ID, config.admins_file)
+    assert course_tracker._is_admin(ADMIN_ID, config)
     message.answer.assert_awaited_once()
 
 
@@ -128,7 +129,7 @@ async def test_second_user_without_deep_link_is_not_admin(db_path):
     command = CommandObject(prefix="/", command="start", args=None)
     await course_tracker.cmd_start(message, command, state, config)
 
-    assert not course_tracker._is_admin(STUDENT_ID, config.admins_file)
+    assert not course_tracker._is_admin(STUDENT_ID, config)
     message.answer.assert_awaited_once()
 
 
@@ -231,3 +232,64 @@ def test_parse_deadline_accepts_expected_format():
 
 def test_parse_deadline_rejects_garbage():
     assert course_tracker._parse_deadline("not a date") is None
+
+
+# ── admin bootstrap security fix ─────────────────────────────────────────────
+# Previously, whoever sent /start FIRST (with no course_ deep link) permanently
+# became admin — a student messaging the bot before the teacher did would
+# silently seize the admin panel. See tests/test_shop_catalog_isolation.py for
+# the original of this fix, applied identically here.
+
+@pytest.mark.asyncio
+async def test_non_owner_messaging_first_does_not_become_admin(db_path):
+    await course_tracker.init_db(db_path)
+    config = _config(db_path)
+    config.bot_id = 924
+    config.owner_telegram_id = 12345
+
+    with tempfile.TemporaryDirectory() as central_tmp:
+        with patch.object(db_module, "DB_PATH", Path(central_tmp) / "central_bots.db"):
+            await db_module.init_db()
+
+            state = _fsm(STUDENT_ID)
+            message = _message(STUDENT_ID)
+            command = CommandObject(prefix="/", command="start", args=None)
+            await course_tracker.cmd_start(message, command, state, config)
+            assert course_tracker._load_admins(config.admins_file) == set()
+            assert not course_tracker._is_admin(STUDENT_ID, config)
+
+            state2 = _fsm(12345)
+            message2 = _message(12345)
+            await course_tracker.cmd_start(message2, command, state2, config)
+            assert course_tracker._is_admin(12345, config)
+            assert course_tracker._load_admins(config.admins_file) == {"12345"}
+
+
+@pytest.mark.asyncio
+async def test_owner_is_always_admin_even_with_stale_admins_file(db_path):
+    await course_tracker.init_db(db_path)
+    config = _config(db_path)
+    config.owner_telegram_id = 777
+    course_tracker._save_admins(config.admins_file, {"999999"})  # some other id, not the owner
+    assert course_tracker._is_admin(777, config)  # owner: always admin
+    assert course_tracker._is_admin(999999, config)  # still honors the file's own admin
+    assert not course_tracker._is_admin(4242, config)  # neither owner nor in the file
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_admin_syncs_to_central_bot_admins_table(db_path):
+    await course_tracker.init_db(db_path)
+    config = _config(db_path)
+    config.bot_id = 925
+
+    with tempfile.TemporaryDirectory() as central_tmp:
+        with patch.object(db_module, "DB_PATH", Path(central_tmp) / "central_bots.db"):
+            await db_module.init_db()
+
+            state = _fsm(321)
+            message = _message(321)
+            command = CommandObject(prefix="/", command="start", args=None)
+            await course_tracker.cmd_start(message, command, state, config)
+
+            central_admins = await db_module.get_bot_admins(925)
+            assert central_admins == ["321"]

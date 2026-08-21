@@ -33,7 +33,7 @@ from aiogram.types import (
     Message,
 )
 
-from db.database import get_bot_sheets_config
+from db.database import add_bot_admin, get_bot_sheets_config
 from features.sheets import write_row
 
 # ── CUSTOMIZE ────────────────────────────────────────────────────────────────
@@ -164,6 +164,7 @@ class CourseTrackerConfig:
     display_name: str | None = None
     group_chat_id: str | None = None
     bot_id: int | None = None
+    owner_telegram_id: int | None = None
 
 
 def _paths_for(name: str, data_dir: Path) -> CourseTrackerConfig:
@@ -193,6 +194,7 @@ def config_from_bot_row(bot_row: dict, data_dir: Path) -> CourseTrackerConfig:
     config.display_name = bot_row.get("display_name")
     config.group_chat_id = bot_row.get("group_chat_id")
     config.bot_id = bot_id
+    config.owner_telegram_id = bot_row.get("owner_telegram_id")
     return config
 
 
@@ -223,8 +225,13 @@ def _save_admins(admins_file: str, ids: set) -> None:
         json.dump({"ids": list(ids)}, f)
 
 
-def _is_admin(user_id: int, admins_file: str) -> bool:
-    return str(user_id) in _load_admins(admins_file)
+def _is_admin(user_id: int, config: CourseTrackerConfig) -> bool:
+    # The DB-known owner (bots.owner_telegram_id) is always an admin, even if
+    # the local admins_file is empty/stale/hijacked — see cmd_start below for
+    # why the file alone can't be trusted as the sole source of truth.
+    if config.owner_telegram_id is not None and str(user_id) == str(config.owner_telegram_id):
+        return True
+    return str(user_id) in _load_admins(config.admins_file)
 
 
 # ── db ────────────────────────────────────────────────────────────────────────
@@ -370,9 +377,24 @@ async def cmd_start(message: Message, command: CommandObject, state: FSMContext,
             return
 
     admins = _load_admins(config.admins_file)
-    if not admins:
-        _save_admins(config.admins_file, {str(message.from_user.id)})
-    elif str(message.from_user.id) not in admins:
+    sender_id = message.from_user.id
+    # Bug fixed here: this used to grant admin to whoever sent /start FIRST
+    # (with no course_ deep link), which lets any student who messages the
+    # bot before the teacher does permanently seize the admin panel. When
+    # bots.owner_telegram_id is known (webhook/production mode), only that
+    # user may claim the empty-admins bootstrap slot. In standalone/env mode
+    # (owner_telegram_id unknown) the old first-comer behavior is kept as the
+    # only option available.
+    is_owner = config.owner_telegram_id is not None and sender_id == config.owner_telegram_id
+    if not admins and (is_owner or config.owner_telegram_id is None):
+        _save_admins(config.admins_file, {str(sender_id)})
+        admins = {str(sender_id)}
+        if config.bot_id is not None:
+            try:
+                await add_bot_admin(config.bot_id, str(sender_id))
+            except Exception as e:
+                logger.warning(f"cmd_start: add_bot_admin sync failed for bot {config.bot_id}: {e}")
+    if str(message.from_user.id) not in admins:
         # Not the admin and no valid course_<id> deep link — nothing to do
         # for this user (a student can only exist inside a course they were
         # invited to, see _join_course below).
@@ -416,7 +438,7 @@ async def _join_course(message: Message, config: CourseTrackerConfig, course_id:
 @router.callback_query(F.data == "ct_main")
 async def cb_main(cb: CallbackQuery, state: FSMContext, config: CourseTrackerConfig):
     await cb.answer()
-    if not _is_admin(cb.from_user.id, config.admins_file):
+    if not _is_admin(cb.from_user.id, config):
         return
     await state.clear()
     await cb.message.edit_text(WELCOME_TEXT, parse_mode="HTML", reply_markup=kb_admin_main())
@@ -428,7 +450,7 @@ MAX_LIST_ROWS = 40
 @router.callback_query(F.data == "ct_courses")
 async def cb_courses(cb: CallbackQuery, config: CourseTrackerConfig):
     await cb.answer()
-    if not _is_admin(cb.from_user.id, config.admins_file):
+    if not _is_admin(cb.from_user.id, config):
         return
     async with aiosqlite.connect(config.db_path) as db:
         db.row_factory = aiosqlite.Row
@@ -450,7 +472,7 @@ async def cb_courses(cb: CallbackQuery, config: CourseTrackerConfig):
 @router.callback_query(F.data == "ct_new_course")
 async def cb_new_course(cb: CallbackQuery, state: FSMContext, config: CourseTrackerConfig):
     await cb.answer()
-    if not _is_admin(cb.from_user.id, config.admins_file):
+    if not _is_admin(cb.from_user.id, config):
         return
     await state.set_state(CreateCourseFlow.title)
     await cb.message.edit_text("Название курса?", reply_markup=kb_cancel())
@@ -458,7 +480,7 @@ async def cb_new_course(cb: CallbackQuery, state: FSMContext, config: CourseTrac
 
 @router.message(CreateCourseFlow.title, F.text)
 async def on_course_title(message: Message, state: FSMContext, config: CourseTrackerConfig):
-    if not _is_admin(message.from_user.id, config.admins_file):
+    if not _is_admin(message.from_user.id, config):
         return
     await state.update_data(title=message.text.strip())
     await state.set_state(CreateCourseFlow.description)
@@ -467,7 +489,7 @@ async def on_course_title(message: Message, state: FSMContext, config: CourseTra
 
 @router.message(CreateCourseFlow.description, F.text)
 async def on_course_description(message: Message, state: FSMContext, config: CourseTrackerConfig):
-    if not _is_admin(message.from_user.id, config.admins_file):
+    if not _is_admin(message.from_user.id, config):
         return
     data = await state.get_data()
     description = None if message.text.strip() == "-" else message.text.strip()
@@ -496,7 +518,7 @@ async def _invite_link(config: CourseTrackerConfig, bot: Bot, course_id: int) ->
 @router.callback_query(F.data.startswith("ct_course:"))
 async def cb_course_detail(cb: CallbackQuery, config: CourseTrackerConfig):
     await cb.answer()
-    if not _is_admin(cb.from_user.id, config.admins_file):
+    if not _is_admin(cb.from_user.id, config):
         return
     course_id = int(cb.data.split(":", 1)[1])
     async with aiosqlite.connect(config.db_path) as db:
@@ -513,7 +535,7 @@ async def cb_course_detail(cb: CallbackQuery, config: CourseTrackerConfig):
 @router.callback_query(F.data.startswith("ct_new_asg:"))
 async def cb_new_assignment(cb: CallbackQuery, state: FSMContext, config: CourseTrackerConfig):
     await cb.answer()
-    if not _is_admin(cb.from_user.id, config.admins_file):
+    if not _is_admin(cb.from_user.id, config):
         return
     course_id = int(cb.data.split(":", 1)[1])
     await state.set_state(AssignmentFlow.title)
@@ -523,7 +545,7 @@ async def cb_new_assignment(cb: CallbackQuery, state: FSMContext, config: Course
 
 @router.message(AssignmentFlow.title, F.text)
 async def on_assignment_title(message: Message, state: FSMContext, config: CourseTrackerConfig):
-    if not _is_admin(message.from_user.id, config.admins_file):
+    if not _is_admin(message.from_user.id, config):
         return
     await state.update_data(title=message.text.strip())
     await state.set_state(AssignmentFlow.description)
@@ -532,7 +554,7 @@ async def on_assignment_title(message: Message, state: FSMContext, config: Cours
 
 @router.message(AssignmentFlow.description, F.text)
 async def on_assignment_description(message: Message, state: FSMContext, config: CourseTrackerConfig):
-    if not _is_admin(message.from_user.id, config.admins_file):
+    if not _is_admin(message.from_user.id, config):
         return
     description = None if message.text.strip() == "-" else message.text.strip()
     await state.update_data(description=description)
@@ -544,7 +566,7 @@ async def on_assignment_description(message: Message, state: FSMContext, config:
 
 @router.message(AssignmentFlow.deadline, F.text)
 async def on_assignment_deadline(message: Message, state: FSMContext, config: CourseTrackerConfig):
-    if not _is_admin(message.from_user.id, config.admins_file):
+    if not _is_admin(message.from_user.id, config):
         return
     raw = message.text.strip()
     deadline = None
@@ -588,7 +610,7 @@ async def _notify_students_new_assignment(bot: Bot, students, title: str, deadli
 @router.callback_query(F.data.startswith("ct_members:"))
 async def cb_members(cb: CallbackQuery, config: CourseTrackerConfig):
     await cb.answer()
-    if not _is_admin(cb.from_user.id, config.admins_file):
+    if not _is_admin(cb.from_user.id, config):
         return
     course_id = int(cb.data.split(":", 1)[1])
     async with aiosqlite.connect(config.db_path) as db:
@@ -654,7 +676,7 @@ async def _progress_rows(db_path: str, course_id: int) -> list[dict]:
 @router.callback_query(F.data.startswith("ct_progress:"))
 async def cb_progress(cb: CallbackQuery, config: CourseTrackerConfig):
     await cb.answer()
-    if not _is_admin(cb.from_user.id, config.admins_file):
+    if not _is_admin(cb.from_user.id, config):
         return
     course_id = int(cb.data.split(":", 1)[1])
     rows = await _progress_rows(config.db_path, course_id)
@@ -686,7 +708,7 @@ def _csv_safe(value: str) -> str:
 @router.callback_query(F.data.startswith("ct_export:"))
 async def cb_export(cb: CallbackQuery, config: CourseTrackerConfig):
     await cb.answer()
-    if not _is_admin(cb.from_user.id, config.admins_file):
+    if not _is_admin(cb.from_user.id, config):
         return
     course_id = int(cb.data.split(":", 1)[1])
     rows = await _progress_rows(config.db_path, course_id)
@@ -737,7 +759,7 @@ if ALLOW_DEADLINE_EDIT:
     @router.callback_query(F.data.startswith("ct_edit_deadline:"))
     async def cb_edit_deadline(cb: CallbackQuery, state: FSMContext, config: CourseTrackerConfig):
         await cb.answer()
-        if not _is_admin(cb.from_user.id, config.admins_file):
+        if not _is_admin(cb.from_user.id, config):
             return
         assignment_id = int(cb.data.split(":", 1)[1])
         await state.set_state(EditDeadlineFlow.awaiting_new_deadline)
@@ -746,7 +768,7 @@ if ALLOW_DEADLINE_EDIT:
 
     @router.message(EditDeadlineFlow.awaiting_new_deadline, F.text)
     async def on_new_deadline(message: Message, state: FSMContext, config: CourseTrackerConfig):
-        if not _is_admin(message.from_user.id, config.admins_file):
+        if not _is_admin(message.from_user.id, config):
             return
         raw = message.text.strip()
         deadline = None
@@ -920,7 +942,7 @@ if ENABLE_GRADING:
     @router.callback_query(F.data.startswith("ct_grade:"))
     async def cb_grade_start(cb: CallbackQuery, state: FSMContext, config: CourseTrackerConfig):
         await cb.answer()
-        if not _is_admin(cb.from_user.id, config.admins_file):
+        if not _is_admin(cb.from_user.id, config):
             return
         submission_id = int(cb.data.split(":", 1)[1])
         await state.set_state(GradeFlow.awaiting_grade)
@@ -929,7 +951,7 @@ if ENABLE_GRADING:
 
     @router.message(GradeFlow.awaiting_grade, F.text)
     async def on_grade_text(message: Message, state: FSMContext, config: CourseTrackerConfig):
-        if not _is_admin(message.from_user.id, config.admins_file):
+        if not _is_admin(message.from_user.id, config):
             return
         data = await state.get_data()
         await state.clear()
