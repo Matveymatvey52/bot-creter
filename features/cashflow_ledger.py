@@ -1,5 +1,5 @@
 # FEATURE: cashflow_ledger
-# COMPATIBLE_WITH: accountant, tour_operator
+# COMPATIBLE_WITH: accountant, property_rental, tour_operator
 """Reusable cash-flow ledger (ДДС) feature module — extracted from
 templates/tour_operator.py's `dds` table/handlers (see cashflow-ledger-inventory
 for the original code this replaces). Records money in/out with an optional

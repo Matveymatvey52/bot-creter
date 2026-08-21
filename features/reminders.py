@@ -1,5 +1,5 @@
 # FEATURE: reminders
-# COMPATIBLE_WITH: event_rsvp, car_rental, boss_bot
+# COMPATIBLE_WITH: boss_bot, car_rental, event_rsvp, property_rental
 """Reusable "remind clients about an upcoming date" feature module — see
 docs/REMINDERS_DESIGN.md for the design this implements.
 
