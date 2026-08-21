@@ -591,5 +591,97 @@ class CoworkingSpaceMiniAppConfigTests(unittest.IsolatedAsyncioTestCase):
                     )
 
 
+class CoworkingSpaceAdminBootstrapTests(unittest.IsolatedAsyncioTestCase):
+    """Security fix: whoever sent /start FIRST used to permanently become the
+    bot's admin — a client who messaged the bot before the owner tested it
+    could silently seize the admin panel. When bots.owner_telegram_id is
+    known, only that user may claim the empty-admins bootstrap slot; the DB-
+    known owner is also always treated as admin regardless of the local
+    admins_file state. Same criterion as tests/test_shop_catalog_isolation.py."""
+
+    async def asyncSetUp(self):
+        self._bot_call_patcher = patch.object(Bot, "__call__", new=AsyncMock(return_value=MagicMock()))
+        self._bot_call_patcher.start()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.data_dir = Path(self._tmp.name)
+
+        # cmd_start now syncs the bootstrap admin into db.database.add_bot_admin
+        # (central bot_admins table, used by the mini-app's _admin_gate_ok) —
+        # must be redirected to a throwaway DB or it hits the real
+        # data/bots.db.
+        import db.database as db_module
+        self._db_module = db_module
+        self._central_db_path = self.data_dir / "central_bots.db"
+        self._db_path_patcher = patch.object(db_module, "DB_PATH", self._central_db_path)
+        self._db_path_patcher.start()
+        await db_module.init_db()
+
+    async def asyncTearDown(self):
+        self._db_path_patcher.stop()
+        self._tmp.cleanup()
+        self._bot_call_patcher.stop()
+
+    async def test_non_owner_messaging_first_does_not_become_admin(self):
+        config = coworking_space.config_from_bot_row(
+            {"bot_id": 807, "name": "coworking_bot_owned", "display_name": None,
+             "group_chat_id": None, "owner_telegram_id": 12345},
+            self.data_dir,
+        )
+        await coworking_space.init_db(config.db_path)
+        bot, dp = _build_bot_dispatcher(config)
+
+        NON_OWNER = 555  # not the owner, messages first
+        await dp.feed_webhook_update(bot, _text_update(1, NON_OWNER, "/start"))
+        self.assertEqual(coworking_space._load_admins(config.admins_file), set())
+        self.assertFalse(coworking_space._is_admin(NON_OWNER, config))
+
+        await dp.feed_webhook_update(bot, _text_update(2, 12345, "/start"))
+        self.assertTrue(coworking_space._is_admin(12345, config))
+        self.assertEqual(coworking_space._load_admins(config.admins_file), {"12345"})
+
+    async def test_owner_is_always_admin_even_with_stale_admins_file(self):
+        config = coworking_space.config_from_bot_row(
+            {"bot_id": 808, "name": "coworking_bot_owned_2", "display_name": None,
+             "group_chat_id": None, "owner_telegram_id": 777},
+            self.data_dir,
+        )
+        await coworking_space.init_db(config.db_path)
+        coworking_space._save_admins(config.admins_file, {"999999"})  # some other id, not the owner
+        self.assertTrue(coworking_space._is_admin(777, config))  # owner: always admin
+        self.assertTrue(coworking_space._is_admin(999999, config))  # still honors the file's own admin
+        self.assertFalse(coworking_space._is_admin(4242, config))  # neither owner nor in the file
+
+    async def test_standalone_mode_keeps_first_comer_bootstrap(self):
+        """When owner_telegram_id is unknown (standalone/env mode), the old
+        first-comer bootstrap behavior remains the only option available."""
+        config = coworking_space.config_from_bot_row(
+            {"bot_id": 809, "name": "coworking_bot_standalone", "display_name": None, "group_chat_id": None},
+            self.data_dir,
+        )
+        await coworking_space.init_db(config.db_path)
+        self.assertIsNone(config.owner_telegram_id)
+        bot, dp = _build_bot_dispatcher(config)
+
+        FIRST_COMER = 4242
+        await dp.feed_webhook_update(bot, _text_update(1, FIRST_COMER, "/start"))
+        self.assertTrue(coworking_space._is_admin(FIRST_COMER, config))
+        self.assertEqual(coworking_space._load_admins(config.admins_file), {"4242"})
+
+    async def test_bootstrap_admin_syncs_to_central_bot_admins_table(self):
+        """The mini-app's admin gate (runtime.miniapp_api._admin_gate_ok)
+        checks db.database.get_bot_admins(), a separate table from this
+        template's local admins_file. The bootstrap grant must land in both."""
+        config = coworking_space.config_from_bot_row(
+            {"bot_id": 810, "name": "coworking_bot_synced", "display_name": None, "group_chat_id": None},
+            self.data_dir,
+        )
+        await coworking_space.init_db(config.db_path)
+        bot, dp = _build_bot_dispatcher(config)
+        await dp.feed_webhook_update(bot, _text_update(1, 321, "/start"))
+
+        central_admins = await self._db_module.get_bot_admins(810)
+        self.assertEqual(central_admins, ["321"])
+
+
 if __name__ == "__main__":
     unittest.main()
