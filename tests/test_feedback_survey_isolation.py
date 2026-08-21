@@ -26,6 +26,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
 
+import db.database as db_module
 from runtime.registry import get_template_router
 from templates import feedback_survey as fb
 
@@ -85,6 +86,15 @@ class FeedbackSurveyIsolationTests(unittest.IsolatedAsyncioTestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.data_dir = Path(self._tmp.name)
 
+        # cmd_start now syncs the bootstrap admin into db.database.add_bot_admin
+        # (central bot_admins table, used by the mini-app's _admin_gate_ok) —
+        # must be redirected to a throwaway DB or it hits the real
+        # data/bots.db, same reasoning as test_shop_catalog_isolation.py.
+        self._central_db_path = self.data_dir / "central_bots.db"
+        self._db_path_patcher = patch.object(db_module, "DB_PATH", self._central_db_path)
+        self._db_path_patcher.start()
+        await db_module.init_db()
+
         self.config_a = fb.config_from_bot_row(
             {"bot_id": 801, "name": "fb_isolation_bot_a", "display_name": None, "group_chat_id": None}, self.data_dir
         )
@@ -101,6 +111,7 @@ class FeedbackSurveyIsolationTests(unittest.IsolatedAsyncioTestCase):
         await self.dp_b.feed_webhook_update(self.bot_b, _text_update(1, ADMIN_ID, "/start"))
 
     async def asyncTearDown(self):
+        self._db_path_patcher.stop()
         self._tmp.cleanup()
         self._bot_call_patcher.stop()
 
@@ -121,6 +132,62 @@ class FeedbackSurveyIsolationTests(unittest.IsolatedAsyncioTestCase):
         rows_b = _rows(self.config_b.db_path)
         self.assertEqual(rows_a, [(5, None, "client", CLIENT_ID, None)])
         self.assertEqual(rows_b, [(2, "Было плохо", "client", CLIENT_ID, None)])
+
+    async def test_non_owner_messaging_first_does_not_become_admin(self):
+        """Security fix: previously, whoever sent /start FIRST permanently
+        became the bot admin — a client testing the bot link before the
+        owner did would silently seize the admin panel. When
+        bots.owner_telegram_id is known, only that user may claim the
+        bootstrap admin slot."""
+        config = fb.config_from_bot_row(
+            {"bot_id": 803, "name": "fb_owned_bot", "display_name": None,
+             "group_chat_id": None, "owner_telegram_id": 12345},
+            self.data_dir,
+        )
+        await fb.init_db(config.db_path)
+        bot, dp = _build_bot_dispatcher(config)
+
+        CLIENT_FIRST_ID = 5551  # not the owner, messages first
+        await dp.feed_webhook_update(bot, _text_update(1, CLIENT_FIRST_ID, "/start"))
+        self.assertEqual(fb._load_admins(config.admins_file), set())
+        self.assertFalse(fb._is_admin(CLIENT_FIRST_ID, config))
+
+        await dp.feed_webhook_update(bot, _text_update(2, 12345, "/start"))
+        self.assertTrue(fb._is_admin(12345, config))
+        self.assertEqual(fb._load_admins(config.admins_file), {"12345"})
+
+    async def test_owner_is_always_admin_even_with_stale_admins_file(self):
+        """Defense in depth: the DB-known owner must see the admin panel even
+        if the local admins_file is empty/stale (e.g. wiped, or hijacked by a
+        prior bug) — owner_telegram_id is treated as an unconditional admin
+        in _is_admin, not just at bootstrap time."""
+        config = fb.config_from_bot_row(
+            {"bot_id": 804, "name": "fb_owned_bot_2", "display_name": None,
+             "group_chat_id": None, "owner_telegram_id": 777},
+            self.data_dir,
+        )
+        await fb.init_db(config.db_path)
+        fb._save_admins(config.admins_file, {"999999"})  # some other id, not the owner
+        self.assertTrue(fb._is_admin(777, config))  # owner: always admin
+        self.assertTrue(fb._is_admin(999999, config))  # still honors the file's own admin
+        self.assertFalse(fb._is_admin(4242, config))  # neither owner nor in the file
+
+    async def test_bootstrap_admin_syncs_to_central_bot_admins_table(self):
+        """The mini-app's admin gate (runtime.miniapp_api._admin_gate_ok)
+        checks db.database.get_bot_admins(), a separate table from this
+        template's local admins_file. The bootstrap grant must land in both,
+        or the owner gets the Telegram admin panel but is locked out of the
+        mini-app admin views."""
+        config = fb.config_from_bot_row(
+            {"bot_id": 805, "name": "fb_synced_bot", "display_name": None, "group_chat_id": None},
+            self.data_dir,
+        )
+        await fb.init_db(config.db_path)
+        bot, dp = _build_bot_dispatcher(config)
+        await dp.feed_webhook_update(bot, _text_update(1, 321, "/start"))
+
+        central_admins = await db_module.get_bot_admins(805)
+        self.assertEqual(central_admins, ["321"])
 
 
 class FeedbackSurveyCollectionFlowTests(unittest.IsolatedAsyncioTestCase):
