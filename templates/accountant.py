@@ -29,6 +29,8 @@ from aiogram.types import (
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 
+from db.database import add_bot_admin, remove_bot_admin
+
 # ── CUSTOMIZE ────────────────────────────────────────────────────────────────
 # NOTE (Stage 2 Phase 2): this section is still per-file source-text customization
 # that Claude edits when generating a specific bot, not a per-bot runtime config —
@@ -89,6 +91,8 @@ class AccountantConfig:
     welcome_image: Path
     display_name: str | None = None
     group_chat_id: str | None = None
+    bot_id: int | None = None
+    owner_telegram_id: int | None = None
 
 
 def _paths_for(name: str, data_dir: Path) -> AccountantConfig:
@@ -139,6 +143,8 @@ def config_from_bot_row(bot_row: dict, data_dir: Path) -> AccountantConfig:
     )
     config.display_name = bot_row.get("display_name")
     config.group_chat_id = bot_row.get("group_chat_id")
+    config.bot_id = bot_id
+    config.owner_telegram_id = bot_row.get("owner_telegram_id")
     return config
 
 
@@ -166,6 +172,14 @@ def _load_admins(admins_file: Path) -> set:
 
 def _save_admins(admins_file: Path, ids: set) -> None:
     admins_file.write_text(json.dumps({"ids": list(ids)}, ensure_ascii=False))
+
+def _is_bot_admin(user_id: int, config: AccountantConfig) -> bool:
+    # The DB-known owner (bots.owner_telegram_id) is always an admin, even if
+    # the local admins_file is empty/stale/hijacked — same defense-in-depth
+    # rationale as templates/shop_catalog.py's _is_bot_admin.
+    if config.owner_telegram_id is not None and str(user_id) == str(config.owner_telegram_id):
+        return True
+    return str(user_id) in _load_admins(config.admins_file)
 
 def _esc(value, max_len: int = 500) -> str:
     """HTML-escapes AND length-bounds any user-supplied text before it goes into
@@ -294,13 +308,19 @@ MAIN_BUTTONS = frozenset({
 
 # ── keyboards ─────────────────────────────────────────────────────────────────
 
-def kb_main() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(keyboard=[
+def kb_main(is_admin: bool = False) -> ReplyKeyboardMarkup:
+    # Security fix: Excel/HTML export used to always be visible even though
+    # the handlers behind them are admin-only (see cmd_excel/cmd_html_report
+    # below) — a non-admin tapping the button just got "⛔ Нет доступа" after
+    # the fact. Now the buttons themselves are gated on is_admin.
+    rows = [
         [KeyboardButton(text="➕ Доход"),     KeyboardButton(text="➖ Расход")],
         [KeyboardButton(text="💰 Баланс"),   KeyboardButton(text="📋 История")],
         [KeyboardButton(text="📊 Отчёт"),    KeyboardButton(text="📁 Проекты")],
-        [KeyboardButton(text="📥 Excel"),    KeyboardButton(text="🌐 HTML")],
-    ], resize_keyboard=True)
+    ]
+    if is_admin:
+        rows.append([KeyboardButton(text="📥 Excel"), KeyboardButton(text="🌐 HTML")])
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 def kb_cats(cats: list[str], kind: str) -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton(text=c, callback_data=f"cat:{kind}:{c}")] for c in cats]
@@ -342,13 +362,28 @@ class ProjectCreate(StatesGroup):
 @router.message(Command("start"))
 async def cmd_start(message: Message, config: AccountantConfig):
     admins = _load_admins(config.admins_file)
-    if not admins:
-        _save_admins(config.admins_file, {str(message.from_user.id)})
+    sender_id = message.from_user.id
+    # Security fix: this used to grant admin to whoever sent /start FIRST,
+    # letting any client who messages the bot before the owner does
+    # permanently seize the admin panel (Excel/HTML export). When
+    # bots.owner_telegram_id is known, only that user may claim the
+    # empty-admins bootstrap slot; in standalone/env mode (owner_telegram_id
+    # unknown) the old first-comer behavior is kept as the only option.
+    is_owner = config.owner_telegram_id is not None and sender_id == config.owner_telegram_id
+    first_time_admin = not admins and (is_owner or config.owner_telegram_id is None)
+    if first_time_admin:
+        _save_admins(config.admins_file, {str(sender_id)})
+        if config.bot_id is not None:
+            try:
+                await add_bot_admin(config.bot_id, str(sender_id))
+            except Exception as e:
+                logger.warning(f"cmd_start: add_bot_admin sync failed for bot {config.bot_id}: {e}")
+    is_admin = _is_bot_admin(sender_id, config)
     if config.welcome_image.exists():
         await message.answer_photo(FSInputFile(str(config.welcome_image)),
-                                   caption=WELCOME_TEXT, parse_mode="HTML", reply_markup=kb_main())
+                                   caption=WELCOME_TEXT, parse_mode="HTML", reply_markup=kb_main(is_admin))
     else:
-        await message.answer(WELCOME_TEXT, parse_mode="HTML", reply_markup=kb_main())
+        await message.answer(WELCOME_TEXT, parse_mode="HTML", reply_markup=kb_main(is_admin))
 
 
 # ── PROJECTS PANEL ────────────────────────────────────────────────────────────
@@ -395,7 +430,7 @@ async def proj_create_name(msg: Message, state: FSMContext, config: AccountantCo
     await msg.answer(
         f"✅ Создан проект <b>{name}</b>!\n"
         f"Теперь добавляйте доходы и расходы.",
-        parse_mode="HTML", reply_markup=kb_main()
+        parse_mode="HTML", reply_markup=kb_main(_is_bot_admin(msg.from_user.id, config))
     )
 
 @router.callback_query(F.data.startswith("proj_sel:"))
@@ -408,7 +443,7 @@ async def cb_proj_sel(cb: CallbackQuery, config: AccountantConfig):
         await cb.message.edit_text("Проект не найден."); return
     await _set_active_project(config.db_path, str(cb.from_user.id), project_id)
     await cb.message.edit_text(f"✅ Активный проект: <b>{row[0]}</b>", parse_mode="HTML")
-    await cb.message.answer("Что сделаем?", reply_markup=kb_main())
+    await cb.message.answer("Что сделаем?", reply_markup=kb_main(_is_bot_admin(cb.from_user.id, config)))
 
 @router.callback_query(F.data == "proj_close")
 async def cb_proj_close(cb: CallbackQuery):
@@ -435,7 +470,7 @@ async def add_start(msg: Message, state: FSMContext, config: AccountantConfig):
     await state.clear()
     project = await _get_active_project(config.db_path, str(msg.from_user.id))
     if not project:
-        await msg.answer("Сначала создайте проект — нажмите 📁 Проекты.", reply_markup=kb_main()); return
+        await msg.answer("Сначала создайте проект — нажмите 📁 Проекты.", reply_markup=kb_main(_is_bot_admin(msg.from_user.id, config))); return
     kind = "income" if "Доход" in msg.text else "expense"
     cats = INCOME_CATEGORIES if kind == "income" else EXPENSE_CATEGORIES
     await state.update_data(kind=kind, project_id=project["id"])
@@ -470,15 +505,15 @@ async def add_amount(msg: Message, state: FSMContext):
 @router.message(AddTx.note, F.text, ~F.text.in_(MAIN_BUTTONS))
 async def add_note(msg: Message, state: FSMContext, config: AccountantConfig):
     note = None if msg.text.strip() == "/skip" else msg.text.strip()
-    await _save_tx(config.db_path, msg, state, note)
+    await _save_tx(config, msg, state, note)
 
 @router.message(Command("skip"), AddTx.note)
 async def skip_note(msg: Message, state: FSMContext, config: AccountantConfig):
-    await _save_tx(config.db_path, msg, state, None)
+    await _save_tx(config, msg, state, None)
 
-async def _save_tx(db_path: str, msg: Message, state: FSMContext, note):
+async def _save_tx(config: AccountantConfig, msg: Message, state: FSMContext, note):
     data = await state.get_data()
-    async with aiosqlite.connect(db_path) as db:
+    async with aiosqlite.connect(config.db_path) as db:
         await db.execute(
             "INSERT INTO transactions (project_id, kind, amount, category, note) VALUES (?,?,?,?,?)",
             (data["project_id"], data["kind"], data["amount"], data.get("category"), note)
@@ -492,14 +527,14 @@ async def _save_tx(db_path: str, msg: Message, state: FSMContext, note):
         f"💰 {sym}{data['amount']:,.0f} ₽\n"
         f"🏷 {data.get('category', '—')}"
         + (f"\n📝 {note}" if note else ""),
-        parse_mode="HTML", reply_markup=kb_main()
+        parse_mode="HTML", reply_markup=kb_main(_is_bot_admin(msg.from_user.id, config))
     )
 
 @router.callback_query(F.data == "tx_cancel")
-async def cb_cancel(cb: CallbackQuery, state: FSMContext):
+async def cb_cancel(cb: CallbackQuery, state: FSMContext, config: AccountantConfig):
     await cb.answer(); await state.clear()
     await cb.message.edit_text("Отменено.")
-    await cb.message.answer("Что сделаем?", reply_markup=kb_main())
+    await cb.message.answer("Что сделаем?", reply_markup=kb_main(_is_bot_admin(cb.from_user.id, config)))
 
 
 # ── BALANCE ───────────────────────────────────────────────────────────────────
@@ -540,7 +575,7 @@ async def show_balance(msg: Message, state: FSMContext, config: AccountantConfig
         f"  📈 +{m_in:,.0f} ₽  📉 -{m_ex:,.0f} ₽\n"
         f"  <b>= {m_in - m_ex:+,.0f} ₽</b>\n\n"
         f"📋 Всего операций: {count}",
-        parse_mode="HTML", reply_markup=kb_main()
+        parse_mode="HTML", reply_markup=kb_main(_is_bot_admin(msg.from_user.id, config))
     )
 
 
@@ -559,7 +594,7 @@ async def show_history(msg: Message, state: FSMContext, config: AccountantConfig
             (project["id"],)
         )).fetchall()
     if not rows:
-        await msg.answer(f"По проекту «{project['name']}» операций нет.", reply_markup=kb_main()); return
+        await msg.answer(f"По проекту «{project['name']}» операций нет.", reply_markup=kb_main(_is_bot_admin(msg.from_user.id, config))); return
     lines = [f"📋 <b>История: {project['name']}</b>\n"]
     for r in [dict(x) for x in rows]:
         sym = "📈" if r["kind"] == "income" else "📉"
@@ -749,7 +784,7 @@ async def cb_cat_filter(cb: CallbackQuery, config: AccountantConfig):
 @router.message(Command("excel"))
 async def cmd_excel(msg: Message, state: FSMContext, config: AccountantConfig):
     await state.clear()
-    if str(msg.from_user.id) not in _load_admins(config.admins_file):
+    if not _is_bot_admin(msg.from_user.id, config):
         await msg.answer("⛔ Нет доступа"); return
     projects = await _all_projects(config.db_path)
     if not projects:
@@ -1046,7 +1081,7 @@ def _build_html(transactions: list, projects: list) -> str:
 @router.message(Command("html"))
 async def cmd_html_report(msg: Message, state: FSMContext, config: AccountantConfig):
     await state.clear()
-    if str(msg.from_user.id) not in _load_admins(config.admins_file):
+    if not _is_bot_admin(msg.from_user.id, config):
         await msg.answer("⛔ Нет доступа"); return
     projects = await _all_projects(config.db_path)
     if not projects:
@@ -1116,7 +1151,7 @@ async def _publish_project(db_path: str, bot_name: str, project: dict, rows: lis
 
 @router.message(Command("publish"))
 async def cmd_publish(msg: Message, config: AccountantConfig):
-    if str(msg.from_user.id) not in _load_admins(config.admins_file):
+    if not _is_bot_admin(msg.from_user.id, config):
         await msg.answer("⛔ Нет доступа"); return
     project = await _get_active_project(config.db_path, str(msg.from_user.id))
     if not project:
@@ -1154,23 +1189,33 @@ async def cmd_weblink(msg: Message, config: AccountantConfig):
 
 @router.message(Command("addadmin"))
 async def cmd_addadmin(msg: Message, config: AccountantConfig):
-    if str(msg.from_user.id) not in _load_admins(config.admins_file): await msg.answer("⛔ Нет доступа"); return
+    if not _is_bot_admin(msg.from_user.id, config): await msg.answer("⛔ Нет доступа"); return
     parts = msg.text.split()
     if len(parts) < 2 or not parts[1].lstrip("-").isdigit(): await msg.answer("Использование: /addadmin <id>"); return
     ids = _load_admins(config.admins_file); ids.add(parts[1]); _save_admins(config.admins_file, ids)
+    if config.bot_id is not None:
+        try:
+            await add_bot_admin(config.bot_id, parts[1])
+        except Exception as e:
+            logger.warning(f"cmd_addadmin: add_bot_admin sync failed for bot {config.bot_id}: {e}")
     await msg.answer(f"✅ <code>{parts[1]}</code> добавлен.", parse_mode="HTML")
 
 @router.message(Command("removeadmin"))
 async def cmd_removeadmin(msg: Message, config: AccountantConfig):
-    if str(msg.from_user.id) not in _load_admins(config.admins_file): await msg.answer("⛔ Нет доступа"); return
+    if not _is_bot_admin(msg.from_user.id, config): await msg.answer("⛔ Нет доступа"); return
     parts = msg.text.split()
     if len(parts) < 2: await msg.answer("Использование: /removeadmin <id>"); return
     ids = _load_admins(config.admins_file); ids.discard(parts[1]); _save_admins(config.admins_file, ids)
+    if config.bot_id is not None:
+        try:
+            await remove_bot_admin(config.bot_id, parts[1])
+        except Exception as e:
+            logger.warning(f"cmd_removeadmin: remove_bot_admin sync failed for bot {config.bot_id}: {e}")
     await msg.answer(f"✅ <code>{_esc(parts[1])}</code> удалён.", parse_mode="HTML")
 
 @router.message(Command("admins"))
 async def cmd_admins(msg: Message, config: AccountantConfig):
-    if str(msg.from_user.id) not in _load_admins(config.admins_file): await msg.answer("⛔ Нет доступа"); return
+    if not _is_bot_admin(msg.from_user.id, config): await msg.answer("⛔ Нет доступа"); return
     ids = _load_admins(config.admins_file)
     await msg.answer("👥 " + ("\n".join(f"• <code>{i}</code>" for i in ids) or "Пусто"), parse_mode="HTML")
 
