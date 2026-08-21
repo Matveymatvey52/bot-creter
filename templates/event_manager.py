@@ -25,6 +25,8 @@ from aiogram.types import (
     KeyboardButton, Message, ReplyKeyboardMarkup, ReplyKeyboardRemove,
 )
 
+from db.database import add_bot_admin, remove_bot_admin
+
 # ── CUSTOMIZE ────────────────────────────────────────────────────────────────
 # Same status as every other template's CUSTOMIZE block: per-file source-text
 # customization Claude edits when generating a specific bot, not per-bot
@@ -129,6 +131,8 @@ class EventManagerConfig:
     welcome_image: Path
     display_name: str | None = None
     group_chat_id: str | None = None
+    bot_id: int | None = None
+    owner_telegram_id: int | None = None
 
 
 def _paths_for(name: str, data_dir: Path) -> EventManagerConfig:
@@ -161,6 +165,8 @@ def config_from_bot_row(bot_row: dict, data_dir: Path) -> EventManagerConfig:
     )
     config.display_name = bot_row.get("display_name")
     config.group_chat_id = bot_row.get("group_chat_id")
+    config.bot_id = bot_id
+    config.owner_telegram_id = bot_row.get("owner_telegram_id")
     return config
 
 
@@ -190,6 +196,11 @@ def _save_admins(admins_file: Path, ids: set) -> None:
     admins_file.write_text(json.dumps({"ids": list(ids)}, ensure_ascii=False))
 
 def _is_bot_admin(user_id: int, config: EventManagerConfig) -> bool:
+    # The DB-known owner (bots.owner_telegram_id) is always an admin, even if
+    # the local admins_file is empty/stale/hijacked — see cmd_start below for
+    # why the file alone can't be trusted as the sole source of truth.
+    if config.owner_telegram_id is not None and str(user_id) == str(config.owner_telegram_id):
+        return True
     return str(user_id) in _load_admins(config.admins_file)
 
 
@@ -692,10 +703,24 @@ async def cmd_start(message: Message, command: CommandObject, state: FSMContext,
         return
 
     admins = _load_admins(config.admins_file)
-    first_time_admin = not admins
+    sender_id = message.from_user.id
+    # Bug fixed here: this used to grant admin to whoever sent /start FIRST,
+    # which lets any client who messages the bot before the owner does
+    # permanently seize the admin panel. When bots.owner_telegram_id is known
+    # (webhook/production mode), only that user may claim the empty-admins
+    # bootstrap slot; a non-owner sending /start first now just gets the
+    # regular guest menu. In standalone/env mode (owner_telegram_id unknown)
+    # the old first-comer behavior is kept as the only option available.
+    is_owner = config.owner_telegram_id is not None and sender_id == config.owner_telegram_id
+    first_time_admin = not admins and (is_owner or config.owner_telegram_id is None)
     if first_time_admin:
-        _save_admins(config.admins_file, {str(message.from_user.id)})
-    is_admin = str(message.from_user.id) in _load_admins(config.admins_file)
+        _save_admins(config.admins_file, {str(sender_id)})
+        if config.bot_id is not None:
+            try:
+                await add_bot_admin(config.bot_id, str(sender_id))
+            except Exception as e:
+                logger.warning(f"cmd_start: add_bot_admin sync failed for bot {config.bot_id}: {e}")
+    is_admin = _is_bot_admin(sender_id, config)
     if is_admin:
         # Same welcome_image convention as every other template's cmd_start
         # (e.g. shop_catalog.py, moderator.py): send it as a photo caption
@@ -1246,6 +1271,11 @@ async def adm_add_admin(msg: Message, bot: Bot, state: FSMContext, config: Event
     if not _valid_telegram_id(text):
         await msg.answer("Пришлите числовой Telegram ID."); return
     ids = _load_admins(config.admins_file); ids.add(text); _save_admins(config.admins_file, ids)
+    if config.bot_id is not None:
+        try:
+            await add_bot_admin(config.bot_id, text)
+        except Exception as e:
+            logger.warning(f"adm_add_admin: add_bot_admin sync failed for bot {config.bot_id}: {e}")
     logger.info(f"adm_add_admin: {text} added as bot admin by {msg.from_user.id}")
     await _clear_flow_keep_panel(state)
     await msg.answer(f"✅ <code>{_esc(text)}</code> добавлен.", parse_mode="HTML")
@@ -1299,6 +1329,11 @@ async def cb_adm_rma(cb: CallbackQuery, bot: Bot, state: FSMContext, config: Eve
         )
         return
     current.discard(target); _save_admins(config.admins_file, current)
+    if config.bot_id is not None:
+        try:
+            await remove_bot_admin(config.bot_id, target)
+        except Exception as e:
+            logger.warning(f"cb_adm_rma: remove_bot_admin sync failed for bot {config.bot_id}: {e}")
     logger.info(f"cb_adm_rma: {target} removed as bot admin by {cb.from_user.id}")
     await _clear_flow_keep_panel(state)
     await _replace_panel(bot, state, chat_id, await _admins_list_text(config), reply_markup=kb_admins_panel())
@@ -1318,6 +1353,11 @@ async def adm_remove_admin_text(msg: Message, bot: Bot, state: FSMContext, confi
     if text in ids and len(ids) <= 1:
         await msg.answer("⚠️ Нельзя удалить единственного администратора."); return
     ids.discard(text); _save_admins(config.admins_file, ids)
+    if config.bot_id is not None:
+        try:
+            await remove_bot_admin(config.bot_id, text)
+        except Exception as e:
+            logger.warning(f"adm_remove_admin_text: remove_bot_admin sync failed for bot {config.bot_id}: {e}")
     logger.info(f"adm_remove_admin_text: {text} removed as bot admin by {msg.from_user.id}")
     await _clear_flow_keep_panel(state)
     await _replace_panel(bot, state, msg.chat.id, await _admins_list_text(config), reply_markup=kb_admins_panel())

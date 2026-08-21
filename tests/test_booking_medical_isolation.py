@@ -32,6 +32,7 @@ import aiosqlite
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
 
+import db.database as db_module
 from runtime.registry import get_template_router
 from templates import booking_medical
 
@@ -485,6 +486,92 @@ class BookingMedicalButtonPathAndFixRegressionTests(unittest.IsolatedAsyncioTest
         count = conn.execute("SELECT COUNT(*) FROM appointments").fetchall()[0][0]
         conn.close()
         self.assertEqual(count, 0)
+
+
+class BookingMedicalAdminSecurityBootstrapTests(unittest.IsolatedAsyncioTestCase):
+    """Security fix: previously, whoever sent /start FIRST permanently became
+    the bot admin — a client testing the bot link before the owner did would
+    silently seize the admin panel. When bots.owner_telegram_id is known,
+    only that user may claim the empty-admins bootstrap slot, and
+    _is_bot_admin treats the DB-known owner as always-admin regardless of the
+    local admins_file state. Mirrors tests/test_shop_catalog_isolation.py's
+    coverage of the same fix pattern."""
+
+    async def asyncSetUp(self):
+        self._bot_call_patcher = patch.object(Bot, "__call__", new=AsyncMock(return_value=MagicMock()))
+        self._bot_call_patcher.start()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.data_dir = Path(self._tmp.name)
+
+        # cmd_start now syncs the bootstrap admin into db.database.add_bot_admin
+        # (central bot_admins table) — must be redirected to a throwaway DB.
+        self._central_db_path = self.data_dir / "central_bots.db"
+        self._db_path_patcher = patch.object(db_module, "DB_PATH", self._central_db_path)
+        self._db_path_patcher.start()
+        await db_module.init_db()
+
+    async def asyncTearDown(self):
+        self._db_path_patcher.stop()
+        self._tmp.cleanup()
+        self._bot_call_patcher.stop()
+
+    async def test_non_owner_messaging_first_does_not_become_admin(self):
+        config = booking_medical.config_from_bot_row(
+            {"bot_id": 611, "name": "medical_bot_owned", "display_name": None,
+             "group_chat_id": None, "owner_telegram_id": 12345},
+            self.data_dir,
+        )
+        await booking_medical.init_db(config.db_path)
+        bot, dp = _build_bot_dispatcher(config)
+
+        CLIENT_ID = 555  # not the owner, messages first
+        await dp.feed_webhook_update(bot, _text_update(1, CLIENT_ID, "/start"))
+        self.assertEqual(booking_medical._load_admins(config.admins_file), set())
+        self.assertFalse(booking_medical._is_bot_admin(CLIENT_ID, config))
+
+        await dp.feed_webhook_update(bot, _text_update(2, 12345, "/start"))
+        self.assertTrue(booking_medical._is_bot_admin(12345, config))
+        self.assertEqual(booking_medical._load_admins(config.admins_file), {"12345"})
+
+    async def test_owner_is_always_admin_even_with_stale_admins_file(self):
+        config = booking_medical.config_from_bot_row(
+            {"bot_id": 612, "name": "medical_bot_owned_2", "display_name": None,
+             "group_chat_id": None, "owner_telegram_id": 777},
+            self.data_dir,
+        )
+        await booking_medical.init_db(config.db_path)
+        booking_medical._save_admins(config.admins_file, {"999999"})  # not the owner
+        self.assertTrue(booking_medical._is_bot_admin(777, config))
+        self.assertTrue(booking_medical._is_bot_admin(999999, config))
+        self.assertFalse(booking_medical._is_bot_admin(4242, config))
+
+    async def test_standalone_mode_keeps_first_comer_bootstrap(self):
+        """owner_telegram_id unknown (standalone/env mode) — the old
+        first-comer behavior is the only option available."""
+        config = booking_medical.config_from_bot_row(
+            {"bot_id": 613, "name": "medical_bot_standalone", "display_name": None, "group_chat_id": None},
+            self.data_dir,
+        )
+        self.assertIsNone(config.owner_telegram_id)
+        await booking_medical.init_db(config.db_path)
+        bot, dp = _build_bot_dispatcher(config)
+
+        FIRST_COMER = 999
+        await dp.feed_webhook_update(bot, _text_update(1, FIRST_COMER, "/start"))
+        self.assertEqual(booking_medical._load_admins(config.admins_file), {"999"})
+        self.assertTrue(booking_medical._is_bot_admin(FIRST_COMER, config))
+
+    async def test_bootstrap_admin_syncs_to_central_bot_admins_table(self):
+        config = booking_medical.config_from_bot_row(
+            {"bot_id": 614, "name": "medical_bot_synced", "display_name": None, "group_chat_id": None},
+            self.data_dir,
+        )
+        await booking_medical.init_db(config.db_path)
+        bot, dp = _build_bot_dispatcher(config)
+        await dp.feed_webhook_update(bot, _text_update(1, 321, "/start"))
+
+        central_admins = await db_module.get_bot_admins(614)
+        self.assertEqual(central_admins, ["321"])
 
 
 class BookingMedicalMiniAppConfigTests(unittest.IsolatedAsyncioTestCase):

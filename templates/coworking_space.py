@@ -21,6 +21,8 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
+from db.database import add_bot_admin, remove_bot_admin
+
 # ── DESIGN NOTE ────────────────────────────────────────────────────────────
 # What makes this template different from every booking_* template already
 # in this repo (booking_beauty/fitness/medical/restaurant): those book a
@@ -134,6 +136,8 @@ class CoworkingSpaceConfig:
     welcome_image: Path
     display_name: str | None = None
     group_chat_id: str | None = None
+    bot_id: int | None = None
+    owner_telegram_id: int | None = None
 
 
 def _paths_for(name: str, data_dir: Path) -> CoworkingSpaceConfig:
@@ -166,6 +170,8 @@ def config_from_bot_row(bot_row: dict, data_dir: Path) -> CoworkingSpaceConfig:
     )
     config.display_name = bot_row.get("display_name")
     config.group_chat_id = bot_row.get("group_chat_id")
+    config.bot_id = bot_id
+    config.owner_telegram_id = bot_row.get("owner_telegram_id")
     return config
 
 
@@ -197,6 +203,11 @@ def _save_admins(admins_file: Path, ids: set) -> None:
 
 
 def _is_admin(user_id: int, config: CoworkingSpaceConfig) -> bool:
+    # The DB-known owner (bots.owner_telegram_id) is always an admin, even if
+    # the local admins_file is empty/stale/hijacked — see cmd_start below for
+    # why the file alone can't be trusted as the sole source of truth.
+    if config.owner_telegram_id is not None and str(user_id) == str(config.owner_telegram_id):
+        return True
     return str(user_id) in _load_admins(config.admins_file)
 
 
@@ -621,12 +632,26 @@ def kb_remove_admins(ids: list[str]) -> InlineKeyboardMarkup:
 async def cmd_start(message: Message, state: FSMContext, config: CoworkingSpaceConfig):
     await state.clear()
     admins = _load_admins(config.admins_file)
-    first_time_admin = not admins
+    sender_id = message.from_user.id
+    # Bug fixed here: this used to grant admin to whoever sent /start FIRST,
+    # which lets any client who messages the bot before the owner does
+    # permanently seize the admin panel. When bots.owner_telegram_id is known
+    # (webhook/production mode), only that user may claim the empty-admins
+    # bootstrap slot; a non-owner sending /start first now just gets the
+    # regular client menu. In standalone/env mode (owner_telegram_id unknown)
+    # the old first-comer behavior is kept as the only option available.
+    is_owner = config.owner_telegram_id is not None and sender_id == config.owner_telegram_id
+    first_time_admin = not admins and (is_owner or config.owner_telegram_id is None)
     if first_time_admin:
-        _save_admins(config.admins_file, {str(message.from_user.id)})
-        admins = {str(message.from_user.id)}
+        _save_admins(config.admins_file, {str(sender_id)})
+        admins = {str(sender_id)}
+        if config.bot_id is not None:
+            try:
+                await add_bot_admin(config.bot_id, str(sender_id))
+            except Exception as e:
+                logger.warning(f"cmd_start: add_bot_admin sync failed for bot {config.bot_id}: {e}")
 
-    is_admin = str(message.from_user.id) in admins
+    is_admin = str(sender_id) in admins
     text = WELCOME_TEXT if is_admin else CLIENT_WELCOME_TEXT
     if config.welcome_image.exists():
         await message.answer_photo(
@@ -1437,6 +1462,11 @@ async def admin_add_id(msg: Message, state: FSMContext, config: CoworkingSpaceCo
     ids = _load_admins(config.admins_file)
     ids.add(text)
     _save_admins(config.admins_file, ids)
+    if config.bot_id is not None:
+        try:
+            await add_bot_admin(config.bot_id, text)
+        except Exception as e:
+            logger.warning(f"admin_add_id: add_bot_admin sync failed for bot {config.bot_id}: {e}")
     await msg.answer(f"✅ <code>{text}</code> добавлен.", parse_mode="HTML", reply_markup=kb_admins_menu())
 
 
@@ -1483,6 +1513,11 @@ async def cb_adm_remove_pick(cb: CallbackQuery, state: FSMContext, config: Cowor
         return
     ids.discard(target)
     _save_admins(config.admins_file, ids)
+    if config.bot_id is not None:
+        try:
+            await remove_bot_admin(config.bot_id, target)
+        except Exception as e:
+            logger.warning(f"cb_adm_remove_pick: remove_bot_admin sync failed for bot {config.bot_id}: {e}")
     await state.clear()
     await cb.message.edit_text(f"✅ <code>{_esc(target)}</code> удалён.", parse_mode="HTML",
                                 reply_markup=kb_admins_menu())
