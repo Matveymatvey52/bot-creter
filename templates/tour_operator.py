@@ -36,6 +36,8 @@ from features import voice_intake
 from features.bot_feedback_entries import FEEDBACK_RESOURCE, init_feedback_table
 from features.voice_intake import VoiceFieldSpec, VoiceRecordType, VoiceSchema
 
+from db.database import add_bot_admin
+
 # ── Config ────────────────────────────────────────────────────────────────────
 # BOT_TOKEN/PORT/BASE_URL are process-wide, NOT per-bot — same treatment as
 # other such constants in manager_secretary/trip_manager (Stage 2 Phases
@@ -311,6 +313,10 @@ class TourOperatorConfig:
     # None in standalone mode simply means no mini-app link can be minted
     # there (WEB_CRM_ENABLED's own standalone web server doesn't need one).
     bot_id: int | None = None
+    # Only set in webhook mode. The sole user allowed to claim the empty-
+    # admins bootstrap slot at /start, and always treated as admin by
+    # _is_admin() regardless of admins_file state — see _is_admin's docstring.
+    owner_telegram_id: int | None = None
 
 
 def _paths_for(name: str, data_dir: Path) -> TourOperatorConfig:
@@ -359,6 +365,7 @@ def config_from_bot_row(bot_row: dict, data_dir: Path) -> TourOperatorConfig:
     config.display_name = bot_row.get("display_name")
     config.group_chat_id = bot_row.get("group_chat_id")
     config.bot_id = bot_id
+    config.owner_telegram_id = bot_row.get("owner_telegram_id")
     # Registers this bot's voice-intake schema NOW, since bot_id is only
     # known from this point on (init_db(db_path) below has no bot_id at
     # all — see runtime/registry.py's _build_generic_middleware, which calls
@@ -405,12 +412,19 @@ def _save_admins(admins_file: str, lst):
     with open(admins_file, "w") as f:
         json.dump({"ids": [str(x) for x in lst]}, f)
 
-def _is_admin(uid, admins_file: str):
-    admins = _load_admins(admins_file)
-    if not admins:
-        _save_admins(admins_file, [uid])
+def _is_admin(uid, config: "TourOperatorConfig"):
+    # DB-known owner (bots.owner_telegram_id) is always admin, even if the
+    # local admins_file is empty/stale — mirrors shop_catalog.py's
+    # _is_bot_admin. Bug fixed here: this used to bootstrap admins_file with
+    # `uid` on EVERY call whenever the admins list was empty (not just at
+    # /start), so removing the last admin via any future /removeadmin-style
+    # flow let the next caller of ANY admin-gated command silently become the
+    # new admin. A rights check must never grant admin as a side effect of
+    # being called — bootstrap is now only done once, explicitly, in
+    # cmd_start below.
+    if config.owner_telegram_id is not None and str(uid) == str(config.owner_telegram_id):
         return True
-    return str(uid) in admins
+    return str(uid) in _load_admins(config.admins_file)
 
 def _esc(value, max_len: int = 500) -> str:
     """HTML-escapes AND length-bounds any user-supplied text before it goes
@@ -778,7 +792,24 @@ def _build_voice_schema() -> VoiceSchema:
 @router.message(Command("start"))
 async def cmd_start(m: Message, state: FSMContext, config: TourOperatorConfig):
     await state.clear()
-    if _is_admin(m.from_user.id, config.admins_file):
+    sender_id = m.from_user.id
+    admins = _load_admins(config.admins_file)
+    # Bug fixed here: this used to grant admin to whoever sent /start FIRST,
+    # which lets any client who messages the bot before the owner does
+    # permanently seize the admin panel. When bots.owner_telegram_id is known
+    # (webhook/production mode), only that user may claim the empty-admins
+    # bootstrap slot; a non-owner sending /start first now just gets the
+    # regular client menu. In standalone/env mode (owner_telegram_id unknown)
+    # the old first-comer behavior is kept as the only option available.
+    is_owner = config.owner_telegram_id is not None and sender_id == config.owner_telegram_id
+    if not admins and (is_owner or config.owner_telegram_id is None):
+        _save_admins(config.admins_file, [str(sender_id)])
+        if config.bot_id is not None:
+            try:
+                await add_bot_admin(config.bot_id, str(sender_id))
+            except Exception as e:
+                logger.warning(f"cmd_start: add_bot_admin sync failed for bot {config.bot_id}: {e}")
+    if _is_admin(sender_id, config):
         await _grant_owner_access(config.db_path, m.from_user.id)
         tour = await get_active_tour(config.db_path, m.from_user.id)
         tour_line = f"\n\n🌍 Активный тур: <b>{tour['name']}</b>" if tour else "\n\n⚠️ Нет тура. Создайте: /newtrip"
@@ -807,7 +838,7 @@ async def cmd_start(m: Message, state: FSMContext, config: TourOperatorConfig):
 
 @router.message(Command("newtrip"))
 async def cmd_newtrip(m: Message, state: FSMContext, config: TourOperatorConfig):
-    if not _is_admin(m.from_user.id, config.admins_file):
+    if not _is_admin(m.from_user.id, config):
         return
     await state.set_state(NewTour.name)
     await m.answer("🆕 <b>Новый тур</b>\n\nВведите название:", parse_mode="HTML")
@@ -864,7 +895,7 @@ async def _finish_tour(m, state, ds, de, config: TourOperatorConfig):
 
 @router.message(Command("tours"))
 async def cmd_tours(m: Message, config: TourOperatorConfig):
-    if not _is_admin(m.from_user.id, config.admins_file):
+    if not _is_admin(m.from_user.id, config):
         return
     async with aiosqlite.connect(config.db_path) as db:
         db.row_factory = aiosqlite.Row
@@ -919,7 +950,7 @@ def _site_url(bot_id: int, telegram_user_id: int) -> str | None:
 
 @router.message(Command("app"))
 async def cmd_app(m: Message, config: TourOperatorConfig):
-    if not _is_admin(m.from_user.id, config.admins_file):
+    if not _is_admin(m.from_user.id, config):
         return
     url = _miniapp_url(config.bot_id, m.from_user.id) if config.bot_id is not None else None
     if not url:
@@ -938,7 +969,7 @@ async def cmd_app(m: Message, config: TourOperatorConfig):
 
 @router.message(Command("lip"))
 async def cmd_lip(m: Message, config: TourOperatorConfig):
-    if not _is_admin(m.from_user.id, config.admins_file):
+    if not _is_admin(m.from_user.id, config):
         return
     tour = await get_active_tour(config.db_path, m.from_user.id)
     if not tour:
@@ -971,7 +1002,7 @@ async def cmd_lip(m: Message, config: TourOperatorConfig):
 # above) rather than relying solely on the button being absent.
 @router.callback_query(F.data == "new_tour")
 async def cb_new_tour(cb: CallbackQuery, state: FSMContext, config: TourOperatorConfig):
-    if not _is_admin(cb.from_user.id, config.admins_file):
+    if not _is_admin(cb.from_user.id, config):
         await cb.answer()
         return
     await state.set_state(NewTour.name)
@@ -996,7 +1027,7 @@ async def cb_open_app(cb: CallbackQuery, config: TourOperatorConfig):
 
 @router.callback_query(F.data == "tours_list")
 async def cb_tours_list(cb: CallbackQuery, config: TourOperatorConfig):
-    if not _is_admin(cb.from_user.id, config.admins_file):
+    if not _is_admin(cb.from_user.id, config):
         await cb.answer()
         return
     await cmd_tours(cb.message, config)
@@ -1004,7 +1035,7 @@ async def cb_tours_list(cb: CallbackQuery, config: TourOperatorConfig):
 
 @router.callback_query(F.data.startswith("sw_tour_"))
 async def cb_sw_tour(cb: CallbackQuery, config: TourOperatorConfig):
-    if not _is_admin(cb.from_user.id, config.admins_file):
+    if not _is_admin(cb.from_user.id, config):
         await cb.answer()
         return
     tid = int(cb.data.split("_")[-1])
@@ -1201,7 +1232,7 @@ async def _section_summary(sec: str, tour: dict, db_path: str) -> str:
 
 @router.callback_query(F.data.startswith("sec_"))
 async def cb_section(cb: CallbackQuery, state: FSMContext, config: TourOperatorConfig):
-    if not _is_admin(cb.from_user.id, config.admins_file):
+    if not _is_admin(cb.from_user.id, config):
         await cb.answer()
         return
     tour = await get_active_tour(config.db_path, cb.from_user.id)
@@ -1245,7 +1276,7 @@ async def check_auth(req):
     tok = req.headers.get("X-Token") or req.rel_url.query.get("token", "")
     config: TourOperatorConfig = req.app["config"]
     try:
-        return _is_admin(int(tok), config.admins_file) if tok else False
+        return _is_admin(int(tok), config) if tok else False
     except (ValueError, TypeError):
         return False
 
@@ -2006,7 +2037,7 @@ setInterval(()=>{if(activeTid)loadTab();},30000);
 async def serve_app(req: web.Request):
     tok = req.rel_url.query.get("token", "")
     config: TourOperatorConfig = req.app["config"]
-    if not tok or not tok.isdigit() or not _is_admin(int(tok), config.admins_file):
+    if not tok or not tok.isdigit() or not _is_admin(int(tok), config):
         return web.Response(
             text="<h1 style='font-family:sans-serif;color:#ef4444'>403 Forbidden</h1><p>Invalid token.</p>",
             content_type="text/html", status=403,

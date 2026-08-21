@@ -38,6 +38,7 @@ import aiosqlite
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
 
+import db.database as db_module
 from runtime.registry import _clone_router, get_template_router
 from templates import tour_operator
 import features.voice_intake as voice_intake
@@ -125,9 +126,14 @@ def _build_bot_dispatcher(config: tour_operator.TourOperatorConfig, bot_id: int)
 
 
 async def _create_and_activate_tour(dp: Dispatcher, bot: Bot, user_id: int, name: str, start_id: int) -> int:
-    """Drives /newtrip -> name -> destination -> /skip (dates) to create a
-    tour and set it active, exactly as a real user would."""
+    """Drives /start -> /newtrip -> name -> destination -> /skip (dates) to
+    create a tour and set it active, exactly as a real user would. The
+    leading /start is required since the admin-bootstrap security fix: admin
+    status is only ever granted explicitly in cmd_start now (never as a
+    side effect of an unrelated admin-gated command like /newtrip), so a
+    caller who never sent /start would fail every _is_admin() check below."""
     uid = start_id
+    await dp.feed_webhook_update(bot, _text_update(uid, user_id, "/start")); uid += 1
     await dp.feed_webhook_update(bot, _text_update(uid, user_id, "/newtrip")); uid += 1
     await dp.feed_webhook_update(bot, _text_update(uid, user_id, name)); uid += 1
     await dp.feed_webhook_update(bot, _text_update(uid, user_id, "Somewhere")); uid += 1
@@ -397,20 +403,31 @@ class TourOperatorWebCrmFlagTests(unittest.IsolatedAsyncioTestCase):
 
     async def _send_app_command(self) -> list[str]:
         """Builds a fresh bot/dispatcher directly from the (possibly just
-        reloaded) tour_operator.router, sends /app, and returns every sent
-        message's text."""
+        reloaded) tour_operator.router, sends /start (required for the caller
+        to become admin under the bootstrap security fix — see
+        _create_and_activate_tour's docstring above) then /app, and returns
+        every sent message's text."""
         bot_call_mock = AsyncMock(return_value=MagicMock())
         with patch.object(Bot, "__call__", new=bot_call_mock):
             with tempfile.TemporaryDirectory() as tmp:
-                config = tour_operator.config_from_bot_row(
-                    {"bot_id": 901, "name": "to_flag_bot", "display_name": None, "group_chat_id": None}, Path(tmp)
-                )
-                await tour_operator.init_db(config.db_path)
-                bot = Bot(token=FAKE_TOKEN)
-                dp = Dispatcher(storage=MemoryStorage())
-                dp.update.outer_middleware(tour_operator.ConfigMiddleware(config))
-                dp.include_router(tour_operator.router)
-                await dp.feed_webhook_update(bot, _text_update(1, SAME_USER_ID, "/app"))
+                # /start now syncs the bootstrap admin into db.database.
+                # add_bot_admin (central bot_admins table) — must be
+                # redirected to a throwaway DB, same reasoning as
+                # test_shop_catalog_isolation.py, or it would hit the real
+                # data/bots.db.
+                central_db_path = Path(tmp) / "central_bots.db"
+                with patch.object(db_module, "DB_PATH", central_db_path):
+                    await db_module.init_db()
+                    config = tour_operator.config_from_bot_row(
+                        {"bot_id": 901, "name": "to_flag_bot", "display_name": None, "group_chat_id": None}, Path(tmp)
+                    )
+                    await tour_operator.init_db(config.db_path)
+                    bot = Bot(token=FAKE_TOKEN)
+                    dp = Dispatcher(storage=MemoryStorage())
+                    dp.update.outer_middleware(tour_operator.ConfigMiddleware(config))
+                    dp.include_router(tour_operator.router)
+                    await dp.feed_webhook_update(bot, _text_update(1, SAME_USER_ID, "/start"))
+                    await dp.feed_webhook_update(bot, _text_update(2, SAME_USER_ID, "/app"))
         return [
             call.args[0].text for call in bot_call_mock.call_args_list
             if getattr(call.args[0], "text", None)
@@ -609,6 +626,114 @@ class TourOperatorClientRoleTests(unittest.IsolatedAsyncioTestCase):
         async with aiosqlite.connect(self.config.db_path) as db:
             names = [r[0] for r in await (await db.execute("SELECT name FROM tours")).fetchall()]
         self.assertNotIn("Forged Tour", names)
+
+
+class TourOperatorAdminBootstrapSecurityTests(unittest.IsolatedAsyncioTestCase):
+    """Security fix regression tests, mirroring test_shop_catalog_isolation.py's
+    ShopCatalogIsolationTests admin-bootstrap tests (see commit 8cea03f).
+
+    tour_operator.py had an EXTRA bug beyond shop_catalog's: _is_admin() used
+    to re-bootstrap admins_file with whichever uid called it, on EVERY call
+    whenever the admins list was empty — not just once at /start. So if the
+    owner ever emptied the admins list (e.g. a future /removeadmin), the next
+    caller of ANY admin-gated command/callback would silently become the new
+    admin. _is_admin() no longer has that side effect; bootstrap now only
+    happens once, explicitly, in cmd_start."""
+
+    async def asyncSetUp(self):
+        self._bot_call_patcher = patch.object(Bot, "__call__", new=AsyncMock(return_value=MagicMock()))
+        self._bot_call_patcher.start()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.data_dir = Path(self._tmp.name)
+
+        # cmd_start now syncs the bootstrap admin into db.database.add_bot_admin
+        # (central bot_admins table) — must be redirected to a throwaway DB,
+        # same reasoning as test_shop_catalog_isolation.py.
+        self._central_db_path = self.data_dir / "central_bots.db"
+        self._db_path_patcher = patch.object(db_module, "DB_PATH", self._central_db_path)
+        self._db_path_patcher.start()
+        await db_module.init_db()
+
+    async def asyncTearDown(self):
+        self._db_path_patcher.stop()
+        self._tmp.cleanup()
+        self._bot_call_patcher.stop()
+
+    async def test_non_owner_messaging_first_does_not_become_admin(self):
+        """Whoever sends /start FIRST used to permanently become the bot
+        admin. When bots.owner_telegram_id is known, only that user may
+        claim the empty-admins bootstrap slot."""
+        config = tour_operator.config_from_bot_row(
+            {"bot_id": 950, "name": "to_owned_bot", "display_name": None,
+             "group_chat_id": None, "owner_telegram_id": 12345},
+            self.data_dir,
+        )
+        await tour_operator.init_db(config.db_path)
+        bot, dp = _build_bot_dispatcher(config, 950)
+
+        CLIENT_ID = 555  # not the owner, messages first
+        await dp.feed_webhook_update(bot, _text_update(1, CLIENT_ID, "/start"))
+        self.assertEqual(tour_operator._load_admins(config.admins_file), [])
+        self.assertFalse(tour_operator._is_admin(CLIENT_ID, config))
+
+        await dp.feed_webhook_update(bot, _text_update(2, 12345, "/start"))
+        self.assertTrue(tour_operator._is_admin(12345, config))
+        self.assertEqual(tour_operator._load_admins(config.admins_file), ["12345"])
+
+    async def test_owner_is_always_admin_even_with_stale_admins_file(self):
+        """Defense in depth: the DB-known owner sees the admin panel even if
+        the local admins_file is empty/stale/hijacked — owner_telegram_id is
+        an unconditional admin in _is_admin, not just at bootstrap time."""
+        config = tour_operator.config_from_bot_row(
+            {"bot_id": 951, "name": "to_owned_bot_2", "display_name": None,
+             "group_chat_id": None, "owner_telegram_id": 777},
+            self.data_dir,
+        )
+        await tour_operator.init_db(config.db_path)
+        tour_operator._save_admins(config.admins_file, ["999999"])  # some other id, not the owner
+        self.assertTrue(tour_operator._is_admin(777, config))  # owner: always admin
+        self.assertTrue(tour_operator._is_admin(999999, config))  # still honors the file's own admin
+        self.assertFalse(tour_operator._is_admin(4242, config))  # neither owner nor in the file
+
+    async def test_emptied_admin_list_does_not_auto_bootstrap_next_caller(self):
+        """The tour_operator-specific extra bug this session fixes: simulate
+        the admins list becoming empty (as it would right after the last
+        admin is removed) and confirm _is_admin() called for an unrelated,
+        non-owner uid does NOT silently grant it admin as a side effect of
+        merely being checked — repeated calls stay refused, and the DB-known
+        owner remains the only admin via the owner_telegram_id fallback."""
+        config = tour_operator.config_from_bot_row(
+            {"bot_id": 952, "name": "to_owned_bot_3", "display_name": None,
+             "group_chat_id": None, "owner_telegram_id": 111},
+            self.data_dir,
+        )
+        await tour_operator.init_db(config.db_path)
+        tour_operator._save_admins(config.admins_file, [])  # admin list just emptied
+
+        RANDOM_UID = 42424242
+        self.assertFalse(tour_operator._is_admin(RANDOM_UID, config))
+        # must NOT have been silently added as a side effect of the check above
+        self.assertEqual(tour_operator._load_admins(config.admins_file), [])
+        self.assertFalse(tour_operator._is_admin(RANDOM_UID, config))
+        self.assertEqual(tour_operator._load_admins(config.admins_file), [])
+
+        # owner fallback still works even with an empty admins_file
+        self.assertTrue(tour_operator._is_admin(111, config))
+
+    async def test_bootstrap_admin_syncs_to_central_bot_admins_table(self):
+        """The mini-app's admin gate (runtime.miniapp_api._admin_gate_ok)
+        checks db.database.get_bot_admins(), a separate table from this
+        template's local admins_file. The bootstrap grant must land in both."""
+        config = tour_operator.config_from_bot_row(
+            {"bot_id": 953, "name": "to_synced_bot", "display_name": None, "group_chat_id": None},
+            self.data_dir,
+        )
+        await tour_operator.init_db(config.db_path)
+        bot, dp = _build_bot_dispatcher(config, 953)
+        await dp.feed_webhook_update(bot, _text_update(1, 321, "/start"))
+
+        central_admins = await db_module.get_bot_admins(953)
+        self.assertEqual(central_admins, ["321"])
 
 
 if __name__ == "__main__":
