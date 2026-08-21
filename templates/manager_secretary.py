@@ -23,6 +23,8 @@ from aiogram.types import (
     KeyboardButton, Message, ReplyKeyboardMarkup,
 )
 
+from db.database import add_bot_admin, remove_bot_admin
+
 # ── CUSTOMIZE ────────────────────────────────────────────────────────────────
 # NOTE (Stage 2 Phase 4): same as accountant.py — this section is per-file
 # source-text customization Claude edits when generating a specific bot, not a
@@ -100,6 +102,8 @@ class ManagerSecretaryConfig:
     welcome_image: Path
     display_name: str | None = None   # used in handle_group_mention (unlike accountant)
     group_chat_id: str | None = None  # not read by this template (verified: no matches)
+    bot_id: int | None = None
+    owner_telegram_id: int | None = None
 
 
 def _paths_for(name: str, data_dir: Path) -> ManagerSecretaryConfig:
@@ -144,6 +148,8 @@ def config_from_bot_row(bot_row: dict, data_dir: Path) -> ManagerSecretaryConfig
     )
     config.display_name = bot_row.get("display_name")
     config.group_chat_id = bot_row.get("group_chat_id")
+    config.bot_id = bot_id
+    config.owner_telegram_id = bot_row.get("owner_telegram_id")
     return config
 
 
@@ -170,6 +176,14 @@ def _load_admins(admins_file: Path) -> set:
 
 def _save_admins(admins_file: Path, ids: set) -> None:
     admins_file.write_text(json.dumps({"ids": list(ids)}, ensure_ascii=False))
+
+def _is_admin(user_id: int, config: ManagerSecretaryConfig) -> bool:
+    # The DB-known owner (bots.owner_telegram_id) is always an admin, even if
+    # the local admins_file is empty/stale/hijacked — see cmd_start below for
+    # why the file alone can't be trusted as the sole source of truth.
+    if config.owner_telegram_id is not None and str(user_id) == str(config.owner_telegram_id):
+        return True
+    return str(user_id) in _load_admins(config.admins_file)
 
 def _esc(value, max_len: int = 500) -> str:
     """HTML-escapes AND length-bounds any user-supplied text before it goes into
@@ -270,9 +284,23 @@ class LeadFlow(StatesGroup):
 @router.message(Command("start"))
 async def cmd_start(message: Message, config: ManagerSecretaryConfig):
     admins = _load_admins(config.admins_file)
-    if not admins:
-        _save_admins(config.admins_file, {str(message.from_user.id)})
-    is_admin = str(message.from_user.id) in _load_admins(config.admins_file)
+    sender_id = message.from_user.id
+    # Bug fixed here: this used to grant admin to whoever sent /start FIRST,
+    # which lets any client who messages the bot before the owner does
+    # permanently seize the admin panel. When bots.owner_telegram_id is known
+    # (webhook/production mode), only that user may claim the empty-admins
+    # bootstrap slot; a non-owner sending /start first now just gets the
+    # regular client menu. In standalone/env mode (owner_telegram_id unknown)
+    # the old first-comer behavior is kept as the only option available.
+    is_owner = config.owner_telegram_id is not None and sender_id == config.owner_telegram_id
+    if not admins and (is_owner or config.owner_telegram_id is None):
+        _save_admins(config.admins_file, {str(sender_id)})
+        if config.bot_id is not None:
+            try:
+                await add_bot_admin(config.bot_id, str(sender_id))
+            except Exception as e:
+                logger.warning(f"cmd_start: add_bot_admin sync failed for bot {config.bot_id}: {e}")
+    is_admin = _is_admin(sender_id, config)
     kb = kb_admin() if is_admin else kb_main()
     if config.welcome_image.exists():
         await message.answer_photo(FSInputFile(str(config.welcome_image)),
@@ -407,7 +435,7 @@ async def show_about(msg: Message):
 
 @router.message(F.text == "📋 Заявки")
 async def admin_leads(msg: Message, config: ManagerSecretaryConfig):
-    if str(msg.from_user.id) not in _load_admins(config.admins_file):
+    if not _is_admin(msg.from_user.id, config):
         await msg.answer("⛔ Нет доступа"); return
     async with aiosqlite.connect(config.db_path) as db:
         db.row_factory = aiosqlite.Row
@@ -445,7 +473,7 @@ async def cb_lead_status(cb: CallbackQuery, config: ManagerSecretaryConfig):
 
 @router.message(F.text == "📊 Статистика")
 async def admin_stats(msg: Message, config: ManagerSecretaryConfig):
-    if str(msg.from_user.id) not in _load_admins(config.admins_file):
+    if not _is_admin(msg.from_user.id, config):
         await msg.answer("⛔ Нет доступа"); return
     async with aiosqlite.connect(config.db_path) as db:
         total  = (await (await db.execute("SELECT COUNT(*) FROM leads")).fetchone())[0]
@@ -470,7 +498,7 @@ async def admin_stats(msg: Message, config: ManagerSecretaryConfig):
 
 @router.message(Command("addfaq"))
 async def cmd_addfaq(msg: Message, config: ManagerSecretaryConfig):
-    if str(msg.from_user.id) not in _load_admins(config.admins_file): await msg.answer("⛔ Нет доступа"); return
+    if not _is_admin(msg.from_user.id, config): await msg.answer("⛔ Нет доступа"); return
     parts = msg.text.split("\n", 2)
     if len(parts) < 3:
         await msg.answer("Формат:\n/addfaq\nВопрос\nОтвет"); return
@@ -482,7 +510,7 @@ async def cmd_addfaq(msg: Message, config: ManagerSecretaryConfig):
 
 @router.message(Command("listfaq"))
 async def cmd_listfaq(msg: Message, config: ManagerSecretaryConfig):
-    if str(msg.from_user.id) not in _load_admins(config.admins_file): await msg.answer("⛔ Нет доступа"); return
+    if not _is_admin(msg.from_user.id, config): await msg.answer("⛔ Нет доступа"); return
     async with aiosqlite.connect(config.db_path) as db:
         rows = await (await db.execute("SELECT id, question FROM faqs ORDER BY sort_order")).fetchall()
     lines = ["📋 <b>Список FAQ:</b>"] + [f"  {fid}. {q}" for fid, q in rows]
@@ -490,7 +518,7 @@ async def cmd_listfaq(msg: Message, config: ManagerSecretaryConfig):
 
 @router.message(Command("delfaq"))
 async def cmd_delfaq(msg: Message, config: ManagerSecretaryConfig):
-    if str(msg.from_user.id) not in _load_admins(config.admins_file): await msg.answer("⛔ Нет доступа"); return
+    if not _is_admin(msg.from_user.id, config): await msg.answer("⛔ Нет доступа"); return
     parts = msg.text.split()
     if len(parts) < 2 or not parts[1].isdigit(): await msg.answer("Использование: /delfaq <id>"); return
     async with aiosqlite.connect(config.db_path) as db:
@@ -503,23 +531,33 @@ async def cmd_delfaq(msg: Message, config: ManagerSecretaryConfig):
 
 @router.message(Command("addadmin"))
 async def cmd_addadmin(msg: Message, config: ManagerSecretaryConfig):
-    if str(msg.from_user.id) not in _load_admins(config.admins_file): await msg.answer("⛔ Нет доступа"); return
+    if not _is_admin(msg.from_user.id, config): await msg.answer("⛔ Нет доступа"); return
     parts = msg.text.split()
     if len(parts) < 2 or not parts[1].lstrip("-").isdigit(): await msg.answer("Использование: /addadmin <id>"); return
     ids = _load_admins(config.admins_file); ids.add(parts[1]); _save_admins(config.admins_file, ids)
+    if config.bot_id is not None:
+        try:
+            await add_bot_admin(config.bot_id, parts[1])
+        except Exception as e:
+            logger.warning(f"cmd_addadmin: add_bot_admin sync failed for bot {config.bot_id}: {e}")
     await msg.answer(f"✅ <code>{parts[1]}</code> добавлен.", parse_mode="HTML")
 
 @router.message(Command("removeadmin"))
 async def cmd_removeadmin(msg: Message, config: ManagerSecretaryConfig):
-    if str(msg.from_user.id) not in _load_admins(config.admins_file): await msg.answer("⛔ Нет доступа"); return
+    if not _is_admin(msg.from_user.id, config): await msg.answer("⛔ Нет доступа"); return
     parts = msg.text.split()
     if len(parts) < 2: await msg.answer("Использование: /removeadmin <id>"); return
     ids = _load_admins(config.admins_file); ids.discard(parts[1]); _save_admins(config.admins_file, ids)
+    if config.bot_id is not None:
+        try:
+            await remove_bot_admin(config.bot_id, parts[1])
+        except Exception as e:
+            logger.warning(f"cmd_removeadmin: remove_bot_admin sync failed for bot {config.bot_id}: {e}")
     await msg.answer(f"✅ <code>{_esc(parts[1])}</code> удалён.", parse_mode="HTML")
 
 @router.message(Command("admins"))
 async def cmd_admins(msg: Message, config: ManagerSecretaryConfig):
-    if str(msg.from_user.id) not in _load_admins(config.admins_file): await msg.answer("⛔ Нет доступа"); return
+    if not _is_admin(msg.from_user.id, config): await msg.answer("⛔ Нет доступа"); return
     ids = _load_admins(config.admins_file)
     await msg.answer("👥 " + ("\n".join(f"• <code>{i}</code>" for i in ids) or "Пусто"), parse_mode="HTML")
 
