@@ -152,6 +152,17 @@ class CompatibleFeatureToggleEnablesAndReloadsTests(_FeatureToggleTestBase):
         self.assertEqual(self._fake_registry.reload_one.await_count, 2)
 
 
+class FeatureLabelCompletenessTests(unittest.TestCase):
+    """manage_bots._FEATURE_LABELS must name every real feature discovered
+    from features/*.py's own "# FEATURE:" headers, so the owner-facing "🧩
+    Фичи" panel never falls back to a raw technical key like "channel_monitor"
+    (Creator-panel readability fix)."""
+
+    def test_every_discovered_feature_has_a_label(self):
+        missing = [f["name"] for f in reg.discover_features() if f["name"] not in manage_bots._FEATURE_LABELS]
+        self.assertEqual(missing, [], f"features missing from _FEATURE_LABELS: {missing}")
+
+
 class NonOwnerCannotToggleTests(_FeatureToggleTestBase):
     owner_id = 424244
 

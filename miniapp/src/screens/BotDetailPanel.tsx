@@ -95,8 +95,8 @@ const FEATURE_QUESTION: Record<string, string> = {
 }
 
 const FEATURE_LABELS: Record<string, string> = {
-  payments: 'Платежи',
-  sheets: 'Google Таблицы',
+  payments: 'Приём платежей',
+  sheets: 'Google-таблицы',
   notifications: 'Рассылки',
   office_events: 'Обмен между ботами',
   reminders: 'Напоминания',
@@ -104,6 +104,11 @@ const FEATURE_LABELS: Record<string, string> = {
   voice_intake: 'Голосовой ввод',
   sellable_items: 'Каталог товаров',
   cashflow_ledger: 'Учёт денег (ДДС)',
+  excel_export: 'Экспорт в Excel',
+  word_export: 'Экспорт в Word',
+  group_task: 'Групповые задачи',
+  channel_monitor: 'Мониторинг каналов',
+  bot_feedback_entries: 'Отзывы клиентов',
 }
 
 function featureLabel(name: string): string {

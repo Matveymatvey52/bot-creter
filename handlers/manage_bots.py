@@ -434,6 +434,34 @@ async def cb_info(callback: CallbackQuery):
     )
 
 
+# Human-readable Russian names for features/*.py's "# FEATURE: <name>" keys —
+# owner-facing (Telegram "🧩 Фичи" panel here, and its miniapp counterpart in
+# miniapp/src/screens/BotDetailPanel.tsx's own FEATURE_LABELS, kept in sync by
+# hand since the two live in separate languages/runtimes). A key missing here
+# falls back to the raw feature name, same fallback miniapp/src/screens/
+# BotDetailPanel.tsx's featureLabel() uses.
+_FEATURE_LABELS: dict[str, str] = {
+    "payments": "Приём платежей",
+    "sheets": "Google-таблицы",
+    "notifications": "Рассылки",
+    "office_events": "Обмен между ботами",
+    "reminders": "Напоминания",
+    "sales_analytics": "Аналитика продаж",
+    "voice_intake": "Голосовой ввод",
+    "sellable_items": "Каталог товаров",
+    "cashflow_ledger": "Учёт денег (ДДС)",
+    "excel_export": "Экспорт в Excel",
+    "word_export": "Экспорт в Word",
+    "group_task": "Групповые задачи",
+    "channel_monitor": "Мониторинг каналов",
+    "bot_feedback_entries": "Отзывы клиентов",
+}
+
+
+def _feature_label(name: str) -> str:
+    return _FEATURE_LABELS.get(name, name)
+
+
 def _features_keyboard(
     bot_id: int,
     compatible: list[dict],
@@ -446,7 +474,9 @@ def _features_keyboard(
         name = feature["name"]
         icon = "✅" if name in enabled else "⬜"
         rows.append([
-            InlineKeyboardButton(text=f"{icon} {name}", callback_data=f"togglefeature:{bot_id}:{name}"),
+            InlineKeyboardButton(
+                text=f"{icon} {_feature_label(name)}", callback_data=f"togglefeature:{bot_id}:{name}"
+            ),
         ])
         # "sheets" needs a spreadsheet_id per bot beyond a plain on/off toggle —
         # this second row only appears once the feature itself is enabled.
