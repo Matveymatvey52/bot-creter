@@ -25,6 +25,7 @@ import aiosqlite
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
 
+import db.database as db_module
 from runtime.registry import get_template_router
 from templates import expense_tracker
 
@@ -156,6 +157,71 @@ class ExpenseTrackerSummarySmokeTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("999.00", text, "expense outside the queried period leaked into the summary")
         # Highest-spend category ("Еда") must appear before the smaller one.
         self.assertLess(text.index("Еда"), text.index("Транспорт"))
+
+
+class ExpenseTrackerAdminBootstrapSecurityTests(unittest.IsolatedAsyncioTestCase):
+    """Security fix: previously, whoever sent /start FIRST permanently became
+    the bot admin — a client testing the bot link before the owner did would
+    silently seize the admin panel. See tests/test_shop_catalog_isolation.py
+    for the original of this fix, applied identically here."""
+
+    async def asyncSetUp(self):
+        self._bot_call_patcher = patch.object(Bot, "__call__", new=AsyncMock(return_value=MagicMock()))
+        self._bot_call_patcher.start()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.data_dir = Path(self._tmp.name)
+
+        self._central_db_path = self.data_dir / "central_bots.db"
+        self._db_path_patcher = patch.object(db_module, "DB_PATH", self._central_db_path)
+        self._db_path_patcher.start()
+        await db_module.init_db()
+
+    async def asyncTearDown(self):
+        self._db_path_patcher.stop()
+        self._tmp.cleanup()
+        self._bot_call_patcher.stop()
+
+    async def test_non_owner_messaging_first_does_not_become_admin(self):
+        config = expense_tracker.config_from_bot_row(
+            {"bot_id": 929, "name": "expense_bot_owned", "display_name": None,
+             "group_chat_id": None, "owner_telegram_id": 12345},
+            self.data_dir,
+        )
+        await expense_tracker.init_db(config.db_path)
+        bot, dp = _build_bot_dispatcher(config)
+
+        CLIENT_ID = 555  # not the owner, messages first
+        await dp.feed_webhook_update(bot, _text_update(1, CLIENT_ID, "/start"))
+        self.assertEqual(expense_tracker._load_admins(config.admins_file), set())
+        self.assertFalse(expense_tracker._is_admin(CLIENT_ID, config))
+
+        await dp.feed_webhook_update(bot, _text_update(2, 12345, "/start"))
+        self.assertTrue(expense_tracker._is_admin(12345, config))
+        self.assertEqual(expense_tracker._load_admins(config.admins_file), {"12345"})
+
+    async def test_owner_is_always_admin_even_with_stale_admins_file(self):
+        config = expense_tracker.config_from_bot_row(
+            {"bot_id": 930, "name": "expense_bot_owned_2", "display_name": None,
+             "group_chat_id": None, "owner_telegram_id": 777},
+            self.data_dir,
+        )
+        await expense_tracker.init_db(config.db_path)
+        expense_tracker._save_admins(config.admins_file, {"999999"})  # some other id, not the owner
+        self.assertTrue(expense_tracker._is_admin(777, config))  # owner: always admin
+        self.assertTrue(expense_tracker._is_admin(999999, config))  # still honors the file's own admin
+        self.assertFalse(expense_tracker._is_admin(4242, config))  # neither owner nor in the file
+
+    async def test_bootstrap_admin_syncs_to_central_bot_admins_table(self):
+        config = expense_tracker.config_from_bot_row(
+            {"bot_id": 931, "name": "expense_bot_synced", "display_name": None, "group_chat_id": None},
+            self.data_dir,
+        )
+        await expense_tracker.init_db(config.db_path)
+        bot, dp = _build_bot_dispatcher(config)
+        await dp.feed_webhook_update(bot, _text_update(1, 321, "/start"))
+
+        central_admins = await db_module.get_bot_admins(931)
+        self.assertEqual(central_admins, ["321"])
 
 
 if __name__ == "__main__":
