@@ -24,6 +24,8 @@ from aiogram.types import (
     KeyboardButton, Message, ReplyKeyboardMarkup,
 )
 
+from db.database import add_bot_admin, remove_bot_admin
+
 # ── CUSTOMIZE ────────────────────────────────────────────────────────────────
 # Same status as every other template's CUSTOMIZE block: per-file source-text
 # customization Claude edits when generating a specific bot, not per-bot
@@ -188,6 +190,8 @@ class TouristDocumentsConfig:
     welcome_image: Path
     display_name: str | None = None
     group_chat_id: str | None = None
+    bot_id: int | None = None
+    owner_telegram_id: int | None = None
 
 
 def _paths_for(name: str, data_dir: Path) -> TouristDocumentsConfig:
@@ -221,6 +225,8 @@ def config_from_bot_row(bot_row: dict, data_dir: Path) -> TouristDocumentsConfig
     )
     config.display_name = bot_row.get("display_name")
     config.group_chat_id = bot_row.get("group_chat_id")
+    config.bot_id = bot_id
+    config.owner_telegram_id = bot_row.get("owner_telegram_id")
     return config
 
 
@@ -252,8 +258,13 @@ def _save_admins(admins_file: Path, ids: set) -> None:
     admins_file.write_text(json.dumps({"ids": list(ids)}, ensure_ascii=False))
 
 
-def _is_admin(user_id: int, admins_file: Path) -> bool:
-    return str(user_id) in _load_admins(admins_file)
+def _is_admin(user_id: int, config: TouristDocumentsConfig) -> bool:
+    # The DB-known owner (bots.owner_telegram_id) is always an admin, even if
+    # the local admins_file is empty/stale/hijacked — see cmd_start below for
+    # why the file alone can't be trusted as the sole source of truth.
+    if config.owner_telegram_id is not None and str(user_id) == str(config.owner_telegram_id):
+        return True
+    return str(user_id) in _load_admins(config.admins_file)
 
 
 # ── db ────────────────────────────────────────────────────────────────────────
@@ -473,10 +484,23 @@ async def cb_noop(cb: CallbackQuery):
 @router.message(Command("start"))
 async def cmd_start(message: Message, config: TouristDocumentsConfig):
     admins = _load_admins(config.admins_file)
-    first_time_admin = not admins
+    sender_id = message.from_user.id
+    # Bug fixed here: this used to grant admin to whoever sent /start FIRST,
+    # which lets any client who messages the bot before the owner does
+    # permanently seize the admin panel. When bots.owner_telegram_id is known
+    # (webhook/production mode), only that user may claim the empty-admins
+    # bootstrap slot. In standalone/env mode (owner_telegram_id unknown) the
+    # old first-comer behavior is kept as the only option available.
+    is_owner = config.owner_telegram_id is not None and sender_id == config.owner_telegram_id
+    first_time_admin = not admins and (is_owner or config.owner_telegram_id is None)
     if first_time_admin:
-        _save_admins(config.admins_file, {str(message.from_user.id)})
-    is_admin = first_time_admin or _is_admin(message.from_user.id, config.admins_file)
+        _save_admins(config.admins_file, {str(sender_id)})
+        if config.bot_id is not None:
+            try:
+                await add_bot_admin(config.bot_id, str(sender_id))
+            except Exception as e:
+                logger.warning(f"cmd_start: add_bot_admin sync failed for bot {config.bot_id}: {e}")
+    is_admin = _is_admin(sender_id, config)
 
     if not is_admin:
         await message.answer(NOT_ADMIN_TEXT)
@@ -499,7 +523,7 @@ async def cmd_start(message: Message, config: TouristDocumentsConfig):
 
 @router.message(F.text == "➕ Добавить туриста")
 async def add_tourist_start(msg: Message, state: FSMContext, config: TouristDocumentsConfig):
-    if not _is_admin(msg.from_user.id, config.admins_file):
+    if not _is_admin(msg.from_user.id, config):
         await msg.answer(NOT_ADMIN_TEXT); return
     await state.set_state(AddTourist.full_name)
     await msg.answer("👤 Пришлите ФИО туриста:", reply_markup=kb_cancel())
@@ -512,7 +536,7 @@ async def add_full_name(msg: Message, state: FSMContext, config: TouristDocument
     # when they WERE admin) could still complete privileged writes further
     # down the wizard. state.clear() removes the stale data too, closing the
     # "keep an old button around" variant of the same issue.
-    if not _is_admin(msg.from_user.id, config.admins_file):
+    if not _is_admin(msg.from_user.id, config):
         await state.clear(); await msg.answer(NOT_ADMIN_TEXT); return
     name = msg.text.strip()
     if not _len_ok(name, FULL_NAME_LEN):
@@ -523,7 +547,7 @@ async def add_full_name(msg: Message, state: FSMContext, config: TouristDocument
 
 @router.message(AddTourist.passport_number, F.text, ~F.text.startswith("/"), ~F.text.in_(MENU_BUTTON_TEXTS))
 async def add_passport_number(msg: Message, state: FSMContext, config: TouristDocumentsConfig):
-    if not _is_admin(msg.from_user.id, config.admins_file):
+    if not _is_admin(msg.from_user.id, config):
         await state.clear(); await msg.answer(NOT_ADMIN_TEXT); return
     number = msg.text.strip()
     if not _len_ok(number, PASSPORT_NUMBER_LEN):
@@ -538,7 +562,7 @@ async def add_passport_number(msg: Message, state: FSMContext, config: TouristDo
 # of it not being a valid date, so the extra filter would be redundant.
 @router.message(AddTourist.passport_expiry, F.text, ~F.text.startswith("/"))
 async def add_passport_expiry(msg: Message, state: FSMContext, config: TouristDocumentsConfig):
-    if not _is_admin(msg.from_user.id, config.admins_file):
+    if not _is_admin(msg.from_user.id, config):
         await state.clear(); await msg.answer(NOT_ADMIN_TEXT); return
     parsed = _parse_date(msg.text)
     if not parsed:
@@ -549,7 +573,7 @@ async def add_passport_expiry(msg: Message, state: FSMContext, config: TouristDo
 
 @router.callback_query(AddTourist.visa_status, F.data.startswith("td_visa:"))
 async def add_visa_status(cb: CallbackQuery, state: FSMContext, config: TouristDocumentsConfig):
-    if not _is_admin(cb.from_user.id, config.admins_file):
+    if not _is_admin(cb.from_user.id, config):
         await cb.answer("⛔ Нет доступа", show_alert=True); await state.clear(); return
     await cb.answer()
     status = cb.data.split(":", 1)[1]
@@ -570,7 +594,7 @@ async def add_visa_status(cb: CallbackQuery, state: FSMContext, config: TouristD
 # menu-button text, so MENU_BUTTON_TEXTS would be redundant here too.
 @router.message(AddTourist.visa_expiry, F.text, ~F.text.startswith("/"))
 async def add_visa_expiry(msg: Message, state: FSMContext, config: TouristDocumentsConfig):
-    if not _is_admin(msg.from_user.id, config.admins_file):
+    if not _is_admin(msg.from_user.id, config):
         await state.clear(); await msg.answer(NOT_ADMIN_TEXT); return
     parsed = _parse_date(msg.text)
     if not parsed:
@@ -591,7 +615,7 @@ async def _ask_group(msg: Message, state: FSMContext, config: TouristDocumentsCo
 
 @router.callback_query(AddTourist.group_pick, F.data.startswith("td_group:"))
 async def add_group_pick(cb: CallbackQuery, state: FSMContext, config: TouristDocumentsConfig):
-    if not _is_admin(cb.from_user.id, config.admins_file):
+    if not _is_admin(cb.from_user.id, config):
         await cb.answer("⛔ Нет доступа", show_alert=True); await state.clear(); return
     await cb.answer()
     group_id = int(cb.data.split(":", 1)[1])
@@ -605,7 +629,7 @@ async def add_group_pick(cb: CallbackQuery, state: FSMContext, config: TouristDo
 
 @router.callback_query(AddTourist.group_pick, F.data == "td_group_new")
 async def add_group_new(cb: CallbackQuery, state: FSMContext, config: TouristDocumentsConfig):
-    if not _is_admin(cb.from_user.id, config.admins_file):
+    if not _is_admin(cb.from_user.id, config):
         await cb.answer("⛔ Нет доступа", show_alert=True); await state.clear(); return
     await cb.answer()
     await state.update_data(group_ctx="add_tourist")
@@ -618,7 +642,7 @@ async def add_notes_skip(cb: CallbackQuery, state: FSMContext, config: TouristDo
     # stale button from an old message at any later time (even after losing
     # admin access), since it wasn't gated to AddTourist.notes like every
     # sibling handler in this flow. Now scoped + re-checked like the rest.
-    if not _is_admin(cb.from_user.id, config.admins_file):
+    if not _is_admin(cb.from_user.id, config):
         await cb.answer("⛔ Нет доступа", show_alert=True); await state.clear(); return
     await cb.answer()
     await state.update_data(notes="")
@@ -626,7 +650,7 @@ async def add_notes_skip(cb: CallbackQuery, state: FSMContext, config: TouristDo
 
 @router.message(AddTourist.notes, F.text, ~F.text.startswith("/"), ~F.text.in_(MENU_BUTTON_TEXTS))
 async def add_notes(msg: Message, state: FSMContext, config: TouristDocumentsConfig):
-    if not _is_admin(msg.from_user.id, config.admins_file):
+    if not _is_admin(msg.from_user.id, config):
         await state.clear(); await msg.answer(NOT_ADMIN_TEXT); return
     notes = msg.text.strip()
     if len(notes) > NOTES_MAX_LEN:
@@ -657,7 +681,7 @@ async def _show_add_confirmation(msg: Message, state: FSMContext, *, answer_only
 
 @router.callback_query(AddTourist.confirm, F.data == "td_add_confirm")
 async def add_confirm(cb: CallbackQuery, state: FSMContext, config: TouristDocumentsConfig):
-    if not _is_admin(cb.from_user.id, config.admins_file):
+    if not _is_admin(cb.from_user.id, config):
         await cb.answer("⛔ Нет доступа", show_alert=True); await state.clear(); return
     await cb.answer()
     data = await state.get_data()
@@ -689,7 +713,7 @@ async def add_confirm(cb: CallbackQuery, state: FSMContext, config: TouristDocum
 
 @router.message(GroupNameEntry.name, F.text, ~F.text.startswith("/"), ~F.text.in_(MENU_BUTTON_TEXTS))
 async def group_name_entry(msg: Message, state: FSMContext, config: TouristDocumentsConfig):
-    if not _is_admin(msg.from_user.id, config.admins_file):
+    if not _is_admin(msg.from_user.id, config):
         await state.clear(); await msg.answer(NOT_ADMIN_TEXT); return
     name = msg.text.strip()
     if not _len_ok(name, GROUP_NAME_LEN):
@@ -721,7 +745,7 @@ async def group_name_entry(msg: Message, state: FSMContext, config: TouristDocum
 
 @router.message(F.text == "🗂 Группы/туры")
 async def groups_panel(msg: Message, config: TouristDocumentsConfig):
-    if not _is_admin(msg.from_user.id, config.admins_file):
+    if not _is_admin(msg.from_user.id, config):
         await msg.answer(NOT_ADMIN_TEXT); return
     groups = await _active_groups(config.db_path)
     text = "🗂 <b>Группы/туры:</b>" if groups else "Групп пока нет."
@@ -729,7 +753,7 @@ async def groups_panel(msg: Message, config: TouristDocumentsConfig):
 
 @router.callback_query(F.data == "td_group_add")
 async def group_add_start(cb: CallbackQuery, state: FSMContext, config: TouristDocumentsConfig):
-    if not _is_admin(cb.from_user.id, config.admins_file):
+    if not _is_admin(cb.from_user.id, config):
         await cb.answer("⛔ Нет доступа", show_alert=True); return
     await cb.answer()
     await state.update_data(group_ctx="standalone")
@@ -738,7 +762,7 @@ async def group_add_start(cb: CallbackQuery, state: FSMContext, config: TouristD
 
 @router.callback_query(F.data.startswith("td_group_deact:"))
 async def group_deactivate(cb: CallbackQuery, config: TouristDocumentsConfig):
-    if not _is_admin(cb.from_user.id, config.admins_file):
+    if not _is_admin(cb.from_user.id, config):
         await cb.answer("⛔ Нет доступа", show_alert=True); return
     await cb.answer()
     group_id = int(cb.data.split(":", 1)[1])
@@ -770,7 +794,7 @@ async def _groups_pick_markup(db_path: str) -> tuple[InlineKeyboardMarkup, bool]
 
 @router.message(F.text == "📋 Список туристов")
 async def list_tourists_start(msg: Message, config: TouristDocumentsConfig):
-    if not _is_admin(msg.from_user.id, config.admins_file):
+    if not _is_admin(msg.from_user.id, config):
         await msg.answer(NOT_ADMIN_TEXT); return
     kb, has_any = await _groups_pick_markup(config.db_path)
     if not has_any:
@@ -779,7 +803,7 @@ async def list_tourists_start(msg: Message, config: TouristDocumentsConfig):
 
 @router.callback_query(F.data.startswith("td_list_group:"))
 async def list_tourists_by_group(cb: CallbackQuery, config: TouristDocumentsConfig):
-    if not _is_admin(cb.from_user.id, config.admins_file):
+    if not _is_admin(cb.from_user.id, config):
         await cb.answer("⛔ Нет доступа", show_alert=True); return
     await cb.answer()
     raw = cb.data.split(":", 1)[1]
@@ -812,7 +836,7 @@ async def list_back(cb: CallbackQuery, config: TouristDocumentsConfig):
 
 @router.callback_query(F.data.startswith("td_tourist:"))
 async def tourist_card(cb: CallbackQuery, config: TouristDocumentsConfig):
-    if not _is_admin(cb.from_user.id, config.admins_file):
+    if not _is_admin(cb.from_user.id, config):
         await cb.answer("⛔ Нет доступа", show_alert=True); return
     await cb.answer()
     tourist_id = int(cb.data.split(":", 1)[1])
@@ -847,7 +871,7 @@ async def open_document(cb: CallbackQuery, config: TouristDocumentsConfig):
     """The ONE place passport_number/visa_status/exact dates render — logs the
     viewer + timestamp to document_view_log BEFORE the data is shown, per the
     owner's explicit audit requirement."""
-    if not _is_admin(cb.from_user.id, config.admins_file):
+    if not _is_admin(cb.from_user.id, config):
         await cb.answer("⛔ Нет доступа", show_alert=True); return
     await cb.answer()
     tourist_id = int(cb.data.split(":", 1)[1])
@@ -888,7 +912,7 @@ async def open_document(cb: CallbackQuery, config: TouristDocumentsConfig):
 
 @router.callback_query(F.data.startswith("td_del:"))
 async def delete_tourist_confirm(cb: CallbackQuery, config: TouristDocumentsConfig):
-    if not _is_admin(cb.from_user.id, config.admins_file):
+    if not _is_admin(cb.from_user.id, config):
         await cb.answer("⛔ Нет доступа", show_alert=True); return
     await cb.answer()
     tourist_id = int(cb.data.split(":", 1)[1])
@@ -896,7 +920,7 @@ async def delete_tourist_confirm(cb: CallbackQuery, config: TouristDocumentsConf
 
 @router.callback_query(F.data.startswith("td_del_ok:"))
 async def delete_tourist(cb: CallbackQuery, config: TouristDocumentsConfig):
-    if not _is_admin(cb.from_user.id, config.admins_file):
+    if not _is_admin(cb.from_user.id, config):
         await cb.answer("⛔ Нет доступа", show_alert=True); return
     await cb.answer()
     tourist_id = int(cb.data.split(":", 1)[1])
@@ -921,7 +945,7 @@ async def delete_tourist(cb: CallbackQuery, config: TouristDocumentsConfig):
 
 @router.callback_query(F.data.startswith("td_edit:"))
 async def edit_menu(cb: CallbackQuery, state: FSMContext, config: TouristDocumentsConfig):
-    if not _is_admin(cb.from_user.id, config.admins_file):
+    if not _is_admin(cb.from_user.id, config):
         await cb.answer("⛔ Нет доступа", show_alert=True); return
     await cb.answer()
     # Review-found blocker: edit_field_start/edit_visa_set point their "❌
@@ -939,7 +963,7 @@ async def edit_menu(cb: CallbackQuery, state: FSMContext, config: TouristDocumen
 
 @router.callback_query(F.data.startswith("td_edit_f:"))
 async def edit_field_start(cb: CallbackQuery, state: FSMContext, config: TouristDocumentsConfig):
-    if not _is_admin(cb.from_user.id, config.admins_file):
+    if not _is_admin(cb.from_user.id, config):
         await cb.answer("⛔ Нет доступа", show_alert=True); return
     await cb.answer()
     _, tourist_id_s, field = cb.data.split(":", 2)
@@ -1002,7 +1026,7 @@ async def edit_field_apply(msg: Message, state: FSMContext, config: TouristDocum
 
 @router.callback_query(F.data.startswith("td_edit_visa:"))
 async def edit_visa_start(cb: CallbackQuery, config: TouristDocumentsConfig):
-    if not _is_admin(cb.from_user.id, config.admins_file):
+    if not _is_admin(cb.from_user.id, config):
         await cb.answer("⛔ Нет доступа", show_alert=True); return
     await cb.answer()
     tourist_id = int(cb.data.split(":", 1)[1])
@@ -1010,7 +1034,7 @@ async def edit_visa_start(cb: CallbackQuery, config: TouristDocumentsConfig):
 
 @router.callback_query(F.data.startswith("td_edit_visa_set:"))
 async def edit_visa_set(cb: CallbackQuery, state: FSMContext, config: TouristDocumentsConfig):
-    if not _is_admin(cb.from_user.id, config.admins_file):
+    if not _is_admin(cb.from_user.id, config):
         await cb.answer("⛔ Нет доступа", show_alert=True); return
     await cb.answer()
     _, tourist_id_s, status = cb.data.split(":", 2)
@@ -1037,7 +1061,7 @@ async def edit_visa_set(cb: CallbackQuery, state: FSMContext, config: TouristDoc
 
 @router.callback_query(F.data.startswith("td_edit_group:"))
 async def edit_group_start(cb: CallbackQuery, config: TouristDocumentsConfig):
-    if not _is_admin(cb.from_user.id, config.admins_file):
+    if not _is_admin(cb.from_user.id, config):
         await cb.answer("⛔ Нет доступа", show_alert=True); return
     await cb.answer()
     tourist_id = int(cb.data.split(":", 1)[1])
@@ -1056,7 +1080,7 @@ async def edit_group_start(cb: CallbackQuery, config: TouristDocumentsConfig):
 
 @router.callback_query(F.data.startswith("td_edit_group_set:"))
 async def edit_group_set(cb: CallbackQuery, config: TouristDocumentsConfig):
-    if not _is_admin(cb.from_user.id, config.admins_file):
+    if not _is_admin(cb.from_user.id, config):
         await cb.answer("⛔ Нет доступа", show_alert=True); return
     await cb.answer()
     _, tourist_id_s, group_id_s = cb.data.split(":", 2)
@@ -1070,7 +1094,7 @@ async def edit_group_set(cb: CallbackQuery, config: TouristDocumentsConfig):
 
 @router.message(F.text == "📜 Журнал просмотров")
 async def view_log(msg: Message, config: TouristDocumentsConfig):
-    if not _is_admin(msg.from_user.id, config.admins_file):
+    if not _is_admin(msg.from_user.id, config):
         await msg.answer(NOT_ADMIN_TEXT); return
     async with aiosqlite.connect(config.db_path) as db:
         db.row_factory = aiosqlite.Row
@@ -1090,7 +1114,7 @@ async def view_log(msg: Message, config: TouristDocumentsConfig):
 
 @router.message(F.text == "👥 Админы")
 async def admins_panel(msg: Message, config: TouristDocumentsConfig):
-    if not _is_admin(msg.from_user.id, config.admins_file):
+    if not _is_admin(msg.from_user.id, config):
         await msg.answer(NOT_ADMIN_TEXT); return
     ids = _load_admins(config.admins_file)
     # _join_bounded (not a plain join) — defensive against a pre-existing
@@ -1103,7 +1127,7 @@ async def admins_panel(msg: Message, config: TouristDocumentsConfig):
 
 @router.callback_query(F.data == "td_admin_add")
 async def admin_add_start(cb: CallbackQuery, state: FSMContext, config: TouristDocumentsConfig):
-    if not _is_admin(cb.from_user.id, config.admins_file):
+    if not _is_admin(cb.from_user.id, config):
         await cb.answer("⛔ Нет доступа", show_alert=True); return
     await cb.answer()
     await state.set_state(AdminFlow.add_id)
@@ -1114,7 +1138,7 @@ async def admin_add_start(cb: CallbackQuery, state: FSMContext, config: TouristD
 # above.
 @router.message(AdminFlow.add_id, F.text, ~F.text.startswith("/"))
 async def admin_add_apply(msg: Message, state: FSMContext, config: TouristDocumentsConfig):
-    if not _is_admin(msg.from_user.id, config.admins_file):
+    if not _is_admin(msg.from_user.id, config):
         await state.clear(); await msg.answer(NOT_ADMIN_TEXT); return
     value = msg.text.strip()
     # Real Telegram user IDs are positive and, as of now, well under 15
@@ -1130,12 +1154,17 @@ async def admin_add_apply(msg: Message, state: FSMContext, config: TouristDocume
     ids = _load_admins(config.admins_file)
     ids.add(value)
     _save_admins(config.admins_file, ids)
+    if config.bot_id is not None:
+        try:
+            await add_bot_admin(config.bot_id, value)
+        except Exception as e:
+            logger.warning(f"admin_add_apply: add_bot_admin sync failed for bot {config.bot_id}: {e}")
     await state.clear()
     await msg.answer(f"✅ <code>{_esc(value)}</code> добавлен.", parse_mode="HTML", reply_markup=kb_admin())
 
 @router.callback_query(F.data == "td_admin_remove")
 async def admin_remove_start(cb: CallbackQuery, config: TouristDocumentsConfig):
-    if not _is_admin(cb.from_user.id, config.admins_file):
+    if not _is_admin(cb.from_user.id, config):
         await cb.answer("⛔ Нет доступа", show_alert=True); return
     await cb.answer()
     ids = sorted(_load_admins(config.admins_file))
@@ -1146,13 +1175,18 @@ async def admin_remove_start(cb: CallbackQuery, config: TouristDocumentsConfig):
 
 @router.callback_query(F.data.startswith("td_admin_rm:"))
 async def admin_remove_apply(cb: CallbackQuery, config: TouristDocumentsConfig):
-    if not _is_admin(cb.from_user.id, config.admins_file):
+    if not _is_admin(cb.from_user.id, config):
         await cb.answer("⛔ Нет доступа", show_alert=True); return
     await cb.answer()
     target = cb.data.split(":", 1)[1]
     ids = _load_admins(config.admins_file)
     ids.discard(target)
     _save_admins(config.admins_file, ids)
+    if config.bot_id is not None:
+        try:
+            await remove_bot_admin(config.bot_id, target)
+        except Exception as e:
+            logger.warning(f"admin_remove_apply: remove_bot_admin sync failed for bot {config.bot_id}: {e}")
     await cb.message.edit_text(f"✅ <code>{_esc(target)}</code> удалён.", parse_mode="HTML")
 
 
