@@ -78,6 +78,7 @@ miniapp_config = {
             "table": "clients",
             "order_by": "name ASC",
             "creatable": False,
+            "scope": {"type": "global"},
             "title": "Клиенты",
             "titleField": "name",
             "fields": [
@@ -91,6 +92,7 @@ miniapp_config = {
             "table": "service_requests",
             "order_by": "created_at DESC",
             "creatable": True,
+            "scope": {"type": "scoped", "parent": "vehicles", "via": "vehicle_id"},
             "title": "Заявки на сервис",
             "titleField": "notes",
             "fields": [
@@ -106,6 +108,7 @@ miniapp_config = {
             "table": "vehicles",
             "order_by": "created_at DESC",
             "creatable": True,
+            "scope": {"type": "scoped", "parent": "clients", "via": "client_id"},
             "title": "Автомобили",
             "titleField": "make_model",
             "fields": [

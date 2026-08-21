@@ -45,6 +45,7 @@ miniapp_config = {
             "table": "incoming_tasks",
             "order_by": "created_at DESC",
             "creatable": False,
+            "scope": {"type": "global"},
             "title": "Входящие задачи",
             "titleField": "title",
             "fields": [

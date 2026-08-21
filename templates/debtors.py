@@ -291,6 +291,7 @@ miniapp_config = {
             "table": "debtors",
             "order_by": "name",
             "creatable": True,
+            "scope": {"type": "global"},
             "title": "Должники",
             "titleField": "name",
             "fields": [
@@ -304,6 +305,7 @@ miniapp_config = {
             "table": "debt_entries",
             "order_by": "entry_date DESC, id DESC",
             "creatable": True,
+            "scope": {"type": "scoped", "parent": "debtors", "via": "debtor_id"},
             "title": "Записи",
             "fields": [
                 {"name": "debtor_id", "required": True, "label": "Должник", "kind": "number", "list": True, "detail": True, "create": True, "ref": {"resource": "debtors", "labelField": "name"}},

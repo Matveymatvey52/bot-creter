@@ -62,6 +62,7 @@ miniapp_config = {
             "table": "leads",
             "order_by": "created_at DESC",
             "creatable": True,
+            "scope": {"type": "global"},
             "title": "Заявки",
             "titleField": "name",
             "fields": [
@@ -77,6 +78,7 @@ miniapp_config = {
             "table": "faqs",
             "order_by": "sort_order ASC",
             "creatable": True,
+            "scope": {"type": "global"},
             "title": "Вопросы-ответы",
             "titleField": "question",
             "fields": [

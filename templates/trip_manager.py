@@ -61,6 +61,7 @@ miniapp_config = {
             "table": "trips",
             "order_by": "created_at DESC",
             "creatable": True,
+            "scope": {"type": "global"},
             "title": "Поездки",
             "titleField": "name",
             "fields": [
@@ -73,6 +74,7 @@ miniapp_config = {
             "table": "items",
             "order_by": "date_start DESC",
             "creatable": True,
+            "scope": {"type": "scoped", "parent": "trips", "via": "trip_id"},
             "title": "Элементы поездки",
             "titleField": "title",
             "fields": [

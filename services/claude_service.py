@@ -2393,6 +2393,7 @@ _TOUR_OPERATOR_MINIAPP_CONFIG_EXAMPLE = """{
             "table": "tours",
             "order_by": "created_at DESC",
             "creatable": true,
+            "scope": {"type": "global"},
             "title": "Туры",
             "titleField": "name",
             "children": [
@@ -2418,6 +2419,7 @@ _TOUR_OPERATOR_MINIAPP_CONFIG_EXAMPLE = """{
             "table": "guests",
             "order_by": "created_at DESC",
             "creatable": true,
+            "scope": {"type": "scoped", "parent": "tours", "via": "tour_id"},
             "title": "Гости",
             "titleField": "name",
             "fields": [
@@ -2466,6 +2468,10 @@ Rules:
 - Only include tables that hold user-facing records worth browsing (bookings, orders, items, clients, etc). Skip purely internal/administrative tables (admins, state, sessions, migration/version tables, FSM storage).
 - If the bot has no table worth showing as a mini-app screen (e.g. a purely conversational bot with no data table, or only internal tables), respond with exactly {{"resources": []}}. This is a valid, expected answer — not an error.
 - Do not include any resource whose table you are not certain is a literal, verbatim CREATE TABLE name in the given code.
+- EVERY resource MUST declare "scope" — what its records belong to. Two forms, no third: {{"type": "scoped", "parent": "<the name of another resource in this same config>", "via": "<the column on THIS table holding the parent's id>"}} for records that belong to a parent record, or {{"type": "global"}} for records that do not. A resource with no "scope" is a generation error and will be rejected.
+- Choose "scoped" when a list of these records makes no sense without saying whose they are: cash-flow operations of a tour, guests of an event, tasks of a project, readings of a meter, messages of a ticket. Choose "global" when the whole list is meaningful on its own: a price list, a category reference, a staff directory, an order log.
+- A foreign key alone does NOT make a resource scoped. Ask whether the parent CONTAINS the records or merely DESCRIBES them. Expenses have a category_id, but "all expenses this month" is a sensible list, so expenses are "global" and the category is just a filter. Cash-flow operations have a tour_id and "all operations" spanning every tour is meaningless, so they are "scoped".
+- For a "scoped" resource, "via" MUST be a real column of that resource's own table AND must also appear in that resource's "fields" list. The "parent" MUST be the "name" of another resource in this same config, and that resource must have a "titleField" — otherwise the parent cannot be named on screen.
 
 The mini-app renders a record's card as a "spec sheet" (approved layout, design/mockups/miniapp_mockup_I.html): coloured status tags under the heading, key-value rows, an attachments block, tables of related sub-records, and buttons into those sections. Every one of those elements is driven by the metadata below — a resource that omits it gets a bare list of strings instead. So declare them WHENEVER the bot's own tables support it, for every bot, not just data-rich ones:
 - "ref": {{"resource": <another resource's "name">, "labelField": <a column of that resource>}} on EVERY foreign-key column. This is mandatory whenever a column holds another table's id (tour_id, order_id, client_id, master_id, ...). It is what turns the row into a tappable link showing the related record's NAME. A foreign key WITHOUT "ref" shows the human a raw number like "ID тура: 7" and lets the create form ask them to type an id — never acceptable. Also give such a field a human label ("Тур"), never "ID тура".

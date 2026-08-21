@@ -87,6 +87,7 @@ miniapp_config = {
             "table": "tickets",
             "order_by": "created_at DESC",
             "creatable": True,
+            "scope": {"type": "global"},
             "title": "Обращения",
             "titleField": "category",
             "fields": [
@@ -102,6 +103,7 @@ miniapp_config = {
             "table": "kb_articles",
             "order_by": "id DESC",
             "creatable": True,
+            "scope": {"type": "global"},
             "title": "База знаний",
             "titleField": "question",
             "fields": [

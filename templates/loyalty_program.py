@@ -73,6 +73,7 @@ miniapp_config = {
             "table": "clients",
             "order_by": "created_at DESC",
             "creatable": True,
+            "scope": {"type": "global"},
             "title": "Клиенты",
             "titleField": "name",
             "fields": [
@@ -86,6 +87,7 @@ miniapp_config = {
             "table": "point_entries",
             "order_by": "created_at DESC",
             "creatable": True,
+            "scope": {"type": "scoped", "parent": "clients", "via": "client_id"},
             "title": "Начисления",
             "titleField": "note",
             "fields": [

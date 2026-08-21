@@ -73,6 +73,7 @@ miniapp_config = {
             "table": "event_details",
             "order_by": "id DESC",
             "creatable": True,
+            "scope": {"type": "global"},
             "title": "События",
             "titleField": "title",
             "fields": [
@@ -87,6 +88,7 @@ miniapp_config = {
             "table": "rsvps",
             "order_by": "created_at DESC",
             "creatable": True,
+            "scope": {"type": "global"},
             # 0 = "not linked to a Telegram account yet". Filled with the
             # real id by services/client_link.py the first time this
             # customer messages the bot.

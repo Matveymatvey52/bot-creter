@@ -264,6 +264,7 @@ miniapp_config = {
             "table": "events",
             "order_by": "event_dt",
             "creatable": True,
+            "scope": {"type": "global"},
             "title": "Мероприятия",
             "titleField": "name",
             "fields": [
@@ -279,6 +280,7 @@ miniapp_config = {
             "table": "guests",
             "order_by": "name",
             "creatable": False,
+            "scope": {"type": "scoped", "parent": "events", "via": "event_id"},
             "title": "Гости",
             "titleField": "name",
             "fields": [

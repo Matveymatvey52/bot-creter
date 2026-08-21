@@ -231,6 +231,7 @@ miniapp_config = {
             "table": "habits",
             "order_by": "owner_user_id, id",
             "creatable": False,
+            "scope": {"type": "global"},
             "title": "Привычки",
             "titleField": "name",
             "fields": [
@@ -251,6 +252,7 @@ miniapp_config = {
             "table": "habit_checkins",
             "order_by": "checkin_date DESC",
             "creatable": False,
+            "scope": {"type": "scoped", "parent": "habits", "via": "habit_id"},
             "title": "Отметки",
             "titleField": "checkin_date",
             "fields": [

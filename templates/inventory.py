@@ -57,6 +57,7 @@ miniapp_config = {
             "table": "items",
             "order_by": "id DESC",
             "creatable": True,
+            "scope": {"type": "global"},
             "title": "Товары",
             "titleField": "name",
             "fields": [
@@ -72,6 +73,7 @@ miniapp_config = {
             "table": "suppliers",
             "order_by": "id DESC",
             "creatable": True,
+            "scope": {"type": "global"},
             "title": "Поставщики",
             "titleField": "name",
             "fields": [
@@ -84,6 +86,7 @@ miniapp_config = {
             "table": "stock_movements",
             "order_by": "created_at DESC",
             "creatable": True,
+            "scope": {"type": "scoped", "parent": "items", "via": "item_id"},
             "title": "Движения склада",
             "titleField": "reason",
             "fields": [

@@ -303,6 +303,7 @@ miniapp_config = {
             "table": "resources",
             "order_by": "id DESC",
             "creatable": True,
+            "scope": {"type": "global"},
             "title": "Ресурсы",
             "titleField": "name",
             "fields": [
@@ -316,6 +317,7 @@ miniapp_config = {
             "table": "bookings",
             "order_by": "created_at DESC",
             "creatable": True,
+            "scope": {"type": "global"},
             # 0 = "not linked to a Telegram account yet". Filled with the
             # real id by services/client_link.py the first time this
             # customer messages the bot.
@@ -345,6 +347,7 @@ miniapp_config = {
             "table": "guest_registrations",
             "order_by": "created_at DESC",
             "creatable": False,
+            "scope": {"type": "scoped", "parent": "bookings", "via": "booking_id"},
             "title": "Гости",
             "titleField": "guest_name",
             "fields": [
@@ -358,6 +361,7 @@ miniapp_config = {
             "table": "service_requests",
             "order_by": "created_at DESC",
             "creatable": False,
+            "scope": {"type": "scoped", "parent": "bookings", "via": "booking_id"},
             "title": "Заявки на услуги",
             "titleField": "service_type",
             "fields": [

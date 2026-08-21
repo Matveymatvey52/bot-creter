@@ -187,6 +187,7 @@ miniapp_config = {
             "table": "slots",
             "order_by": "slot_date DESC, slot_time DESC",
             "creatable": False,
+            "scope": {"type": "global"},
             "title": "Слоты",
             "titleField": "master",
             "fields": [
@@ -204,6 +205,7 @@ miniapp_config = {
             "table": "bookings",
             "order_by": "created_at DESC",
             "creatable": True,
+            "scope": {"type": "global"},
             "title": "Записи",
             "titleField": "client_name",
             "fields": [

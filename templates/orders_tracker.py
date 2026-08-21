@@ -78,6 +78,7 @@ miniapp_config = {
             "table": "orders",
             "order_by": "created_at DESC",
             "creatable": True,
+            "scope": {"type": "global"},
             "title": "Заказы",
             "titleField": "notes",
             "fields": [
@@ -93,6 +94,7 @@ miniapp_config = {
             "table": "customers",
             "order_by": "created_at DESC",
             "creatable": True,
+            "scope": {"type": "global"},
             "title": "Клиенты",
             "titleField": "name",
             "fields": [

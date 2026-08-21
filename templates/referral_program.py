@@ -59,6 +59,7 @@ miniapp_config = {
             "table": "referrals",
             "order_by": "created_at DESC",
             "creatable": False,
+            "scope": {"type": "global"},
             "title": "Рефералы",
             "titleField": "status",
             "fields": [

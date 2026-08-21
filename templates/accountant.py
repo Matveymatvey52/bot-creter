@@ -202,6 +202,7 @@ miniapp_config = {
             "table": "projects",
             "order_by": "id DESC",
             "creatable": True,
+            "scope": {"type": "global"},
             "title": "Проекты",
             "titleField": "name",
             "fields": [
@@ -214,6 +215,7 @@ miniapp_config = {
             "table": "transactions",
             "order_by": "tx_date DESC, id DESC",
             "creatable": True,
+            "scope": {"type": "scoped", "parent": "projects", "via": "project_id"},
             "title": "Операции",
             "titleField": "category",
             "fields": [

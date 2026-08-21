@@ -61,6 +61,7 @@ miniapp_config = {
             "table": "repair_tickets",
             "order_by": "created_at DESC",
             "creatable": True,
+            "scope": {"type": "global"},
             "title": "Заявки на ремонт",
             "titleField": "item_description",
             "fields": [

@@ -359,6 +359,7 @@ miniapp_config = {
             "table": "properties",
             "order_by": "id DESC",
             "creatable": True,
+            "scope": {"type": "global"},
             "title": "Объекты",
             "titleField": "address",
             "fields": [
@@ -386,6 +387,7 @@ miniapp_config = {
             "table": "leases",
             "order_by": "created_at DESC",
             "creatable": False,
+            "scope": {"type": "scoped", "parent": "properties", "via": "property_id"},
             "title": "Договоры аренды",
             "titleField": "tenant_name",
             "fields": [
@@ -413,6 +415,7 @@ miniapp_config = {
             "table": "rent_payments",
             "order_by": "due_date DESC",
             "creatable": False,
+            "scope": {"type": "scoped", "parent": "leases", "via": "lease_id"},
             "title": "Платежи",
             "titleField": "period",
             "fields": [
@@ -443,6 +446,7 @@ miniapp_config = {
             "table": "maintenance_requests",
             "order_by": "created_at DESC",
             "creatable": True,
+            "scope": {"type": "scoped", "parent": "leases", "via": "lease_id"},
             "title": "Заявки на ремонт",
             "titleField": "description",
             "fields": [

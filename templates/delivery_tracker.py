@@ -292,6 +292,7 @@ miniapp_config = {
             "table": "deliveries",
             "order_by": "created_at DESC",
             "creatable": False,
+            "scope": {"type": "global"},
             "title": "Доставки",
             "titleField": "item_description",
             "fields": [
