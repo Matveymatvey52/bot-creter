@@ -36,7 +36,6 @@ from db.database import (
     get_bot_admins,
     get_bot_feature_config,
     get_bot_features,
-    get_bot_miniapp_config,
     get_bot_office_hook_config,
     get_bot_sheets_config,
     get_bot_yookassa_credentials,
@@ -67,8 +66,14 @@ from handlers.manage_bots import (
     generate_fix_preview_core,
     recreate_bot_core,
 )
-from runtime.miniapp_api import _authenticate, _resource_display_schema, _resource_spec, mint_magic_link_token
-from runtime.registry import FACTORY_BOT_ID, Registry, _load_template_module_async, discover_features, infer_template_id
+from runtime.miniapp_api import (
+    _authenticate,
+    _resource_display_schema,
+    _resource_spec,
+    load_miniapp_config,
+    mint_magic_link_token,
+)
+from runtime.registry import FACTORY_BOT_ID, Registry, discover_features, infer_template_id
 from runtime.webhook_app import REGISTRY_KEY
 from services.bot_runner import _make_extra_env, get_bot_logs, is_running, start_bot, stop_bot
 from services.claude_service import assess_feature_description
@@ -419,10 +424,11 @@ async def _resolve_bot_resource(bot_id: int, resource_name: str, request: web.Re
     if entry is None:
         return web.json_response({"error": "unknown bot"}, status=404)
 
-    miniapp_config = await get_bot_miniapp_config(bot_id)
-    if miniapp_config is None and entry.template_id:
-        module = await _load_template_module_async(entry.template_id)
-        miniapp_config = getattr(module, "miniapp_config", None) if module is not None else None
+    # Same resolution the mini-app itself uses — shared, not re-implemented, so
+    # the owner's record editor can't end up showing a stale snapshot while the
+    # mini-app shows the template (this block was duplicated three times, which
+    # is precisely how such a rule drifts).
+    miniapp_config = await load_miniapp_config(bot_id, entry)
     if miniapp_config is None:
         return web.json_response({"error": "mini-app not available for this bot"}, status=404)
 
@@ -446,10 +452,11 @@ async def _resolve_bot_miniapp_config(bot_id: int, request: web.Request) -> dict
     if entry is None:
         return web.json_response({"error": "unknown bot"}, status=404)
 
-    miniapp_config = await get_bot_miniapp_config(bot_id)
-    if miniapp_config is None and entry.template_id:
-        module = await _load_template_module_async(entry.template_id)
-        miniapp_config = getattr(module, "miniapp_config", None) if module is not None else None
+    # Same resolution the mini-app itself uses — shared, not re-implemented, so
+    # the owner's record editor can't end up showing a stale snapshot while the
+    # mini-app shows the template (this block was duplicated three times, which
+    # is precisely how such a rule drifts).
+    miniapp_config = await load_miniapp_config(bot_id, entry)
     if miniapp_config is None:
         return web.json_response({"error": "mini-app not available for this bot"}, status=404)
     return miniapp_config
