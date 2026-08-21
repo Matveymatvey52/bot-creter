@@ -26,7 +26,7 @@ from templates import shop_catalog
 class ShopCatalogMiniAppConfigTests(unittest.IsolatedAsyncioTestCase):
     def test_miniapp_config_resource_names(self):
         names = {r["name"] for r in shop_catalog.miniapp_config["resources"]}
-        self.assertEqual(names, {"products", "orders"})
+        self.assertEqual(names, {"products", "orders", "categories"})
 
     async def test_miniapp_config_fields_match_real_schema(self):
         with tempfile.TemporaryDirectory() as tmp:

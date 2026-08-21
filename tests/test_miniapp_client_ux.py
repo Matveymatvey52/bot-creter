@@ -25,8 +25,16 @@ from unittest.mock import AsyncMock, patch
 import aiosqlite
 from aiohttp.test_utils import TestClient, TestServer
 
+import importlib
+
 import templates.team_manager as team_manager
 import templates.tour_operator as tour_operator
+from services.client_link import (
+    UNLINKED_USER_ID,
+    ensure_username_column,
+    link_pending_by_username,
+    normalize_username,
+)
 from runtime.miniapp_api import mint_magic_link_token, register_routes
 from runtime.registry import BotEntry
 from runtime.webhook_app import create_app
@@ -465,3 +473,115 @@ class SchemaMetadataTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UsernameFieldTests(unittest.IsolatedAsyncioTestCase):
+    """The @username → real-id linking that replaces the raw Telegram-id
+    inputs. Unit-level, against services/client_link.py's own contract."""
+
+    def test_normalize_accepts_with_and_without_at_and_lowercases(self):
+        for raw in ("@Ivanov", "Ivanov", "  ivanov ", "@ivanov"):
+            self.assertEqual(normalize_username(raw), "ivanov", raw)
+
+    def test_normalize_rejects_malformed_handles(self):
+        # Telegram's rules: 5-32 chars, letters/digits/underscore only.
+        for raw in ("abc", "", "@", "has space", "плохой", "a" * 33, None, 12345):
+            self.assertIsNone(normalize_username(raw), repr(raw))
+
+    async def test_link_fills_real_id_only_for_unlinked_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = os.path.join(tmp, "link.db")
+            async with aiosqlite.connect(db_path) as db:
+                await db.execute(
+                    "CREATE TABLE reservations (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                    " client_user_id INTEGER NOT NULL, client_username TEXT)"
+                )
+                await db.executemany(
+                    "INSERT INTO reservations (client_user_id, client_username) VALUES (?, ?)",
+                    [
+                        (UNLINKED_USER_ID, "ivanov"),   # waiting for this person
+                        (UNLINKED_USER_ID, "petrov"),   # someone else's row
+                        (999111, "ivanov"),             # already linked, must not move
+                    ],
+                )
+                await db.commit()
+
+            linked = await link_pending_by_username(db_path, "reservations", 555222, "@Ivanov")
+            self.assertEqual(linked, 1)
+
+            async with aiosqlite.connect(db_path) as db:
+                async with db.execute(
+                    "SELECT client_user_id, client_username FROM reservations ORDER BY id"
+                ) as cur:
+                    rows = await cur.fetchall()
+            # Row 1 claimed; row 2 untouched; row 3's existing link preserved —
+            # adopting someone's old @handle must not hijack their records.
+            self.assertEqual(rows[0], (555222, "ivanov"))
+            self.assertEqual(rows[1], (UNLINKED_USER_ID, "petrov"))
+            self.assertEqual(rows[2], (999111, "ivanov"))
+
+    async def test_link_is_a_no_op_for_a_user_with_no_username(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = os.path.join(tmp, "link.db")
+            async with aiosqlite.connect(db_path) as db:
+                await db.execute(
+                    "CREATE TABLE rsvps (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                    " client_user_id INTEGER NOT NULL, client_username TEXT)"
+                )
+                await db.execute(
+                    "INSERT INTO rsvps (client_user_id, client_username) VALUES (?, 'ivanov')",
+                    (UNLINKED_USER_ID,),
+                )
+                await db.commit()
+            self.assertEqual(await link_pending_by_username(db_path, "rsvps", 1, None), 0)
+
+    async def test_migration_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = os.path.join(tmp, "mig.db")
+            async with aiosqlite.connect(db_path) as db:
+                await db.execute("CREATE TABLE bookings (id INTEGER PRIMARY KEY)")
+                await ensure_username_column(db, "bookings")
+                await ensure_username_column(db, "bookings")  # already there
+                await db.commit()
+                async with db.execute("PRAGMA table_info(bookings)") as cur:
+                    cols = {r[1] for r in await cur.fetchall()}
+        self.assertIn("client_username", cols)
+
+
+class UsernameTemplateWiringTests(unittest.IsolatedAsyncioTestCase):
+    """Each of the 5 templates must declare the whole trio, or a record
+    created from the mini-app breaks: the username field, the sentinel that
+    satisfies the NOT NULL id column, and the id column dropped from the form."""
+
+    SPECS = {
+        "booking_restaurant": ("reservations", "reservations", "client_user_id"),
+        "car_rental": ("bookings", "rental_bookings", "client_user_id"),
+        "coworking_space": ("bookings", "bookings", "client_user_id"),
+        "event_rsvp": ("rsvps", "rsvps", "client_user_id"),
+        "booking_fitness": ("subscriptions", "subscriptions", "user_id"),
+    }
+
+    def test_each_template_declares_username_field_and_sentinel(self):
+        for tpl, (res_name, _table, id_column) in self.SPECS.items():
+            module = importlib.import_module(f"templates.{tpl}")
+            resource = next(
+                r for r in module.miniapp_config["resources"] if r["name"] == res_name
+            )
+            fields = {f["name"]: f for f in resource["fields"]}
+
+            self.assertEqual(fields["client_username"]["kind"], "username", tpl)
+            self.assertTrue(fields["client_username"]["create"], tpl)
+            # The raw numeric id must no longer be askable in the form.
+            self.assertFalse(fields[id_column].get("create", False), tpl)
+            self.assertEqual(resource["on_create"]["set"][id_column], UNLINKED_USER_ID, tpl)
+
+    async def test_init_db_adds_the_username_column(self):
+        for tpl, (_res, table, _id) in self.SPECS.items():
+            module = importlib.import_module(f"templates.{tpl}")
+            with tempfile.TemporaryDirectory() as tmp:
+                db_path = os.path.join(tmp, f"{tpl}.db")
+                await module.init_db(db_path)
+                async with aiosqlite.connect(db_path) as db:
+                    async with db.execute(f"PRAGMA table_info({table})") as cur:
+                        cols = {r[1] for r in await cur.fetchall()}
+            self.assertIn("client_username", cols, tpl)

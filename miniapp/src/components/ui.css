@@ -1292,3 +1292,30 @@
   flex-direction: column;
   width: 100%;
 }
+
+/* ── Prefixed input (@username) ───────────────────────────────────────────
+   The prefix is a label, not part of the value — the backend accepts the
+   handle with or without a leading "@" and normalizes it either way. */
+.input-prefixed {
+  display: flex;
+  align-items: center;
+  background: var(--surface-inset);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+}
+
+.input-prefix {
+  padding: 0 4px 0 12px;
+  color: var(--text-secondary);
+  font-size: 15px;
+  user-select: none;
+}
+
+.input-prefixed input {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  background: transparent;
+  padding-left: 0;
+}

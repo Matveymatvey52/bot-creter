@@ -25,6 +25,7 @@ from aiogram.types import (
     KeyboardButton, Message, ReplyKeyboardMarkup,
 )
 
+from services.client_link import ensure_username_column, link_pending_by_username
 from db.database import add_bot_admin, remove_bot_admin
 
 # ── CUSTOMIZE ────────────────────────────────────────────────────────────────
@@ -329,10 +330,19 @@ miniapp_config = {
             "table": "subscriptions",
             "order_by": "purchased_at DESC",
             "creatable": True,
+            # 0 = "not linked to a Telegram account yet". Filled with the
+            # real id by services/client_link.py the first time this
+            # customer messages the bot.
+            "on_create": {"set": {"user_id": 0}},
             "title": "Абонементы клиентов",
             "titleField": "plan_name",
             "fields": [
-                {"name": "user_id", "required": True, "label": "ID клиента", "kind": "number", "list": True, "detail": True, "create": True},
+                {"name": "user_id", "required": False, "label": "ID клиента", "kind": "number", "list": True, "detail": True, "create": False},
+                # The admin knows the customer by @handle, never by numeric id.
+                # Stored alongside user_id (which stays the notification
+                # target) and matched to a real id on first contact — see
+                # services/client_link.py.
+                {"name": "client_username", "label": "Клиент (@username)", "kind": "username", "list": True, "detail": True, "create": True},
                 {"name": "plan_name", "required": True, "label": "Тариф", "kind": "text", "list": True, "detail": True, "create": True},
                 {"name": "total_visits", "required": True, "label": "Всего посещений", "kind": "number", "list": False, "detail": True, "create": True},
                 {"name": "visits_left", "required": True, "label": "Осталось посещений", "kind": "number", "list": True, "detail": True, "create": True},
@@ -499,6 +509,7 @@ async def init_db(db_path: str):
             )
         """)
         await db.execute("INSERT OR IGNORE INTO bot_settings (id) VALUES (1)")
+        await ensure_username_column(db, "subscriptions")
         await db.commit()
     await _ensure_group_sessions(db_path)
     await _ensure_individual_slots(db_path)
@@ -1178,6 +1189,14 @@ def kb_remove_admins(ids: list[str]) -> InlineKeyboardMarkup:
 
 @router.message(Command("start"), F.chat.type == "private")
 async def cmd_start(message: Message, state: FSMContext, config: BookingFitnessConfig):
+    # Claim any record an admin pre-filled for this person's @username
+    # from the mini-app: until now it carried the "not linked yet"
+    # sentinel in user_id and so could not be notified. Opportunistic —
+    # never blocks the menu below (see services/client_link.py).
+    await link_pending_by_username(
+        config.db_path, "subscriptions", message.from_user.id,
+        message.from_user.username, id_column="user_id",
+    )
     # Same reasoning as moderator.py/inventory.py's cmd_start: /start must
     # reset any dangling mid-flow FSM state.
     await state.clear()

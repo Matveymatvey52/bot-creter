@@ -131,6 +131,29 @@ function FormInput({
     )
   }
 
+  if (field.kind === 'username') {
+    // The "@" is decoration, not part of the value — the backend strips and
+    // lowercases whatever arrives (services/client_link.py), so typing it or
+    // not both work; showing it just makes the expected format obvious.
+    return (
+      <div className="input-prefixed">
+        <span className="input-prefix" aria-hidden="true">
+          @
+        </span>
+        <input
+          id={field.name}
+          type="text"
+          autoCapitalize="none"
+          autoCorrect="off"
+          spellCheck={false}
+          placeholder="username"
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+        />
+      </div>
+    )
+  }
+
   return (
     <input
       id={field.name}

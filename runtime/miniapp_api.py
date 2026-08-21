@@ -55,6 +55,7 @@ from db.database import (
     get_bot_office_hook_config,
 )
 from features.excel_export import MAX_FILE_SIZE, build_workbook, fetch_export_rows
+from services.client_link import normalize_username
 from features.sales_analytics import Period, compute_metrics
 from runtime.registry import FACTORY_BOT_ID, Registry, _load_template_module_async
 
@@ -770,6 +771,22 @@ async def create_resource_handler(request: web.Request) -> web.Response:
         return web.json_response({"error": f"missing required fields: {sorted(missing)}"}, status=400)
     if not values:
         return web.json_response({"error": "no valid fields in payload"}, status=400)
+
+    # A "username" field identifies a person the admin knows only by @handle.
+    # Normalized here (bare + lowercase) so the row can be matched against an
+    # incoming update's from_user later, and rejected outright when malformed
+    # — a typo'd handle would otherwise produce a record that can never link
+    # to anybody. See services/client_link.py for the full linking story.
+    for field in resource["fields"]:
+        if field.get("kind") != "username" or field["name"] not in values:
+            continue
+        handle = normalize_username(values[field["name"]])
+        if handle is None:
+            return web.json_response(
+                {"error": f"{field.get('label', field['name'])}: неверный формат username"},
+                status=400,
+            )
+        values[field["name"]] = handle
 
     db_path = entry.config.get("db_path") if isinstance(entry.config, dict) else None
     if not db_path:

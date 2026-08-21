@@ -144,7 +144,7 @@ export interface SchemaField {
   required?: boolean
   creatable?: boolean
   label?: string
-  kind?: 'text' | 'number' | 'date' | 'status' | 'link' | 'file'
+  kind?: 'text' | 'number' | 'date' | 'status' | 'link' | 'file' | 'username'
   list?: boolean
   detail?: boolean
   create?: boolean

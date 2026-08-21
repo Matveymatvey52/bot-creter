@@ -49,6 +49,21 @@ export function FieldValue({
     )
   }
 
+  if (field.kind === 'username') {
+    // Stored bare and lowercase; the "@" goes back on for display, and the
+    // link opens the person's Telegram profile.
+    return (
+      <a
+        className="field-value-link"
+        href={`https://t.me/${text}`}
+        target="_blank"
+        rel="noopener noreferrer"
+      >
+        @{text}
+      </a>
+    )
+  }
+
   if (field.kind === 'file') {
     return (
       <span className="field-value-file">

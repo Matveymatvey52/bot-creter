@@ -23,6 +23,7 @@ from aiogram.types import (
     CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message,
 )
 
+from services.client_link import ensure_username_column, link_pending_by_username
 from db.database import add_bot_admin, remove_bot_admin
 
 # BASE_URL/PORT are process-wide, same treatment as templates/tour_operator.py
@@ -86,10 +87,19 @@ miniapp_config = {
             "table": "rsvps",
             "order_by": "created_at DESC",
             "creatable": True,
+            # 0 = "not linked to a Telegram account yet". Filled with the
+            # real id by services/client_link.py the first time this
+            # customer messages the bot.
+            "on_create": {"set": {"client_user_id": 0}},
             "title": "Заявки",
             "titleField": "client_name",
             "fields": [
-                {"name": "client_user_id", "required": True, "label": "ID клиента", "kind": "number", "list": False, "detail": False, "create": True},
+                {"name": "client_user_id", "required": False, "label": "ID клиента", "kind": "number", "list": False, "detail": False, "create": False},
+                # The admin knows the customer by @handle, never by numeric id.
+                # Stored alongside client_user_id (which stays the notification
+                # target) and matched to a real id on first contact — see
+                # services/client_link.py.
+                {"name": "client_username", "label": "Клиент (@username)", "kind": "username", "list": True, "detail": True, "create": True},
                 {"name": "client_name", "label": "Имя клиента", "kind": "text", "list": False, "detail": True, "create": True},
                 {"name": "client_phone", "label": "Телефон", "kind": "text", "list": False, "detail": True, "create": True},
                 {"name": "guests_count", "label": "Гостей", "kind": "number", "list": True, "detail": True, "create": True},
@@ -289,6 +299,7 @@ async def init_db(db_path: str):
                 created_at      TEXT DEFAULT (datetime('now','localtime'))
             )
         """)
+        await ensure_username_column(db, "rsvps")
         await db.commit()
 
 
@@ -559,6 +570,14 @@ async def _waitlist_text(db_path: str) -> str:
 
 @router.message(Command("start"), F.chat.type == "private")
 async def cmd_start(message: Message, state: FSMContext, config: EventRsvpConfig):
+    # Claim any record an admin pre-filled for this person's @username
+    # from the mini-app: until now it carried the "not linked yet"
+    # sentinel in client_user_id and so could not be notified. Opportunistic —
+    # never blocks the menu below (see services/client_link.py).
+    await link_pending_by_username(
+        config.db_path, "rsvps", message.from_user.id,
+        message.from_user.username, id_column="client_user_id",
+    )
     await state.clear()
     admins = _load_admins(config.admins_file)
     sender_id = message.from_user.id

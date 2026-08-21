@@ -16,7 +16,7 @@ import type { SchemaChild, SchemaField, SchemaRef, SchemaResource } from './api'
 export interface FieldDisplay {
   name: string
   label: string
-  kind: 'text' | 'number' | 'date' | 'status' | 'link' | 'file'
+  kind: 'text' | 'number' | 'date' | 'status' | 'link' | 'file' | 'username'
   ref?: SchemaRef
 }
 

@@ -484,7 +484,7 @@ class CarRentalMiniAppConfigTests(unittest.IsolatedAsyncioTestCase):
         field_names = {f["name"] for f in bookings["fields"]}
         self.assertEqual(
             field_names,
-            {"item_id", "client_user_id", "client_name", "client_phone",
+            {"item_id", "client_user_id", "client_username", "client_name", "client_phone",
              "start_date", "end_date", "status", "created_at"},
         )
 

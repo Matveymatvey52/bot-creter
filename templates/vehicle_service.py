@@ -71,6 +71,22 @@ router = Router()
 miniapp_config = {
     "resources": [
         {
+            # Exposed so vehicles.client_id renders as a picker over client
+            # NAMES instead of asking an admin to know a row id. Read-only
+            # here: clients are registered through the bot's own flow.
+            "name": "clients",
+            "table": "clients",
+            "order_by": "name ASC",
+            "creatable": False,
+            "title": "Клиенты",
+            "titleField": "name",
+            "fields": [
+                {"name": "name", "label": "Имя", "kind": "text", "list": True, "detail": True, "create": False},
+                {"name": "phone", "label": "Телефон", "kind": "text", "list": True, "detail": True, "create": False},
+                {"name": "created_at", "label": "Добавлен", "kind": "date", "list": False, "detail": True, "create": False},
+            ],
+        },
+        {
             "name": "service_requests",
             "table": "service_requests",
             "order_by": "created_at DESC",
@@ -93,7 +109,7 @@ miniapp_config = {
             "title": "Автомобили",
             "titleField": "make_model",
             "fields": [
-                {"name": "client_id", "required": True, "label": "ID клиента", "kind": "number", "list": False, "detail": True, "create": True},
+                {"name": "client_id", "required": True, "label": "Клиент", "kind": "number", "list": False, "detail": True, "create": True, "ref": {"resource": "clients", "labelField": "name"}},
                 {"name": "plate_number", "required": True, "label": "Госномер", "kind": "text", "list": True, "detail": True, "create": True},
                 {"name": "make_model", "required": True, "label": "Марка/модель", "kind": "text", "list": True, "detail": True, "create": True},
                 {"name": "vin", "label": "VIN", "kind": "text", "list": False, "detail": True, "create": True},
