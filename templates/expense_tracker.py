@@ -265,7 +265,7 @@ miniapp_config = {
             "title": "Расходы",
             "titleField": "comment",
             "fields": [
-                {"name": "category_id", "required": True, "label": "ID категории", "kind": "number", "list": False, "detail": True, "create": True},
+                {"name": "category_id", "required": True, "label": "Категория", "kind": "number", "list": False, "detail": True, "create": True, "ref": {"resource": "categories", "labelField": "name"}},
                 {"name": "amount", "required": True, "label": "Сумма", "kind": "number", "list": True, "detail": True, "create": True},
                 {"name": "expense_date", "required": True, "label": "Дата", "kind": "date", "list": True, "detail": True, "create": True},
                 {"name": "comment", "label": "Комментарий", "kind": "text", "list": False, "detail": True, "create": True},

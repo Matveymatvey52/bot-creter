@@ -109,7 +109,7 @@ miniapp_config = {
             "title": "Бронирования",
             "titleField": "client_name",
             "fields": [
-                {"name": "item_id", "required": True, "label": "ID авто", "kind": "number", "list": False, "detail": False, "create": True},
+                {"name": "item_id", "required": True, "label": "Автомобиль", "kind": "number", "list": False, "detail": False, "create": True, "ref": {"resource": "cars", "labelField": "name"}},
                 {"name": "client_user_id", "required": True, "label": "ID клиента", "kind": "number", "list": False, "detail": False, "create": True},
                 {"name": "client_name", "label": "Имя клиента", "kind": "text", "list": False, "detail": True, "create": True},
                 {"name": "client_phone", "label": "Телефон", "kind": "text", "list": False, "detail": True, "create": True},

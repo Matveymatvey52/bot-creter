@@ -123,13 +123,16 @@
   color: var(--text-secondary);
 }
 
+/* Full-bleed by default. The old 600px cap left a wide Telegram window or a
+   tablet showing a narrow ribbon of content with dead space beside it; the
+   desktop breakpoint in index.css is where extra width becomes a card grid
+   instead of over-long single-column rows. */
 .screen {
   display: flex;
   flex-direction: column;
   gap: 16px;
   padding: 16px;
   padding-bottom: calc(16px + env(safe-area-inset-bottom, 0px));
-  max-width: 600px;
   margin: 0 auto;
   width: 100%;
 }
@@ -1141,4 +1144,151 @@
     padding-right: 0;
     background: linear-gradient(to top, var(--bg) 70%, transparent);
   }
+}
+
+/* ── Section rail ─────────────────────────────────────────────────────────
+   Horizontal, swipeable navigation over the bot's sections (SectionRail.tsx).
+   Never wraps: a bot with eight resources scrolls sideways instead of eating
+   three rows of vertical space before any content appears. */
+.section-rail {
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  scroll-snap-type: x proximity;
+  padding: 16px 16px 4px;
+  /* The rail is the one horizontally-scrolling element here; hiding its own
+     scrollbar keeps the gesture without a stray bar over the content. */
+  scrollbar-width: none;
+  -webkit-overflow-scrolling: touch;
+}
+
+.section-rail::-webkit-scrollbar {
+  display: none;
+}
+
+.section-rail-item {
+  flex: 0 0 auto;
+  scroll-snap-align: start;
+  background: var(--surface-inset);
+  color: var(--text-secondary);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-pill);
+  padding: 8px 16px;
+  font: inherit;
+  font-size: 14px;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.section-rail-item-active {
+  background: var(--accent);
+  color: var(--accent-text);
+  border-color: var(--accent);
+}
+
+/* ── Data table ───────────────────────────────────────────────────────────
+   The wrapper is what scrolls when a table is wider than the viewport, so a
+   wide table never makes the PAGE scroll sideways. */
+.data-table-wrap {
+  width: 100%;
+  overflow-x: auto;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  -webkit-overflow-scrolling: touch;
+}
+
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 14px;
+}
+
+.data-table th,
+.data-table td {
+  text-align: left;
+  padding: 10px 14px;
+  white-space: nowrap;
+  border-bottom: 1px solid var(--border-hair);
+}
+
+.data-table th {
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  background: var(--surface-inset);
+  position: sticky;
+  top: 0;
+}
+
+.data-table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.data-table-row-clickable {
+  cursor: pointer;
+}
+
+.data-table-row-clickable:hover td {
+  background: var(--accent-soft);
+}
+
+/* ── Related sub-records rendered as a list rather than a table ──────────── */
+.related-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.related-list-row {
+  background: var(--surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  padding: 12px 14px;
+}
+
+.related-list-title {
+  font-weight: 600;
+}
+
+.related-list-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  margin-top: 6px;
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+/* ── Field values ─────────────────────────────────────────────────────────
+   A stored URL is tappable wherever it appears; an absent value reads as a
+   dash rather than as literal "null". */
+.field-value-link {
+  color: var(--accent);
+  text-decoration: none;
+  word-break: break-all;
+}
+
+.field-value-link:hover {
+  text-decoration: underline;
+}
+
+.field-value-file {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.field-value-empty {
+  color: var(--text-secondary);
+}
+
+.screen-section {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
 }

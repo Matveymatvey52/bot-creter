@@ -126,7 +126,7 @@ a {
   }
 
   .screen {
-    max-width: 1080px;
+    max-width: 1440px;
     padding: 40px 32px calc(40px + env(safe-area-inset-bottom, 0px));
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
@@ -147,6 +147,7 @@ a {
   .screen > .cta-row,
   .screen > .bottom-bar,
   .screen > .field,
+  .screen > .data-table-wrap,
   .screen > form {
     grid-column: 1 / -1;
   }

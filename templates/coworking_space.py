@@ -317,7 +317,7 @@ miniapp_config = {
             "title": "Брони",
             "titleField": "client_name",
             "fields": [
-                {"name": "resource_id", "required": True, "label": "ID ресурса", "kind": "number", "list": False, "detail": False, "create": True},
+                {"name": "resource_id", "required": True, "label": "Ресурс", "kind": "number", "list": False, "detail": False, "create": True, "ref": {"resource": "resources", "labelField": "name"}},
                 {"name": "client_user_id", "required": True, "label": "ID клиента", "kind": "number", "list": False, "detail": False, "create": True},
                 {"name": "client_name", "label": "Имя клиента", "kind": "text", "list": True, "detail": True, "create": True},
                 {"name": "booking_date", "required": True, "label": "Дата", "kind": "date", "list": True, "detail": True, "create": True},

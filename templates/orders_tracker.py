@@ -81,7 +81,7 @@ miniapp_config = {
             "title": "Заказы",
             "titleField": "notes",
             "fields": [
-                {"name": "customer_id", "required": True, "label": "ID клиента", "kind": "number", "list": False, "detail": True, "create": True},
+                {"name": "customer_id", "required": True, "label": "Клиент", "kind": "number", "list": False, "detail": True, "create": True, "ref": {"resource": "customers", "labelField": "name"}},
                 {"name": "status", "label": "Статус", "kind": "status", "list": True, "detail": True, "create": False},
                 {"name": "notes", "label": "Заметки", "kind": "text", "list": True, "detail": True, "create": True},
                 {"name": "created_at", "label": "Создан", "kind": "date", "list": True, "detail": True, "create": False},

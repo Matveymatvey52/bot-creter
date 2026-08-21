@@ -84,7 +84,7 @@ miniapp_config = {
             "title": "Аренды",
             "titleField": "status",
             "fields": [
-                {"name": "item_id", "required": True, "label": "ID предмета", "kind": "number", "list": False, "detail": True, "create": True},
+                {"name": "item_id", "required": True, "label": "Позиция", "kind": "number", "list": False, "detail": True, "create": True, "ref": {"resource": "items", "labelField": "name"}},
                 {"name": "client_id", "required": True, "label": "ID клиента", "kind": "number", "list": False, "detail": True, "create": True},
                 {"name": "issued_at", "label": "Выдано", "kind": "date", "list": True, "detail": True, "create": False},
                 {"name": "due_date", "required": True, "label": "Вернуть до", "kind": "date", "list": True, "detail": True, "create": True},

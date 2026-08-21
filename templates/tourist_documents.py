@@ -68,7 +68,7 @@ miniapp_config = {
                 {"name": "passport_expiry", "required": True, "label": "Паспорт действителен до", "kind": "date", "list": True, "detail": True, "create": True},
                 {"name": "visa_status", "label": "Статус визы", "kind": "status", "list": True, "detail": True, "create": True},
                 {"name": "visa_expiry", "label": "Виза действительна до", "kind": "date", "list": False, "detail": True, "create": True},
-                {"name": "tour_group_id", "label": "ID группы", "kind": "number", "list": False, "detail": True, "create": True},
+                {"name": "tour_group_id", "label": "Группа", "kind": "number", "list": False, "detail": True, "create": True, "ref": {"resource": "tour_groups", "labelField": "name"}},
                 {"name": "notes", "label": "Заметки", "kind": "text", "list": False, "detail": True, "create": True},
                 {"name": "created_at", "label": "Создан", "kind": "date", "list": False, "detail": True, "create": False},
             ],

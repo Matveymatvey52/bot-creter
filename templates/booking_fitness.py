@@ -269,7 +269,7 @@ miniapp_config = {
             "fields": [
                 {"name": "day_of_week", "required": True, "label": "День недели", "kind": "number", "list": True, "detail": True, "create": True},
                 {"name": "slot_time", "required": True, "label": "Время", "kind": "text", "list": True, "detail": True, "create": True},
-                {"name": "trainer_id", "label": "ID тренера", "kind": "number", "list": False, "detail": True, "create": True},
+                {"name": "trainer_id", "label": "Тренер", "kind": "number", "list": False, "detail": True, "create": True, "ref": {"resource": "trainers", "labelField": "name"}},
                 {"name": "class_name", "required": True, "label": "Занятие", "kind": "text", "list": True, "detail": True, "create": True},
                 {"name": "capacity", "required": True, "label": "Вместимость", "kind": "number", "list": True, "detail": True, "create": True},
                 {"name": "duration_min", "label": "Длительность (мин)", "kind": "number", "list": False, "detail": True, "create": True},
@@ -285,7 +285,7 @@ miniapp_config = {
             "titleField": "class_name",
             "fields": [
                 {"name": "session_type", "label": "Тип", "kind": "status", "list": True, "detail": True, "create": False},
-                {"name": "trainer_id", "label": "ID тренера", "kind": "number", "list": False, "detail": True, "create": False},
+                {"name": "trainer_id", "label": "Тренер", "kind": "number", "list": False, "detail": True, "create": False, "ref": {"resource": "trainers", "labelField": "name"}},
                 {"name": "slot_date", "label": "Дата", "kind": "date", "list": True, "detail": True, "create": False},
                 {"name": "slot_time", "label": "Время", "kind": "text", "list": True, "detail": True, "create": False},
                 {"name": "duration_min", "label": "Длительность (мин)", "kind": "number", "list": False, "detail": True, "create": False},
@@ -353,7 +353,7 @@ miniapp_config = {
             "title": "Оценки тренеров",
             "titleField": "comment",
             "fields": [
-                {"name": "trainer_id", "label": "ID тренера", "kind": "number", "list": True, "detail": True, "create": False},
+                {"name": "trainer_id", "label": "Тренер", "kind": "number", "list": True, "detail": True, "create": False, "ref": {"resource": "trainers", "labelField": "name"}},
                 {"name": "user_id", "label": "ID клиента", "kind": "number", "list": False, "detail": True, "create": False},
                 {"name": "booking_id", "label": "ID записи", "kind": "number", "list": False, "detail": True, "create": False},
                 {"name": "rating", "label": "Оценка", "kind": "number", "list": True, "detail": True, "create": False},

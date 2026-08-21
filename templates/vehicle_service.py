@@ -78,7 +78,7 @@ miniapp_config = {
             "title": "Заявки на сервис",
             "titleField": "notes",
             "fields": [
-                {"name": "vehicle_id", "required": True, "label": "ID автомобиля", "kind": "number", "list": False, "detail": True, "create": True},
+                {"name": "vehicle_id", "required": True, "label": "Автомобиль", "kind": "number", "list": False, "detail": True, "create": True, "ref": {"resource": "vehicles", "labelField": "make_model"}},
                 {"name": "status", "label": "Статус", "kind": "status", "list": True, "detail": True, "create": False},
                 {"name": "notes", "label": "Заметки", "kind": "text", "list": True, "detail": True, "create": True},
                 {"name": "created_at", "label": "Создана", "kind": "date", "list": True, "detail": True, "create": False},

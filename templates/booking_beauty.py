@@ -207,7 +207,7 @@ miniapp_config = {
             "title": "Записи",
             "titleField": "client_name",
             "fields": [
-                {"name": "slot_id", "required": True, "label": "ID слота", "kind": "number", "list": False, "detail": False, "create": True},
+                {"name": "slot_id", "required": True, "label": "Слот", "kind": "number", "list": False, "detail": False, "create": True, "ref": {"resource": "slots", "labelField": "master"}},
                 {"name": "client_name", "label": "Имя клиента", "kind": "text", "list": True, "detail": True, "create": True},
                 {"name": "client_phone", "label": "Телефон", "kind": "text", "list": True, "detail": True, "create": True},
                 {"name": "service", "label": "Услуга", "kind": "text", "list": True, "detail": True, "create": True},

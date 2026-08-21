@@ -389,7 +389,7 @@ miniapp_config = {
             "title": "Договоры аренды",
             "titleField": "tenant_name",
             "fields": [
-                {"name": "property_id", "label": "ID объекта", "kind": "number", "list": True, "detail": True, "create": False},
+                {"name": "property_id", "label": "Объект", "kind": "number", "list": True, "detail": True, "create": False, "ref": {"resource": "properties", "labelField": "address"}},
                 {"name": "tenant_user_id", "label": "ID арендатора", "kind": "number", "list": False, "detail": True, "create": False},
                 {"name": "tenant_name", "label": "Арендатор", "kind": "text", "list": True, "detail": True, "create": False},
                 {"name": "tenant_phone", "label": "Телефон", "kind": "text", "list": False, "detail": True, "create": False},
@@ -416,7 +416,7 @@ miniapp_config = {
             "title": "Платежи",
             "titleField": "period",
             "fields": [
-                {"name": "lease_id", "label": "ID договора", "kind": "number", "list": True, "detail": True, "create": False},
+                {"name": "lease_id", "label": "Договор", "kind": "number", "list": True, "detail": True, "create": False, "ref": {"resource": "leases", "labelField": "tenant_name"}},
                 {"name": "period", "label": "Период", "kind": "text", "list": True, "detail": True, "create": False},
                 {"name": "amount", "label": "Сумма", "kind": "number", "list": True, "detail": True, "create": False},
                 {"name": "due_date", "label": "Срок оплаты", "kind": "date", "list": True, "detail": True, "create": False},
@@ -446,9 +446,9 @@ miniapp_config = {
             "title": "Заявки на ремонт",
             "titleField": "description",
             "fields": [
-                {"name": "lease_id", "label": "ID договора", "kind": "number", "list": False, "detail": True, "create": True},
-                {"name": "property_id", "label": "ID объекта", "kind": "number", "list": True, "detail": True, "create": True},
-                {"name": "tenant_user_id", "label": "ID арендатора", "kind": "number", "list": False, "detail": True, "create": True},
+                {"name": "lease_id", "label": "Договор", "kind": "number", "list": False, "detail": True, "create": True, "ref": {"resource": "leases", "labelField": "tenant_name"}},
+                {"name": "property_id", "label": "Объект", "kind": "number", "list": True, "detail": True, "create": True, "ref": {"resource": "properties", "labelField": "address"}},
+                {"name": "tenant_user_id", "label": "ID арендатора", "kind": "number", "list": False, "detail": True, "create": False},
                 {"name": "description", "required": True, "label": "Описание", "kind": "text", "list": True, "detail": True, "create": True},
                 {"name": "photo", "label": "Фото", "kind": "text", "list": False, "detail": True, "create": False},
                 {"name": "status", "label": "Статус", "kind": "status", "list": True, "detail": True, "create": False},

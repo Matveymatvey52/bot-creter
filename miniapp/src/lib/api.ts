@@ -102,7 +102,21 @@ export function listResource(resource: string): Promise<{ resource: string; item
   return request(`/${resource}`)
 }
 
-export function getResource(resource: string, itemId: number): Promise<{ resource: string; item: ResourceItem }> {
+// Sub-records the backend joined onto a detail response — a record's own
+// program/guests/attachments/payments, so the detail screen shows them in
+// place instead of making the user hunt for them in a sibling tab. Absent on
+// resources that declare no `children` (older configs included).
+export interface RelatedSection {
+  resource: string
+  title: string
+  as: 'table' | 'list'
+  items: ResourceItem[]
+}
+
+export function getResource(
+  resource: string,
+  itemId: number,
+): Promise<{ resource: string; item: ResourceItem; related?: RelatedSection[] }> {
   return request(`/${resource}/${itemId}`)
 }
 
@@ -117,27 +131,56 @@ export function getMe(): Promise<{ bot_id: number; telegram_user_id: number }> {
   return request('/me')
 }
 
+// A foreign-key field: it stores another resource's id, but the user must
+// never see or type that id (see the create form's picker). `labelField` is
+// the human-readable column to show instead.
+export interface SchemaRef {
+  resource: string
+  labelField: string
+}
+
 export interface SchemaField {
   name: string
   required?: boolean
   creatable?: boolean
   label?: string
-  kind?: 'text' | 'number' | 'date' | 'status'
+  kind?: 'text' | 'number' | 'date' | 'status' | 'link' | 'file'
   list?: boolean
   detail?: boolean
   create?: boolean
+  ref?: SchemaRef
+}
+
+export interface SchemaChild {
+  resource: string
+  via: string
+  title?: string
+  as?: 'table' | 'list'
 }
 
 export interface SchemaResource {
   name: string
   creatable?: boolean
+  // Whether POST would actually succeed for THIS viewer — the backend's own
+  // verdict (miniapp_api.py's _can_create), not something inferable client
+  // side. Drives whether any create affordance is rendered at all.
+  canCreate?: boolean
   title?: string
   titleField?: string
+  tableView?: boolean
+  children?: SchemaChild[]
   fields: SchemaField[]
 }
 
 export function getSchema(): Promise<{ resources: SchemaResource[] }> {
   return request('/schema')
+}
+
+// Optional features the bot's owner actually enabled (miniapp_api.py's
+// features_handler). Sections like analytics are opt-in: absent from the
+// navigation unless the corresponding feature is switched on for this bot.
+export function getFeatures(): Promise<{ features: string[] }> {
+  return request('/features')
 }
 
 export type AnalyticsPeriod = 'week' | 'month' | 'quarter'

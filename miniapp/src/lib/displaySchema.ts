@@ -11,21 +11,34 @@
    configs stored before this schema existed still render, just with
    less-polished labels/ordering — degrade gracefully, never blank-screen). */
 
-import type { SchemaField, SchemaResource } from './api'
+import type { SchemaChild, SchemaField, SchemaRef, SchemaResource } from './api'
 
 export interface FieldDisplay {
   name: string
   label: string
-  kind: 'text' | 'number' | 'date' | 'status'
+  kind: 'text' | 'number' | 'date' | 'status' | 'link' | 'file'
+  ref?: SchemaRef
 }
 
 export interface ResourceDisplay {
   name: string
   title: string
   titleField: string
+  canCreate: boolean
+  tableView: boolean
+  children: SchemaChild[]
   listFields: FieldDisplay[]
   detailFields: FieldDisplay[]
   createFields: FieldDisplay[]
+}
+
+// A URL-bearing value should be tappable wherever it appears, even when the
+// config never labelled the field as a link — most templates predate the
+// 'link' kind and just store a maps/booking/site URL in a plain text column.
+const URL_RE = /^https?:\/\/\S+$/i
+
+export function isLinkValue(field: FieldDisplay, value: unknown): boolean {
+  return field.kind === 'link' || (typeof value === 'string' && URL_RE.test(value.trim()))
 }
 
 function humanizeFieldName(name: string): string {
@@ -37,6 +50,7 @@ function normalizeField(field: SchemaField): FieldDisplay {
     name: field.name,
     label: field.label ?? humanizeFieldName(field.name),
     kind: field.kind ?? 'text',
+    ref: field.ref,
   }
 }
 
@@ -49,6 +63,13 @@ export function normalizeResource(resource: SchemaResource): ResourceDisplay {
     name: resource.name,
     title: resource.title ?? resource.name,
     titleField: resource.titleField ?? fields[0]?.name ?? 'id',
+    // Defaults to false, not to `resource.creatable`: a config served by a
+    // backend that doesn't send canCreate can't promise the POST would
+    // succeed, and offering a form that 403s is exactly the failure this
+    // flag exists to prevent.
+    canCreate: resource.canCreate === true,
+    tableView: resource.tableView === true,
+    children: resource.children ?? [],
     // Old configs (no list/detail/create flags) fall back to "show
     // everything in detail, nothing extra in the list chips, everything
     // creatable in the form" — the closest approximation to the
