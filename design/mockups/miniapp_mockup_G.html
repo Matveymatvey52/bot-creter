@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Mini App Mockup — Вариант G: Emerald &amp; Gold</title>
+<style>
+  /* ============================================================
+     ВАРИАНТ G — «Emerald & Gold». Тот же солидный каркас, что и
+     у E/F, но цветовая система построена на тёплом контрасте:
+       · база — глубокий изумрудно-зелёный (не серый и не синий)
+       · главный акцент — золото/янтарь: заголовочные панели,
+         ключевые кнопки, крупные цифры
+       · вторичные цвета разделов подобраны внутри той же
+         тёплой гаммы: мята, бирюза, золото, коралл, песок
+       · ощущение «частного банка», а не приложения для геймеров
+     Дизайн-токены переносятся в реальный miniapp одним слоем.
+     themeParams Telegram сознательно НЕ используется.
+     ============================================================ */
+  :root {
+    --bg:        #071a17;
+    --bg-raise:  #0b2320;
+    --surface:   #0e2b26;
+    --surface-2: #13372f;
+    --surface-3: #1a453b;
+
+    --line:      rgba(255,255,255,0.085);
+    --line-2:    rgba(232,178,74,0.28);
+
+    --gold:      #e8b24a;
+    --gold-2:    #f5cd7c;
+    --emerald:   #2fd39b;
+
+    --text:      #f0f4ef;
+    --text-2:    #a7bdb2;
+    --text-3:    #6f8a80;
+
+    --pos:       #4fd8a6;
+    --neg:       #e8806f;
+
+    --r:12px; --r-sm:9px; --r-xs:7px;
+    --font:-apple-system,BlinkMacSystemFont,"SF Pro Text","Inter",system-ui,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0;background:#03100e}
+  body{font-family:var(--font);color:var(--text);padding:40px 16px;-webkit-font-smoothing:antialiased}
+  .page-t{text-align:center;color:#c9a457;font-size:13px;letter-spacing:.14em;text-transform:uppercase;font-weight:700;margin-bottom:6px}
+  .page-s{text-align:center;color:#5c7a70;font-size:12.5px;margin-bottom:32px;line-height:1.6}
+  .frames{display:flex;flex-wrap:wrap;gap:26px;justify-content:center;align-items:flex-start}
+  .frame{width:360px}
+  .frame-cap{text-align:center;color:#6f8a80;font-size:11px;letter-spacing:.1em;text-transform:uppercase;font-weight:650;margin-bottom:10px}
+
+  .device{
+    width:360px;min-height:760px;border-radius:36px;overflow:hidden;position:relative;
+    background:
+      radial-gradient(115% 42% at 50% -6%, rgba(232,178,74,.20) 0%, transparent 60%),
+      radial-gradient(90% 50% at 100% 100%, rgba(47,211,155,.10) 0%, transparent 60%),
+      var(--bg);
+    border:1px solid rgba(255,255,255,.07);
+    box-shadow:0 34px 80px rgba(0,0,0,.6);
+    display:flex;flex-direction:column;
+  }
+  .ic{display:block;flex:0 0 auto}
+
+  .topbar{flex:0 0 auto;display:flex;align-items:center;gap:11px;padding:15px 15px 12px;border-bottom:1px solid var(--line)}
+  .tb{width:31px;height:31px;border-radius:var(--r-sm);background:var(--surface-2);border:1px solid var(--line);display:flex;align-items:center;justify-content:center;color:var(--text-2)}
+  .mark{width:31px;height:31px;border-radius:var(--r-sm);flex:0 0 auto;background:linear-gradient(140deg,var(--gold),var(--gold-2));display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:750;color:#071a17}
+  .brand{display:flex;align-items:center;gap:10px;flex:1;min-width:0}
+  .bn{font-size:14px;font-weight:660;letter-spacing:-.005em}
+  .bs{font-size:10.5px;color:var(--text-3);margin-top:1px}
+
+  .body{flex:1 1 auto;overflow:hidden}
+
+  .lane{display:flex;gap:8px;overflow:hidden;padding:13px 15px 14px;border-bottom:1px solid var(--line)}
+  .li{flex:0 0 auto;width:98px;background:var(--surface);border:1px solid var(--line);border-radius:var(--r-sm);padding:10px 11px 11px}
+  .li-n{font-size:12px;font-weight:640;color:var(--text-2);margin-top:8px}
+  .li-c{font-size:10px;color:var(--text-3);margin-top:2px;font-variant-numeric:tabular-nums}
+  .li.on .li-n{color:#fff}
+
+  .head{display:flex;align-items:center;justify-content:space-between;padding:18px 15px 12px}
+  .head h2{font-size:19.5px;margin:0;font-weight:680;letter-spacing:-.02em}
+  .head .c{font-size:10.5px;color:var(--text-3);margin-top:3px}
+  .add{width:31px;height:31px;border-radius:var(--r-sm);background:linear-gradient(140deg,var(--gold),var(--gold-2));display:flex;align-items:center;justify-content:center;color:#071a17}
+
+  .list{padding:0 15px 18px;display:flex;flex-direction:column;gap:8px}
+
+  /* карточка: цветной чип-иконка слева вместо полосы (отличие от F) */
+  .item{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);overflow:hidden}
+  .it-top{display:flex;align-items:flex-start;gap:11px;padding:12px 13px 10px}
+  .it-ic{width:34px;height:34px;border-radius:var(--r-xs);display:flex;align-items:center;justify-content:center;flex:0 0 auto}
+  .it-x{flex:1;min-width:0}
+  .it-n{font-size:15px;font-weight:640;letter-spacing:-.012em}
+  .it-s{font-size:11.5px;color:var(--text-3);margin-top:3px}
+  .it-a{font-size:13.5px;font-weight:680;text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap;color:var(--gold)}
+  .st{display:inline-flex;align-items:center;gap:5px;font-size:10.5px;font-weight:640;padding:3px 8px;border-radius:999px;white-space:nowrap}
+  .facts{display:flex;border-top:1px solid var(--line);background:rgba(255,255,255,.02)}
+  .fact{flex:1;padding:8px 13px 9px;border-right:1px solid var(--line)}
+  .fact:last-child{border-right:none}
+  .fk{font-size:8.5px;text-transform:uppercase;letter-spacing:.09em;color:var(--text-3);font-weight:680}
+  .fv{font-size:12px;font-weight:640;margin-top:3px;color:var(--text-2);font-variant-numeric:tabular-nums}
+
+  .chev{color:var(--text-3)}
+
+  .hero-card{margin:15px 15px 13px;border-radius:var(--r);padding:16px;background:linear-gradient(145deg,#e8b24a 0%,#f0c268 42%,#d99b3a 100%);position:relative;overflow:hidden}
+  .hero-card::after{content:"";position:absolute;right:-34px;top:-34px;width:135px;height:135px;border-radius:50%;background:rgba(255,255,255,.16)}
+  .hc-k{font-size:9.5px;text-transform:uppercase;letter-spacing:.1em;font-weight:750;color:rgba(7,26,23,.62)}
+  .hc-v{font-size:27px;font-weight:760;letter-spacing:-.028em;margin-top:6px;color:#071a17;font-variant-numeric:tabular-nums}
+  .hc-d{font-size:11.5px;color:rgba(7,26,23,.72);margin-top:5px;font-weight:560}
+  .bars{display:flex;align-items:flex-end;gap:5px;height:44px;margin-top:14px;position:relative}
+  .bar{flex:1;border-radius:3px 3px 0 0;background:rgba(7,26,23,.28)}
+  .bar.hi{background:#071a17}
+
+  .tiles{display:grid;grid-template-columns:1fr 1fr;gap:8px;padding:0 15px 13px}
+  .tile{border-radius:var(--r);padding:12px 13px;border:1px solid var(--line)}
+  .tl-i{width:28px;height:28px;border-radius:var(--r-xs);display:flex;align-items:center;justify-content:center;margin-bottom:9px}
+  .tl-v{font-size:19px;font-weight:720;letter-spacing:-.02em;font-variant-numeric:tabular-nums}
+  .tl-k{font-size:10.5px;color:var(--text-3);margin-top:2px;font-weight:560}
+
+  .prog{height:5px;border-radius:3px;background:rgba(255,255,255,.09);overflow:hidden;margin-top:9px}
+  .prog i{display:block;height:100%;border-radius:3px}
+
+  .sheet{margin:15px 15px 13px;background:var(--surface);border:1px solid var(--line);border-radius:var(--r);overflow:hidden}
+  .sh-h{padding:15px 15px 14px;border-bottom:1px solid var(--line-2);background:linear-gradient(140deg,rgba(232,178,74,.22),rgba(47,211,155,.07))}
+  .crumb{display:inline-flex;align-items:center;gap:5px;font-size:11px;color:var(--text-2);margin-bottom:11px}
+  .sh-h h1{font-size:23px;margin:0;font-weight:700;letter-spacing:-.024em}
+  .sh-h .sub{font-size:12px;color:var(--text-2);margin-top:5px}
+  .tags{display:flex;gap:7px;margin-top:11px}
+  .spec{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:11px 15px;border-bottom:1px solid var(--line)}
+  .spec:last-child{border-bottom:none}
+  .sk{font-size:12px;color:var(--text-3)}
+  .srt{display:flex;align-items:center;gap:8px}
+  .sv{font-size:13px;font-weight:640;font-variant-numeric:tabular-nums}
+
+  .sec{margin:0 15px 13px}
+  .sect{font-size:9px;text-transform:uppercase;letter-spacing:.1em;color:var(--text-3);font-weight:700;margin:0 0 8px;padding-left:2px}
+  .panel{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);overflow:hidden}
+  .frow{display:flex;align-items:center;gap:11px;padding:10px 12px;border-bottom:1px solid var(--line)}
+  .frow:last-child{border-bottom:none}
+  .fic{width:29px;height:29px;border-radius:var(--r-xs);display:flex;align-items:center;justify-content:center;flex:0 0 auto}
+  .fn{font-size:12.5px;font-weight:600;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .fs{font-size:10.5px;color:var(--text-3);font-variant-numeric:tabular-nums}
+
+  table.g{width:100%;border-collapse:collapse;font-size:12px}
+  table.g th{text-align:left;padding:8px 12px;color:var(--text-3);font-weight:700;font-size:9px;text-transform:uppercase;letter-spacing:.09em;background:rgba(255,255,255,.03);border-bottom:1px solid var(--line)}
+  table.g td{padding:10px 12px;border-bottom:1px solid var(--line);font-variant-numeric:tabular-nums}
+  table.g tr:last-child td{border-bottom:none}
+
+  .acts{padding:2px 15px 20px;display:flex;flex-direction:column;gap:8px}
+  .arow{display:flex;gap:8px}
+  .btn{flex:1;display:flex;align-items:center;justify-content:center;gap:7px;padding:12px;border-radius:var(--r-sm);font-size:13px;font-weight:650;background:var(--surface-2);border:1px solid var(--line);color:var(--text)}
+  .btn.pri{background:linear-gradient(140deg,var(--gold),var(--gold-2));border-color:transparent;color:#071a17;font-weight:700}
+
+  .tbl{margin:15px 15px 11px;border:1px solid var(--line);border-radius:var(--r);overflow:hidden;background:var(--surface)}
+  table.d{width:100%;border-collapse:collapse;font-size:11.5px}
+  table.d th{text-align:left;padding:9px 11px;background:var(--surface-2);color:var(--gold);font-weight:700;font-size:9px;text-transform:uppercase;letter-spacing:.08em;border-bottom:1px solid var(--line-2);white-space:nowrap}
+  table.d td{padding:10px 11px;border-bottom:1px solid var(--line);font-variant-numeric:tabular-nums}
+  table.d tr:last-child td{border-bottom:none}
+  .num{text-align:right;white-space:nowrap}
+  .pos{color:var(--pos);font-weight:680}
+  .neg{color:var(--neg);font-weight:680}
+
+  .totals{margin:0 15px 13px;display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}
+  .tot{border-radius:var(--r);padding:11px 12px;border:1px solid var(--line)}
+  .tk{font-size:8.5px;text-transform:uppercase;letter-spacing:.09em;color:var(--text-3);font-weight:700}
+  .tv{font-size:14.5px;font-weight:720;margin-top:4px;font-variant-numeric:tabular-nums;letter-spacing:-.01em}
+
+  .nav{flex:0 0 auto;display:flex;border-top:1px solid var(--line);background:var(--bg-raise)}
+  .nv{flex:1;display:flex;flex-direction:column;align-items:center;gap:4px;padding:10px 4px 12px;color:var(--text-3);font-size:9px;font-weight:600;position:relative}
+  .nv.on{color:var(--gold)}
+  .nv.on::before{content:"";position:absolute;top:0;left:24%;right:24%;height:2px;background:currentColor;border-radius:0 0 2px 2px}
+</style>
+</head>
+<body>
+
+<div class="page-t">Вариант G — Emerald &amp; Gold</div>
+<div class="page-s">Глубокий изумруд + золото. Тёплый контраст вместо серого: золотые панели и цифры,<br>разделы — мята, бирюза, золото, коралл, песок. Ощущение частного банка.</div>
+
+<div id="frames" class="frames"></div>
+
+<script>
+const P={
+ tours:'<rect x="3" y="7" width="18" height="13" rx="2"/><path d="M8 7V5.6A1.6 1.6 0 0 1 9.6 4h4.8A1.6 1.6 0 0 1 16 5.6V7"/>',
+ program:'<path d="M8.5 6h11M8.5 12h11M8.5 18h11"/><circle cx="4.5" cy="6" r="1.1" fill="currentColor" stroke="none"/><circle cx="4.5" cy="12" r="1.1" fill="currentColor" stroke="none"/><circle cx="4.5" cy="18" r="1.1" fill="currentColor" stroke="none"/>',
+ lip:'<rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="9" cy="11" r="2.1"/><path d="M5.8 16.4c.7-1.5 1.9-2.2 3.2-2.2s2.5.7 3.2 2.2"/><path d="M14.8 9.8h4M14.8 13.4h4"/>',
+ hotels:'<path d="M4.5 20V6.4L12 3.4l7.5 3V20"/><path d="M9.5 20v-4.2h5V20"/><path d="M8 9.4h2M14 9.4h2M8 12.8h2M14 12.8h2"/>',
+ guests:'<circle cx="9.2" cy="9" r="3.1"/><path d="M3.6 19c.7-2.8 2.9-4.3 5.6-4.3S14.1 16.2 14.8 19"/><path d="M16 6.3a3 3 0 0 1 0 5.5"/><path d="M17.6 15c1.6.5 2.7 1.9 3 3.7"/>',
+ dds:'<rect x="3" y="6" width="18" height="12.5" rx="2.2"/><path d="M3 10.2h18"/><circle cx="17" cy="14.4" r="1.1" fill="currentColor" stroke="none"/>',
+ chev:'<path d="M9.5 5.5l6.5 6.5-6.5 6.5"/>',
+ back:'<path d="M14.5 5.5L8 12l6.5 6.5"/>',
+ plus:'<path d="M12 5.5v13M5.5 12h13"/>',
+ dots:'<circle cx="5" cy="12" r="1.3" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1.3" fill="currentColor" stroke="none"/><circle cx="19" cy="12" r="1.3" fill="currentColor" stroke="none"/>',
+ doc:'<path d="M14 3H7.5A2 2 0 0 0 5.5 5v14a2 2 0 0 0 2 2h9a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h4.5"/><path d="M9 13.5h6M9 16.8h4"/>',
+ img:'<rect x="3.5" y="5" width="17" height="14" rx="2"/><circle cx="8.8" cy="10" r="1.5"/><path d="M5 17l4.4-4 3 2.6L16 12l3.5 3.4"/>',
+ receipt:'<path d="M6.5 3.5h11v17l-2.75-1.4L12 20.5l-2.75-1.4L6.5 20.5z"/><path d="M9.5 8.5h5M9.5 12.5h5"/>',
+ gear:'<circle cx="12" cy="12" r="3"/><path d="M12 3.5v2.2M12 18.3v2.2M5.2 7.8l1.9 1.1M16.9 15.1l1.9 1.1M5.2 16.2l1.9-1.1M16.9 8.9l1.9-1.1"/>',
+ chat:'<path d="M20 14.8a2 2 0 0 1-2 2H8.4L4.5 20.5V6a2 2 0 0 1 2-2h11.5a2 2 0 0 1 2 2z"/>',
+ wallet:'<path d="M4 7.5A2 2 0 0 1 6 5.5h11a2 2 0 0 1 2 2"/><rect x="3.5" y="7.5" width="17" height="11.5" rx="2"/><circle cx="16.4" cy="13.2" r="1.15" fill="currentColor" stroke="none"/>',
+ grid:'<rect x="3.5" y="3.5" width="7" height="7" rx="1.6"/><rect x="13.5" y="3.5" width="7" height="7" rx="1.6"/><rect x="3.5" y="13.5" width="7" height="7" rx="1.6"/><rect x="13.5" y="13.5" width="7" height="7" rx="1.6"/>'
+};
+const ic=(n,s)=>'<svg class="ic" width="'+(s||16)+'" height="'+(s||16)+'" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">'+P[n]+'</svg>';
+
+/* тёплая гамма: золото, мята, бирюза, коралл, песок */
+const C={tours:'#e8b24a',program:'#3fc9c0',lip:'#d9a066',hotels:'#2fd39b',guests:'#e8806f',dds:'#f0c268'};
+const wash=(hex,a)=>{const n=parseInt(hex.slice(1),16);return 'rgba('+(n>>16)+','+(n>>8&255)+','+(n&255)+','+a+')';};
+
+const SEC={tours:['Туры','12 активных'],program:['Программа','8 пунктов'],lip:['ЛиП','34 лица'],hotels:['Отели','6 объектов'],guests:['Гости','57 гостей'],dds:['ДДС','5 операций']};
+const ORDER=['tours','program','lip','hotels','guests','dds'];
+
+const TOURS=[
+ {n:'Сочи',s:'12 – 19 сентября · 8 ночей',st:'planning',c:'#d9a066',amt:'1 260 000 ₽',g:14,h:'Radisson',pay:'40%',pct:40},
+ {n:'Стамбул',s:'3 – 10 октября · 7 ночей',st:'confirmed',c:'#2fd39b',amt:'2 040 000 ₽',g:22,h:'CVK Park',pay:'100%',pct:100},
+ {n:'Дубай',s:'даты уточняются',st:'draft',c:'#6f8a80',amt:'—',g:0,h:'не выбран',pay:'0%',pct:0},
+ {n:'Красная Поляна',s:'14 – 18 января · 4 ночи',st:'завершён',c:'#3fc9c0',amt:'640 000 ₽',g:9,h:'Rosa Springs',pay:'закрыт',pct:100},
+];
+const DDS=[
+ ['02.09','Предоплата группа','+504 000','pos','40% от суммы'],
+ ['04.09','Бронь отеля','−380 000','neg','Radisson, депозит'],
+ ['06.09','Авиабилеты','−210 000','neg','14 билетов'],
+ ['10.09','Доплата группа','+756 000','pos','Остаток 60%'],
+ ['11.09','Гид и трансфер','−96 000','neg','8 ночей'],
+];
+const FILES=[['Договор_Сочи_2026.pdf','1.2 МБ','doc','tours'],['Ваучер_отель.pdf','340 КБ','receipt','hotels'],['Схема_рассадки.jpg','890 КБ','img','guests']];
+
+const topbar=()=>'<div class="topbar"><div class="tb">'+ic('back',15)+'</div>'+
+ '<div class="brand"><div class="mark">ТО</div><div><div class="bn">TravelOps</div><div class="bs">Тур-оператор</div></div></div>'+
+ '<div class="tb">'+ic('dots',15)+'</div></div>';
+
+const nav=on=>'<div class="nav">'+[['grid','Обзор','over'],['tours','Туры','tours'],['dds','ДДС','dds'],['gear','Ещё','more']]
+ .map(x=>'<div class="nv '+(x[2]===on?'on':'')+'">'+ic(x[0],17)+'<span>'+x[1]+'</span></div>').join('')+'</div>';
+
+const lane=act=>'<div class="lane">'+ORDER.map(k=>{
+ const on=k===act;
+ return '<div class="li '+(on?'on':'')+'" style="'+(on?'background:'+wash(C[k],.16)+';border-color:'+wash(C[k],.5)+';':'')+'">'+
+  '<span style="color:'+C[k]+'">'+ic(k,16)+'</span><div class="li-n">'+SEC[k][0]+'</div><div class="li-c">'+SEC[k][1]+'</div></div>';
+}).join('')+'</div>';
+
+const stTag=(t,c)=>'<span class="st" style="background:'+wash(c,.17)+';color:'+c+'">'+t+'</span>';
+
+/* --- 1. Обзор --- */
+function vOver(){
+ const bars=[38,52,44,66,58,80,72,95,64,86,74,100];
+ return topbar()+'<div class="body">'+
+ '<div class="hero-card"><div class="hc-k">Оборот · сентябрь</div><div class="hc-v">3 940 000 ₽</div>'+
+ '<div class="hc-d">+18% к августу · 4 тура в работе</div>'+
+ '<div class="bars">'+bars.map((h,i)=>'<div class="bar '+(i>9?'hi':'')+'" style="height:'+h+'%"></div>').join('')+'</div></div>'+
+ '<div class="tiles">'+
+  [['tours','Активных туров','12'],['guests','Гостей','57'],['hotels','Отелей','6'],['dds','Остаток, ₽','574 000']]
+  .map(t=>'<div class="tile" style="background:'+wash(C[t[0]],.12)+';border-color:'+wash(C[t[0]],.32)+'">'+
+   '<div class="tl-i" style="background:'+wash(C[t[0]],.2)+';color:'+C[t[0]]+'">'+ic(t[0],15)+'</div>'+
+   '<div class="tl-v" style="color:'+C[t[0]]+'">'+t[2]+'</div><div class="tl-k">'+t[1]+'</div></div>').join('')+
+ '</div>'+
+ '<div class="sec"><div class="sect">Ближайшие туры · оплата</div><div class="list" style="padding:0">'+
+  TOURS.slice(0,3).map(t=>'<div class="item"><div class="it-top">'+
+   '<div class="it-ic" style="background:'+wash(t.c,.18)+';color:'+t.c+'">'+ic('tours',16)+'</div>'+
+   '<div class="it-x"><div class="it-n">'+t.n+'</div><div class="it-s">'+t.s+'</div>'+
+   '<div class="prog"><i style="width:'+t.pct+'%;background:'+t.c+'"></i></div></div>'+
+   '<div><div class="it-a">'+t.amt+'</div><div style="margin-top:7px;text-align:right">'+stTag(t.pay,t.c)+'</div></div>'+
+  '</div></div>').join('')+
+ '</div></div></div>'+nav('over');
+}
+
+/* --- 2. Туры --- */
+function vTours(){
+ return topbar()+'<div class="body">'+lane('tours')+
+ '<div class="head"><div><h2>Туры</h2><div class="c">12 активных · 4 показано</div></div>'+
+ '<div class="add">'+ic('plus',15)+'</div></div>'+
+ '<div class="list">'+TOURS.map(t=>'<div class="item">'+
+  '<div class="it-top"><div class="it-ic" style="background:'+wash(t.c,.18)+';color:'+t.c+'">'+ic('tours',16)+'</div>'+
+  '<div class="it-x"><div class="it-n">'+t.n+'</div><div class="it-s">'+t.s+'</div></div>'+
+  '<div><div class="it-a">'+t.amt+'</div><div style="margin-top:7px;text-align:right">'+stTag(t.st,t.c)+'</div></div></div>'+
+  '<div class="facts">'+
+   '<div class="fact"><div class="fk">Гостей</div><div class="fv" style="color:'+C.guests+'">'+(t.g||'—')+'</div></div>'+
+   '<div class="fact"><div class="fk">Отель</div><div class="fv">'+t.h+'</div></div>'+
+   '<div class="fact"><div class="fk">Оплата</div><div class="fv" style="color:'+t.c+'">'+t.pay+'</div></div>'+
+  '</div></div>').join('')+'</div></div>'+nav('tours');
+}
+
+/* --- 3. Деталка --- */
+function vTour(){
+ return topbar()+'<div class="body">'+
+ '<div class="sheet"><div class="sh-h"><div class="crumb">'+ic('back',12)+'Все туры</div>'+
+  '<h1>Сочи</h1><div class="sub">12 – 19 сентября 2026 · 8 ночей</div>'+
+  '<div class="tags">'+stTag('planning','#d9a066')+stTag('оплачено 40%','#2fd39b')+'</div></div>'+
+  [['Гостей','14',C.guests],['Бюджет','1 260 000 ₽',C.tours],['Отель','Radisson Collection',C.hotels],['Менеджер','Анна К.',C.program]]
+   .map(r=>'<div class="spec"><span class="sk">'+r[0]+'</span><span class="srt"><span class="sv" style="color:'+r[2]+'">'+r[1]+'</span><span class="chev">'+ic('chev',13)+'</span></span></div>').join('')+
+ '</div>'+
+ '<div class="sec"><div class="sect">Файлы и вложения</div><div class="panel">'+
+  FILES.map(f=>'<div class="frow"><div class="fic" style="background:'+wash(C[f[3]],.18)+';color:'+C[f[3]]+'">'+ic(f[2],14)+'</div>'+
+   '<div class="fn">'+f[0]+'</div><div class="fs">'+f[1]+'</div><span class="chev">'+ic('chev',13)+'</span></div>').join('')+
+ '</div></div>'+
+ '<div class="sec"><div class="sect">Программа тура</div><div class="panel"><table class="g">'+
+  '<thead><tr><th>День</th><th>Время</th><th>Пункт</th></tr></thead><tbody>'+
+  [['12.09','14:00','Заезд, трансфер'],['13.09','10:00','Экскурсия «Роза Хутор»'],['14.09','—','Свободный день']]
+   .map(r=>'<tr><td style="color:'+C.program+'">'+r[0]+'</td><td style="color:var(--text-3)">'+r[1]+'</td><td>'+r[2]+'</td></tr>').join('')+
+ '</tbody></table></div></div>'+
+ '<div class="acts"><div class="arow">'+
+  '<div class="btn" style="color:'+C.guests+'">'+ic('guests',14)+'Гости · 14</div>'+
+  '<div class="btn" style="color:'+C.hotels+'">'+ic('wallet',14)+'Смета</div></div>'+
+  '<div class="btn pri">'+ic('chat',14)+'Чат с группой</div></div>'+
+ '</div>'+nav('tours');
+}
+
+/* --- 4. ДДС --- */
+function vDDS(){
+ return topbar()+'<div class="body">'+lane('dds')+
+ '<div class="head"><div><h2>ДДС</h2><div class="c">Тур «Сочи» · 5 операций</div></div>'+
+ '<div class="add">'+ic('plus',15)+'</div></div>'+
+ '<div class="totals">'+
+  '<div class="tot" style="background:'+wash('#4fd8a6',.12)+';border-color:'+wash('#4fd8a6',.32)+'"><div class="tk">Приход</div><div class="tv pos">+1 260 000</div></div>'+
+  '<div class="tot" style="background:'+wash('#e8806f',.12)+';border-color:'+wash('#e8806f',.32)+'"><div class="tk">Расход</div><div class="tv neg">−686 000</div></div>'+
+  '<div class="tot" style="background:'+wash('#e8b24a',.13)+';border-color:'+wash('#e8b24a',.34)+'"><div class="tk">Остаток</div><div class="tv" style="color:#e8b24a">574 000</div></div>'+
+ '</div>'+
+ '<div class="tbl"><table class="d">'+
+  '<thead><tr><th>Дата</th><th>Статья</th><th class="num">Сумма, ₽</th></tr></thead><tbody>'+
+  DDS.map(d=>'<tr><td style="color:var(--text-3)">'+d[0]+'</td>'+
+   '<td>'+d[1]+'<div style="font-size:10px;color:var(--text-3);margin-top:2px">'+d[4]+'</div></td>'+
+   '<td class="num '+d[3]+'">'+d[2]+'</td></tr>').join('')+
+ '</tbody></table></div>'+
+ '<div class="sec"><div class="sect">Структура расходов</div><div class="panel" style="padding:13px">'+
+  [['Отель','380 000',55,C.hotels],['Авиабилеты','210 000',31,C.program],['Гид и трансфер','96 000',14,C.lip]]
+   .map(r=>'<div style="margin-bottom:11px"><div style="display:flex;justify-content:space-between;font-size:11.5px"><span style="color:var(--text-2)">'+r[0]+'</span><span style="font-variant-numeric:tabular-nums;font-weight:640;color:'+r[3]+'">'+r[1]+' ₽</span></div>'+
+    '<div class="prog"><i style="width:'+r[2]+'%;background:'+r[3]+'"></i></div></div>').join('')+
+ '</div></div></div>'+nav('dds');
+}
+
+const FRAMES=[['Обзор',vOver()],['Раздел «Туры»',vTours()],['Карточка тура',vTour()],['Таблица ДДС',vDDS()]];
+document.getElementById('frames').innerHTML=FRAMES.map(f=>
+ '<div class="frame"><div class="frame-cap">'+f[0]+'</div><div class="device">'+f[1]+'</div></div>').join('');
+</script>
+</body>
+</html>

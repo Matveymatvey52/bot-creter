@@ -72,6 +72,33 @@ export function normalizeResources(resources: SchemaResource[]): Record<string, 
 
 const PAID_STATUSES = new Set(['paid', 'active', 'confirmed'])
 
+/* Тон статуса для варианта I: в эталоне-мокапе статусы цветные
+   (planning — янтарный, confirmed — зелёный, завершён — медный,
+   draft — серый), а прежний statusTone() различал только «успех» и
+   «нейтрально», из-за чего всё сводилось к серому.
+
+   Словарь намеренно двуязычный и по подстроке: статусы приходят из
+   miniapp_config каждого бота и не унифицированы (paid/оплачен/completed…).
+   Порядок проверок важен — «отменён» должен победить «завершён», а
+   «завершён» — «активен». Неизвестный статус остаётся нейтральным, а не
+   красится наугад. */
+export type StatusTone = 'ok' | 'warn' | 'done' | 'danger' | 'neutral'
+
+const TONE_RULES: Array<[RegExp, StatusTone]> = [
+  [/cancel|reject|fail|overdue|declin|отмен|отклон|просроч|провал/i, 'danger'],
+  [/done|complete|closed|finish|archiv|завершен|завершён|закрыт|выполн|готов/i, 'done'],
+  [/paid|active|confirm|approv|success|оплач|подтвержд|актив|принят/i, 'ok'],
+  [/plan|pending|wait|new|progress|process|hold|book|планир|ожид|в работе|нов|бронь/i, 'warn'],
+]
+
+export function statusToneRich(status: unknown): StatusTone {
+  if (typeof status !== 'string' || status.trim() === '') return 'neutral'
+  for (const [re, tone] of TONE_RULES) {
+    if (re.test(status)) return tone
+  }
+  return 'neutral'
+}
+
 export function statusTone(status: unknown): 'success' | 'neutral' {
   return typeof status === 'string' && PAID_STATUSES.has(status) ? 'success' : 'neutral'
 }

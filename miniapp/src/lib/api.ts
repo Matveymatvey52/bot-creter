@@ -136,7 +136,16 @@ export interface SchemaResource {
   fields: SchemaField[]
 }
 
-export function getSchema(): Promise<{ resources: SchemaResource[] }> {
+/* Кто этот бот — для шапки приложения. Оба поля берутся из строки владельца
+   в таблице bots и вполне могут быть пустыми (описание никто не обязан
+   заполнять), поэтому nullable, а не пустые строки: шапка сама решает, что
+   рисовать, а `bot` целиком отсутствует у ответов старого бэкенда. */
+export interface SchemaBot {
+  name: string | null
+  subtitle: string | null
+}
+
+export function getSchema(): Promise<{ resources: SchemaResource[]; bot?: SchemaBot }> {
   return request('/schema')
 }
 

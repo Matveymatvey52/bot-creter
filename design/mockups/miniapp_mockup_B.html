@@ -1,0 +1,388 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Mini App Mockup — Вариант B: Strict Premium</title>
+<style>
+  /* ============================================================
+     ДИЗАЙН-ТОКЕНЫ — при выборе варианта переносятся в реальный
+     miniapp одним слоем. themeParams Telegram сознательно НЕ
+     используется для базовых цветов — фирменный тёплый
+     тёмный вид не зависит от темы клиента пользователя.
+     ============================================================ */
+  :root {
+    --bg-0: #0c0b0a;
+    --bg-1: #121110;
+    --line: rgba(255,255,255,0.09);
+    --line-strong: rgba(255,255,255,0.16);
+    --accent: #b58bff;
+    --accent-dim: #8f6fd6;
+    --text: #f2efe9;
+    --text-dim: #a49d92;
+    --muted: #726b60;
+    --success: #7fcf9d;
+    --warning: #d9a86c;
+    --danger: #d97b7b;
+    --font: "Georgia", "Iowan Old Style", -apple-system, "SF Pro Display", serif;
+    --font-ui: -apple-system, BlinkMacSystemFont, "SF Pro Display", system-ui, sans-serif;
+  }
+
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html,body { margin:0; padding:0; background:#050505; }
+  body {
+    font-family: var(--font-ui);
+    color: var(--text);
+    display:flex; flex-direction:column; align-items:center;
+    gap:48px; padding:48px 12px;
+  }
+
+  .device {
+    width: 390px; max-width:100%; min-height: 844px;
+    background: var(--bg-0);
+    position:relative;
+    box-shadow: 0 30px 80px rgba(0,0,0,0.6);
+    border: 1px solid rgba(255,255,255,0.05);
+  }
+
+  .label {
+    color:#6b675f; font-size:13px; letter-spacing:0.02em; font-weight:600;
+    text-transform:uppercase; margin-bottom:10px; text-align:center;
+  }
+
+  .topbar {
+    display:flex; align-items:center; justify-content:space-between;
+    padding: 22px 24px 14px;
+    border-bottom: 1px solid var(--line);
+  }
+  .topbar .title { font-family: var(--font); font-size:19px; font-weight:600; letter-spacing:0.01em; }
+  .topbar .sub { font-size:11px; color:var(--muted); letter-spacing:.04em; text-transform:uppercase; margin-top:2px; }
+  .icon-btn {
+    width:30px; height:30px; display:flex; align-items:center; justify-content:center;
+    color: var(--text-dim); font-size:16px;
+  }
+
+  /* --- Лента разделов: тонкая, текстовая, без "плашечности" --- */
+  .carousel {
+    display:flex; gap:0;
+    overflow-x:auto;
+    border-bottom:1px solid var(--line);
+  }
+  .carousel::-webkit-scrollbar{display:none;}
+  .sect-item {
+    flex:0 0 auto;
+    padding: 16px 18px 13px;
+    font-size:13.5px; color:var(--muted);
+    border-bottom: 2px solid transparent;
+    white-space:nowrap;
+    letter-spacing:.01em;
+  }
+  .sect-item.active { color: var(--text); border-bottom-color: var(--accent); font-weight:600; }
+
+  .section-head {
+    display:flex; align-items:baseline; justify-content:space-between;
+    padding: 26px 24px 16px;
+  }
+  .section-head h2 { font-family: var(--font); font-size:26px; margin:0; font-weight:500; }
+  .section-head .add-btn {
+    font-size:12.5px; color:var(--accent); font-weight:600; letter-spacing:.02em;
+    border-bottom: 1px solid var(--accent-dim); padding-bottom:1px;
+  }
+
+  /* --- Список: editorial rows, без карточных теней, разделители --- */
+  .list { display:flex; flex-direction:column; }
+  .row {
+    display:flex; justify-content:space-between; align-items:flex-start;
+    padding: 18px 24px;
+    border-bottom: 1px solid var(--line);
+  }
+  .row-left { flex:1; min-width:0; }
+  .row-num { font-size:11px; color:var(--muted); letter-spacing:.05em; margin-bottom:6px; }
+  .row-title { font-family: var(--font); font-size:19px; font-weight:500; margin-bottom:5px; }
+  .row-meta { font-size:12.5px; color:var(--text-dim); }
+  .row-right { text-align:right; flex:0 0 auto; padding-left:16px; }
+  .row-price { font-size:14px; font-weight:600; margin-bottom:8px; }
+  .badge {
+    font-size:10px; font-weight:700; letter-spacing:.06em; text-transform:uppercase;
+    padding: 3px 0; display:inline-block;
+    border-top: 1px solid currentColor;
+  }
+  .badge.planning { color: var(--warning); }
+  .badge.confirmed { color: var(--success); }
+  .badge.draft { color: var(--muted); }
+  .badge.done { color: var(--accent); }
+  .row-facts { display:flex; gap:14px; margin-top:10px; font-size:11.5px; color:var(--muted); }
+  .row-facts b { color:var(--text-dim); font-weight:600; }
+
+  /* --- Экран 2: деталка, крупная типографика --- */
+  .hero { padding: 28px 24px 22px; border-bottom:1px solid var(--line-strong); }
+  .hero-back { font-size:12px; color:var(--muted); margin-bottom:18px; letter-spacing:.03em; }
+  .hero h1 { font-family: var(--font); font-size:38px; font-weight:500; margin:0 0 8px; letter-spacing:-0.01em; }
+  .hero .hero-meta { font-size:13.5px; color:var(--text-dim); }
+  .hero .hero-badges { display:flex; gap:16px; margin-top:16px; }
+
+  .detail-list { }
+  .field-row {
+    display:flex; justify-content:space-between; padding:15px 24px;
+    border-bottom:1px solid var(--line); font-size:14px;
+  }
+  .field-row .k { color:var(--muted); }
+  .field-row .v { font-weight:600; }
+
+  .block { padding: 24px 24px 6px; }
+  .block h3 {
+    font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.08em;
+    margin:0 0 14px; font-weight:700;
+  }
+
+  .files { display:flex; flex-direction:column; }
+  .file-row {
+    display:flex; align-items:center; justify-content:space-between;
+    padding:13px 0; border-bottom:1px solid var(--line);
+  }
+  .file-name { font-size:14px; }
+  .file-size { font-size:11.5px; color:var(--muted); }
+
+  .mini-table table { width:100%; border-collapse:collapse; font-size:13px; }
+  .mini-table th {
+    text-align:left; padding:8px 0; color:var(--muted); font-weight:600;
+    font-size:10.5px; text-transform:uppercase; letter-spacing:.05em;
+    border-bottom:1px solid var(--line-strong);
+  }
+  .mini-table td { padding:10px 0; border-bottom:1px solid var(--line); }
+
+  .actions { display:flex; flex-direction:column; padding: 24px; gap:0; }
+  .action-btn {
+    display:flex; align-items:center; justify-content:space-between;
+    padding:16px 0; border-bottom:1px solid var(--line);
+    font-size:14.5px; font-weight:600; color:var(--text);
+  }
+  .action-btn.primary {
+    background: var(--accent); color:#0c0b0a;
+    padding:16px 20px; border-radius:2px; border:none;
+    justify-content:center; margin-top:10px; letter-spacing:.02em;
+  }
+
+  /* --- Экран 3: настоящая таблица, editorial --- */
+  .table-scroll { overflow-x:auto; margin: 0 0 20px; }
+  table.data { width:100%; border-collapse:collapse; min-width:600px; font-size:13px; }
+  table.data thead th {
+    text-align:left; padding:14px 24px;
+    border-bottom:1px solid var(--line-strong);
+    color: var(--muted); font-weight:600; font-size:10.5px;
+    text-transform:uppercase; letter-spacing:.06em;
+  }
+  table.data td { padding:14px 24px; border-bottom:1px solid var(--line); white-space:nowrap; }
+  .amt-in { color: var(--success); font-weight:600; }
+  .amt-out { color: var(--danger); font-weight:600; }
+  .table-total {
+    display:flex; justify-content:space-between; padding: 20px 24px;
+    border-top: 1px solid var(--line-strong); font-size:13.5px; color:var(--text-dim);
+  }
+  .table-total b { color:var(--text); font-size:18px; font-family:var(--font); font-weight:500; }
+
+  .bottom-nav {
+    display:flex; justify-content:space-around;
+    padding:16px 24px; border-top: 1px solid var(--line);
+  }
+  .bottom-nav .n { display:flex; flex-direction:column; align-items:center; gap:5px; font-size:10px; color:var(--muted); letter-spacing:.03em; text-transform:uppercase; }
+  .bottom-nav .n.active { color: var(--accent); }
+  .bottom-nav .dot { width:4px; height:4px; border-radius:50%; background:currentColor; }
+</style>
+</head>
+<body>
+
+<div class="label">Экран 1 — Разделы (лента) + список Туров</div>
+<div class="device">
+  <div class="topbar">
+    <div>
+      <div class="title">TravelOps</div>
+      <div class="sub">Тур-оператор</div>
+    </div>
+    <div class="icon-btn">⋯</div>
+  </div>
+
+  <div class="carousel">
+    <div class="sect-item active">Туры</div>
+    <div class="sect-item">Программа</div>
+    <div class="sect-item">ЛиП</div>
+    <div class="sect-item">Отели</div>
+    <div class="sect-item">Гости</div>
+    <div class="sect-item">ДДС</div>
+  </div>
+
+  <div class="section-head">
+    <h2>Туры</h2>
+    <div class="add-btn">+ Добавить</div>
+  </div>
+
+  <div class="list">
+    <div class="row">
+      <div class="row-left">
+        <div class="row-num">№ 1</div>
+        <div class="row-title">Сочи</div>
+        <div class="row-meta">12 – 19 сентября · 8 ночей</div>
+        <div class="row-facts">
+          <span><b>14</b> гостей</span>
+          <span>Radisson</span>
+        </div>
+      </div>
+      <div class="row-right">
+        <div class="row-price">1 260 000 ₽</div>
+        <div class="badge planning">planning</div>
+      </div>
+    </div>
+
+    <div class="row">
+      <div class="row-left">
+        <div class="row-num">№ 2</div>
+        <div class="row-title">Стамбул</div>
+        <div class="row-meta">3 – 10 октября · 7 ночей</div>
+        <div class="row-facts">
+          <span><b>22</b> гостя</span>
+          <span>CVK Park</span>
+        </div>
+      </div>
+      <div class="row-right">
+        <div class="row-price">2 040 000 ₽</div>
+        <div class="badge confirmed">confirmed</div>
+      </div>
+    </div>
+
+    <div class="row">
+      <div class="row-left">
+        <div class="row-num">№ 3</div>
+        <div class="row-title">Дубай</div>
+        <div class="row-meta">даты уточняются</div>
+        <div class="row-facts">
+          <span>не выбран отель</span>
+        </div>
+      </div>
+      <div class="row-right">
+        <div class="row-price">—</div>
+        <div class="badge draft">draft</div>
+      </div>
+    </div>
+
+    <div class="row">
+      <div class="row-left">
+        <div class="row-num">№ 4</div>
+        <div class="row-title">Красная Поляна</div>
+        <div class="row-meta">14 – 18 января · 4 ночи</div>
+        <div class="row-facts">
+          <span><b>9</b> гостей</span>
+          <span>Rosa Springs</span>
+        </div>
+      </div>
+      <div class="row-right">
+        <div class="row-price">640 000 ₽</div>
+        <div class="badge done">завершён</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="bottom-nav">
+    <div class="n active"><span class="dot"></span>Туры</div>
+    <div class="n">Гости</div>
+    <div class="n">ДДС</div>
+    <div class="n">Ещё</div>
+  </div>
+</div>
+
+<div class="label">Экран 2 — Детальная карточка тура «Сочи»</div>
+<div class="device">
+  <div class="topbar">
+    <div class="icon-btn">←</div>
+    <div class="icon-btn">✎</div>
+  </div>
+
+  <div class="hero">
+    <div class="hero-back">← Все туры</div>
+    <h1>Сочи</h1>
+    <div class="hero-meta">12 – 19 сентября 2026 · 8 ночей</div>
+    <div class="hero-badges">
+      <div class="badge planning">planning</div>
+      <div class="badge confirmed">оплата 40%</div>
+    </div>
+  </div>
+
+  <div class="detail-list">
+    <div class="field-row"><span class="k">Гостей</span><span class="v">14 человек</span></div>
+    <div class="field-row"><span class="k">Бюджет</span><span class="v">1 260 000 ₽</span></div>
+    <div class="field-row"><span class="k">Отель</span><span class="v">Radisson Collection</span></div>
+    <div class="field-row"><span class="k">Менеджер</span><span class="v">Анна К.</span></div>
+  </div>
+
+  <div class="block">
+    <h3>Файлы и вложения</h3>
+    <div class="files">
+      <div class="file-row"><span class="file-name">Договор_Сочи_2026.pdf</span><span class="file-size">1.2 МБ</span></div>
+      <div class="file-row"><span class="file-name">Ваучер_отель.pdf</span><span class="file-size">340 КБ</span></div>
+      <div class="file-row"><span class="file-name">Схема_рассадки.jpg</span><span class="file-size">890 КБ</span></div>
+    </div>
+  </div>
+
+  <div class="block">
+    <h3>Программа тура</h3>
+    <div class="mini-table">
+      <table>
+        <tr><th>День</th><th>Время</th><th>Пункт</th></tr>
+        <tr><td>12.09</td><td>14:00</td><td>Заезд, трансфер</td></tr>
+        <tr><td>13.09</td><td>10:00</td><td>Экскурсия «Роза Хутор»</td></tr>
+        <tr><td>14.09</td><td>—</td><td>Свободный день</td></tr>
+      </table>
+    </div>
+  </div>
+
+  <div class="actions">
+    <div class="action-btn">Гости (14) <span>→</span></div>
+    <div class="action-btn">Смета <span>→</span></div>
+    <div class="action-btn primary">Открыть чат с группой</div>
+  </div>
+</div>
+
+<div class="label">Экран 3 — Таблица ДДС (кэш-флоу)</div>
+<div class="device">
+  <div class="topbar">
+    <div class="icon-btn">←</div>
+    <div>
+      <div class="title" style="font-size:17px;">ДДС</div>
+      <div class="sub">Тур «Сочи»</div>
+    </div>
+    <div class="icon-btn">＋</div>
+  </div>
+
+  <div class="section-head" style="padding-bottom:8px;">
+    <h2 style="font-size:20px;">Движение средств</h2>
+  </div>
+
+  <div class="table-scroll">
+    <table class="data">
+      <thead>
+        <tr><th>Дата</th><th>Статья</th><th>Тип</th><th>Сумма</th><th>Комментарий</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>02.09</td><td>Предоплата группа</td><td>Приход</td><td class="amt-in">+504 000 ₽</td><td>40% от суммы</td></tr>
+        <tr><td>04.09</td><td>Бронь отеля</td><td>Расход</td><td class="amt-out">−380 000 ₽</td><td>Radisson, депозит</td></tr>
+        <tr><td>06.09</td><td>Авиабилеты</td><td>Расход</td><td class="amt-out">−210 000 ₽</td><td>14 билетов</td></tr>
+        <tr><td>10.09</td><td>Доплата группа</td><td>Приход</td><td class="amt-in">+756 000 ₽</td><td>Остаток 60%</td></tr>
+        <tr><td>11.09</td><td>Гид и трансфер</td><td>Расход</td><td class="amt-out">−96 000 ₽</td><td>8 ночей</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="table-total">
+    <span>Итого приход / расход</span>
+    <span><b style="color:var(--success)">+1 260 000</b> / <b style="color:var(--danger)">−686 000</b> ₽</span>
+  </div>
+
+  <div class="bottom-nav">
+    <div class="n">Туры</div>
+    <div class="n">Гости</div>
+    <div class="n active"><span class="dot"></span>ДДС</div>
+    <div class="n">Ещё</div>
+  </div>
+</div>
+
+</body>
+</html>

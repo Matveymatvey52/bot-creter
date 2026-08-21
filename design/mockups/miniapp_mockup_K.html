@@ -1,0 +1,716 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Mini App Mockup — Вариант K: Brass on Slate</title>
+<style>
+  /* ============================================================
+     ВАРИАНТ K — цветовая ветка варианта I. Каркас и вся интерактивность варианта E,
+     изменена только цветовая палитра. Середина между A и B, сдвинутая в
+     сторону дорогой сдержанности:
+       · нейтральный графит вместо фиолетового свечения (A читался
+         как магазин игр — убраны неон, градиентные заливки, эмодзи)
+       · но без editorial-аскетизма B: плотность, карточки, иконки
+       · акцент приглушённый и точечный, цифры табличные,
+         иконки — тонкий монолинейный SVG
+     Дизайн-токены переносятся в реальный miniapp одним слоем.
+     themeParams Telegram сознательно НЕ используется для базовых
+     цветов — фирменный вид не зависит от темы клиента.
+     ============================================================ */
+  :root {
+    --bg:          #101214;
+    --bg-raise:    #141719;
+    --surface:     #171b1e;
+    --surface-2:   #1d2226;
+    --surface-3:   #242a2f;
+
+    --line:        rgba(255,255,255,0.07);
+    --line-2:      rgba(255,255,255,0.115);
+
+    --accent:      #c69c5d;
+    --accent-dim:  #9e7943;
+    --accent-wash: rgba(198,156,93,0.11);
+
+    --text:        #e9ecee;
+    --text-2:      #9ba5ac;
+    --text-3:      #6a747b;
+
+    --st-plan:     #c69c5d;
+    --st-ok:       #6fa892;
+    --st-draft:    #6a747b;
+    --st-done:     #7d90a0;
+    --pos:         #6fb094;
+    --neg:         #c8827a;
+
+    --r:    12px;
+    --r-sm: 9px;
+    --r-xs: 7px;
+
+    --font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", system-ui, sans-serif;
+  }
+
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html,body { margin:0; padding:0; background:#08090b; }
+  body {
+    font-family:var(--font); color:var(--text);
+    display:flex; flex-direction:column; align-items:center;
+    gap:22px; padding:44px 12px;
+    -webkit-font-smoothing:antialiased;
+  }
+  .cap { color:#5c5d66; font-size:12px; letter-spacing:.10em; font-weight:600; text-transform:uppercase; }
+  .hint { color:#4a4b53; font-size:12px; text-align:center; max-width:360px; line-height:1.5; margin-bottom:4px; }
+
+  .device {
+    width:390px; max-width:100%; height:844px;
+    border-radius:40px; overflow:hidden; position:relative;
+    background:var(--bg);
+    border:1px solid rgba(255,255,255,0.055);
+    box-shadow:0 40px 90px rgba(0,0,0,0.65);
+    display:flex; flex-direction:column;
+  }
+  /* матовая зернистость — «дорогая» фактура без цветного свечения */
+  .device::before {
+    content:""; position:absolute; inset:0; z-index:5; pointer-events:none; opacity:.5;
+    background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='3'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='140' height='140' filter='url(%23n)' opacity='.035'/%3E%3C/svg%3E");
+  }
+
+  .ic { display:block; flex:0 0 auto; }
+
+  /* ---------- Шапка ---------- */
+  .topbar {
+    flex:0 0 auto; display:flex; align-items:center; gap:12px;
+    padding:16px 16px 13px; border-bottom:1px solid var(--line);
+    background:var(--bg-raise);
+  }
+  .tb-btn {
+    width:32px; height:32px; border-radius:var(--r-sm); cursor:pointer;
+    background:var(--surface-2); border:1px solid var(--line);
+    display:flex; align-items:center; justify-content:center; color:var(--text-2);
+  }
+  .tb-btn:active { background:var(--surface-3); color:var(--text); }
+  .brand { display:flex; align-items:center; gap:10px; flex:1; min-width:0; cursor:pointer; }
+  .mark {
+    width:32px; height:32px; border-radius:var(--r-sm); flex:0 0 auto;
+    background:var(--surface-3); border:1px solid var(--line-2);
+    display:flex; align-items:center; justify-content:center;
+    font-size:11.5px; font-weight:700; letter-spacing:.04em; color:var(--accent);
+  }
+  .brand-name { font-size:14.5px; font-weight:650; letter-spacing:-.005em; }
+  .brand-sub { font-size:11px; color:var(--text-3); margin-top:1px; letter-spacing:.01em; }
+
+  .body { flex:1 1 auto; overflow-y:auto; }
+  .body::-webkit-scrollbar { width:0; }
+
+  /* ---------- Лента разделов ---------- */
+  .lane { display:flex; gap:8px; overflow-x:auto; padding:14px 16px 15px; border-bottom:1px solid var(--line); }
+  .lane::-webkit-scrollbar { display:none; }
+  .lane-item {
+    flex:0 0 auto; width:106px; cursor:pointer;
+    background:var(--surface); border:1px solid var(--line);
+    border-radius:var(--r-sm); padding:11px 12px 12px;
+    position:relative; overflow:hidden; color:var(--text-3);
+  }
+  .lane-item .li-n { font-size:12.5px; font-weight:600; color:var(--text-2); margin-top:9px; letter-spacing:-.005em; }
+  .lane-item .li-c { font-size:10.5px; color:var(--text-3); margin-top:2px; font-variant-numeric:tabular-nums; }
+  .lane-item.on { background:var(--surface-2); border-color:var(--line-2); color:var(--accent); }
+  .lane-item.on .li-n { color:var(--text); }
+  .lane-item.on::before { content:""; position:absolute; left:0; top:0; bottom:0; width:2px; background:var(--accent); }
+
+  /* ---------- Контекст: по какому туру открыт раздел ---------- */
+  .ctxbar{display:flex;align-items:center;gap:10px;padding:11px 16px;border-bottom:1px solid var(--line);background:var(--bg-raise);cursor:pointer}
+  .ctxbar:active{background:var(--surface)}
+  .ctx-x{flex:1;min-width:0}
+  .ctx-k{font-size:9.5px;text-transform:uppercase;letter-spacing:.09em;color:var(--text-3);font-weight:650}
+  .ctx-v{font-size:13.5px;font-weight:640;letter-spacing:-.008em;margin-top:3px;display:flex;align-items:center;gap:7px}
+  .ctx-dot{width:6px;height:6px;border-radius:50%;flex:0 0 auto}
+  .ctx-sw{display:flex;align-items:center;gap:4px;font-size:11.5px;color:var(--accent);font-weight:620}
+  .ctx-glob{padding:10px 16px;border-bottom:1px solid var(--line);font-size:11px;color:var(--text-3);display:flex;align-items:center;gap:7px}
+
+  .pick{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:13px 15px;border-bottom:1px solid var(--line);cursor:pointer}
+  .pick:last-child{border-bottom:none}
+  .pick:active{background:var(--surface-2)}
+  .pick.on{background:var(--accent-wash)}
+  .pick-t{font-size:14px;font-weight:620;display:flex;align-items:center;gap:8px}
+  .pick-s{font-size:11.5px;color:var(--text-3);margin-top:3px}
+
+  /* ---------- Заголовок раздела ---------- */
+  .head { display:flex; align-items:center; justify-content:space-between; padding:20px 16px 13px; }
+  .head h2 { font-size:20px; margin:0; font-weight:650; letter-spacing:-.018em; }
+  .head .cnt { font-size:11px; color:var(--text-3); margin-top:3px; letter-spacing:.02em; }
+  .head-add {
+    width:32px; height:32px; border-radius:var(--r-sm); cursor:pointer;
+    background:var(--surface-2); border:1px solid var(--line-2);
+    display:flex; align-items:center; justify-content:center; color:var(--accent);
+  }
+  .head-add:active { background:var(--surface-3); }
+
+  /* ---------- Список ---------- */
+  .list { padding:0 16px 20px; display:flex; flex-direction:column; gap:8px; }
+
+  .item {
+    background:var(--surface); border:1px solid var(--line);
+    border-radius:var(--r); cursor:pointer; overflow:hidden;
+  }
+  .item:active { background:var(--surface-2); }
+  .item-top { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; padding:13px 14px 11px; }
+  .item-name { font-size:15.5px; font-weight:620; letter-spacing:-.012em; }
+  .item-sub { font-size:12px; color:var(--text-3); margin-top:3px; letter-spacing:.005em; }
+  .item-amt { font-size:14px; font-weight:640; text-align:right; font-variant-numeric:tabular-nums; white-space:nowrap; }
+
+  .st { display:inline-flex; align-items:center; gap:6px; font-size:11px; font-weight:560; letter-spacing:.01em; white-space:nowrap; }
+  .st .d { width:5px; height:5px; border-radius:50%; background:currentColor; flex:0 0 auto; }
+  .st.plan  { color:var(--st-plan); }
+  .st.ok    { color:var(--st-ok); }
+  .st.draft { color:var(--st-draft); }
+  .st.done  { color:var(--st-done); }
+
+  .facts { display:flex; border-top:1px solid var(--line); background:rgba(255,255,255,0.012); }
+  .fact { flex:1; padding:9px 14px 10px; border-right:1px solid var(--line); }
+  .fact:last-child { border-right:none; }
+  .fact .k { font-size:9px; text-transform:uppercase; letter-spacing:.09em; color:var(--text-3); font-weight:600; }
+  .fact .v { font-size:12.5px; font-weight:600; margin-top:3px; color:var(--text-2); font-variant-numeric:tabular-nums; }
+
+  /* строки для простых разделов */
+  .lrow {
+    display:flex; align-items:center; gap:12px; cursor:pointer;
+    background:var(--surface); border:1px solid var(--line);
+    border-radius:var(--r-sm); padding:12px 13px;
+  }
+  .lrow:active { background:var(--surface-2); }
+  .lrow-ic { width:30px; height:30px; border-radius:var(--r-xs); background:var(--surface-3); border:1px solid var(--line); display:flex; align-items:center; justify-content:center; color:var(--text-3); flex:0 0 auto; }
+  .lrow-t { font-size:14px; font-weight:600; letter-spacing:-.008em; }
+  .lrow-s { font-size:11.5px; color:var(--text-3); margin-top:2px; }
+  .lrow-x { flex:1; min-width:0; }
+  .chev { color:var(--text-3); }
+
+  /* ---------- Деталка ---------- */
+  .sheet { margin:16px 16px 14px; background:var(--surface); border:1px solid var(--line); border-radius:var(--r); overflow:hidden; }
+  .sheet-h { padding:16px 16px 14px; border-bottom:1px solid var(--line); }
+  .crumb { display:inline-flex; align-items:center; gap:6px; font-size:11.5px; color:var(--text-3); cursor:pointer; margin-bottom:12px; letter-spacing:.01em; }
+  .crumb:active { color:var(--accent); }
+  .sheet-h h1 { font-size:24px; margin:0; font-weight:660; letter-spacing:-.022em; }
+  .sheet-h .sub { font-size:12.5px; color:var(--text-3); margin-top:5px; }
+  .sheet-tags { display:flex; gap:14px; margin-top:12px; }
+  .sheet-tags .st { cursor:pointer; }
+
+  .spec { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:12px 16px; border-bottom:1px solid var(--line); cursor:pointer; }
+  .spec:last-child { border-bottom:none; }
+  .spec:active { background:var(--surface-2); }
+  .spec .k { font-size:12.5px; color:var(--text-3); }
+  .spec .rt { display:flex; align-items:center; gap:9px; }
+  .spec .v { font-size:13.5px; font-weight:600; font-variant-numeric:tabular-nums; }
+
+  .sec { margin:0 16px 14px; }
+  .sec-t { font-size:9.5px; text-transform:uppercase; letter-spacing:.1em; color:var(--text-3); font-weight:650; margin:0 0 9px; padding-left:2px; }
+
+  .panel { background:var(--surface); border:1px solid var(--line); border-radius:var(--r); overflow:hidden; }
+  .frow { display:flex; align-items:center; gap:12px; padding:11px 13px; border-bottom:1px solid var(--line); cursor:pointer; }
+  .frow:last-child { border-bottom:none; }
+  .frow:active { background:var(--surface-2); }
+  .frow-ic { width:30px; height:30px; border-radius:var(--r-xs); background:var(--accent-wash); color:var(--accent); display:flex; align-items:center; justify-content:center; flex:0 0 auto; }
+  .frow-n { font-size:13px; font-weight:580; flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .frow-s { font-size:11px; color:var(--text-3); font-variant-numeric:tabular-nums; }
+
+  table.grid { width:100%; border-collapse:collapse; font-size:12.5px; }
+  table.grid th {
+    text-align:left; padding:9px 13px; color:var(--text-3); font-weight:650;
+    font-size:9.5px; text-transform:uppercase; letter-spacing:.09em;
+    background:rgba(255,255,255,0.015); border-bottom:1px solid var(--line);
+  }
+  table.grid td { padding:11px 13px; border-bottom:1px solid var(--line); cursor:pointer; font-variant-numeric:tabular-nums; }
+  table.grid tr:last-child td { border-bottom:none; }
+  table.grid tbody tr:active td { background:var(--surface-2); }
+  .num { text-align:right; font-variant-numeric:tabular-nums; }
+  .pos { color:var(--pos); font-weight:620; }
+  .neg { color:var(--neg); font-weight:620; }
+
+  .acts { padding:2px 16px 22px; display:flex; flex-direction:column; gap:8px; }
+  .acts-row { display:flex; gap:8px; }
+  .btn {
+    flex:1; display:flex; align-items:center; justify-content:center; gap:8px;
+    padding:13px; border-radius:var(--r-sm); font-size:13.5px; font-weight:620;
+    background:var(--surface-2); border:1px solid var(--line-2); color:var(--text); cursor:pointer;
+    letter-spacing:-.005em;
+  }
+  .btn:active { background:var(--surface-3); }
+  .btn.pri { background:var(--accent); border-color:var(--accent); color:#14151a; }
+  .btn.pri:active { background:var(--accent-dim); border-color:var(--accent-dim); }
+
+  .fview { margin:0 16px 14px; background:var(--surface); border:1px solid var(--line); border-radius:var(--r); padding:52px 0; display:flex; align-items:center; justify-content:center; color:var(--text-3); }
+
+  /* ---------- Таблица ДДС ---------- */
+  .tbl { margin:16px 16px 12px; border:1px solid var(--line); border-radius:var(--r); overflow:hidden; background:var(--surface); }
+  .tbl-scroll { overflow-x:auto; }
+  .tbl-scroll::-webkit-scrollbar { height:0; }
+  table.data { width:100%; border-collapse:collapse; min-width:540px; font-size:12.5px; }
+  table.data th {
+    position:sticky; top:0; text-align:left; padding:10px 13px;
+    background:var(--surface-2); color:var(--text-3); font-weight:650;
+    font-size:9.5px; text-transform:uppercase; letter-spacing:.09em;
+    border-bottom:1px solid var(--line-2); white-space:nowrap;
+  }
+  table.data td { padding:11px 13px; border-bottom:1px solid var(--line); white-space:nowrap; cursor:pointer; font-variant-numeric:tabular-nums; }
+  table.data tr:last-child td { border-bottom:none; }
+  table.data tbody tr:active td { background:var(--surface-2); }
+
+  .totals { margin:0 16px 22px; display:flex; border:1px solid var(--line); border-radius:var(--r); overflow:hidden; background:var(--surface); }
+  .tot { flex:1; padding:12px 14px; border-right:1px solid var(--line); }
+  .tot:last-child { border-right:none; }
+  .tot .k { font-size:9px; text-transform:uppercase; letter-spacing:.09em; color:var(--text-3); font-weight:650; }
+  .tot .v { font-size:15px; font-weight:660; margin-top:4px; font-variant-numeric:tabular-nums; letter-spacing:-.01em; }
+
+  /* ---------- Низ ---------- */
+  .nav { flex:0 0 auto; display:flex; border-top:1px solid var(--line); background:var(--bg-raise); }
+  .nv { flex:1; display:flex; flex-direction:column; align-items:center; gap:5px; padding:11px 4px 13px; cursor:pointer; color:var(--text-3); font-size:9.5px; font-weight:560; letter-spacing:.02em; position:relative; }
+  .nv:active { background:var(--surface); }
+  .nv.on { color:var(--accent); }
+  .nv.on::before { content:""; position:absolute; top:0; left:22%; right:22%; height:1.5px; background:var(--accent); }
+
+  .toast {
+    position:absolute; left:50%; bottom:86px; transform:translate(-50%,6px); z-index:6;
+    background:var(--surface-3); border:1px solid var(--line-2);
+    color:var(--text); font-size:12.5px; padding:10px 15px; border-radius:var(--r-sm);
+    opacity:0; pointer-events:none; transition:opacity .18s, transform .18s; white-space:nowrap;
+    box-shadow:0 12px 28px rgba(0,0,0,.5);
+  }
+  .toast.show { opacity:1; transform:translate(-50%,0); }
+</style>
+</head>
+<body>
+
+<div class="cap">Вариант K — Brass on Slate</div>
+<div class="hint">Холодная сторона варианта I: подложка — нейтрально-холодный сланцевый графит, акцент уведён из меди в латунь. Тёплый металл на холодном камне. Кликается всё, включая переключатель тура.</div>
+
+<div class="device">
+  <div class="topbar">
+    <div id="back" class="tb-btn" onclick="goBack()"></div>
+    <div class="brand" onclick="go('detail',{section:'people',id:'me'})">
+      <div class="mark">ТО</div>
+      <div><div class="brand-name">TravelOps</div><div class="brand-sub">Тур-оператор</div></div>
+    </div>
+    <div id="menu-btn" class="tb-btn" onclick="go('menu')"></div>
+  </div>
+
+  <div id="body" class="body"></div>
+
+  <div class="nav">
+    <div id="nv-tours" class="nv" onclick="go('home',{section:'tours'},1)"></div>
+    <div id="nv-guests" class="nv" onclick="go('home',{section:'guests'},1)"></div>
+    <div id="nv-dds" class="nv" onclick="go('home',{section:'dds'},1)"></div>
+    <div id="nv-more" class="nv" onclick="go('more')"></div>
+  </div>
+
+  <div id="toast" class="toast"></div>
+</div>
+
+<script>
+/* ---------- монолинейные иконки (эмодзи удешевляют вид) ---------- */
+const P = {
+  tours:'<rect x="3" y="7" width="18" height="13" rx="2"/><path d="M8 7V5.6A1.6 1.6 0 0 1 9.6 4h4.8A1.6 1.6 0 0 1 16 5.6V7"/>',
+  program:'<path d="M8.5 6h11M8.5 12h11M8.5 18h11"/><circle cx="4.5" cy="6" r="1.1" fill="currentColor" stroke="none"/><circle cx="4.5" cy="12" r="1.1" fill="currentColor" stroke="none"/><circle cx="4.5" cy="18" r="1.1" fill="currentColor" stroke="none"/>',
+  lip:'<rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="9" cy="11" r="2.1"/><path d="M5.8 16.4c.7-1.5 1.9-2.2 3.2-2.2s2.5.7 3.2 2.2"/><path d="M14.8 9.8h4M14.8 13.4h4"/>',
+  hotels:'<path d="M4.5 20V6.4L12 3.4l7.5 3V20"/><path d="M9.5 20v-4.2h5V20"/><path d="M8 9.4h2M14 9.4h2M8 12.8h2M14 12.8h2"/>',
+  guests:'<circle cx="9.2" cy="9" r="3.1"/><path d="M3.6 19c.7-2.8 2.9-4.3 5.6-4.3S14.1 16.2 14.8 19"/><path d="M16 6.3a3 3 0 0 1 0 5.5"/><path d="M17.6 15c1.6.5 2.7 1.9 3 3.7"/>',
+  dds:'<rect x="3" y="6" width="18" height="12.5" rx="2.2"/><path d="M3 10.2h18"/><circle cx="17" cy="14.4" r="1.1" fill="currentColor" stroke="none"/>',
+  chev:'<path d="M9.5 5.5l6.5 6.5-6.5 6.5"/>',
+  back:'<path d="M14.5 5.5L8 12l6.5 6.5"/>',
+  plus:'<path d="M12 5.5v13M5.5 12h13"/>',
+  dots:'<circle cx="5" cy="12" r="1.3" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1.3" fill="currentColor" stroke="none"/><circle cx="19" cy="12" r="1.3" fill="currentColor" stroke="none"/>',
+  doc:'<path d="M14 3H7.5A2 2 0 0 0 5.5 5v14a2 2 0 0 0 2 2h9a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h4.5"/><path d="M9 13.5h6M9 16.8h4"/>',
+  img:'<rect x="3.5" y="5" width="17" height="14" rx="2"/><circle cx="8.8" cy="10" r="1.5"/><path d="M5 17l4.4-4 3 2.6L16 12l3.5 3.4"/>',
+  receipt:'<path d="M6.5 3.5h11v17l-2.75-1.4L12 20.5l-2.75-1.4L6.5 20.5z"/><path d="M9.5 8.5h5M9.5 12.5h5"/>',
+  down:'<path d="M12 4.5v11M8 12l4 4 4-4"/><path d="M5.5 19.5h13"/>',
+  share:'<circle cx="17.8" cy="6.2" r="2.4"/><circle cx="6.2" cy="12" r="2.4"/><circle cx="17.8" cy="17.8" r="2.4"/><path d="M8.4 10.9l7.2-3.6M8.4 13.1l7.2 3.6"/>',
+  gear:'<circle cx="12" cy="12" r="3"/><path d="M12 3.5v2.2M12 18.3v2.2M5.2 7.8l1.9 1.1M16.9 15.1l1.9 1.1M5.2 16.2l1.9-1.1M16.9 8.9l1.9-1.1"/>',
+  user:'<circle cx="12" cy="8.6" r="3.4"/><path d="M5.4 19.4c.9-3.1 3.5-4.8 6.6-4.8s5.7 1.7 6.6 4.8"/>',
+  chat:'<path d="M20 14.8a2 2 0 0 1-2 2H8.4L4.5 20.5V6a2 2 0 0 1 2-2h11.5a2 2 0 0 1 2 2z"/>',
+  hist:'<circle cx="12" cy="12" r="8.2"/><path d="M12 7.4V12l3.2 2.1"/>',
+  wallet:'<path d="M4 7.5A2 2 0 0 1 6 5.5h11a2 2 0 0 1 2 2"/><rect x="3.5" y="7.5" width="17" height="11.5" rx="2"/><circle cx="16.4" cy="13.2" r="1.15" fill="currentColor" stroke="none"/>'
+};
+function ic(n, s) {
+  s = s || 16;
+  return '<svg class="ic" width="'+s+'" height="'+s+'" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">'+P[n]+'</svg>';
+}
+
+/* ---------- данные-заглушки (тур-оператор) ---------- */
+const SEC = {
+  tours:  {icon:'tours',   name:'Туры',      count:'12 активных'},
+  program:{icon:'program', name:'Программа', count:'8 пунктов'},
+  lip:    {icon:'lip',     name:'ЛиП',       count:'34 лица'},
+  hotels: {icon:'hotels',  name:'Отели',     count:'6 объектов'},
+  guests: {icon:'guests',  name:'Гости',     count:'57 гостей'},
+  dds:    {icon:'dds',     name:'ДДС',       count:'5 операций'},
+};
+const ORDER = ['tours','program','lip','hotels','guests','dds'];
+
+const TOURS = [
+  {id:'sochi',    name:'Сочи',           sub:'12 – 19 сентября · 8 ночей', st:'planning',  stc:'plan',  guests:14, amt:'1 260 000 ₽', hotel:'radisson', hotelName:'Radisson Collection', mgr:'anna', mgrName:'Анна К.', pay:'оплачено 40%'},
+  {id:'istanbul', name:'Стамбул',        sub:'3 – 10 октября · 7 ночей',   st:'confirmed', stc:'ok',    guests:22, amt:'2 040 000 ₽', hotel:'cvk',      hotelName:'CVK Park',            mgr:'anna', mgrName:'Анна К.', pay:'оплачено 100%'},
+  {id:'dubai',    name:'Дубай',          sub:'даты уточняются',            st:'draft',     stc:'draft', guests:0,  amt:'—',           hotel:null,       hotelName:'не выбран',           mgr:'oleg', mgrName:'Олег С.', pay:'оплат нет'},
+  {id:'redpoly',  name:'Красная Поляна', sub:'14 – 18 января · 4 ночи',    st:'завершён',  stc:'done',  guests:9,  amt:'640 000 ₽',   hotel:'rosa',     hotelName:'Rosa Springs',        mgr:'anna', mgrName:'Анна К.', pay:'закрыт'},
+];
+
+const GEN = {
+  program:[
+    {id:'d1', ic:'program', t:'Заезд, трансфер',        s:'12.09 · 14:00', tour:'sochi'},
+    {id:'d2', ic:'program', t:'Экскурсия «Роза Хутор»', s:'13.09 · 10:00', tour:'sochi'},
+    {id:'d3', ic:'program', t:'Свободный день',         s:'14.09',         tour:'sochi'},
+    {id:'d4', ic:'program', t:'Босфор, обзорная',       s:'04.10 · 11:00', tour:'istanbul'},
+  ],
+  lip:[
+    {id:'p1', ic:'lip', t:'Иванов Иван Иванович', s:'Паспорт ·· 4521 · ДР 03.05.1988', tour:'sochi'},
+    {id:'p2', ic:'lip', t:'Петрова Мария',        s:'Паспорт ·· 7734 · ДР 21.11.1990', tour:'sochi'},
+    {id:'p3', ic:'lip', t:'Сидоров Пётр',         s:'Паспорт ·· 1190 · ДР 09.02.1979', tour:'istanbul'},
+  ],
+  hotels:[
+    {id:'radisson', ic:'hotels', t:'Radisson Collection', s:'Сочи · 5★ · 14 номеров'},
+    {id:'cvk',      ic:'hotels', t:'CVK Park',            s:'Стамбул · 5★ · 22 номера'},
+    {id:'rosa',     ic:'hotels', t:'Rosa Springs',        s:'Красная Поляна · 4★ · 9 номеров'},
+  ],
+  guests:[
+    {id:'g1', ic:'user', t:'Смирнова Ольга', s:'взрослый · осн. место',  tour:'sochi'},
+    {id:'g2', ic:'user', t:'Смирнов Игорь',  s:'взрослый · осн. место',  tour:'sochi'},
+    {id:'g3', ic:'user', t:'Кузнецова Вера', s:'взрослый · осн. место',  tour:'istanbul'},
+    {id:'g4', ic:'user', t:'Волков Артём',   s:'ребёнок · доп. место',   tour:'sochi'},
+  ],
+  people:[
+    {id:'anna', ic:'user', t:'Анна К.', s:'Менеджер · 3 тура в работе'},
+    {id:'oleg', ic:'user', t:'Олег С.', s:'Менеджер · 1 тур в работе'},
+    {id:'me',   ic:'user', t:'Вы',      s:'Владелец аккаунта'},
+  ],
+};
+
+const DDS = [
+  {id:'t1', date:'02.09', t:'Предоплата группа', kind:'Приход', num: 504000, note:'40% от суммы',    tour:'sochi'},
+  {id:'t2', date:'04.09', t:'Бронь отеля',       kind:'Расход', num:-380000, note:'Radisson, депозит', tour:'sochi'},
+  {id:'t3', date:'06.09', t:'Авиабилеты',        kind:'Расход', num:-210000, note:'14 билетов',      tour:'sochi'},
+  {id:'t4', date:'10.09', t:'Доплата группа',    kind:'Приход', num: 756000, note:'Остаток 60%',     tour:'sochi'},
+  {id:'t5', date:'11.09', t:'Гид и трансфер',    kind:'Расход', num: -96000, note:'8 ночей',         tour:'sochi'},
+  {id:'t6', date:'21.09', t:'Предоплата группа', kind:'Приход', num:2040000, note:'100% от суммы',   tour:'istanbul'},
+  {id:'t7', date:'23.09', t:'Бронь отеля',       kind:'Расход', num:-820000, note:'CVK Park',        tour:'istanbul'},
+];
+const fmt = n => Math.abs(n).toLocaleString('ru-RU').replace(/ /g,' ');
+const sign = n => (n >= 0 ? '+' : '−') + fmt(n);
+
+const FILES = [
+  {n:'Договор_Сочи_2026.pdf', s:'1.2 МБ', ic:'doc'},
+  {n:'Ваучер_отель.pdf',      s:'340 КБ', ic:'receipt'},
+  {n:'Схема_рассадки.jpg',    s:'890 КБ', ic:'img'},
+];
+
+/* ---------- роутер ---------- */
+/* Разделы, привязанные к конкретному туру. Остальные (Туры, Отели) —
+   общие справочники и живут вне контекста тура. */
+const SCOPED = ['program','lip','guests','dds'];
+let ctx = 'sochi';           // текущий тур-контекст; 'all' = сводно по всем
+
+let stack = [];
+let cur = {v:'home', p:{section:'tours'}};
+
+function go(v, p, replace) {
+  p = p || {};
+  if (!replace) stack.push(cur);
+  cur = {v:v, p:p};
+  draw();
+}
+function goBack() { if (stack.length) { cur = stack.pop(); draw(); } }
+function toast(m) {
+  const t = document.getElementById('toast');
+  t.textContent = m; t.classList.add('show');
+  clearTimeout(window.__tt);
+  window.__tt = setTimeout(function(){ t.classList.remove('show'); }, 1700);
+}
+const findT = id => TOURS.find(x => x.id === id);
+const findG = (s,id) => (GEN[s]||[]).find(x => x.id === id);
+function st(text, cls, click) {
+  return '<span class="st '+cls+'"'+(click?' onclick="'+click+'"':'')+'><span class="d"></span>'+text+'</span>';
+}
+
+const ST_COLOR = {plan:'var(--st-plan)', ok:'var(--st-ok)', draft:'var(--st-draft)', done:'var(--st-done)'};
+const inCtx = x => ctx === 'all' || x.tour === ctx;
+function setCtx(id){ ctx = id; goBack(); }
+
+/* Строка контекста: по какому туру открыт раздел */
+function ctxbar(section){
+  if (!SCOPED.includes(section)) {
+    return '<div class="ctx-glob">'+ic('hist',13)+'Общий справочник — не зависит от тура</div>';
+  }
+  const t = ctx === 'all' ? null : findT(ctx);
+  const col = t ? ST_COLOR[t.stc] : 'var(--text-3)';
+  return '<div class="ctxbar" onclick="go(\'picker\',{from:\''+section+'\'})">'+
+    '<div class="ctx-x"><div class="ctx-k">Раздел по туру</div>'+
+    '<div class="ctx-v"><span class="ctx-dot" style="background:'+col+'"></span>'+
+      (t ? t.name : 'Все туры · сводно')+'</div></div>'+
+    '<span class="ctx-sw">Сменить'+ic('chev',13)+'</span></div>';
+}
+
+/* Экран выбора тура-контекста */
+function vPicker(from){
+  const rows = [{id:'all', name:'Все туры', sub:'сводно по всем турам', stc:'draft'}].concat(TOURS);
+  return '<div class="sheet"><div class="sheet-h">'+
+    '<div class="crumb" onclick="goBack()">'+ic('back',13)+'Назад</div>'+
+    '<h1 style="font-size:20px;">Выбор тура</h1>'+
+    '<div class="sub">Раздел «'+SEC[from].name+'» покажет данные выбранного тура</div></div>'+
+    rows.map(function(r){
+      const on = r.id === ctx;
+      return '<div class="pick '+(on?'on':'')+'" onclick="setCtx(\''+r.id+'\')">'+
+        '<div><div class="pick-t"><span class="ctx-dot" style="background:'+ST_COLOR[r.stc]+'"></span>'+r.name+'</div>'+
+        '<div class="pick-s">'+(r.sub || r.sub === '' ? r.sub : r.sub)+'</div></div>'+
+        (on ? '<span style="color:var(--accent);font-size:11.5px;font-weight:650">выбран</span>' : '<span class="chev">'+ic('chev',14)+'</span>')+
+      '</div>';
+    }).join('') + '</div>';
+}
+
+/* ---------- экраны ---------- */
+function lane(active) {
+  return '<div class="lane">' + ORDER.map(function(k){
+    const s = SEC[k];
+    return '<div class="lane-item '+(k===active?'on':'')+'" onclick="go(\'home\',{section:\''+k+'\'},1)">'+
+      ic(s.icon,17)+'<div class="li-n">'+s.name+'</div><div class="li-c">'+s.count+'</div></div>';
+  }).join('') + '</div>';
+}
+
+function vHome(section) {
+  const s = SEC[section];
+  let inner = '';
+
+  if (section === 'tours') {
+    inner = '<div class="list">' + TOURS.map(function(t){
+      return '<div class="item" onclick="go(\'detail\',{section:\'tours\',id:\''+t.id+'\'})">'+
+        '<div class="item-top">'+
+          '<div><div class="item-name">'+t.name+'</div><div class="item-sub">'+t.sub+'</div></div>'+
+          '<div><div class="item-amt">'+t.amt+'</div><div style="margin-top:6px;text-align:right;">'+st(t.st,t.stc)+'</div></div>'+
+        '</div>'+
+        '<div class="facts">'+
+          '<div class="fact"><div class="k">Гостей</div><div class="v">'+(t.guests||'—')+'</div></div>'+
+          '<div class="fact"><div class="k">Отель</div><div class="v">'+t.hotelName+'</div></div>'+
+          '<div class="fact"><div class="k">Оплата</div><div class="v">'+t.pay+'</div></div>'+
+        '</div></div>';
+    }).join('') + '</div>';
+
+  } else if (section === 'dds') {
+    const rows = DDS.filter(inCtx);
+    const income  = rows.filter(d => d.num > 0).reduce((a,d) => a + d.num, 0);
+    const outcome = rows.filter(d => d.num < 0).reduce((a,d) => a + d.num, 0);
+    const showTour = ctx === 'all';
+    inner = '<div class="tbl"><div class="tbl-scroll"><table class="data">'+
+      '<thead><tr><th>Дата</th>'+(showTour?'<th>Тур</th>':'')+'<th>Статья</th><th>Тип</th><th class="num">Сумма, ₽</th><th>Комментарий</th></tr></thead><tbody>'+
+      rows.map(function(d){
+        return '<tr onclick="go(\'detail\',{section:\'ddstx\',id:\''+d.id+'\'})">'+
+          '<td style="color:var(--text-3)">'+d.date+'</td>'+
+          (showTour?'<td style="color:var(--accent)">'+findT(d.tour).name+'</td>':'')+
+          '<td>'+d.t+'</td>'+
+          '<td style="color:var(--text-3)">'+d.kind+'</td>'+
+          '<td class="num '+(d.num>0?'pos':'neg')+'">'+sign(d.num)+'</td>'+
+          '<td style="color:var(--text-3)">'+d.note+'</td></tr>';
+      }).join('') + '</tbody></table></div></div>'+
+      '<div class="totals">'+
+        '<div class="tot"><div class="k">Приход</div><div class="v pos">+'+fmt(income)+'</div></div>'+
+        '<div class="tot"><div class="k">Расход</div><div class="v neg">−'+fmt(outcome)+'</div></div>'+
+        '<div class="tot"><div class="k">Остаток</div><div class="v">'+fmt(income+outcome)+'</div></div>'+
+      '</div>';
+
+  } else {
+    const rows = GEN[section].filter(inCtx);
+    inner = '<div class="list">' + rows.map(function(g){
+      return '<div class="lrow" onclick="go(\'detail\',{section:\''+section+'\',id:\''+g.id+'\'})">'+
+        '<div class="lrow-ic">'+ic(g.ic,15)+'</div>'+
+        '<div class="lrow-x"><div class="lrow-t">'+g.t+'</div><div class="lrow-s">'+
+          (ctx==='all' && SCOPED.includes(section) && findT(g.tour)
+            ? '<span style="color:var(--accent)">'+findT(g.tour).name+'</span> · ' : '')+g.s+'</div></div>'+
+        '<span class="chev">'+ic('chev',15)+'</span></div>';
+    }).join('') + '</div>';
+  }
+
+  /* подпись под заголовком всегда сообщает, чьи это данные */
+  let cnt = s.count;
+  if (SCOPED.includes(section)) {
+    const n = (section === 'dds' ? DDS : GEN[section]).filter(inCtx).length;
+    cnt = (ctx === 'all' ? 'Все туры' : 'Тур «'+findT(ctx).name+'»') + ' · записей: ' + n;
+  }
+
+  return lane(section) + ctxbar(section) +
+    '<div class="head"><div><h2>'+s.name+'</h2><div class="cnt">'+cnt+'</div></div>'+
+    '<div class="head-add" onclick="go(\'create\',{section:\''+section+'\'})">'+ic('plus',16)+'</div></div>' + inner;
+}
+
+function vTour(id) {
+  const t = findT(id);
+  const hotelGo = t.hotel ? "go('detail',{section:'hotels',id:'"+t.hotel+"'})" : "go('create',{section:'hotels'})";
+  return (
+    '<div class="sheet"><div class="sheet-h">'+
+      '<div class="crumb" onclick="goBack()">'+ic('back',13)+'Все туры</div>'+
+      '<h1>'+t.name+'</h1><div class="sub">'+t.sub+'</div>'+
+      '<div class="sheet-tags">'+
+        st(t.st, t.stc, "go('detail',{section:'status',id:'"+t.id+"'})")+
+        st(t.pay, 'ok', "go('home',{section:'dds'})")+
+      '</div></div>'+
+      '<div class="spec" onclick="go(\'home\',{section:\'guests\'})"><span class="k">Гостей</span><span class="rt"><span class="v">'+t.guests+'</span><span class="chev">'+ic('chev',14)+'</span></span></div>'+
+      '<div class="spec" onclick="go(\'home\',{section:\'dds\'})"><span class="k">Бюджет</span><span class="rt"><span class="v">'+t.amt+'</span><span class="chev">'+ic('chev',14)+'</span></span></div>'+
+      '<div class="spec" onclick="'+hotelGo+'"><span class="k">Отель</span><span class="rt"><span class="v">'+t.hotelName+'</span><span class="chev">'+ic('chev',14)+'</span></span></div>'+
+      '<div class="spec" onclick="go(\'detail\',{section:\'people\',id:\''+t.mgr+'\'})"><span class="k">Менеджер</span><span class="rt"><span class="v">'+t.mgrName+'</span><span class="chev">'+ic('chev',14)+'</span></span></div>'+
+    '</div>'+
+
+    '<div class="sec"><div class="sec-t">Файлы и вложения</div><div class="panel">'+
+      FILES.map(function(f){
+        return '<div class="frow" onclick="go(\'file\',{name:\''+f.n+'\'})">'+
+          '<div class="frow-ic">'+ic(f.ic,15)+'</div>'+
+          '<div class="frow-n">'+f.n+'</div><div class="frow-s">'+f.s+'</div>'+
+          '<span class="chev">'+ic('chev',14)+'</span></div>';
+      }).join('') + '</div></div>'+
+
+    '<div class="sec"><div class="sec-t">Программа тура</div><div class="panel">'+
+      '<table class="grid"><thead><tr><th>День</th><th>Время</th><th>Пункт</th></tr></thead><tbody>'+
+      GEN.program.map(function(p){
+        const parts = p.s.split(' · ');
+        return '<tr onclick="go(\'detail\',{section:\'program\',id:\''+p.id+'\'})">'+
+          '<td style="color:var(--text-3)">'+parts[0]+'</td><td style="color:var(--text-3)">'+(parts[1]||'—')+'</td><td>'+p.t+'</td></tr>';
+      }).join('') + '</tbody></table></div></div>'+
+
+    '<div class="acts">'+
+      '<div class="acts-row">'+
+        '<div class="btn" onclick="go(\'home\',{section:\'guests\'})">'+ic('guests',15)+'Гости · '+t.guests+'</div>'+
+        '<div class="btn" onclick="go(\'home\',{section:\'dds\'})">'+ic('wallet',15)+'Смета</div>'+
+      '</div>'+
+      '<div class="btn pri" onclick="toast(\'Открыт чат с группой (демо)\')">'+ic('chat',15)+'Чат с группой</div>'+
+    '</div>'
+  );
+}
+
+function vDetail(section, id) {
+  if (section === 'ddstx') {
+    const d = DDS.find(x => x.id === id);
+    return (
+      '<div class="sheet"><div class="sheet-h">'+
+        '<div class="crumb" onclick="goBack()">'+ic('back',13)+'ДДС</div>'+
+        '<h1 style="font-size:20px;">'+d.t+'</h1><div class="sub">'+d.date+' · '+d.kind+'</div></div>'+
+        '<div class="spec"><span class="k">Сумма</span><span class="rt"><span class="v '+d.cls+'">'+d.amt+' ₽</span></span></div>'+
+        '<div class="spec"><span class="k">Комментарий</span><span class="rt"><span class="v">'+d.note+'</span></span></div>'+
+        '<div class="spec" onclick="go(\'detail\',{section:\'tours\',id:\'sochi\'})"><span class="k">Тур</span><span class="rt"><span class="v">Сочи</span><span class="chev">'+ic('chev',14)+'</span></span></div>'+
+      '</div>'+
+      '<div class="acts"><div class="btn" onclick="go(\'home\',{section:\'dds\'})">Все операции</div></div>'
+    );
+  }
+  if (section === 'status') {
+    return (
+      '<div class="sheet"><div class="sheet-h">'+
+        '<div class="crumb" onclick="goBack()">'+ic('back',13)+'Тур</div>'+
+        '<h1 style="font-size:20px;">История статуса</h1><div class="sub">Тур «Сочи»</div></div>'+
+        '<div class="spec"><span class="k">'+st('planning','plan')+'</span><span class="rt"><span class="v" style="color:var(--text-3);font-weight:500">20.08.2026 · Анна К.</span></span></div>'+
+        '<div class="spec"><span class="k">'+st('draft','draft')+'</span><span class="rt"><span class="v" style="color:var(--text-3);font-weight:500">02.08.2026 · Анна К.</span></span></div>'+
+      '</div>'+
+      '<div class="acts"><div class="btn" onclick="go(\'detail\',{section:\'tours\',id:\'sochi\'})">К карточке тура</div></div>'
+    );
+  }
+  const g = findG(section, id) || {t:'Не найдено', s:'', ic:'doc'};
+  const s = SEC[section] || {name:'Раздел'};
+  return (
+    '<div class="sheet"><div class="sheet-h">'+
+      '<div class="crumb" onclick="goBack()">'+ic('back',13)+s.name+'</div>'+
+      '<h1 style="font-size:21px;">'+g.t+'</h1><div class="sub">'+g.s+'</div></div>'+
+      '<div class="spec" onclick="go(\'detail\',{section:\'tours\',id:\'sochi\'})"><span class="k">Связанный тур</span><span class="rt"><span class="v">Сочи</span><span class="chev">'+ic('chev',14)+'</span></span></div>'+
+      '<div class="spec" onclick="go(\'home\',{section:\''+section+'\'})"><span class="k">Все записи</span><span class="rt"><span class="v">'+s.name+'</span><span class="chev">'+ic('chev',14)+'</span></span></div>'+
+    '</div>'+
+    '<div class="acts"><div class="btn pri" onclick="toast(\'Редактирование (демо)\')">Редактировать</div></div>'
+  );
+}
+
+function vFile(name) {
+  const f = FILES.find(x => x.n === name) || {ic:'doc', s:''};
+  return (
+    '<div class="sheet"><div class="sheet-h">'+
+      '<div class="crumb" onclick="goBack()">'+ic('back',13)+'Файлы</div>'+
+      '<h1 style="font-size:17px;letter-spacing:-.01em;">'+name+'</h1><div class="sub">'+f.s+'</div></div></div>'+
+    '<div class="fview">'+ic(f.ic,56)+'</div>'+
+    '<div class="acts"><div class="acts-row">'+
+      '<div class="btn" onclick="toast(\'Скачивание (демо)\')">'+ic('down',15)+'Скачать</div>'+
+      '<div class="btn" onclick="toast(\'Ссылка скопирована (демо)\')">'+ic('share',15)+'Поделиться</div>'+
+    '</div></div>'
+  );
+}
+
+function vCreate(section) {
+  const s = SEC[section] || {name:'Запись'};
+  return (
+    '<div class="sheet"><div class="sheet-h">'+
+      '<div class="crumb" onclick="goBack()">'+ic('back',13)+'Отмена</div>'+
+      '<h1 style="font-size:20px;">Новая запись</h1><div class="sub">Раздел «'+s.name+'»</div></div>'+
+      '<div class="spec" onclick="toast(\'Ввод названия (демо)\')"><span class="k">Название</span><span class="rt"><span class="v" style="color:var(--text-3)">—</span><span class="chev">'+ic('chev',14)+'</span></span></div>'+
+      '<div class="spec" onclick="toast(\'Выбор даты (демо)\')"><span class="k">Дата</span><span class="rt"><span class="v" style="color:var(--text-3)">—</span><span class="chev">'+ic('chev',14)+'</span></span></div>'+
+      '<div class="spec" onclick="toast(\'Выбор статуса (демо)\')"><span class="k">Статус</span><span class="rt"><span class="v" style="color:var(--text-3)">draft</span><span class="chev">'+ic('chev',14)+'</span></span></div>'+
+    '</div>'+
+    '<div class="acts"><div class="btn pri" onclick="toast(\'Сохранено (демо)\'); goBack();">Сохранить</div></div>'
+  );
+}
+
+function vMenu() {
+  const rows = [
+    ['user','Профиль',                 "go('detail',{section:'people',id:'me'})"],
+    ['gear','Настройки',               "toast('Настройки (демо)')"],
+    ['share','Поделиться приложением', "toast('Ссылка скопирована (демо)')"],
+    ['hist','История действий',        "toast('История (демо)')"],
+  ];
+  return (
+    '<div class="sheet"><div class="sheet-h">'+
+      '<div class="crumb" onclick="goBack()">'+ic('back',13)+'Закрыть</div>'+
+      '<h1 style="font-size:20px;">Меню</h1></div>'+
+      rows.map(function(r){
+        return '<div class="spec" onclick="'+r[2]+'"><span class="k" style="display:flex;align-items:center;gap:10px;color:var(--text)">'+ic(r[0],15)+r[1]+'</span><span class="chev">'+ic('chev',14)+'</span></div>';
+      }).join('') +
+    '</div>'
+  );
+}
+
+function vMore() {
+  return (
+    '<div class="sheet"><div class="sheet-h">'+
+      '<div class="crumb" onclick="goBack()">'+ic('back',13)+'Назад</div>'+
+      '<h1 style="font-size:20px;">Все разделы</h1></div>'+
+      ORDER.map(function(k){
+        return '<div class="spec" onclick="go(\'home\',{section:\''+k+'\'})">'+
+          '<span class="k" style="display:flex;align-items:center;gap:10px;color:var(--text)">'+ic(SEC[k].icon,15)+SEC[k].name+'</span>'+
+          '<span class="rt"><span class="v" style="color:var(--text-3);font-weight:500">'+SEC[k].count+'</span><span class="chev">'+ic('chev',14)+'</span></span></div>';
+      }).join('') +
+    '</div>'
+  );
+}
+
+/* ---------- рендер ---------- */
+function draw() {
+  const root = document.getElementById('body');
+  document.getElementById('back').style.visibility = stack.length ? 'visible' : 'hidden';
+
+  if (cur.v === 'home')        root.innerHTML = vHome(cur.p.section);
+  else if (cur.v === 'detail') root.innerHTML = cur.p.section === 'tours' ? vTour(cur.p.id) : vDetail(cur.p.section, cur.p.id);
+  else if (cur.v === 'file')   root.innerHTML = vFile(cur.p.name);
+  else if (cur.v === 'create') root.innerHTML = vCreate(cur.p.section);
+  else if (cur.v === 'picker') root.innerHTML = vPicker(cur.p.from);
+  else if (cur.v === 'menu')   root.innerHTML = vMenu();
+  else if (cur.v === 'more')   root.innerHTML = vMore();
+  root.scrollTop = 0;
+
+  document.querySelectorAll('.nv').forEach(function(el){ el.classList.remove('on'); });
+  if (cur.v === 'home') {
+    const el = document.getElementById('nv-' + cur.p.section);
+    if (el) el.classList.add('on');
+  } else if (cur.v === 'more') {
+    document.getElementById('nv-more').classList.add('on');
+  }
+}
+
+/* иконки в статичной разметке шапки и нижней навигации */
+function paint() {
+  document.getElementById('back').innerHTML = ic('back',16);
+  document.getElementById('menu-btn').innerHTML = ic('dots',16);
+  document.getElementById('nv-tours').innerHTML  = ic('tours',18)  + '<span>Туры</span>';
+  document.getElementById('nv-guests').innerHTML = ic('guests',18) + '<span>Гости</span>';
+  document.getElementById('nv-dds').innerHTML    = ic('dds',18)    + '<span>ДДС</span>';
+  document.getElementById('nv-more').innerHTML   = ic('gear',18)   + '<span>Ещё</span>';
+}
+
+paint();
+draw();
+</script>
+</body>
+</html>

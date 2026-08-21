@@ -1,23 +1,34 @@
 # FEATURE: channel_monitor
-# COMPATIBLE_WITH: *
-"""Reusable Telegram channel-monitoring feature module — turns ANY compatible
-factory bot into a userbot-backed aggregator of other Telegram channels via a
-Telethon Client-API session the bot's owner authorizes through this feature's
-own FSM. See docs/USERBOT_FEATURE_DESIGN.md for the full design (this module
-implements that design after all 5 open questions were resolved: session is
-per-bot/isolated, COMPATIBLE_WITH is "*", userbot-worker stays one process,
-templates/channel_monitor.py is retired in favor of this feature,
-TELEGRAM_API_ID/API_HASH/USERBOT_ENCRYPTION_KEY stay shared factory-wide) and
-docs/USERBOT_CHANNEL_MONITOR_DESIGN.md for the underlying Telethon mechanics
-(session storage, FSM error handling, process model, Gemini integration).
+# COMPATIBLE_WITH: channel_aggregator
+"""Reusable Telegram channel-monitoring feature module. As of the owner's
+2026-08-21 decision, channel monitoring is offered to factory users ONLY as
+its own standalone bot type (templates/channel_aggregator.py, which imports
+this module's router/init_db directly and auto-enables it — see that file's
+docstring) — this module is no longer offered as a pluggable feature for
+arbitrary templates (COMPATIBLE_WITH used to be "*", letting the owner attach
+it to any bot; that is reverted here). COMPATIBLE_WITH now names only
+channel_aggregator, so handlers/manage_bots.py's Features panel never offers
+it to a NEW bot of any other template.
+
+features/channel_monitor.py itself is deliberately NOT deleted and its module
+path is unchanged: bot_id=12 (tour_operator_demo) already has "channel_monitor"
+enabled in bot_features from before this decision, and
+runtime/registry.py's _load_and_include_features() imports feature modules by
+that exact bot_features name — deleting or renaming the file would break that
+bot, which the owner explicitly asked to leave untouched. It keeps working,
+"orphaned": functional for bot 12, invisible to everyone else's Features
+panel. See docs/USERBOT_FEATURE_DESIGN.md for the (now superseded) design
+that made this a universal "*" feature, and
+docs/CHANNEL_AGGREGATOR_TEMPLATE_DESIGN.md for the standalone-template design
+that replaces it as the only way to get channel monitoring on a new bot.
 
 Exposes a module-level `router` so runtime/registry.py's
-_load_and_include_features() can clone and attach it to any bot that has
-"channel_monitor" enabled in bot_features — the same by-convention mechanism
-features/payments.py and features/sellable_items.py already use. This module
-does NOT own the host bot's /start — it only adds a "📡 Мониторинг каналов"
-entry point (button/command) into whatever menu the host template already
-has, via `bot_commands` below.
+_load_and_include_features() can clone and attach it to bot_id=12 (the sole
+remaining bot with "channel_monitor" enabled in bot_features) and
+templates/channel_aggregator.py can wire it directly into its own Dispatcher.
+This module does NOT own the host bot's /start — it only adds a "📡 Мониторинг
+каналов" entry point (button/command) into whatever menu the host template
+already has, via `bot_commands` below.
 
 Session ownership (design doc §2, Variant A): one userbot Telethon session
 belongs to exactly ONE bot_id, stored in that bot's OWN per-bot db_path (same

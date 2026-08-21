@@ -1,5 +1,14 @@
 # Дизайн: `channel_monitor` как feature-модуль (а не отдельный юзербот-продукт)
 
+> **УСТАРЕЛО (2026-08-21).** Владелец развернул решение обратно: мониторинг каналов
+> снова только отдельный тип бота — `templates/channel_aggregator.py` (см.
+> [docs/CHANNEL_AGGREGATOR_TEMPLATE_DESIGN.md](CHANNEL_AGGREGATOR_TEMPLATE_DESIGN.md)).
+> `features/channel_monitor.py` физически остался в репозитории (не удалён) только
+> ради уже существующего бота 12 (tour_operator_demo), у которого фича была включена
+> до этого решения — `COMPATIBLE_WITH` сужен до `channel_aggregator`, конструктор
+> больше не предлагает её как опцию для новых ботов любого другого шаблона. Документ
+> ниже описывает дизайн, который теперь отменён, оставлен для истории.
+
 Продолжение [docs/CHANNEL_MONITOR_DESIGN.md](CHANNEL_MONITOR_DESIGN.md) (отклонённый Bot-API-вариант)
 и [docs/USERBOT_CHANNEL_MONITOR_DESIGN.md](USERBOT_CHANNEL_MONITOR_DESIGN.md) (принятая Telethon-архитектура,
 но как **отдельный standalone-продукт** `templates/channel_monitor.py`). Новое требование владельца:

@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Mini App Mockup — Вариант C: Bento Hybrid</title>
+<style>
+  /* ============================================================
+     ДИЗАЙН-ТОКЕНЫ — при выборе варианта переносятся в реальный
+     miniapp одним слоем. themeParams Telegram сознательно НЕ
+     используется для базовых цветов — фирменная палитра
+     не зависит от темы клиента пользователя.
+     ============================================================ */
+  :root {
+    --bg-0: #0e0e16;
+    --bg-1: #15151f;
+    --surface: #1a1a26;
+    --surface-hi: #20202f;
+    --border: rgba(255,255,255,0.08);
+    --border-strong: rgba(140,110,255,0.4);
+    --accent: #8c6eff;
+    --accent-2: #5ee0c4;
+    --accent-soft: rgba(140,110,255,0.15);
+    --text: #eeedf7;
+    --text-dim: #9a97b3;
+    --muted: #6b6884;
+    --success: #5ee0c4;
+    --warning: #ffb45c;
+    --danger: #ff6b8b;
+    --radius: 18px;
+    --radius-sm: 14px;
+    --font: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Inter", system-ui, sans-serif;
+  }
+
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html,body { margin:0; padding:0; background:#050508; }
+  body {
+    font-family: var(--font);
+    color: var(--text);
+    display:flex; flex-direction:column; align-items:center;
+    gap:48px; padding:48px 12px;
+  }
+
+  .device {
+    width: 390px; max-width:100%; min-height: 844px;
+    background: var(--bg-0);
+    position:relative;
+    box-shadow: 0 30px 80px rgba(0,0,0,0.6);
+    border: 1px solid rgba(255,255,255,0.05);
+    overflow:hidden;
+  }
+
+  .label {
+    color:#736f92; font-size:13px; letter-spacing:0.02em; font-weight:600;
+    text-transform:uppercase; margin-bottom:10px; text-align:center;
+  }
+
+  .topbar {
+    display:flex; align-items:center; justify-content:space-between;
+    padding: 18px 18px 8px;
+  }
+  .topbar .brand { display:flex; align-items:center; gap:10px; }
+  .topbar .avatar {
+    width:34px; height:34px; border-radius:11px;
+    background: linear-gradient(135deg, var(--accent), var(--accent-2));
+    display:flex; align-items:center; justify-content:center;
+    font-weight:800; font-size:13px; color:#0e0e16;
+  }
+  .topbar .title { font-size:16px; font-weight:800; }
+  .topbar .sub { font-size:11.5px; color:var(--muted); }
+  .icon-btn {
+    width:34px; height:34px; border-radius:11px;
+    background: var(--surface); border:1px solid var(--border);
+    display:flex; align-items:center; justify-content:center; color: var(--text-dim);
+  }
+
+  /* --- Карусель разделов --- */
+  .carousel { display:flex; gap:10px; overflow-x:auto; padding: 12px 18px 16px; }
+  .carousel::-webkit-scrollbar{display:none;}
+  .sect-card {
+    flex:0 0 auto; width:96px; height:82px;
+    border-radius: var(--radius-sm);
+    background: var(--surface); border:1px solid var(--border);
+    padding:11px; display:flex; flex-direction:column; justify-content:space-between;
+  }
+  .sect-card .icon { font-size:18px; }
+  .sect-card .name { font-size:12px; font-weight:700; color:var(--text-dim); }
+  .sect-card.active {
+    background: linear-gradient(155deg, var(--accent), #6a4fe0);
+    border-color: transparent;
+  }
+  .sect-card.active .name { color:#0e0e16; }
+  .sect-card.active .icon { filter: none; }
+
+  .section-head { display:flex; align-items:center; justify-content:space-between; padding: 4px 18px 14px; }
+  .section-head h2 { font-size:21px; margin:0; font-weight:800; }
+  .add-btn {
+    width:34px; height:34px; border-radius:11px;
+    background: linear-gradient(135deg, var(--accent), #6a4fe0);
+    color:#fff; font-size:18px; display:flex; align-items:center; justify-content:center; font-weight:700;
+  }
+
+  /* --- Bento grid: карточки разного размера --- */
+  .bento { display:grid; grid-template-columns: repeat(2, 1fr); gap:10px; padding: 0 18px 24px; }
+  .bcard {
+    background: var(--surface); border:1px solid var(--border);
+    border-radius: var(--radius); padding:14px; position:relative; overflow:hidden;
+  }
+  .bcard.wide { grid-column: 1 / -1; }
+  .bcard .b-icon {
+    width:34px; height:34px; border-radius:10px; background: var(--accent-soft);
+    display:flex; align-items:center; justify-content:center; font-size:16px; margin-bottom:10px;
+  }
+  .bcard .b-title { font-size:15.5px; font-weight:800; margin-bottom:3px; }
+  .bcard .b-meta { font-size:11.5px; color:var(--text-dim); }
+  .bcard .b-badge {
+    position:absolute; top:14px; right:14px;
+    font-size:10px; font-weight:800; padding:4px 8px; border-radius:8px;
+  }
+  .b-badge.planning { background: rgba(255,180,92,0.16); color:var(--warning); }
+  .b-badge.confirmed { background: rgba(94,224,196,0.16); color:var(--success); }
+  .b-badge.draft { background: rgba(107,104,132,0.2); color:var(--muted); }
+  .b-badge.done { background: rgba(140,110,255,0.18); color:var(--accent); }
+  .bcard .b-stats { display:flex; gap:12px; margin-top:12px; padding-top:10px; border-top:1px solid var(--border); font-size:11px; color:var(--text-dim); }
+  .bcard .b-stats b { color:var(--text); }
+  .bcard.wide .b-row { display:flex; justify-content:space-between; align-items:flex-start; }
+
+  /* --- Экран 2: деталка --- */
+  .hero { margin: 4px 18px 16px; border-radius: var(--radius); padding:20px;
+    background: linear-gradient(160deg, var(--surface-hi), var(--bg-1));
+    border:1px solid var(--border-strong); position:relative; overflow:hidden; }
+  .hero::after { content:""; position:absolute; top:-40px; right:-40px; width:140px; height:140px;
+    background: radial-gradient(circle, var(--accent-soft), transparent 70%); }
+  .hero-back { font-size:12.5px; color:var(--text-dim); margin-bottom:14px; }
+  .hero h1 { font-size:25px; margin:0 0 6px; font-weight:800; }
+  .hero .hero-badges { display:flex; gap:8px; margin-top:10px; }
+
+  .detail-grid { display:grid; grid-template-columns: repeat(2,1fr); gap:10px; margin:0 18px 16px; }
+  .field { background: var(--surface); border:1px solid var(--border); border-radius: var(--radius-sm); padding:12px 14px; }
+  .field .k { font-size:10.5px; color:var(--muted); text-transform:uppercase; letter-spacing:.04em; margin-bottom:4px; }
+  .field .v { font-size:14.5px; font-weight:800; }
+
+  .block { margin:0 18px 16px; }
+  .block h3 { font-size:13px; color:var(--text-dim); margin:0 0 10px; font-weight:800; }
+
+  .files { display:grid; grid-template-columns: repeat(3, 1fr); gap:8px; }
+  .file-tile {
+    background: var(--surface); border:1px solid var(--border); border-radius: var(--radius-sm);
+    padding:12px 8px; text-align:center;
+  }
+  .file-tile .fi { font-size:20px; margin-bottom:6px; }
+  .file-tile .fn { font-size:10.5px; font-weight:700; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .file-tile .fs { font-size:9.5px; color:var(--muted); margin-top:2px; }
+
+  .mini-table { background: var(--surface); border:1px solid var(--border); border-radius: var(--radius-sm); overflow:hidden; }
+  .mini-table table { width:100%; border-collapse:collapse; font-size:12px; }
+  .mini-table th { text-align:left; padding:9px 12px; color:var(--muted); background: rgba(255,255,255,0.02); font-size:10px; text-transform:uppercase; }
+  .mini-table td { padding:9px 12px; border-top:1px solid var(--border); }
+
+  .actions { display:grid; grid-template-columns: 1fr 1fr; gap:10px; margin:0 18px; }
+  .action-btn { display:flex; align-items:center; justify-content:center; gap:8px; padding:14px; border-radius: var(--radius-sm); font-size:13.5px; font-weight:800; border:1px solid var(--border); background: var(--surface); }
+  .action-btn.primary { grid-column: 1/-1; background: linear-gradient(135deg, var(--accent), #6a4fe0); border:none; color:#fff; }
+
+  /* --- Экран 3: таблица --- */
+  .table-wrap { margin: 0 18px 20px; border-radius: var(--radius); overflow:hidden; border:1px solid var(--border); }
+  .table-scroll { overflow-x:auto; background: var(--surface); }
+  table.data { width:100%; border-collapse:collapse; min-width:560px; font-size:12.5px; }
+  table.data thead th { position:sticky; top:0; text-align:left; padding:11px 14px; background: var(--surface-hi); color: var(--text-dim); font-weight:800; font-size:10.5px; text-transform:uppercase; border-bottom:1px solid var(--border-strong); }
+  table.data td { padding:11px 14px; border-top:1px solid var(--border); white-space:nowrap; }
+  .amt-in { color: var(--success); font-weight:800; }
+  .amt-out { color: var(--danger); font-weight:800; }
+  .table-total { display:flex; justify-content:space-between; padding:14px 18px 0; font-size:13px; color:var(--text-dim); }
+  .table-total b { color:var(--text); font-size:16px; }
+
+  .bottom-nav { margin: 18px 18px 18px; display:flex; justify-content:space-around; padding:10px 6px; border-radius: var(--radius-sm); background: var(--surface); border:1px solid var(--border); }
+  .bottom-nav .n { display:flex; flex-direction:column; align-items:center; gap:4px; font-size:10px; color:var(--muted); }
+  .bottom-nav .n.active { color: var(--accent); }
+</style>
+</head>
+<body>
+
+<div class="label">Экран 1 — Разделы (лента) + bento-список Туров</div>
+<div class="device">
+  <div class="topbar">
+    <div class="brand">
+      <div class="avatar">ТО</div>
+      <div><div class="title">TravelOps</div><div class="sub">Тур-оператор</div></div>
+    </div>
+    <div class="icon-btn">⋯</div>
+  </div>
+
+  <div class="carousel">
+    <div class="sect-card active"><div class="icon">🧳</div><div class="name">Туры</div></div>
+    <div class="sect-card"><div class="icon">📋</div><div class="name">Программа</div></div>
+    <div class="sect-card"><div class="icon">🧑‍🤝‍🧑</div><div class="name">ЛиП</div></div>
+    <div class="sect-card"><div class="icon">🏨</div><div class="name">Отели</div></div>
+    <div class="sect-card"><div class="icon">👥</div><div class="name">Гости</div></div>
+    <div class="sect-card"><div class="icon">💰</div><div class="name">ДДС</div></div>
+  </div>
+
+  <div class="section-head"><h2>Туры</h2><div class="add-btn">＋</div></div>
+
+  <div class="bento">
+    <div class="bcard wide">
+      <div class="b-row">
+        <div>
+          <div class="b-icon">🏝️</div>
+          <div class="b-title">Сочи</div>
+          <div class="b-meta">12 – 19 сентября · 8 ночей</div>
+        </div>
+        <div class="b-badge planning">planning</div>
+      </div>
+      <div class="b-stats">
+        <span>👥 <b>14</b> гостей</span>
+        <span>🏨 <b>Radisson</b></span>
+        <span>💵 <b>1 260 000 ₽</b></span>
+      </div>
+    </div>
+
+    <div class="bcard">
+      <div class="b-badge confirmed">confirmed</div>
+      <div class="b-icon">🕌</div>
+      <div class="b-title">Стамбул</div>
+      <div class="b-meta">3–10 окт · 22 гостя</div>
+    </div>
+
+    <div class="bcard">
+      <div class="b-badge draft">draft</div>
+      <div class="b-icon">🏜️</div>
+      <div class="b-title">Дубай</div>
+      <div class="b-meta">даты уточняются</div>
+    </div>
+
+    <div class="bcard wide">
+      <div class="b-row">
+        <div>
+          <div class="b-icon">🏔️</div>
+          <div class="b-title">Красная Поляна</div>
+          <div class="b-meta">14 – 18 января · 4 ночи</div>
+        </div>
+        <div class="b-badge done">завершён</div>
+      </div>
+      <div class="b-stats">
+        <span>👥 <b>9</b> гостей</span>
+        <span>🏨 <b>Rosa Springs</b></span>
+        <span>💵 <b>640 000 ₽</b></span>
+      </div>
+    </div>
+  </div>
+
+  <div class="bottom-nav">
+    <div class="n active">🧳<span>Туры</span></div>
+    <div class="n">👥<span>Гости</span></div>
+    <div class="n">💰<span>ДДС</span></div>
+    <div class="n">⚙️<span>Ещё</span></div>
+  </div>
+</div>
+
+<div class="label">Экран 2 — Детальная карточка тура «Сочи»</div>
+<div class="device">
+  <div class="topbar">
+    <div class="icon-btn">←</div>
+    <div class="icon-btn">✎</div>
+  </div>
+
+  <div class="hero">
+    <div class="hero-back">← Все туры</div>
+    <h1>Сочи</h1>
+    <div class="b-meta">12 – 19 сентября 2026 · 8 ночей</div>
+    <div class="hero-badges">
+      <div class="b-badge planning" style="position:static;">planning</div>
+      <div class="b-badge confirmed" style="position:static;">оплата 40%</div>
+    </div>
+  </div>
+
+  <div class="detail-grid">
+    <div class="field"><div class="k">Гостей</div><div class="v">14 человек</div></div>
+    <div class="field"><div class="k">Бюджет</div><div class="v">1 260 000 ₽</div></div>
+    <div class="field"><div class="k">Отель</div><div class="v">Radisson Collection</div></div>
+    <div class="field"><div class="k">Менеджер</div><div class="v">Анна К.</div></div>
+  </div>
+
+  <div class="block">
+    <h3>Файлы и вложения</h3>
+    <div class="files">
+      <div class="file-tile"><div class="fi">📄</div><div class="fn">Договор.pdf</div><div class="fs">1.2 МБ</div></div>
+      <div class="file-tile"><div class="fi">🧾</div><div class="fn">Ваучер.pdf</div><div class="fs">340 КБ</div></div>
+      <div class="file-tile"><div class="fi">🖼️</div><div class="fn">Рассадка.jpg</div><div class="fs">890 КБ</div></div>
+    </div>
+  </div>
+
+  <div class="block">
+    <h3>Программа тура</h3>
+    <div class="mini-table">
+      <table>
+        <tr><th>День</th><th>Время</th><th>Пункт</th></tr>
+        <tr><td>12.09</td><td>14:00</td><td>Заезд, трансфер</td></tr>
+        <tr><td>13.09</td><td>10:00</td><td>Экскурсия «Роза Хутор»</td></tr>
+        <tr><td>14.09</td><td>—</td><td>Свободный день</td></tr>
+      </table>
+    </div>
+  </div>
+
+  <div class="actions">
+    <div class="action-btn">👥 Гости (14)</div>
+    <div class="action-btn">💰 Смета</div>
+    <div class="action-btn primary">Открыть чат с группой</div>
+  </div>
+</div>
+
+<div class="label">Экран 3 — Таблица ДДС (кэш-флоу)</div>
+<div class="device">
+  <div class="topbar">
+    <div class="icon-btn">←</div>
+    <div class="title">ДДС · Сочи</div>
+    <div class="icon-btn">＋</div>
+  </div>
+
+  <div class="section-head" style="padding-top:2px;"><h2 style="font-size:18px;">Движение денежных средств</h2></div>
+
+  <div class="table-wrap">
+    <div class="table-scroll">
+      <table class="data">
+        <thead><tr><th>Дата</th><th>Статья</th><th>Тип</th><th>Сумма</th><th>Комментарий</th></tr></thead>
+        <tbody>
+          <tr><td>02.09</td><td>Предоплата группа</td><td>Приход</td><td class="amt-in">+504 000 ₽</td><td>40% от суммы</td></tr>
+          <tr><td>04.09</td><td>Бронь отеля</td><td>Расход</td><td class="amt-out">−380 000 ₽</td><td>Radisson, депозит</td></tr>
+          <tr><td>06.09</td><td>Авиабилеты</td><td>Расход</td><td class="amt-out">−210 000 ₽</td><td>14 билетов</td></tr>
+          <tr><td>10.09</td><td>Доплата группа</td><td>Приход</td><td class="amt-in">+756 000 ₽</td><td>Остаток 60%</td></tr>
+          <tr><td>11.09</td><td>Гид и трансфер</td><td>Расход</td><td class="amt-out">−96 000 ₽</td><td>8 ночей</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="table-total">
+    <span>Итого приход / расход</span>
+    <span><b style="color:var(--success)">+1 260 000</b> / <b style="color:var(--danger)">−686 000</b> ₽</span>
+  </div>
+
+  <div class="bottom-nav">
+    <div class="n">🧳<span>Туры</span></div>
+    <div class="n">👥<span>Гости</span></div>
+    <div class="n active">💰<span>ДДС</span></div>
+    <div class="n">⚙️<span>Ещё</span></div>
+  </div>
+</div>
+
+</body>
+</html>

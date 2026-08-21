@@ -1,8 +1,10 @@
 import { useEffect, useState } from 'react'
 import './components/ui.css'
-import { getSchema, ApiError } from './lib/api'
+import { getSchema, listResource, ApiError, type SchemaBot } from './lib/api'
+import { AppHeader } from './components/AppHeader'
 import { normalizeResources, type ResourceDisplay } from './lib/displaySchema'
 import { getTelegramWebApp } from './lib/telegram'
+import { Icon, iconForResource } from './components/Icon'
 import { ListScreen } from './screens/ListScreen'
 import { DetailScreen } from './screens/DetailScreen'
 import { CreateFormScreen } from './screens/CreateFormScreen'
@@ -63,6 +65,14 @@ function TenantApp() {
   const [resources, setResources] = useState<Record<string, ResourceDisplay> | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [route, setRoute] = useState<Route | null>(null)
+  // Счётчик записей под названием раздела в ленте (вариант I). Схема их не
+  // отдаёт, поэтому считаем сами — по одному запросу на раздел, параллельно.
+  // Раздел, который не отдался, просто остаётся без счётчика: подпись для
+  // навигации второстепенна и не должна ломать экран.
+  const [counts, setCounts] = useState<Record<string, number>>({})
+  // Кто этот бот — для шапки (вариант I). Приходит тем же /schema,
+  // отдельного запроса не нужно.
+  const [bot, setBot] = useState<SchemaBot | null>(null)
 
   useEffect(() => {
     let cancelled = false
@@ -70,6 +80,7 @@ function TenantApp() {
       .then((data) => {
         if (cancelled) return
         const normalized = normalizeResources(data.resources)
+        setBot(data.bot ?? null)
         setResources(normalized)
         const firstName = Object.keys(normalized)[0]
         // A bot can have office_hook_config (analytics available) with NO
@@ -91,6 +102,25 @@ function TenantApp() {
     }
   }, [])
 
+  useEffect(() => {
+    if (!resources) return
+    let cancelled = false
+    const names = Object.keys(resources)
+    Promise.all(
+      names.map((name) =>
+        listResource(name)
+          .then((data) => [name, data.items.length] as const)
+          .catch(() => [name, -1] as const),
+      ),
+    ).then((pairs) => {
+      if (cancelled) return
+      setCounts(Object.fromEntries(pairs.filter(([, n]) => n >= 0)))
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [resources])
+
   if (error) {
     return <div className="state-message">{error}</div>
   }
@@ -99,23 +129,33 @@ function TenantApp() {
   }
 
   const resourceNames = Object.keys(resources)
+  // Нижняя навигация — первые три раздела плюс «Аналитика» (вариант I).
+  // Лента выше остаётся полным списком разделов; нижняя панель — быстрый
+  // доступ к тем, куда ходят чаще всего.
+  const navNames = resourceNames.slice(0, 3)
+
+  const activeResource = route.kind === 'analytics' ? null : route.resource
 
   return (
-    <div>
+    <>
+      <AppHeader bot={bot} />
+
+      {/* Лента разделов — свайп по горизонтали, а не ряд обособленных
+          pill-кнопок: раскладка варианта I, утверждённая владельцем
+          (design/mockups/miniapp_mockup_I.html). */}
       {(route.kind === 'list' || route.kind === 'analytics') && (
-        <div className="chip-row" style={{ padding: '16px 16px 0' }}>
+        <div className="sol-lane">
           {resourceNames.map((name) => (
             <button
               key={name}
-              className="chip"
-              style={
-                route.kind === 'list' && name === route.resource
-                  ? { background: 'var(--accent)', color: 'var(--accent-text)' }
-                  : undefined
-              }
+              className={`sol-lane-item${route.kind === 'list' && name === route.resource ? ' is-on' : ''}`}
               onClick={() => setRoute({ kind: 'list', resource: name })}
             >
-              {resources[name].title}
+              <Icon name={iconForResource(name, resources[name].title)} size={17} />
+              <div className="sol-lane-name">{resources[name].title}</div>
+              <div className="sol-lane-count">
+                {counts[name] === undefined ? '\u00A0' : `записей: ${counts[name]}`}
+              </div>
             </button>
           ))}
           {/* Always rendered — analytics_handler is the one that decides per-
@@ -125,11 +165,12 @@ function TenantApp() {
               opens an empty screen rather than a tab that's conspicuously
               missing (which would itself leak "you're not the owner"). */}
           <button
-            className="chip"
-            style={route.kind === 'analytics' ? { background: 'var(--accent)', color: 'var(--accent-text)' } : undefined}
+            className={`sol-lane-item${route.kind === 'analytics' ? ' is-on' : ''}`}
             onClick={() => setRoute({ kind: 'analytics' })}
           >
-            Аналитика
+            <Icon name="chart" size={17} />
+            <div className="sol-lane-name">Аналитика</div>
+            <div className="sol-lane-count">&nbsp;</div>
           </button>
         </div>
       )}
@@ -159,6 +200,28 @@ function TenantApp() {
       )}
 
       {route.kind === 'analytics' && <AnalyticsScreen />}
-    </div>
+
+      {navNames.length > 0 && (
+        <nav className="sol-nav">
+          {navNames.map((name) => (
+            <button
+              key={name}
+              className={`sol-nv${activeResource === name ? ' is-on' : ''}`}
+              onClick={() => setRoute({ kind: 'list', resource: name })}
+            >
+              <Icon name={iconForResource(name, resources[name].title)} size={18} />
+              <span>{resources[name].title}</span>
+            </button>
+          ))}
+          <button
+            className={`sol-nv${route.kind === 'analytics' ? ' is-on' : ''}`}
+            onClick={() => setRoute({ kind: 'analytics' })}
+          >
+            <Icon name="chart" size={18} />
+            <span>Аналитика</span>
+          </button>
+        </nav>
+      )}
+    </>
   )
 }

@@ -47,7 +47,12 @@ from urllib.parse import parse_qsl
 import aiosqlite
 from aiohttp import web
 
-from db.database import get_bot_admins, get_bot_miniapp_config, get_bot_office_hook_config
+from db.database import (
+    get_bot,
+    get_bot_admins,
+    get_bot_miniapp_config,
+    get_bot_office_hook_config,
+)
 from features.excel_export import MAX_FILE_SIZE, build_workbook, fetch_export_rows
 from features.sales_analytics import Period, compute_metrics
 from runtime.registry import FACTORY_BOT_ID, Registry, _load_template_module_async
@@ -301,7 +306,25 @@ async def schema_handler(request: web.Request) -> web.Response:
         return web.json_response({"error": "forbidden"}, status=403)
 
     resources = [_resource_display_schema(r) for r in miniapp_config.get("resources", [])]
-    return web.json_response({"resources": resources})
+    return web.json_response({"resources": resources, "bot": await _bot_identity(bot_id)})
+
+
+async def _bot_identity(bot_id: int) -> dict:
+    """Имя и подпись бота для шапки мини-аппа (эталон
+    design/mockups/miniapp_mockup_I.html: квадрат с инициалами · название ·
+    род занятий). До этого /schema отдавал только ресурсы, и SPA нечем было
+    заполнить шапку — она просто отсутствовала.
+
+    Берём ровно два поля из строки bots и ничего больше: get_bot() возвращает
+    расшифрованную строку целиком, включая token, — он не должен утечь
+    клиенту. display_name (то, как владелец назвал бота для людей) важнее
+    технического name; description — вольный текст владельца, поэтому он
+    может быть пустым, и тогда SPA просто не рисует вторую строку.
+    """
+    row = await get_bot(bot_id) or {}
+    name = (row.get("display_name") or row.get("name") or "").strip()
+    subtitle = (row.get("description") or "").strip()
+    return {"name": name or None, "subtitle": subtitle or None}
 
 
 def _resource_spec(miniapp_config: dict, resource_name: str) -> dict | None:

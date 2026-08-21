@@ -1,0 +1,470 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Preflight Audit</title>
+<style>
+:root{
+  --bg:#f5f6f8;
+  --surface:#ffffff;
+  --surface-2:#eef0f3;
+  --border:#dde1e7;
+  --text:#1a1e26;
+  --text-dim:#565f6e;
+  --text-faint:#8790a0;
+  --accent:#2f5fb3;
+  --accent-dim:#e8eefa;
+  --critical:#c4342f;
+  --critical-bg:#fbe9e8;
+  --major:#b5680a;
+  --major-bg:#faefdd;
+  --minor:#3d7a3f;
+  --minor-bg:#e9f3e9;
+  --info:#4a5568;
+  --info-bg:#eceff2;
+  --mono: ui-monospace, "SF Mono", "Cascadia Code", "JetBrains Mono", Menlo, Consolas, monospace;
+  --sans: -apple-system, "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#14171d;
+    --surface:#1b1f27;
+    --surface-2:#20252f;
+    --border:#2c323e;
+    --text:#e6e9ef;
+    --text-dim:#9aa3b2;
+    --text-faint:#6b7484;
+    --accent:#7ea6ec;
+    --accent-dim:#1f2b40;
+    --critical:#ff8079;
+    --critical-bg:#3a1e1d;
+    --major:#f0a850;
+    --major-bg:#3a2c15;
+    --minor:#7fca82;
+    --minor-bg:#1b2f1c;
+    --info:#a7b0bf;
+    --info-bg:#242933;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#14171d;
+  --surface:#1b1f27;
+  --surface-2:#20252f;
+  --border:#2c323e;
+  --text:#e6e9ef;
+  --text-dim:#9aa3b2;
+  --text-faint:#6b7484;
+  --accent:#7ea6ec;
+  --accent-dim:#1f2b40;
+  --critical:#ff8079;
+  --critical-bg:#3a1e1d;
+  --major:#f0a850;
+  --major-bg:#3a2c15;
+  --minor:#7fca82;
+  --minor-bg:#1b2f1c;
+  --info:#a7b0bf;
+  --info-bg:#242933;
+}
+
+*{box-sizing:border-box;}
+body{
+  background:var(--bg);
+  color:var(--text);
+  font-family:var(--sans);
+  margin:0;
+  padding:0 20px 80px;
+  line-height:1.5;
+}
+.wrap{max-width:860px;margin:0 auto;}
+
+/* header */
+header{
+  padding:48px 0 28px;
+  border-bottom:1px solid var(--border);
+  margin-bottom:28px;
+}
+.eyebrow{
+  font-family:var(--mono);
+  font-size:12px;
+  letter-spacing:.08em;
+  text-transform:uppercase;
+  color:var(--accent);
+  margin:0 0 10px;
+}
+h1{
+  font-size:clamp(28px,4vw,38px);
+  font-weight:700;
+  margin:0 0 10px;
+  letter-spacing:-0.01em;
+  text-wrap:balance;
+}
+.subhead{
+  color:var(--text-dim);
+  font-size:15px;
+  max-width:60ch;
+  margin:0;
+}
+.meta-row{
+  display:flex;
+  gap:20px;
+  flex-wrap:wrap;
+  margin-top:20px;
+  font-family:var(--mono);
+  font-size:12px;
+  color:var(--text-faint);
+}
+.meta-row b{color:var(--text-dim);font-weight:600;}
+
+/* summary counters */
+.counters{
+  display:grid;
+  grid-template-columns:repeat(4,1fr);
+  gap:10px;
+  margin-bottom:36px;
+}
+.counter{
+  background:var(--surface);
+  border:1px solid var(--border);
+  border-radius:10px;
+  padding:14px 16px;
+}
+.counter .n{
+  font-family:var(--mono);
+  font-size:26px;
+  font-weight:600;
+  font-variant-numeric:tabular-nums;
+  line-height:1;
+}
+.counter .label{
+  font-size:11px;
+  text-transform:uppercase;
+  letter-spacing:.06em;
+  color:var(--text-faint);
+  margin-top:6px;
+}
+.counter.critical .n{color:var(--critical);}
+.counter.major .n{color:var(--major);}
+.counter.minor .n{color:var(--minor);}
+.counter.fixed .n{color:var(--accent);}
+
+/* sections */
+.area-section{margin-bottom:40px;}
+.area-title{
+  display:flex;
+  align-items:baseline;
+  gap:10px;
+  margin:0 0 4px;
+  font-size:13px;
+  font-family:var(--mono);
+  text-transform:uppercase;
+  letter-spacing:.06em;
+  color:var(--text-faint);
+}
+.area-title .rule{flex:1;height:1px;background:var(--border);}
+
+/* finding card */
+.finding{
+  background:var(--surface);
+  border:1px solid var(--border);
+  border-left:3px solid var(--border);
+  border-radius:8px;
+  padding:18px 20px;
+  margin-bottom:12px;
+}
+.finding.sev-critical{border-left-color:var(--critical);}
+.finding.sev-major{border-left-color:var(--major);}
+.finding.sev-minor{border-left-color:var(--minor);}
+
+.finding-top{
+  display:flex;
+  align-items:center;
+  gap:10px;
+  flex-wrap:wrap;
+  margin-bottom:8px;
+}
+.chip{
+  font-family:var(--mono);
+  font-size:10.5px;
+  font-weight:600;
+  text-transform:uppercase;
+  letter-spacing:.05em;
+  padding:3px 8px;
+  border-radius:5px;
+  white-space:nowrap;
+}
+.chip.critical{background:var(--critical-bg);color:var(--critical);}
+.chip.major{background:var(--major-bg);color:var(--major);}
+.chip.minor{background:var(--minor-bg);color:var(--minor);}
+.chip.status{background:var(--info-bg);color:var(--info);}
+.chip.status.fixed{background:var(--accent-dim);color:var(--accent);}
+
+.loc{
+  font-family:var(--mono);
+  font-size:12.5px;
+  color:var(--text-dim);
+}
+
+.finding h3{
+  font-size:15.5px;
+  font-weight:600;
+  margin:0 0 8px;
+  text-wrap:balance;
+}
+.finding p{
+  margin:0 0 8px;
+  font-size:13.5px;
+  color:var(--text-dim);
+}
+.finding p:last-child{margin-bottom:0;}
+.finding .scenario{
+  background:var(--surface-2);
+  border-radius:6px;
+  padding:10px 12px;
+  font-size:13px;
+  color:var(--text);
+}
+.finding .scenario b{
+  font-family:var(--mono);
+  font-size:10.5px;
+  text-transform:uppercase;
+  letter-spacing:.05em;
+  color:var(--text-faint);
+  display:block;
+  margin-bottom:4px;
+  font-weight:600;
+}
+.finding .verdict{
+  margin-top:10px;
+  font-size:13px;
+  display:flex;
+  gap:6px;
+  align-items:baseline;
+}
+.finding .verdict b{color:var(--text);font-weight:600;}
+
+/* verified ok list */
+.ok-box{
+  background:var(--minor-bg);
+  border:1px solid color-mix(in srgb, var(--minor) 30%, transparent);
+  border-radius:8px;
+  padding:16px 20px;
+  margin-top:14px;
+}
+.ok-box h4{
+  margin:0 0 10px;
+  font-size:12px;
+  font-family:var(--mono);
+  text-transform:uppercase;
+  letter-spacing:.05em;
+  color:var(--minor);
+}
+.ok-box ul{margin:0;padding-left:18px;}
+.ok-box li{font-size:13px;color:var(--text-dim);margin-bottom:6px;}
+.ok-box li:last-child{margin-bottom:0;}
+.ok-box code{font-family:var(--mono);font-size:12px;color:var(--text);}
+
+code{font-family:var(--mono);font-size:.92em;background:var(--surface-2);padding:1px 5px;border-radius:4px;}
+
+footer{
+  margin-top:48px;
+  padding-top:20px;
+  border-top:1px solid var(--border);
+  font-size:12px;
+  color:var(--text-faint);
+  font-family:var(--mono);
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <p class="eyebrow">Bot Factory · Preflight Audit</p>
+    <h1>Аудит перед живым тестированием</h1>
+    <p class="subhead">Три фокус-области: from-scratch генерация ботов, miniapp-стек (role_filter / admin-gate / resource-editor), система подключения фич. Проведено тремя независимыми ревью перед запуском 3 живых Railway-ботов.</p>
+    <div class="meta-row">
+      <span><b>Дата:</b> 2026-08-21</span>
+      <span><b>Область:</b> handlers/create_bot.py · runtime/miniapp_api.py · runtime/factory_analytics_api.py · runtime/registry.py · features/payments.py · features/sellable_items.py</span>
+    </div>
+  </header>
+
+  <div class="counters">
+    <div class="counter critical"><div class="n">1</div><div class="label">Critical</div></div>
+    <div class="counter major"><div class="n">6</div><div class="label">Major</div></div>
+    <div class="counter minor"><div class="n">5</div><div class="label">Minor</div></div>
+    <div class="counter fixed"><div class="n">1</div><div class="label">Исправлено сразу</div></div>
+  </div>
+
+  <!-- CRITICAL -->
+  <section class="area-section">
+    <p class="area-title">Critical<span class="rule"></span></p>
+
+    <div class="finding sev-critical">
+      <div class="finding-top">
+        <span class="chip critical">Critical</span>
+        <span class="chip status fixed">Исправлено сразу</span>
+        <span class="loc">features/payments.py:268</span>
+      </div>
+      <h3>on_successful_payment падал с AttributeError на 19 из 23 payments-совместимых шаблонов</h3>
+      <p>PaymentsConfig (протокол) утверждает, что у каждого совместимого шаблона Config несёт поле <code>bot_id</code> — это неверно. Реальная проверка всех <code>templates/*.py</code> нашла поле <code>bot_id</code> только в 4 из 23: <code>car_rental</code>, <code>course_tracker</code>, <code>event_rsvp</code>, <code>orders_tracker</code>. У остальных 19 (в т.ч. <code>shop_catalog</code>, <code>moderator</code>, <code>booking_*</code>, <code>accountant</code> — самые вероятные кандидаты для 3 тестовых ботов) поля нет вовсе.</p>
+      <div class="scenario">
+        <b>Сценарий отказа</b>
+        Клиент оплачивает реальный платёж → строка платежа корректно записывается в БД → сразу после коммита обращение к <code>config.bot_id</code> кидает необработанный AttributeError → в вебхук-режиме это долетает до owner как критический алерт "unhandled_exception" на каждый успешный платёж. Деньги не теряются, но первый же реальный платёж в тестовой сессии выглядел бы как «платежи сломаны».
+      </div>
+      <div class="verdict"><b>Исправлено:</b> заменено на <code>getattr(config, "bot_id", None)</code> — деньги записываются как и раньше, событие <code>order.created</code> для «офисов» просто не публикуется там, где bot_id недоступен (как и было задумано изначально). Тесты (77 шт., payments/sellable_items/narrow_risk_review) — зелёные.</div>
+    </div>
+  </section>
+
+  <!-- MAJOR -->
+  <section class="area-section">
+    <p class="area-title">Major<span class="rule"></span></p>
+
+    <div class="finding sev-major">
+      <div class="finding-top">
+        <span class="chip major">Major</span>
+        <span class="chip status">Требует отдельного ТЗ</span>
+        <span class="loc">handlers/create_bot.py:638</span>
+      </div>
+      <h3>Сбор требований (chat_gather_requirements) — единственный Claude-вызов во флоу без try/except</h3>
+      <p>В отличие от <code>generate_bot_code</code> чуть ниже (аккуратно обёрнут в <code>asyncio.wait_for</code> + try/except + кнопка retry), здесь при ошибке Anthropic API (429/500/таймаут) исключение улетает наружу необработанным. Сообщение «Анализирую... ⏳» не удаляется, пользователь не получает ответа, FSM зависает в состоянии <code>gathering</code> без видимого выхода кроме нигде не упомянутого <code>/cancel</code>. В polling-режиме (main.py) для фабричного бота вообще нет глобального error-хендлера — ошибка не долетает даже до owner.</p>
+      <div class="scenario"><b>Сценарий отказа</b>Сетевой сбой/rate-limit во время диалога сбора требований → пользователь видит «Анализирую...» навсегда, диалог создания бота нужно начинать заново вслепую.</div>
+      <div class="verdict"><b>Рекомендация:</b> обернуть тем же паттерном, что уже используется для generate_bot_code — быстрый точечный фикс.</div>
+    </div>
+
+    <div class="finding sev-major">
+      <div class="finding-top">
+        <span class="chip major">Major</span>
+        <span class="chip status">Требует отдельного ТЗ</span>
+        <span class="loc">services/voice_service.py:13-24</span>
+      </div>
+      <h3>Распознавание голоса не имеет таймаута на вызывающей стороне</h3>
+      <p>AssemblyAI SDK опрашивается синхронно в default executor-потоке без <code>asyncio.wait_for</code>. Try/except ловит исключение, но не зависание. При зависании поллинга статус «🎤 Распознаю...» висит бесконечно, поток из пула теряется навсегда — повторные зависания постепенно исчерпывают пул потоков процесса.</p>
+      <div class="scenario"><b>Сценарий отказа</b>Сетевой затык на стороне AssemblyAI при обработке голосового сообщения в /create → пользователь ждёт вечно, поток утекает.</div>
+      <div class="verdict"><b>Рекомендация:</b> явный <code>asyncio.wait_for(transcribe_voice(...), timeout=...)</code>.</div>
+    </div>
+
+    <div class="finding sev-major">
+      <div class="finding-top">
+        <span class="chip major">Major</span>
+        <span class="chip status">Требует отдельного ТЗ</span>
+        <span class="loc">handlers/create_bot.py:1158, 1265</span>
+      </div>
+      <h3>Файл сгенерированного бота именуется по bot_name (от Claude), а не по уникальному bot_id</h3>
+      <p><code>extract_bot_name()</code> ничем не гарантирует уникальность (snake_case, ≤20 символов) — вполне вероятны совпадения (<code>shop</code>, <code>booking</code>, <code>orders</code>) у двух разных пользователей. Второй бот с таким же именем молча перезаписывает <code>.py</code>-файл первого на диске. Оба они уже сохранят в БД одинаковый <code>file_path</code>. Первый бот не падает сразу (код уже загружен в его процессе), но следующий <code>/admin/reload</code> или рестарт подгрузит код второго бота в процесс первого — тихая подмена логики между двумя клиентами. То же с аватарками (ниже критичности — теряется только картинка).</p>
+      <div class="scenario"><b>Сценарий отказа</b>Два клиента создают ботов с похожими названиями почти одновременно → у одного из них бот через время начинает вести себя как бот другого клиента, без единой ошибки в логах.</div>
+      <div class="verdict"><b>Рекомендация:</b> ключевать файл по bot_id, а не по имени (имя оставить только как отображаемую метку) — не одна строка, т.к. файл пишется до того, как bot_id известен (round-trip с BotFather происходит между этими шагами). Нужно дизайн-решение.</div>
+    </div>
+
+    <div class="finding sev-major">
+      <div class="finding-top">
+        <span class="chip major">Major</span>
+        <span class="chip status">Требует отдельного ТЗ</span>
+        <span class="loc">handlers/create_bot.py:1234-1237</span>
+      </div>
+      <h3>Нет проверки на дубликат токена перед созданием записи бота</h3>
+      <p>Валидация токена при ручном вводе — только <code>":" in token and len(token) &gt;= 30</code>. Поиска по существующим ботам с тем же токеном нет, колонка <code>bots.token</code> в БД без UNIQUE. При случайной повторной вставке одного токена: в polling-режиме оба процесса дерутся за <code>getUpdates</code> (Telegram 409), один бот тихо перестаёт получать апдейты со статусом <code>running</code>; в webhook-режиме второй <code>setWebhook</code> просто перенаправляет единственный вебхук на новый bot_id — первый навсегда деактивирован без единой ошибки.</p>
+      <div class="scenario"><b>Сценарий отказа</b>Владелец или клиент случайно вставляет токен уже зарегистрированного бота → один из двух ботов перестаёт отвечать без какого-либо алерта.</div>
+      <div class="verdict"><b>Рекомендация:</b> проверка на существующий токен перед вставкой + отказ/предупреждение.</div>
+    </div>
+
+    <div class="finding sev-major">
+      <div class="finding-top">
+        <span class="chip major">Major</span>
+        <span class="chip status">Известный архитектурный гэп</span>
+        <span class="loc">runtime/registry_holder.py:17-18 · services/bot_runner.py</span>
+      </div>
+      <h3>В subprocess/polling-режиме bot_features вообще не загружаются</h3>
+      <p>Каждый шаблон в своём <code>if __name__ == "__main__"</code> запускает только собственный router/init_db — механизма подгрузки фич там нет в принципе. Включение фичи через UI в такой конфигурации пишет строку в <code>bot_features</code> и показывает ✅, но запущенный процесс никогда не подключает роутер фичи и не вызывает её init_db — фича молча не работает вообще, без единой ошибки или даже warning-лога.</p>
+      <div class="scenario"><b>Сценарий отказа</b>Если хотя бы один из 3 тестовых ботов окажется в polling-режиме (например <code>PUBLIC_BASE_URL</code> не задан, либо через <code>/recreate</code>/<code>/autofix</code> — см. следующий пункт), включённые payments/sellable_items — полный тихий no-op.</div>
+      <div class="verdict"><b>Статус:</b> уже отмечено в коде как известный архитектурный гэп, не новое — но напрямую угрожает предстоящему живому тесту, если кто-то из 3 ботов окажется вне webhook-режима.</div>
+    </div>
+
+    <div class="finding sev-major">
+      <div class="finding-top">
+        <span class="chip major">Major</span>
+        <span class="chip status">Требует отдельного ТЗ</span>
+        <span class="loc">handlers/manage_bots.py:559-566, 2242-2244</span>
+      </div>
+      <h3>recreate_bot_core / autofix_bot_core не перегружают живой Registry после включения фичи</h3>
+      <p>Оба пути включают фичи напрямую через <code>enable_bot_feature</code> (в обход <code>enable_feature_and_reload</code>), затем только спавнят subprocess через <code>start_bot()</code> — <code>_reload_registry</code>/<code>reload_one</code> не вызывается никогда. Для бота, реально обслуживаемого через живой webhook Registry, в памяти остаётся старый Dispatcher без роутера новой фичи, пока что-то другое (ручной тоггл) не вызовет reload_one.</p>
+      <div class="scenario"><b>Сценарий отказа</b><code>/recreate</code> для бота с voice_intake/cashflow_ledger включает фичи в БД, но обслуживающий вебхук-процесс продолжает работать по старому коду — фича никогда не появляется в реальности, пока владелец не потрогает тоггл вручную.</div>
+      <div class="verdict"><b>Рекомендация:</b> добавить вызов reload_one/_reload_registry в оба пути.</div>
+    </div>
+  </section>
+
+  <!-- MINOR -->
+  <section class="area-section">
+    <p class="area-title">Minor<span class="rule"></span></p>
+
+    <div class="finding sev-minor">
+      <div class="finding-top">
+        <span class="chip minor">Minor</span>
+        <span class="chip status">На заметку</span>
+        <span class="loc">runtime/miniapp_api.py:435-459, 395-410</span>
+      </div>
+      <h3>role_filter с default_deny: False полностью отключает admin-gate как страховку</h3>
+      <p><code>_admin_gate_ok</code> считает ресурс безопасным при одном лишь наличии ключа <code>role_filter</code>, независимо от формы. Если у роли-резолвед фильтра явно стоит <code>default_deny: False</code> и у пользователя нет ни одной из объявленных ролей — фильтр возвращает пустой <code>where</code> (не фильтровано), а admin-gate это не перепроверяет. Итог: гипотетически любой аутентифицированный пользователь бота увидел бы все строки ресурса.</p>
+      <div class="scenario"><b>Сценарий</b>Сейчас не эксплуатируется: оба живых шаблона с role_filter (team_manager, habit_tracker) используют либо ownership-only форму, либо явный <code>default_deny: True</code>; AI-генератор miniapp_config вообще не знает о role_filter. Риск актуален только если человек вручную допишет role_filter с default_deny: False в новом шаблоне.</div>
+      <div class="verdict"><b>Рекомендация:</b> не давать default_deny: False для роли-резолвед фильтров, либо перепроверять admin-статус в этом случае явно.</div>
+    </div>
+
+    <div class="finding sev-minor">
+      <div class="finding-top">
+        <span class="chip minor">Minor</span>
+        <span class="chip status">На заметку</span>
+        <span class="loc">runtime/miniapp_api.py:624-641</span>
+      </div>
+      <h3>Ownership-контроль при создании записи покрывает только простую форму where</h3>
+      <p><code>_resolve_create_owner_column</code> форсирует owner-колонку только когда where матчит ровно <code>"&lt;col&gt; = :telegram_user_id"</code>. Для любой другой формы (subquery, join) — ownership при создании не форсируется вовсе.</p>
+      <div class="scenario"><b>Сценарий</b>Не эксплуатируется сейчас: во всех текущих шаблонах <code>creatable: False</code> на уровне ресурса для всех role_filter-ресурсов. Актуализируется в момент, когда появится первый role-scoped + creatable ресурс.</div>
+    </div>
+
+    <div class="finding sev-minor">
+      <div class="finding-top">
+        <span class="chip minor">Minor</span>
+        <span class="chip status">Быстрый фикс, не срочно</span>
+        <span class="loc">services/telegram_api.py:11</span>
+      </div>
+      <h3>get_managed_bot_token без явного ClientTimeout</h3>
+      <p>Полагается на дефолтный 5-минутный таймаут aiohttp. try/except уже есть, но нет верхнего <code>asyncio.wait_for</code> — при медленном ответе BotFather пользователь может ждать до 5 минут без обратной связи после «бот создан».</p>
+    </div>
+
+    <div class="finding sev-minor">
+      <div class="finding-top">
+        <span class="chip minor">Minor</span>
+        <span class="chip status">Не требует действия</span>
+        <span class="loc">handlers/create_bot.py:1235</span>
+      </div>
+      <h3>Проверка формата токена поверхностна</h3>
+      <p>Только <code>":" in token and len &gt;= 30</code> — мусор технически проходит. Не является риском на практике: все нижестоящие потребители (<code>get_me()</code>, <code>set_webhook_for_bot</code>, <code>start_bot</code>) уже аккуратно откатываются с понятной ошибкой пользователю.</p>
+    </div>
+
+    <div class="finding sev-minor">
+      <div class="finding-top">
+        <span class="chip minor">Minor</span>
+        <span class="chip status">Низкий приоритет</span>
+        <span class="loc">handlers/create_bot.py — retry_generate</span>
+      </div>
+      <h3>Двойной тап на retry_generate/пропуск аватарки может запустить два параллельных _run_generation</h3>
+      <p>Обе генерации пишут в <code>_pending[user_id]</code>, побеждает последняя запись. Не портит данные — просто возможен дубль сообщения «Код готов!» со ссылкой на устаревший результат. <code>/create</code> уже явно защищён от двойного тапа тем же паттерном (<code>_start_create_flow</code>) — здесь то же самое просто ещё не сделано для retry-кнопок.</p>
+    </div>
+  </section>
+
+  <div class="ok-box">
+    <h4>Проверено и подтверждено рабочим корректно</h4>
+    <ul>
+      <li>SQL-инъекции: все имена таблиц/колонок в miniapp_api.py и factory_analytics_api.py берутся из доверенного, провалидированного <code>miniapp_config</code> — никогда из тела запроса; значения всегда параметризованы.</li>
+      <li>Resource-editor: allowlist полей по <code>resource["fields"]</code>, update/delete — атомарные <code>WHERE id=?</code> запросы без TOCTOU-окна; <code>_authenticate_owner</code> корректно скопирован по bot_id через HMAC-магик-линк, не реплеится между ботами.</li>
+      <li>Некорректная AI-генерация miniapp_config (несуществующие колонки/типы) отклоняется целиком до сохранения — <code>_validate_miniapp_config_against_code</code> сверяет с реальным CREATE TABLE.</li>
+      <li>Обратная совместимость: боты без role_filter корректно падают на admin-only gate — это документированное поведение, не краш и не тихий обход.</li>
+      <li>Двойное включение фичи: <code>INSERT OR IGNORE</code> + PRIMARY KEY(bot_id, feature_name) — идемпотентно; UI дополнительно блокирует конкурентные тогглы через <code>_busy_bots</code>.</li>
+      <li>init_db для фич в вебхук-режиме вызывается всегда перед подключением роутера, идемпотентен (<code>CREATE TABLE IF NOT EXISTS</code>), ошибка одной фичи изолирована и не роняет весь Registry.</li>
+      <li>payments.py + sellable_items.py не дублируют учёт: sellable_items не регистрирует свой обработчик successful_payment, читает контекст из invoice payload read-only.</li>
+      <li>bot_id аллоцируется через SQLite AUTOINCREMENT — конкурентное создание ботов безопасно, коллизий ID не будет.</li>
+      <li><code>generate_bot_code</code>, <code>parse_gather_result</code>, <code>extract_bot_name</code> — все корректно обёрнуты таймаутом/try-except с деградацией.</li>
+    </ul>
+  </div>
+
+  <footer>3 параллельных ревью · security / qa-stability / state-db · payments.py:268 исправлено и протестировано в рамках этой сессии</footer>
+</div>
+</body>
+</html>

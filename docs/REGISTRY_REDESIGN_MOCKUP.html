@@ -1,0 +1,660 @@
+<meta charset="utf-8">
+<title>Реестр — вайрфрейм</title>
+<style>
+  @font-face {
+    font-family: 'JBMono';
+    src: local('JetBrains Mono'), local('SF Mono'), local('Consolas');
+  }
+
+  :root {
+    --bg: #f4f5f3;
+    --surface: #ffffff;
+    --surface-2: #eceeec;
+    --ink: #1b1e1c;
+    --ink-dim: #5b615c;
+    --ink-faint: #8b918c;
+    --line: #d7dad6;
+    --accent: #2f6f4f;
+    --accent-ink: #ffffff;
+    --accent-soft: #e3efe7;
+    --warn: #a6631c;
+    --warn-soft: #f6ead9;
+    --tab-inactive: #dfe2de;
+    --shadow: 0 1px 2px rgba(20, 25, 20, 0.06), 0 4px 14px rgba(20, 25, 20, 0.05);
+    --radius: 10px;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #14161a;
+      --surface: #1c1f23;
+      --surface-2: #23262b;
+      --ink: #eceeec;
+      --ink-dim: #a3a8a3;
+      --ink-faint: #6d726d;
+      --line: #32363a;
+      --accent: #5cb583;
+      --accent-ink: #0d1410;
+      --accent-soft: #1e2c22;
+      --warn: #d69a54;
+      --warn-soft: #2e2418;
+      --tab-inactive: #26292d;
+      --shadow: 0 1px 2px rgba(0,0,0,0.3), 0 4px 18px rgba(0,0,0,0.35);
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #14161a;
+    --surface: #1c1f23;
+    --surface-2: #23262b;
+    --ink: #eceeec;
+    --ink-dim: #a3a8a3;
+    --ink-faint: #6d726d;
+    --line: #32363a;
+    --accent: #5cb583;
+    --accent-ink: #0d1410;
+    --accent-soft: #1e2c22;
+    --warn: #d69a54;
+    --warn-soft: #2e2418;
+    --tab-inactive: #26292d;
+    --shadow: 0 1px 2px rgba(0,0,0,0.3), 0 4px 18px rgba(0,0,0,0.35);
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+    margin: 0;
+    padding: 40px 20px 100px;
+    line-height: 1.5;
+  }
+
+  .wrap { max-width: 980px; margin: 0 auto; }
+
+  .doc-head {
+    margin-bottom: 36px;
+  }
+  .doc-head .kicker {
+    font-family: 'JBMono', ui-monospace, monospace;
+    font-size: 12px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin-bottom: 10px;
+  }
+  .doc-head h1 {
+    font-size: 30px;
+    font-weight: 700;
+    margin: 0 0 8px;
+    text-wrap: balance;
+    letter-spacing: -0.01em;
+  }
+  .doc-head p {
+    color: var(--ink-dim);
+    max-width: 62ch;
+    margin: 0;
+    font-size: 15px;
+  }
+
+  .callout {
+    background: var(--warn-soft);
+    border: 1px solid color-mix(in srgb, var(--warn) 35%, var(--line));
+    border-radius: var(--radius);
+    padding: 16px 18px;
+    margin: 28px 0;
+    font-size: 14px;
+    color: var(--ink);
+  }
+  .callout b { color: var(--warn); }
+
+  h2.section-title {
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+    color: var(--ink-faint);
+    margin: 48px 0 14px;
+    padding-bottom: 10px;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .screen-frame {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 16px;
+    box-shadow: var(--shadow);
+    overflow: hidden;
+    margin-bottom: 14px;
+  }
+  .frame-label {
+    font-family: 'JBMono', ui-monospace, monospace;
+    font-size: 11px;
+    color: var(--ink-faint);
+    padding: 8px 16px;
+    background: var(--surface-2);
+    border-bottom: 1px solid var(--line);
+  }
+  .frame-body { padding: 0; }
+
+  .note {
+    font-size: 13.5px;
+    color: var(--ink-dim);
+    margin: 10px 2px 30px;
+    max-width: 68ch;
+  }
+  .note b { color: var(--ink); }
+
+  /* ---- mocked telegram-esque top bar ---- */
+  .topbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 14px 16px 0;
+  }
+  .whoami {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12.5px;
+    color: var(--ink-dim);
+  }
+  .avatar {
+    width: 26px; height: 26px; border-radius: 50%;
+    background: linear-gradient(135deg, var(--accent), color-mix(in srgb, var(--accent) 60%, #6aa8ff));
+    display: flex; align-items: center; justify-content: center;
+    font-size: 11px; font-weight: 700; color: var(--accent-ink);
+    flex-shrink: 0;
+  }
+  .whoami .name { color: var(--ink); font-weight: 600; }
+
+  .title-row {
+    padding: 10px 16px 0;
+    font-size: 19px;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+  }
+
+  /* ---- tabs ---- */
+  .tabs {
+    display: flex;
+    gap: 4px;
+    padding: 12px 16px;
+    overflow-x: auto;
+  }
+  .tab {
+    font-family: 'JBMono', ui-monospace, monospace;
+    font-size: 12px;
+    padding: 7px 12px;
+    border-radius: 999px;
+    background: var(--tab-inactive);
+    color: var(--ink-dim);
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+  .tab.active {
+    background: var(--accent);
+    color: var(--accent-ink);
+    font-weight: 600;
+  }
+  .swipe-hint {
+    font-size: 11px;
+    color: var(--ink-faint);
+    padding: 0 16px 4px;
+  }
+
+  .content { padding: 4px 16px 20px; }
+
+  /* ---- list rows ---- */
+  .row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 12px 10px;
+    border-radius: 10px;
+    border: 1px solid var(--line);
+    background: var(--surface);
+    margin-bottom: 8px;
+  }
+  .row.selected {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+  }
+  .row-avatar {
+    width: 36px; height: 36px; border-radius: 50%;
+    background: var(--surface-2);
+    border: 1px solid var(--line);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 15px;
+    flex-shrink: 0;
+  }
+  .row-main { flex: 1; min-width: 0; }
+  .row-title { font-size: 14px; font-weight: 600; }
+  .row-sub { font-size: 12px; color: var(--ink-dim); margin-top: 1px; }
+  .row-tail { font-size: 12px; color: var(--ink-faint); text-align: right; flex-shrink: 0; }
+  .pill {
+    display: inline-block;
+    font-size: 10.5px;
+    font-family: 'JBMono', ui-monospace, monospace;
+    padding: 2px 7px;
+    border-radius: 999px;
+    background: var(--accent-soft);
+    color: var(--accent);
+    font-weight: 600;
+  }
+  .pill.muted { background: var(--surface-2); color: var(--ink-faint); }
+  .chev { color: var(--ink-faint); font-size: 14px; flex-shrink: 0; }
+
+  .stars { color: var(--warn); font-size: 12px; letter-spacing: 1px; }
+
+  /* ---- detail card ---- */
+  .detail-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 14px;
+  }
+  .back-arrow {
+    font-family: 'JBMono', ui-monospace, monospace;
+    font-size: 12px;
+    color: var(--ink-dim);
+  }
+
+  .owner-strip {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 12px;
+    background: var(--surface-2);
+    border-radius: 10px;
+    margin-bottom: 12px;
+  }
+  .owner-strip .row-avatar { background: var(--surface); }
+  .owner-strip .row-title { font-size: 13.5px; }
+  .owner-strip .row-sub { font-size: 11.5px; }
+
+  .btn {
+    font-size: 12px;
+    font-weight: 600;
+    padding: 7px 12px;
+    border-radius: 8px;
+    border: 1px solid var(--line);
+    background: var(--surface);
+    color: var(--ink);
+    white-space: nowrap;
+  }
+  .btn.primary {
+    background: var(--accent);
+    color: var(--accent-ink);
+    border-color: var(--accent);
+  }
+  .btn-row { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0 16px; }
+
+  .kv-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+    margin-bottom: 14px;
+  }
+  .kv {
+    background: var(--surface-2);
+    border-radius: 8px;
+    padding: 9px 11px;
+  }
+  .kv .k { font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--ink-faint); }
+  .kv .v { font-size: 13.5px; font-weight: 600; margin-top: 2px; }
+
+  .logs-box {
+    background: #0f1210;
+    color: #a9d9b8;
+    font-family: 'JBMono', ui-monospace, monospace;
+    font-size: 11px;
+    border-radius: 8px;
+    padding: 10px 12px;
+    line-height: 1.65;
+    overflow-x: auto;
+    white-space: pre;
+  }
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) .logs-box { background: #16211a; }
+  }
+
+  .section-label {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--ink-faint);
+    margin: 16px 0 6px;
+  }
+
+  .review-comment {
+    font-size: 13px;
+    color: var(--ink);
+    margin-top: 6px;
+    padding-top: 8px;
+    border-top: 1px dashed var(--line);
+  }
+
+  .stat-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 8px;
+  }
+  .stat-tile {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 12px 10px;
+    text-align: center;
+  }
+  .stat-tile .num { font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .stat-tile .lbl { font-size: 10.5px; color: var(--ink-faint); margin-top: 2px; }
+
+  .flow-diagram {
+    font-family: 'JBMono', ui-monospace, monospace;
+    font-size: 12px;
+    color: var(--ink-dim);
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    padding: 18px 20px;
+    overflow-x: auto;
+    white-space: pre;
+    line-height: 1.7;
+  }
+
+  .question-box {
+    border: 1px solid var(--line);
+    border-left: 3px solid var(--accent);
+    border-radius: 0 10px 10px 0;
+    padding: 14px 16px;
+    margin: 10px 0;
+    background: var(--surface);
+    font-size: 14px;
+  }
+  .question-box .q-label {
+    font-family: 'JBMono', ui-monospace, monospace;
+    font-size: 11px;
+    color: var(--accent);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-bottom: 4px;
+  }
+
+  .foot-cta {
+    margin-top: 56px;
+    padding-top: 24px;
+    border-top: 1px solid var(--line);
+    font-size: 14px;
+    color: var(--ink-dim);
+  }
+</style>
+
+<div class="wrap">
+  <div class="doc-head">
+    <div class="kicker">Вайрфрейм · на утверждение</div>
+    <h1>Реестр ботов — переработка</h1>
+    <p>Макет новой структуры перед тем, как начинать код. Горизонтальные вкладки вместо текущих 7 плиток, drill-down в бота / пользователя / отзыв, Telegram-идентичность видна everywhere.</p>
+  </div>
+
+  <div class="callout">
+    <b>Важно перед реализацией:</b> вкладка «Отзывы» ниже требует нового хранилища — сейчас в БД по каждому боту хранится только <code>avg_rating</code> и <code>feedback_count</code> (агрегат), а <b>кто именно поставил оценку и что написал в комментарии — не сохраняется отдельной записью нигде</b>. Чтобы кликать на конкретный отзыв и видеть автора + писать ему в Telegram, нужно завести таблицу отдельных отзывов (rater_telegram_id, rating, comment, created_at) — это бэкенд-работа, не только фронт. Также для фото/имени владельцев сейчас в реестре есть только «владелец #<id>» (голый Telegram ID) — понадобится подтягивать профиль через Telegram Login данные, которые уже приходят при авторизации.
+  </div>
+
+  <h2 class="section-title">01 · Общая навигация</h2>
+  <div class="flow-diagram">Реестр (владелец залогинен через Telegram Login Widget — фото+имя видны в шапке)
+│
+├─ 🤖 Боты        → список всех запущенных ботов → карточка бота
+├─ 👤 Пользователи → список владельцев ботов      → его боты → карточка бота
+├─ ⭐ Отзывы       → список оценок                → карточка отзыва
+├─ 📊 Обзор        → total / active / paused
+├─ 🧩 Шаблоны      → боты по шаблону
+├─ ⚙️ Фичи         → адопция фич по ботам
+└─ ✏️ Правки       → суммарно правок / незакрытые паттерны
+
+Свайп влево/вправо переключает вкладки. Один и тот же тап на бота
+из ЛЮБОЙ вкладки открывает одну и ту же карточку бота (уровень 2).</div>
+  <div class="note">Вкладки 4–7 (Обзор / Шаблоны / Фичи / Правки) — предположение по составу текущих 7 плиток. Нужно подтвердить у владельца, что группировка верна, при реализации.</div>
+
+  <h2 class="section-title">02 · Вкладка «Боты»</h2>
+  <div class="screen-frame">
+    <div class="frame-label">/registry — tab: Боты</div>
+    <div class="frame-body">
+      <div class="topbar">
+        <div></div>
+        <div class="whoami">
+          <span class="name">Матвей</span>
+          <div class="avatar">М</div>
+        </div>
+      </div>
+      <div class="title-row">Реестр</div>
+      <div class="tabs">
+        <div class="tab active">🤖 Боты</div>
+        <div class="tab">👤 Пользователи</div>
+        <div class="tab">⭐ Отзывы</div>
+        <div class="tab">📊 Обзор</div>
+        <div class="tab">🧩 Шаблоны</div>
+        <div class="tab">⚙️ Фичи</div>
+        <div class="tab">✏️ Правки</div>
+      </div>
+      <div class="swipe-hint">← свайп →</div>
+      <div class="content">
+        <div class="row">
+          <div class="row-avatar">🍽️</div>
+          <div class="row-main">
+            <div class="row-title">Ресторан «Bella Vita»</div>
+            <div class="row-sub">booking_restaurant · владелец: Ирина К.</div>
+          </div>
+          <div class="row-tail"><span class="pill">Активен</span></div>
+          <div class="chev">›</div>
+        </div>
+        <div class="row">
+          <div class="row-avatar">💈</div>
+          <div class="row-main">
+            <div class="row-title">Барбершоп «Фактура»</div>
+            <div class="row-sub">booking_fitness · владелец: Данил С.</div>
+          </div>
+          <div class="row-tail"><span class="pill muted">На паузе</span></div>
+          <div class="chev">›</div>
+        </div>
+        <div class="row">
+          <div class="row-avatar">🚗</div>
+          <div class="row-main">
+            <div class="row-title">АвтоСервис Плюс</div>
+            <div class="row-sub">vehicle_service · владелец: Ирина К.</div>
+          </div>
+          <div class="row-tail"><span class="pill">Активен</span></div>
+          <div class="chev">›</div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="note">Клик на строку → карточка бота (макет ниже, п.05). Владелец виден сразу в списке — не нужно проваливаться, чтобы понять, чей бот.</div>
+
+  <h2 class="section-title">03 · Вкладка «Пользователи»</h2>
+  <div class="screen-frame">
+    <div class="frame-label">/registry — tab: Пользователи</div>
+    <div class="frame-body">
+      <div class="title-row" style="padding-top:14px;">Реестр</div>
+      <div class="tabs">
+        <div class="tab">🤖 Боты</div>
+        <div class="tab active">👤 Пользователи</div>
+        <div class="tab">⭐ Отзывы</div>
+        <div class="tab">📊 Обзор</div>
+        <div class="tab">🧩 Шаблоны</div>
+      </div>
+      <div class="content">
+        <div class="row">
+          <div class="row-avatar">👩</div>
+          <div class="row-main">
+            <div class="row-title">Ирина К.</div>
+            <div class="row-sub">@irina_bellavita · 2 бота</div>
+          </div>
+          <div class="chev">›</div>
+        </div>
+        <div class="row">
+          <div class="row-avatar">👨</div>
+          <div class="row-main">
+            <div class="row-title">Данил С.</div>
+            <div class="row-sub">@danil_factura · 1 бот</div>
+          </div>
+          <div class="chev">›</div>
+        </div>
+      </div>
+
+      <div class="section-label" style="margin-top:18px;">→ клик на Ирину К.</div>
+      <div class="owner-strip">
+        <div class="row-avatar">👩</div>
+        <div class="row-main">
+          <div class="row-title">Ирина К.</div>
+          <div class="row-sub">@irina_bellavita · Telegram ID 8xxxxxxx1 · с нами с 12.03.2026</div>
+        </div>
+        <button class="btn primary">✉️ Написать</button>
+      </div>
+      <div class="row">
+        <div class="row-avatar">🍽️</div>
+        <div class="row-main">
+          <div class="row-title">Ресторан «Bella Vita»</div>
+          <div class="row-sub">booking_restaurant</div>
+        </div>
+        <div class="row-tail"><span class="pill">Активен</span></div>
+        <div class="chev">›</div>
+      </div>
+      <div class="row">
+        <div class="row-avatar">🚗</div>
+        <div class="row-main">
+          <div class="row-title">АвтоСервис Плюс</div>
+          <div class="row-sub">vehicle_service</div>
+        </div>
+        <div class="row-tail"><span class="pill">Активен</span></div>
+        <div class="chev">›</div>
+      </div>
+    </div>
+  </div>
+  <div class="note">Фото и имя настоящие — из Telegram Login Widget данных, которые уже собираются при авторизации (нужно только сохранить/подтянуть <code>photo_url</code> + <code>first_name</code>, сейчас в реестре хранится голый <code>owner_telegram_id</code>).</div>
+
+  <h2 class="section-title">04 · Вкладка «Отзывы»</h2>
+  <div class="screen-frame">
+    <div class="frame-label">/registry — tab: Отзывы</div>
+    <div class="frame-body">
+      <div class="title-row" style="padding-top:14px;">Реестр</div>
+      <div class="tabs">
+        <div class="tab">🤖 Боты</div>
+        <div class="tab">👤 Пользователи</div>
+        <div class="tab active">⭐ Отзывы</div>
+        <div class="tab">📊 Обзор</div>
+      </div>
+      <div class="content">
+        <div class="row">
+          <div class="row-avatar">👩</div>
+          <div class="row-main">
+            <div class="row-title">Ирина К. <span class="stars">★★★★★</span></div>
+            <div class="row-sub">Ресторан «Bella Vita» · 18.08.2026</div>
+          </div>
+          <div class="chev">›</div>
+        </div>
+        <div class="row selected">
+          <div class="row-avatar">👨</div>
+          <div class="row-main">
+            <div class="row-title">Данил С. <span class="stars">★★☆☆☆</span></div>
+            <div class="row-sub">Барбершоп «Фактура» · 20.08.2026</div>
+          </div>
+          <div class="chev">›</div>
+        </div>
+      </div>
+
+      <div class="section-label" style="margin-top:18px;">→ карточка отзыва (2 звезды)</div>
+      <div class="owner-strip">
+        <div class="row-avatar">👨</div>
+        <div class="row-main">
+          <div class="row-title">Данил С. <span class="stars">★★☆☆☆</span></div>
+          <div class="row-sub">@danil_factura · бот: Барбершоп «Фактура»</div>
+        </div>
+        <button class="btn primary">✉️ Спросить, в чём проблема</button>
+      </div>
+      <div class="review-comment">«Постоянно путает свободные слоты, два клиента пришли на одно время»</div>
+    </div>
+  </div>
+  <div class="note">Кнопка «Написать» — deep-link <code>t.me/danil_factura</code> (по <code>owner_telegram_id</code>/username), открывает личный чат владельца регистра с этим человеком напрямую в Telegram.</div>
+
+  <h2 class="section-title">05 · Карточка бота (общая для всех точек входа)</h2>
+  <div class="screen-frame">
+    <div class="frame-label">Уровень 2 — открывается из Ботов / Пользователей / Шаблонов</div>
+    <div class="frame-body">
+      <div class="content" style="padding-top:14px;">
+        <div class="detail-head">
+          <span class="back-arrow">← Назад</span>
+        </div>
+        <div class="title-row" style="padding:0 0 10px;">🍽️ Ресторан «Bella Vita»</div>
+
+        <div class="owner-strip">
+          <div class="row-avatar">👩</div>
+          <div class="row-main">
+            <div class="row-title">Ирина К.</div>
+            <div class="row-sub">владелец бота</div>
+          </div>
+        </div>
+
+        <div class="kv-grid">
+          <div class="kv"><div class="k">Шаблон</div><div class="v">booking_restaurant</div></div>
+          <div class="kv"><div class="k">Статус</div><div class="v">🟢 Активен</div></div>
+          <div class="kv"><div class="k">Фичи</div><div class="v">sheets, payments</div></div>
+          <div class="kv"><div class="k">Оценка</div><div class="v">★ 4.8 (12 отзывов)</div></div>
+        </div>
+
+        <div class="btn-row">
+          <button class="btn primary">💬 Открыть чат с ботом</button>
+          <button class="btn">⏸ Остановить</button>
+          <button class="btn">🔄 Перезапустить</button>
+        </div>
+
+        <div class="section-label">Логи</div>
+        <div class="logs-box">14:02:11 INFO  update: /start from 8xxxxxxx1
+14:02:11 INFO  booking created: table 4, 19:30
+14:03:47 WARN  sheets sync retry (timeout)
+14:03:49 INFO  sheets sync ok</div>
+      </div>
+    </div>
+  </div>
+  <div class="note">Ссылка «Открыть чат с ботом» = <code>t.me/&lt;username&gt;</code>. Логи — то, что уже отдаёт <code>bot_logs_handler</code>, просто перенесено внутрь этой карточки вместо отдельного экрана.</div>
+
+  <h2 class="section-title">06 · Вкладки 4–7: Обзор / Шаблоны / Фичи / Правки</h2>
+  <div class="screen-frame">
+    <div class="frame-label">/registry — tab: Обзор</div>
+    <div class="frame-body">
+      <div class="title-row" style="padding-top:14px;">Реестр</div>
+      <div class="tabs">
+        <div class="tab">🤖 Боты</div>
+        <div class="tab">👤 Пользователи</div>
+        <div class="tab">⭐ Отзывы</div>
+        <div class="tab active">📊 Обзор</div>
+        <div class="tab">🧩 Шаблоны</div>
+      </div>
+      <div class="content">
+        <div class="stat-grid">
+          <div class="stat-tile"><div class="num">14</div><div class="lbl">всего ботов</div></div>
+          <div class="stat-tile"><div class="num">11</div><div class="lbl">активных</div></div>
+          <div class="stat-tile"><div class="num">3</div><div class="lbl">на паузе</div></div>
+          <div class="stat-tile"><div class="num">6</div><div class="lbl">владельцев</div></div>
+        </div>
+        <div class="section-label" style="margin-top:16px;">Каждая плитка кликабельна → фильтрует вкладку «Боты» по этому срезу</div>
+      </div>
+    </div>
+  </div>
+  <div class="note">Вместо статичных чисел плитки на «Обзоре» ведут в отфильтрованный список на вкладке «Боты» (клик на «3 на паузе» → сразу список этих трёх). «Шаблоны» и «Фичи» — та же механика: список групп → клик на шаблон/фичу → отфильтрованный список ботов. «Правки» — суммарный счётчик + сюда же переезжают текущие блоки «Незакрытые паттерны» / «Кандидаты на шаблон» с реестра.</div>
+
+  <h2 class="section-title">Открытые вопросы для владельца</h2>
+  <div class="question-box">
+    <div class="q-label">Вопрос 1</div>
+    Состав вкладок 4–7 — «Обзор / Шаблоны / Фичи / Правки» — моё предположение по текущим 7 плиткам реестра. Верно?
+  </div>
+  <div class="question-box">
+    <div class="q-label">Вопрос 2</div>
+    Вкладка «Отзывы» требует новой таблицы отзывов (сейчас хранится только агрегат) — ок начинать с этого как с отдельного бэкенд-этапа перед фронтом?
+  </div>
+  <div class="question-box">
+    <div class="q-label">Вопрос 3</div>
+    Кнопка «Написать» на отзыве/пользователе — это диплинк в Telegram (открывает чат в самом Telegram-приложении), а не чат внутри мини-аппа. Подходит?
+  </div>
+
+  <div class="foot-cta">Это вайрфрейм — цвета/шрифты ориентировочные, важна структура и flow. После «да» перехожу к реализации: сначала таблица отзывов на бэкенде, потом сама вёрстка вкладок.</div>
+</div>

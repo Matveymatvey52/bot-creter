@@ -1,0 +1,516 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Mini App Mockup — Вариант D: AB Hybrid, интерактивный</title>
+<style>
+  /* ============================================================
+     ДИЗАЙН-ТОКЕНЫ — гибрид A (глубина/фиолетовый градиент) и
+     B (сдержанность/hairline-разделители/крупная типографика).
+     При выборе варианта переносятся в реальный miniapp одним
+     слоем. themeParams Telegram сознательно НЕ используется для
+     базовых цветов — фирменный вид не зависит от темы клиента.
+     ============================================================ */
+  :root {
+    --bg-0: #0d0a18;
+    --bg-1: #171128;
+    --surface: rgba(255,255,255,0.04);
+    --surface-hi: rgba(255,255,255,0.07);
+    --border: rgba(255,255,255,0.10);
+    --border-strong: rgba(169,134,255,0.35);
+    --accent: #a986ff;
+    --accent-2: #8f6fe0;
+    --accent-soft: rgba(169,134,255,0.15);
+    --text: #f1eef9;
+    --text-dim: #aca6c9;
+    --muted: #746e90;
+    --success: #6fd8ac;
+    --warning: #e2ac68;
+    --danger: #e37b8f;
+    --radius: 14px;
+    --radius-sm: 10px;
+    --font-ui: -apple-system, BlinkMacSystemFont, "SF Pro Display", system-ui, sans-serif;
+    --font-serif: Georgia, "Iowan Old Style", serif;
+  }
+
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html,body { margin:0; padding:0; background:#050308; }
+  body {
+    font-family: var(--font-ui);
+    color: var(--text);
+    display:flex; flex-direction:column; align-items:center;
+    gap:28px; padding:48px 12px;
+  }
+  .label { color:#6f6a8a; font-size:13px; letter-spacing:.02em; font-weight:600; text-transform:uppercase; text-align:center; max-width:390px; }
+  .hint { color:#524d6b; font-size:12px; text-align:center; max-width:340px; margin-bottom:6px; }
+
+  .device {
+    width: 390px; max-width:100%; height: 844px;
+    border-radius: 40px; overflow:hidden; position:relative;
+    background:
+      radial-gradient(110% 55% at 15% -10%, var(--bg-1) 0%, transparent 60%),
+      radial-gradient(90% 45% at 100% 0%, rgba(143,111,224,0.14) 0%, transparent 55%),
+      var(--bg-0);
+    box-shadow: 0 30px 80px rgba(0,0,0,0.6);
+    border: 1px solid rgba(255,255,255,0.06);
+    display:flex; flex-direction:column;
+  }
+
+  .topbar {
+    display:flex; align-items:center; justify-content:space-between;
+    padding: 18px 18px 12px; border-bottom:1px solid var(--border); flex:0 0 auto;
+  }
+  .icon-btn {
+    width:34px; height:34px; border-radius:50%;
+    background: var(--surface); border:1px solid var(--border);
+    display:flex; align-items:center; justify-content:center;
+    color: var(--text-dim); cursor:pointer; flex:0 0 auto;
+  }
+  .icon-btn:active { background: var(--surface-hi); }
+  .brand { display:flex; align-items:center; gap:10px; cursor:pointer; }
+  .avatar {
+    width:32px; height:32px; border-radius:50%;
+    background: linear-gradient(135deg, var(--accent-2), var(--accent));
+    display:flex; align-items:center; justify-content:center;
+    font-weight:700; font-size:13px; color:#0d0a18;
+  }
+  .title { font-family: var(--font-serif); font-size:16px; font-weight:600; }
+  .sub { font-size:11px; color:var(--muted); }
+
+  .screen-body { flex:1 1 auto; overflow-y:auto; padding-bottom:12px; }
+  .screen-body::-webkit-scrollbar{ width:0; }
+
+  /* --- Карусель разделов --- */
+  .carousel { display:flex; gap:10px; overflow-x:auto; padding: 14px 18px; }
+  .carousel::-webkit-scrollbar{display:none;}
+  .sect-card {
+    flex:0 0 auto; width:98px; height:80px; cursor:pointer;
+    border-radius: var(--radius-sm);
+    background: var(--surface); border:1px solid var(--border);
+    padding:11px; display:flex; flex-direction:column; justify-content:space-between;
+    transition:.15s;
+  }
+  .sect-card .icon { font-size:18px; }
+  .sect-card .name { font-size:12px; font-weight:600; color:var(--text-dim); }
+  .sect-card.active {
+    background: linear-gradient(155deg, rgba(169,134,255,0.2), rgba(143,111,224,0.06));
+    border-color: var(--border-strong);
+  }
+  .sect-card.active .name { color:#fff; }
+
+  .section-head { display:flex; align-items:center; justify-content:space-between; padding: 4px 18px 14px; }
+  .section-head h2 { font-family: var(--font-serif); font-size:23px; margin:0; font-weight:600; }
+  .add-btn {
+    width:32px; height:32px; border-radius:50%; cursor:pointer;
+    background: linear-gradient(135deg, var(--accent-2), var(--accent));
+    color:#fff; font-size:17px; display:flex; align-items:center; justify-content:center; font-weight:700;
+  }
+  .add-btn:active { filter:brightness(0.9); }
+
+  .list { display:flex; flex-direction:column; padding: 0 18px 20px; gap:10px; }
+
+  /* Карточки (список Туров) — глубина от A, hairline от B */
+  .card {
+    background: var(--surface); border:1px solid var(--border); border-radius: var(--radius);
+    padding:14px; cursor:pointer; transition:.15s;
+  }
+  .card:active { background: var(--surface-hi); }
+  .card-row1 { display:flex; align-items:center; justify-content:space-between; gap:8px; }
+  .card-title { font-size:16px; font-weight:700; }
+  .card-meta { color:var(--text-dim); font-size:12.5px; margin-top:3px; }
+  .card-stats { display:flex; gap:14px; margin-top:11px; padding-top:11px; border-top:1px solid var(--border); font-size:12px; color:var(--text-dim); }
+
+  .badge { font-size:10.5px; font-weight:700; padding:4px 9px; border-radius:999px; white-space:nowrap; }
+  .badge.planning { background: rgba(226,172,104,0.16); color:var(--warning); }
+  .badge.confirmed { background: rgba(111,216,172,0.16); color:var(--success); }
+  .badge.draft { background: rgba(116,110,144,0.2); color:var(--muted); }
+  .badge.done { background: rgba(169,134,255,0.16); color:var(--accent); }
+
+  /* Editorial-строки для остальных разделов — от B */
+  .row {
+    display:flex; align-items:center; justify-content:space-between;
+    padding: 13px 14px; cursor:pointer; border-radius: var(--radius-sm);
+    background: var(--surface); border:1px solid var(--border);
+  }
+  .row:active { background: var(--surface-hi); }
+  .row-title { font-size:14.5px; font-weight:600; }
+  .row-meta { font-size:12px; color:var(--muted); margin-top:2px; }
+  .row-arrow { color: var(--muted); font-size:14px; }
+
+  /* --- Деталка --- */
+  .hero { margin: 4px 18px 16px; border-radius: var(--radius); padding:20px;
+    background: linear-gradient(160deg, rgba(255,255,255,0.05), rgba(255,255,255,0.015));
+    border:1px solid var(--border-strong); }
+  .hero-back { font-size:12.5px; color:var(--text-dim); margin-bottom:14px; cursor:pointer; display:inline-block; }
+  .hero-back:active { color:var(--accent); }
+  .hero h1 { font-family: var(--font-serif); font-size:28px; margin:0 0 6px; font-weight:600; }
+  .hero-badges { display:flex; gap:8px; margin-top:12px; }
+
+  .detail-grid { display:grid; grid-template-columns: 1fr 1fr; gap:10px; margin:0 18px 16px; }
+  .field { background: var(--surface); border:1px solid var(--border); border-radius: var(--radius-sm); padding:12px 14px; cursor:pointer; }
+  .field:active { background: var(--surface-hi); }
+  .field .k { font-size:10.5px; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; margin-bottom:5px; }
+  .field .v { font-size:14.5px; font-weight:700; }
+
+  .block { margin: 0 18px 16px; }
+  .block h3 { font-size:12.5px; color:var(--text-dim); margin:0 0 10px; font-weight:700; text-transform:uppercase; letter-spacing:.03em; }
+
+  .files { display:flex; flex-direction:column; gap:8px; }
+  .file-row { display:flex; align-items:center; gap:12px; background: var(--surface); border:1px solid var(--border); border-radius: var(--radius-sm); padding:11px 14px; cursor:pointer; }
+  .file-row:active { background: var(--surface-hi); }
+  .file-ico { width:32px; height:32px; border-radius:9px; background: var(--accent-soft); color:var(--accent); display:flex; align-items:center; justify-content:center; font-size:15px; flex:0 0 auto; }
+  .file-name { font-size:13px; font-weight:600; flex:1; }
+  .file-size { font-size:11px; color:var(--muted); }
+
+  .mini-table { background: var(--surface); border:1px solid var(--border); border-radius: var(--radius-sm); overflow:hidden; }
+  .mini-table table { width:100%; border-collapse:collapse; font-size:12.5px; }
+  .mini-table th { text-align:left; padding:8px 12px; color:var(--muted); font-weight:600; font-size:10.5px; text-transform:uppercase; background: rgba(255,255,255,0.02); }
+  .mini-table td { padding:9px 12px; border-top:1px solid var(--border); cursor:pointer; }
+  .mini-table tr:not(:first-child):active td { background: var(--surface-hi); }
+
+  .actions { display:grid; grid-template-columns: 1fr 1fr; gap:10px; margin:0 18px; }
+  .action-btn { display:flex; align-items:center; justify-content:center; gap:8px; padding:14px; border-radius: var(--radius-sm); font-size:13.5px; font-weight:700; border:1px solid var(--border); background: var(--surface); cursor:pointer; }
+  .action-btn:active { background: var(--surface-hi); }
+  .action-btn.primary { grid-column: 1/-1; background: linear-gradient(135deg, var(--accent-2), var(--accent)); border:none; color:#fff; }
+
+  .file-preview { font-size:76px; text-align:center; padding:56px 0; background: var(--surface); margin:4px 18px 20px; border-radius: var(--radius); border:1px solid var(--border); }
+
+  /* --- Таблица ДДС --- */
+  .table-wrap { margin: 4px 18px 16px; border-radius: var(--radius); overflow:hidden; border:1px solid var(--border); }
+  .table-scroll { overflow-x:auto; background: var(--surface); }
+  table.data { width:100%; border-collapse:collapse; min-width:540px; font-size:12.5px; }
+  table.data thead th { position:sticky; top:0; text-align:left; padding:11px 14px; background: rgba(23,17,40,0.92); color: var(--text-dim); font-weight:700; font-size:10.5px; text-transform:uppercase; border-bottom:1px solid var(--border-strong); }
+  table.data td { padding:11px 14px; border-top:1px solid var(--border); white-space:nowrap; cursor:pointer; }
+  table.data tbody tr:active td { background: var(--surface-hi); }
+  .amt-in { color: var(--success); font-weight:700; }
+  .amt-out { color: var(--danger); font-weight:700; }
+  .table-total { display:flex; justify-content:space-between; padding: 0 18px 20px; font-size:13px; color:var(--text-dim); }
+  .table-total b { color:var(--text); font-size:16px; }
+
+  .bottom-nav { flex:0 0 auto; display:flex; justify-content:space-around; padding:10px 8px; border-top:1px solid var(--border); background: rgba(13,10,24,0.6); }
+  .bn { display:flex; flex-direction:column; align-items:center; gap:4px; font-size:10px; color:var(--muted); cursor:pointer; padding:4px 10px; border-radius:10px; }
+  .bn:active { background: var(--surface); }
+  .bn.active { color: var(--accent); }
+
+  .toast {
+    position:absolute; left:50%; bottom:78px; transform:translate(-50%,8px);
+    background: rgba(20,15,36,0.95); border:1px solid var(--border-strong);
+    color:#fff; font-size:12.5px; padding:10px 16px; border-radius:999px;
+    opacity:0; pointer-events:none; transition:.2s; white-space:nowrap;
+    box-shadow: 0 10px 26px rgba(0,0,0,0.4);
+  }
+  .toast.show { opacity:1; transform:translate(-50%,0); }
+</style>
+</head>
+<body>
+
+<div class="label">Вариант D — AB Hybrid, интерактивный прототип</div>
+<div class="hint">Открой в браузере и кликай: карточки, поля (Гостей/Бюджет/Отель/Менеджер), файлы, строки программы и ДДС, бейджи, ⋯, аватар, «Ещё» — всё реально переключает экран.</div>
+
+<div class="device">
+  <div class="topbar">
+    <div id="back-btn" class="icon-btn" onclick="goBack()">←</div>
+    <div class="brand" onclick="navigate('detail',{section:'people',id:'me'})">
+      <div class="avatar">ТО</div>
+      <div><div class="title">TravelOps</div><div class="sub">Тур-оператор</div></div>
+    </div>
+    <div class="icon-btn" onclick="navigate('menu')">⋯</div>
+  </div>
+
+  <div id="screen-body" class="screen-body"></div>
+
+  <div class="bottom-nav">
+    <div id="bn-tours" class="bn" onclick="navigate('home',{section:'tours'},true)">🧳<span>Туры</span></div>
+    <div id="bn-guests" class="bn" onclick="navigate('home',{section:'guests'},true)">👥<span>Гости</span></div>
+    <div id="bn-dds" class="bn" onclick="navigate('home',{section:'dds'},true)">💰<span>ДДС</span></div>
+    <div class="bn" onclick="navigate('more')">⚙️<span>Ещё</span></div>
+  </div>
+
+  <div id="toast" class="toast"></div>
+</div>
+
+<script>
+const SECTIONS = {
+  tours:   {icon:'🧳', name:'Туры'},
+  program: {icon:'📋', name:'Программа'},
+  lip:     {icon:'🧑‍🤝‍🧑', name:'ЛиП'},
+  hotels:  {icon:'🏨', name:'Отели'},
+  guests:  {icon:'👥', name:'Гости'},
+  dds:     {icon:'💰', name:'ДДС'},
+};
+const SECTION_ORDER = ['tours','program','lip','hotels','guests','dds'];
+
+const TOURS = [
+  {id:'sochi', title:'Сочи', meta:'12 – 19 сентября · 8 ночей', badge:'planning', badgeClass:'planning', guests:14, budget:'1 260 000 ₽', hotel:'radisson', hotelName:'Radisson Collection', manager:'anna', managerName:'Анна К.'},
+  {id:'istanbul', title:'Стамбул', meta:'3 – 10 октября · 7 ночей', badge:'confirmed', badgeClass:'confirmed', guests:22, budget:'2 040 000 ₽', hotel:'cvk', hotelName:'CVK Park', manager:'anna', managerName:'Анна К.'},
+  {id:'dubai', title:'Дубай', meta:'даты уточняются', badge:'draft', badgeClass:'draft', guests:0, budget:'—', hotel:null, hotelName:'не выбран', manager:'oleg', managerName:'Олег С.'},
+  {id:'redpoly', title:'Красная Поляна', meta:'14 – 18 января · 4 ночи', badge:'завершён', badgeClass:'done', guests:9, budget:'640 000 ₽', hotel:'rosa', hotelName:'Rosa Springs', manager:'anna', managerName:'Анна К.'},
+];
+
+const GENERIC = {
+  program: [
+    {id:'d1', title:'Заезд, трансфер', subtitle:'12.09 · 14:00'},
+    {id:'d2', title:'Экскурсия «Роза Хутор»', subtitle:'13.09 · 10:00'},
+    {id:'d3', title:'Свободный день', subtitle:'14.09'},
+  ],
+  lip: [
+    {id:'p1', title:'Иванов Иван Иванович', subtitle:'Паспорт •• 4521 · ДР 03.05.1988'},
+    {id:'p2', title:'Петрова Мария', subtitle:'Паспорт •• 7734 · ДР 21.11.1990'},
+    {id:'p3', title:'Сидоров Пётр', subtitle:'Паспорт •• 1190 · ДР 09.02.1979'},
+  ],
+  hotels: [
+    {id:'radisson', title:'Radisson Collection', subtitle:'Сочи · 5★ · 14 номеров'},
+    {id:'cvk', title:'CVK Park', subtitle:'Стамбул · 5★ · 22 номера'},
+    {id:'rosa', title:'Rosa Springs', subtitle:'Красная Поляна · 4★ · 9 номеров'},
+  ],
+  guests: [
+    {id:'g1', title:'Смирнова Ольга', subtitle:'Тур: Сочи · взрослый'},
+    {id:'g2', title:'Смирнов Игорь', subtitle:'Тур: Сочи · взрослый'},
+    {id:'g3', title:'Кузнецова Вера', subtitle:'Тур: Стамбул · взрослый'},
+    {id:'g4', title:'Волков Артём', subtitle:'Тур: Сочи · ребёнок'},
+  ],
+  people: [
+    {id:'anna', title:'Анна К.', subtitle:'Менеджер · 3 тура в работе'},
+    {id:'oleg', title:'Олег С.', subtitle:'Менеджер · 1 тур в работе'},
+    {id:'me', title:'Вы', subtitle:'Владелец аккаунта'},
+  ],
+};
+
+const DDS = [
+  {id:'t1', date:'02.09', title:'Предоплата группа', type:'Приход', amount:'+504 000 ₽', cls:'in', comment:'40% от суммы'},
+  {id:'t2', date:'04.09', title:'Бронь отеля', type:'Расход', amount:'−380 000 ₽', cls:'out', comment:'Radisson, депозит'},
+  {id:'t3', date:'06.09', title:'Авиабилеты', type:'Расход', amount:'−210 000 ₽', cls:'out', comment:'14 билетов'},
+  {id:'t4', date:'10.09', title:'Доплата группа', type:'Приход', amount:'+756 000 ₽', cls:'in', comment:'Остаток 60%'},
+  {id:'t5', date:'11.09', title:'Гид и трансфер', type:'Расход', amount:'−96 000 ₽', cls:'out', comment:'8 ночей'},
+];
+
+const FILES = [
+  {name:'Договор_Сочи_2026.pdf', size:'1.2 МБ', icon:'📄'},
+  {name:'Ваучер_отель.pdf', size:'340 КБ', icon:'🧾'},
+  {name:'Схема_рассадки.jpg', size:'890 КБ', icon:'🖼️'},
+];
+
+let stack = [];
+let current = {view:'home', params:{section:'tours'}};
+
+function navigate(view, params, replace) {
+  params = params || {};
+  if (!replace) stack.push(current);
+  current = {view:view, params:params};
+  render();
+}
+function goBack() {
+  if (stack.length) { current = stack.pop(); render(); }
+}
+function showToast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  clearTimeout(window.__toastTimer);
+  window.__toastTimer = setTimeout(function(){ t.classList.remove('show'); }, 1700);
+}
+function findGeneric(section, id) { return (GENERIC[section]||[]).find(function(x){return x.id===id;}); }
+function findTour(id){ return TOURS.find(function(t){return t.id===id;}); }
+function badge(text, cls){ return '<span class="badge '+cls+'">'+text+'</span>'; }
+function badgeClick(text, cls, onclick){ return '<span class="badge '+cls+'" style="cursor:pointer" onclick="'+onclick+'">'+text+'</span>'; }
+
+function renderCarousel(activeSection) {
+  return '<div class="carousel">' + SECTION_ORDER.map(function(key){
+    var s = SECTIONS[key];
+    return '<div class="sect-card '+(key===activeSection?'active':'')+'" onclick="navigate(\'home\',{section:\''+key+'\'},true)">'+
+      '<div class="icon">'+s.icon+'</div><div class="name">'+s.name+'</div></div>';
+  }).join('') + '</div>';
+}
+
+function renderHome(section) {
+  const s = SECTIONS[section];
+  let body = '';
+  if (section === 'tours') {
+    body = TOURS.map(function(t){
+      return '<div class="card" onclick="navigate(\'detail\',{section:\'tours\',id:\''+t.id+'\'})">'+
+        '<div class="card-row1"><div class="card-title">'+t.title+'</div>'+badge(t.badge, t.badgeClass)+'</div>'+
+        '<div class="card-meta">'+t.meta+'</div>'+
+        '<div class="card-stats"><span>👥 '+(t.guests||'—')+'</span><span>🏨 '+t.hotelName+'</span><span>💵 '+t.budget+'</span></div>'+
+      '</div>';
+    }).join('');
+    body = '<div class="list">'+body+'</div>';
+  } else if (section === 'dds') {
+    body = '<div class="table-wrap"><div class="table-scroll"><table class="data">'+
+      '<thead><tr><th>Дата</th><th>Статья</th><th>Тип</th><th>Сумма</th><th>Коммент.</th></tr></thead><tbody>'+
+      DDS.map(function(d){
+        return '<tr onclick="navigate(\'detail\',{section:\'ddstx\',id:\''+d.id+'\'})">'+
+          '<td>'+d.date+'</td><td>'+d.title+'</td><td>'+d.type+'</td>'+
+          '<td class="amt-'+d.cls+'">'+d.amount+'</td><td>'+d.comment+'</td></tr>';
+      }).join('') + '</tbody></table></div></div>'+
+      '<div class="table-total"><span>Итого приход / расход</span><span><b class="amt-in">+1 260 000</b> / <b class="amt-out">−686 000</b> ₽</span></div>';
+  } else {
+    body = '<div class="list">' + GENERIC[section].map(function(it){
+      return '<div class="row" onclick="navigate(\'detail\',{section:\''+section+'\',id:\''+it.id+'\'})">'+
+        '<div class="row-left"><div class="row-title">'+it.title+'</div><div class="row-meta">'+it.subtitle+'</div></div>'+
+        '<div class="row-arrow">→</div></div>';
+    }).join('') + '</div>';
+  }
+  return renderCarousel(section) +
+    '<div class="section-head"><h2>'+s.name+'</h2><div class="add-btn" onclick="navigate(\'create\',{section:\''+section+'\'})">＋</div></div>' +
+    body;
+}
+
+function renderTourDetail(id) {
+  const t = findTour(id);
+  const hotelClick = t.hotel ? "navigate('detail',{section:'hotels',id:'"+t.hotel+"'})" : "navigate('create',{section:'hotels'})";
+  return (
+    '<div class="hero">'+
+      '<div class="hero-back" onclick="goBack()">← Все туры</div>'+
+      '<h1>'+t.title+'</h1>'+
+      '<div class="card-meta">'+t.meta+'</div>'+
+      '<div class="hero-badges">'+
+        badgeClick(t.badge, t.badgeClass, "navigate('detail',{section:'status',id:'"+t.id+"'})")+
+        badgeClick('оплата 40%','confirmed', "navigate('home',{section:'dds'})")+
+      '</div>'+
+    '</div>'+
+    '<div class="detail-grid">'+
+      '<div class="field" onclick="navigate(\'home\',{section:\'guests\'})"><div class="k">Гостей</div><div class="v">'+t.guests+' человек</div></div>'+
+      '<div class="field" onclick="navigate(\'home\',{section:\'dds\'})"><div class="k">Бюджет</div><div class="v">'+t.budget+'</div></div>'+
+      '<div class="field" onclick="'+hotelClick+'"><div class="k">Отель</div><div class="v">'+t.hotelName+'</div></div>'+
+      '<div class="field" onclick="navigate(\'detail\',{section:\'people\',id:\''+t.manager+'\'})"><div class="k">Менеджер</div><div class="v">'+t.managerName+'</div></div>'+
+    '</div>'+
+    '<div class="block"><h3>Файлы и вложения</h3><div class="files">'+
+      FILES.map(function(f){
+        return '<div class="file-row" onclick="navigate(\'file\',{name:\''+f.name+'\'})">'+
+          '<div class="file-ico">'+f.icon+'</div><div class="file-name">'+f.name+'</div><div class="file-size">'+f.size+'</div></div>';
+      }).join('') +
+    '</div></div>'+
+    '<div class="block"><h3>Программа тура</h3><div class="mini-table"><table>'+
+      '<tr><th>День</th><th>Время</th><th>Пункт</th></tr>'+
+      GENERIC.program.map(function(p){
+        const parts = p.subtitle.split(' · ');
+        return '<tr onclick="navigate(\'detail\',{section:\'program\',id:\''+p.id+'\'})"><td>'+parts[0]+'</td><td>'+(parts[1]||'—')+'</td><td>'+p.title+'</td></tr>';
+      }).join('') +
+    '</table></div></div>'+
+    '<div class="actions">'+
+      '<div class="action-btn" onclick="navigate(\'home\',{section:\'guests\'})">👥 Гости ('+t.guests+')</div>'+
+      '<div class="action-btn" onclick="navigate(\'home\',{section:\'dds\'})">💰 Смета</div>'+
+      '<div class="action-btn primary" onclick="showToast(\'Открыт чат с группой (демо)\')">Открыть чат с группой</div>'+
+    '</div>'
+  );
+}
+
+function renderGenericDetail(section, id) {
+  if (section === 'ddstx') {
+    const d = DDS.find(function(x){return x.id===id;});
+    return (
+      '<div class="hero"><div class="hero-back" onclick="goBack()">← ДДС</div><h1 style="font-size:22px;">'+d.title+'</h1>'+
+      '<div class="card-meta">'+d.date+' · '+d.type+'</div></div>'+
+      '<div class="detail-grid">'+
+        '<div class="field"><div class="k">Сумма</div><div class="v amt-'+d.cls+'">'+d.amount+'</div></div>'+
+        '<div class="field"><div class="k">Комментарий</div><div class="v">'+d.comment+'</div></div>'+
+      '</div>'+
+      '<div class="block"><h3>Связано с туром</h3>'+
+        '<div class="row" onclick="navigate(\'detail\',{section:\'tours\',id:\'sochi\'})">'+
+          '<div class="row-left"><div class="row-title">Сочи</div><div class="row-meta">Открыть тур</div></div><div class="row-arrow">→</div></div>'+
+      '</div>'
+    );
+  }
+  if (section === 'status') {
+    return (
+      '<div class="hero"><div class="hero-back" onclick="goBack()">← Тур</div><h1 style="font-size:22px;">История статуса</h1></div>'+
+      '<div class="block"><h3>Изменения</h3>'+
+        '<div class="row" style="margin-bottom:8px;"><div class="row-left"><div class="row-title">planning</div><div class="row-meta">с 20.08.2026, Анна К.</div></div></div>'+
+        '<div class="row"><div class="row-left"><div class="row-title">draft</div><div class="row-meta">с 02.08.2026, Анна К.</div></div></div>'+
+      '</div>'
+    );
+  }
+  const it = findGeneric(section, id) || {title:'Не найдено', subtitle:''};
+  const s = SECTIONS[section] || {name:'Раздел'};
+  return (
+    '<div class="hero"><div class="hero-back" onclick="goBack()">← '+s.name+'</div>'+
+      '<h1 style="font-size:24px;">'+it.title+'</h1><div class="card-meta">'+it.subtitle+'</div></div>'+
+    '<div class="block"><h3>Связанное</h3>'+
+      '<div class="row" style="margin-bottom:8px;" onclick="navigate(\'detail\',{section:\'tours\',id:\'sochi\'})">'+
+        '<div class="row-left"><div class="row-title">Тур «Сочи»</div><div class="row-meta">Открыть карточку тура</div></div><div class="row-arrow">→</div></div>'+
+      '<div class="row" onclick="navigate(\'home\',{section:\''+section+'\'})">'+
+        '<div class="row-left"><div class="row-title">Все: '+s.name+'</div><div class="row-meta">Вернуться к списку</div></div><div class="row-arrow">→</div></div>'+
+    '</div>'
+  );
+}
+
+function renderFile(name) {
+  const f = FILES.find(function(x){return x.name===name;}) || {icon:'📄', size:''};
+  return (
+    '<div class="hero"><div class="hero-back" onclick="goBack()">← Файлы</div><h1 style="font-size:19px;">'+name+'</h1>'+
+    '<div class="card-meta">'+f.size+'</div></div>'+
+    '<div class="file-preview">'+f.icon+'</div>'+
+    '<div class="actions">'+
+      '<div class="action-btn" onclick="showToast(\'Скачивание (демо)\')">Скачать</div>'+
+      '<div class="action-btn" onclick="showToast(\'Ссылка скопирована (демо)\')">Поделиться</div>'+
+    '</div>'
+  );
+}
+
+function renderCreate(section) {
+  const s = SECTIONS[section] || {name:'Запись'};
+  return (
+    '<div class="hero"><div class="hero-back" onclick="goBack()">← Отмена</div><h1 style="font-size:21px;">Новая запись</h1>'+
+    '<div class="card-meta">'+s.name+'</div></div>'+
+    '<div class="detail-grid">'+
+      '<div class="field"><div class="k">Название</div><div class="v">—</div></div>'+
+      '<div class="field"><div class="k">Дата</div><div class="v">—</div></div>'+
+    '</div>'+
+    '<div class="actions"><div class="action-btn primary" onclick="showToast(\'Сохранено (демо)\'); goBack();">Сохранить</div></div>'
+  );
+}
+
+function renderMenu() {
+  return (
+    '<div class="hero"><div class="hero-back" onclick="goBack()">← Закрыть</div><h1 style="font-size:21px;">Меню</h1></div>'+
+    '<div class="block">'+
+      '<div class="row" style="margin-bottom:8px;" onclick="navigate(\'detail\',{section:\'people\',id:\'me\'})"><div class="row-left"><div class="row-title">Профиль</div></div><div class="row-arrow">→</div></div>'+
+      '<div class="row" style="margin-bottom:8px;" onclick="showToast(\'Настройки (демо)\')"><div class="row-left"><div class="row-title">Настройки</div></div><div class="row-arrow">→</div></div>'+
+      '<div class="row" onclick="showToast(\'Ссылка на приложение скопирована\')"><div class="row-left"><div class="row-title">Поделиться приложением</div></div><div class="row-arrow">→</div></div>'+
+    '</div>'
+  );
+}
+
+function renderMore() {
+  return (
+    '<div class="hero"><div class="hero-back" onclick="goBack()">← Назад</div><h1 style="font-size:21px;">Все разделы</h1></div>'+
+    '<div class="block">' + SECTION_ORDER.map(function(key, i){
+      return '<div class="row" style="'+(i<SECTION_ORDER.length-1?'margin-bottom:8px;':'')+'" onclick="navigate(\'home\',{section:\''+key+'\'})">'+
+        '<div class="row-left"><div class="row-title">'+SECTIONS[key].icon+' '+SECTIONS[key].name+'</div></div><div class="row-arrow">→</div></div>';
+    }).join('') + '</div>'
+  );
+}
+
+function render() {
+  const root = document.getElementById('screen-body');
+  document.getElementById('back-btn').style.visibility = stack.length ? 'visible' : 'hidden';
+
+  if (current.view === 'home') {
+    root.innerHTML = renderHome(current.params.section);
+  } else if (current.view === 'detail') {
+    root.innerHTML = current.params.section === 'tours'
+      ? renderTourDetail(current.params.id)
+      : renderGenericDetail(current.params.section, current.params.id);
+  } else if (current.view === 'file') {
+    root.innerHTML = renderFile(current.params.name);
+  } else if (current.view === 'create') {
+    root.innerHTML = renderCreate(current.params.section);
+  } else if (current.view === 'menu') {
+    root.innerHTML = renderMenu();
+  } else if (current.view === 'more') {
+    root.innerHTML = renderMore();
+  }
+  root.scrollTop = 0;
+
+  document.querySelectorAll('.bn').forEach(function(el){ el.classList.remove('active'); });
+  if (current.view === 'home') {
+    const el = document.getElementById('bn-' + current.params.section);
+    if (el) el.classList.add('active');
+  }
+}
+
+render();
+</script>
+</body>
+</html>
