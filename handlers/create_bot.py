@@ -446,7 +446,21 @@ async def _recognize_voice(message: Message, bot: Bot) -> str | None:
     try:
         file = await bot.get_file(message.voice.file_id)
         await bot.download_file(file.file_path, destination=tmp_path)
-        text = await transcribe_voice(tmp_path)
+        # transcribe_voice runs AssemblyAI's synchronous SDK (its own internal
+        # polling, no timeout of its own) in a default-executor thread — a
+        # stalled poll would otherwise hang this handler (and leak the
+        # executor thread) forever. The wait_for gives the *caller* a bound;
+        # the leaked thread itself is a separate, harder fix (SDK has no
+        # cancellation hook), out of scope here.
+        text = await asyncio.wait_for(transcribe_voice(tmp_path), timeout=120.0)
+    except asyncio.TimeoutError:
+        logger.error("Voice transcription timed out after 120s")
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+        await message.answer("Не удалось распознать голосовое (слишком долго) 😔 Попробуйте текстом.")
+        return None
     except Exception as e:
         logger.error(f"Voice transcription failed: {e}")
         try:
