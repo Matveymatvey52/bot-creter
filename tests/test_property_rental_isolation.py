@@ -22,6 +22,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
 
+import db.database as db_module
 from runtime.registry import get_template_router
 from templates import property_rental
 
@@ -431,6 +432,100 @@ class PropertyRentalStandaloneSmokeTest(unittest.TestCase):
     def test_router_and_main_entrypoint_exist(self):
         self.assertTrue(hasattr(property_rental, "router"))
         self.assertTrue(hasattr(property_rental, "main"))
+
+
+class PropertyRentalAdminHijackTests(unittest.IsolatedAsyncioTestCase):
+    """Security fix: whoever sent /start FIRST used to permanently become the
+    bot's owner (full admin panel: properties/leases/payments/maintenance/
+    admins management) — a prospective tenant or random client who messaged
+    the bot before the real owner tested it could hijack that role. Same
+    criterion/pattern as tests/test_shop_catalog_isolation.py's admin-hijack
+    tests. Note: property_access (role_filter source table for the mini-app)
+    is a SEPARATE concern from admins.json/_is_admin (Telegram-side gating) —
+    these tests target the latter, which had the naive first-comer bug."""
+
+    async def asyncSetUp(self):
+        self._bot_call_patcher = patch.object(Bot, "__call__", new=AsyncMock(return_value=MagicMock()))
+        self._bot_call_patcher.start()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.data_dir = Path(self._tmp.name)
+
+        # cmd_start now syncs the bootstrap admin into db.database.add_bot_admin
+        # (central bot_admins table) -- must be redirected to a throwaway DB.
+        self._central_db_path = self.data_dir / "central_bots.db"
+        self._db_path_patcher = patch.object(db_module, "DB_PATH", self._central_db_path)
+        self._db_path_patcher.start()
+        await db_module.init_db()
+
+    async def asyncTearDown(self):
+        self._db_path_patcher.stop()
+        self._tmp.cleanup()
+        self._bot_call_patcher.stop()
+
+    async def test_non_owner_messaging_first_does_not_become_admin(self):
+        config = property_rental.config_from_bot_row(
+            {"bot_id": 961, "name": "property_bot_owned", "display_name": None,
+             "group_chat_id": None, "owner_telegram_id": 12345},
+            self.data_dir,
+        )
+        await property_rental.init_db(config.db_path)
+        bot, dp = _build_bot_dispatcher(config)
+
+        CLIENT_ID = 555  # not the owner, messages first (e.g. a prospect)
+        await dp.feed_webhook_update(bot, _text_update(1, CLIENT_ID, "/start"))
+        self.assertEqual(property_rental._load_admins(config.admins_file), set())
+        self.assertFalse(property_rental._is_admin(CLIENT_ID, config))
+
+    async def test_owner_start_becomes_admin(self):
+        config = property_rental.config_from_bot_row(
+            {"bot_id": 962, "name": "property_bot_owned2", "display_name": None,
+             "group_chat_id": None, "owner_telegram_id": 12345},
+            self.data_dir,
+        )
+        await property_rental.init_db(config.db_path)
+        bot, dp = _build_bot_dispatcher(config)
+
+        await dp.feed_webhook_update(bot, _text_update(1, 12345, "/start"))
+        self.assertTrue(property_rental._is_admin(12345, config))
+        self.assertEqual(property_rental._load_admins(config.admins_file), {"12345"})
+
+    async def test_owner_is_always_admin_even_with_stale_admins_file(self):
+        config = property_rental.config_from_bot_row(
+            {"bot_id": 963, "name": "property_bot_owned3", "display_name": None,
+             "group_chat_id": None, "owner_telegram_id": 777},
+            self.data_dir,
+        )
+        await property_rental.init_db(config.db_path)
+        property_rental._save_admins(config.admins_file, {"999999"})
+        self.assertTrue(property_rental._is_admin(777, config))  # owner: always admin
+        self.assertTrue(property_rental._is_admin(999999, config))  # still honors the file's own admin
+        self.assertFalse(property_rental._is_admin(4242, config))  # neither owner nor in the file
+
+    async def test_standalone_mode_keeps_first_comer_behavior(self):
+        """owner_telegram_id unknown (standalone/env mode) -- the old
+        first-comer bootstrap is the only option available, so it's kept."""
+        config = property_rental.config_from_bot_row(
+            {"bot_id": 964, "name": "property_bot_standalone", "display_name": None, "group_chat_id": None},
+            self.data_dir,
+        )
+        await property_rental.init_db(config.db_path)
+        bot, dp = _build_bot_dispatcher(config)
+
+        await dp.feed_webhook_update(bot, _text_update(1, 111, "/start"))
+        self.assertEqual(property_rental._load_admins(config.admins_file), {"111"})
+        self.assertTrue(property_rental._is_admin(111, config))
+
+    async def test_bootstrap_admin_syncs_to_central_bot_admins_table(self):
+        config = property_rental.config_from_bot_row(
+            {"bot_id": 965, "name": "property_bot_synced", "display_name": None, "group_chat_id": None},
+            self.data_dir,
+        )
+        await property_rental.init_db(config.db_path)
+        bot, dp = _build_bot_dispatcher(config)
+        await dp.feed_webhook_update(bot, _text_update(1, 321, "/start"))
+
+        central_admins = await db_module.get_bot_admins(965)
+        self.assertEqual(central_admins, ["321"])
 
 
 if __name__ == "__main__":
