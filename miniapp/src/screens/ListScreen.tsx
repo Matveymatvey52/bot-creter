@@ -11,6 +11,7 @@ import { DataTable, type TableColumn } from '../components/DataTable'
 import { refLabelKey, type RefLabels } from '../components/FieldValue'
 import { TotalsStrip } from '../components/TotalsStrip'
 import { Icon } from '../components/Icon'
+import { dismissKeyboardOnBackdrop } from '../lib/keyboard'
 import { ParentPickerScreen } from './ParentPickerScreen'
 
 /* Раскладка карточки — вариант I (утверждён владельцем 2026-08-21,
@@ -257,7 +258,9 @@ export function ListScreen({
   }
 
   return (
-    <div className="screen">
+    /* Тап мимо поля прячет клавиатуру — то же правило, что на форме создания и
+       в поиске: одно поведение на всех экранах. */
+    <div className="screen" onPointerDown={dismissKeyboardOnBackdrop}>
       {/* Панель контекста из эталона (design/mockups/miniapp_mockup_I.html,
           .ctxbar): раздел всегда говорит, чьи записи показывает, и здесь же
           меняется. Справочник на том же месте говорит, что родителя у него

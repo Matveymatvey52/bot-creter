@@ -2,14 +2,7 @@ import { useCallback, useEffect, useState } from 'react'
 import { createResource, listResource, ApiError, type ResourceItem } from '../lib/api'
 import type { FieldDisplay, ResourceDisplay } from '../lib/displaySchema'
 import { Icon } from '../components/Icon'
-
-/* Спрятать клавиатуру. В WebView нет своей кнопки «свернуть», и единственный
-   способ её убрать — снять фокус с поля. Без этого человек, начав печатать,
-   оставался с поднятой клавиатурой до самой отправки или отмены. */
-function dismissKeyboard() {
-  const active = document.activeElement
-  if (active instanceof HTMLElement) active.blur()
-}
+import { dismissKeyboardOnBackdrop } from '../lib/keyboard'
 
 export function CreateFormScreen({
   resource,
@@ -84,11 +77,7 @@ export function CreateFormScreen({
        строками формы. */
     <div
       className="screen"
-      onPointerDown={(e) => {
-        if (!(e.target as HTMLElement).closest('input, select, textarea, button, label')) {
-          dismissKeyboard()
-        }
-      }}
+      onPointerDown={dismissKeyboardOnBackdrop}
     >
       {/* Форма — тот же спец-лист, что и карточка записи (вариант I):
           подпись слева, поле ввода справа. Отдельного «бланка» с крупными
