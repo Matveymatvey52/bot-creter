@@ -1680,6 +1680,40 @@ select.sol-spec-in {
   color: var(--text-tertiary);
 }
 
+/* ── Итоги под таблицей раздела ── */
+.sol-totals {
+  display: flex;
+  margin: 0 0 8px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  background: var(--surface);
+}
+.sol-tot {
+  flex: 1;
+  min-width: 0;
+  padding: 12px 14px;
+  border-right: 1px solid var(--hairline);
+}
+.sol-tot:last-child { border-right: none; }
+.sol-tot-k {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.09em;
+  color: var(--text-tertiary);
+  font-weight: 650;
+}
+.sol-tot-v {
+  font-size: 15px;
+  font-weight: 660;
+  margin-top: 4px;
+  letter-spacing: -0.01em;
+  color: var(--text-primary);
+  overflow-wrap: anywhere;
+}
+.sol-tot-v.pos { color: var(--success-text); }
+.sol-tot-v.neg { color: var(--danger-text); }
+
 /* ── Нижняя навигация ── */
 .sol-nav {
   margin-top: auto;

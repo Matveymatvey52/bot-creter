@@ -101,18 +101,13 @@ router = Router()
 # by cashflow_ledger.record_entry, see that module's docstring), shown here
 # the same way "tour_id" is already shown on guests below — visible but not
 # a fill-it-yourself field.
-# tour_access resolve table for role_filter (see the helpers section near
-# _grant_owner_access/_grant_client_access above) — "owner" is granted to
-# admins.json members at /start, "client" to everyone else. Only
-# "tours_public" below declares role_filter: it's the one resource real
-# customers (non-admins) are meant to see through the mini-app, and it is
-# deliberately NOT creatable — role_filter's create-time enforcement
-# (runtime/miniapp_api.py's _resolve_create_owner_column) only recognizes a
-# single-column-ownership where-template; a bare "where: None" client rule
-# (needed here since any client may browse ANY tour, not just their own)
-# would leave POST wide open with no ownership check at all, so creation
-# stays on the separate, role_filter-less "tours" resource above, which
-# keeps requiring admins.json membership exactly as before.
+# tour_access resolve table: "owner" присваивается членам admins.json на
+# /start, "client" — всем остальным. Ресурса с role_filter в конфиге больше
+# нет: тур-оператор — инструмент одного человека, клиентов у него не бывает,
+# и отдельный «клиентский» срез над той же таблицей tours только плодил
+# вторую вкладку «Туры» у владельца. Таблица и выдача ролей оставлены как
+# есть — их наполняют обработчики /start, и сносить рабочую механику ради
+# косметики конфига было бы риском без выгоды.
 _TOUR_ACCESS_RESOLVE = {
     "table": "tour_access",
     "identity_column": "user_id",
@@ -149,40 +144,11 @@ miniapp_config = {
             ],
         },
         {
-            # Read-only, all-tours view over the SAME "tours" table — the
-            # one resource clients (real customers) can see via the
-            # mini-app, per docs/MINIAPP_ROLE_SCOPING_DESIGN.md. See
-            # _TOUR_ACCESS_RESOLVE's comment above for why this is a
-            # separate resource rather than role_filter added onto "tours"
-            # itself.
-            "name": "tours_public",
-            "table": "tours",
-            "order_by": "created_at DESC",
-            "creatable": False,
-            "title": "Туры",
-            "titleField": "name",
-            "fields": [
-                {"name": "name", "label": "Название", "kind": "text", "list": True, "detail": True, "create": False},
-                {"name": "destination", "label": "Направление", "kind": "text", "list": True, "detail": True, "create": False},
-                {"name": "date_start", "label": "Начало", "kind": "date", "list": False, "detail": True, "create": False},
-                {"name": "date_end", "label": "Окончание", "kind": "date", "list": False, "detail": True, "create": False},
-                {"name": "status", "label": "Статус", "kind": "status", "list": True, "detail": True, "create": False},
-                {"name": "created_at", "label": "Создано", "kind": "date", "list": False, "detail": False, "create": False},
-            ],
-            "role_filter": {
-                "resolve": _TOUR_ACCESS_RESOLVE,
-                "rules": [
-                    {"role": "owner", "where": None},
-                    {"role": "client", "where": None},
-                ],
-                "default_deny": True,
-            },
-        },
-        {
             "name": "program",
             "table": "program",
             "order_by": "day_num ASC, date ASC, time ASC",
             "creatable": True,
+            "tableView": True,
             "title": "Программа",
             "titleField": "title",
             "fields": [
@@ -206,6 +172,7 @@ miniapp_config = {
             "table": "locations",
             "order_by": "region ASC, category ASC, name ASC",
             "creatable": True,
+            "tableView": True,
             "title": "ЛиП",
             "titleField": "name",
             "fields": [
@@ -217,7 +184,7 @@ miniapp_config = {
                 {"name": "hours", "label": "Часы работы", "kind": "text", "list": False, "detail": True, "create": True},
                 {"name": "cost", "label": "Стоимость", "kind": "text", "list": False, "detail": True, "create": True},
                 {"name": "notes", "label": "Заметки", "kind": "text", "list": False, "detail": True, "create": True},
-                {"name": "maps_link", "label": "Google Maps", "kind": "text", "list": False, "detail": True, "create": True},
+                {"name": "maps_link", "label": "Google Maps", "kind": "link", "list": False, "detail": True, "create": True},
                 {"name": "contacts", "label": "Контакты", "kind": "text", "list": False, "detail": True, "create": True},
                 {"name": "website", "label": "Сайт", "kind": "text", "list": False, "detail": True, "create": True},
                 {"name": "youtube", "label": "YouTube", "kind": "text", "list": False, "detail": True, "create": True},
@@ -230,6 +197,7 @@ miniapp_config = {
             "table": "hotels",
             "order_by": "region ASC, name ASC",
             "creatable": True,
+            "tableView": True,
             "title": "Отели",
             "titleField": "name",
             "fields": [
@@ -242,8 +210,8 @@ miniapp_config = {
                 {"name": "our_cost", "label": "Наша цена", "kind": "text", "list": True, "detail": True, "create": True},
                 {"name": "notes", "label": "Заметки", "kind": "text", "list": False, "detail": True, "create": True},
                 {"name": "contacts", "label": "Контакты", "kind": "text", "list": False, "detail": True, "create": True},
-                {"name": "maps_link", "label": "Google Maps", "kind": "text", "list": False, "detail": True, "create": True},
-                {"name": "booking_link", "label": "Ссылка Booking", "kind": "text", "list": False, "detail": True, "create": True},
+                {"name": "maps_link", "label": "Google Maps", "kind": "link", "list": False, "detail": True, "create": True},
+                {"name": "booking_link", "label": "Ссылка Booking", "kind": "link", "list": False, "detail": True, "create": True},
                 {"name": "status", "label": "Статус", "kind": "status", "list": True, "detail": True, "create": False},
                 {"name": "created_at", "creatable": False, "label": "Создано", "kind": "date", "list": False, "detail": False, "create": False},
             ],
@@ -253,6 +221,7 @@ miniapp_config = {
             "table": "guests",
             "order_by": "created_at DESC",
             "creatable": True,
+            "tableView": True,
             "title": "Гости",
             "titleField": "name",
             "fields": [
@@ -271,6 +240,17 @@ miniapp_config = {
             "table": "cashflow_entries",
             "order_by": "created_at DESC",
             "creatable": True,
+            # Однотипные короткие строки читаются таблицей, а не карточками.
+            "tableView": True,
+            # Итоги под таблицей считаются ТОЛЬКО по объявленным здесь
+            # колонкам — автоматическая сумма по всем числовым полям давала бы
+            # бессмысленные итоги (сложить рубли с долларами и с id тура).
+            # signBy делит строки на приход и расход: где type == "in" —
+            # приход, остальное — расход; тогда движок рисует три плитки
+            # «Приход / Расход / Остаток» вместо одной «Итого».
+            "totals": [
+                {"field": "amount_rub", "label": "₽", "signBy": {"field": "type", "positive": "in"}},
+            ],
             "title": "ДДС",
             "titleField": "description",
             "fields": [

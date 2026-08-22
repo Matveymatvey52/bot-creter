@@ -308,7 +308,12 @@ async def me_handler(request: web.Request) -> web.Response:
 # picker over that resource's human-readable titles instead of a raw ID
 # input. Both are display metadata only — neither can widen what the role
 # filter and admin gate already allow (see _related_for_item).
-_SCHEMA_RESOURCE_KEYS = ("name", "creatable", "title", "titleField", "children", "tableView")
+# "totals" — какие числовые колонки суммировать под таблицей. Только
+# объявленные шаблоном: автоматическая сумма по всем числовым полям
+# складывала бы рубли с долларами и с чужими id.
+_SCHEMA_RESOURCE_KEYS = (
+    "name", "creatable", "title", "titleField", "children", "tableView", "totals",
+)
 _SCHEMA_FIELD_KEYS = ("name", "required", "creatable", "label", "kind", "list", "detail", "create", "ref")
 
 

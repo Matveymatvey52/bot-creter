@@ -8,12 +8,16 @@ import type { ResourceDisplay } from '../lib/displaySchema'
 export function MenuScreen({
   resources,
   counts,
+  analyticsEnabled,
   onOpen,
+  onOpenAnalytics,
   onBack,
 }: {
   resources: Record<string, ResourceDisplay>
   counts: Record<string, number>
+  analyticsEnabled: boolean
   onOpen: (resource: string) => void
+  onOpenAnalytics: () => void
   onBack: () => void
 }) {
   const names = Object.keys(resources)
@@ -37,6 +41,16 @@ export function MenuScreen({
             <Icon name="chevron" size={14} />
           </button>
         ))}
+        {/* «Аналитика» живёт здесь, а не отдельной вкладкой внизу: она нужна
+            заметно реже разделов с записями, и только если владелец подключил
+            боту эту фичу. */}
+        {analyticsEnabled && (
+          <button className="sol-mrow" onClick={onOpenAnalytics}>
+            <Icon name="chart" size={15} />
+            <span className="sol-mrow-n">Аналитика</span>
+            <Icon name="chevron" size={14} />
+          </button>
+        )}
       </div>
     </div>
   )

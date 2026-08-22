@@ -158,6 +158,15 @@ export interface SchemaChild {
   as?: 'table' | 'list'
 }
 
+/* Итог под таблицей раздела. Считается по одной объявленной числовой
+   колонке; signBy делит строки на приход и расход по значению другого поля —
+   тогда вместо одной суммы показываются «Приход / Расход / Остаток». */
+export interface SchemaTotal {
+  field: string
+  label?: string
+  signBy?: { field: string; positive: string }
+}
+
 export interface SchemaResource {
   name: string
   creatable?: boolean
@@ -168,6 +177,7 @@ export interface SchemaResource {
   title?: string
   titleField?: string
   tableView?: boolean
+  totals?: SchemaTotal[]
   children?: SchemaChild[]
   fields: SchemaField[]
 }
