@@ -262,6 +262,8 @@ function TenantApp() {
         <MenuScreen
           resources={resources}
           counts={counts}
+          analyticsEnabled={analyticsEnabled}
+          onOpenAnalytics={() => setRoute({ kind: 'analytics' })}
           onOpen={(name) => setRoute({ kind: 'list', resource: name })}
           onBack={() => backRoute && setRoute(backRoute)}
         />
@@ -283,15 +285,17 @@ function TenantApp() {
               <span>{resources[name].title}</span>
             </button>
           ))}
-          {analyticsEnabled && (
-            <button
-              className={`sol-nv${route.kind === 'analytics' ? ' is-on' : ''}`}
-              onClick={() => setRoute({ kind: 'analytics' })}
-            >
-              <Icon name="chart" size={18} />
-              <span>Аналитика</span>
-            </button>
-          )}
+          {/* Четвёртый пункт — «Ещё», как в эталоне: первые три раздела уже
+              есть в ленте выше, дублировать четвёртым тот же список незачем.
+              «Ещё» ведёт на «Все разделы», где видны ВСЕ разделы сразу и
+              «Аналитика», если она подключена этому боту. */}
+          <button
+            className={`sol-nv${route.kind === 'menu' || route.kind === 'analytics' ? ' is-on' : ''}`}
+            onClick={() => setRoute({ kind: 'menu' })}
+          >
+            <Icon name="dots" size={18} />
+            <span>Ещё</span>
+          </button>
         </nav>
       )}
     </>

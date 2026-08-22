@@ -11,7 +11,7 @@
    configs stored before this schema existed still render, just with
    less-polished labels/ordering — degrade gracefully, never blank-screen). */
 
-import type { SchemaChild, SchemaField, SchemaRef, SchemaResource } from './api'
+import type { SchemaChild, SchemaField, SchemaRef, SchemaResource, SchemaTotal } from './api'
 
 export interface FieldDisplay {
   name: string
@@ -27,6 +27,7 @@ export interface ResourceDisplay {
   titleField: string
   canCreate: boolean
   tableView: boolean
+  totals: SchemaTotal[]
   children: SchemaChild[]
   listFields: FieldDisplay[]
   detailFields: FieldDisplay[]
@@ -71,6 +72,7 @@ export function normalizeResource(resource: SchemaResource): ResourceDisplay {
     // flag exists to prevent.
     canCreate: resource.canCreate === true,
     tableView: resource.tableView === true,
+    totals: resource.totals ?? [],
     children: resource.children ?? [],
     // Old configs (no list/detail/create flags) fall back to "show
     // everything in detail, nothing extra in the list chips, everything

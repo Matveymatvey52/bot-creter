@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { listResource, ApiError, type ResourceItem } from '../lib/api'
 import { statusToneRich, type FieldDisplay, type ResourceDisplay } from '../lib/displaySchema'
 import { DataTable, type TableColumn } from '../components/DataTable'
+import { TotalsStrip } from '../components/TotalsStrip'
 import { Icon } from '../components/Icon'
 
 /* Раскладка карточки — вариант I (утверждён владельцем 2026-08-21,
@@ -90,7 +91,10 @@ export function ListScreen({
       )}
 
       {items !== null && items.length > 0 && resource.tableView && (
-        <DataTable columns={tableColumns} rows={items} onRowClick={(row) => onOpenItem(row.id)} />
+        <>
+          <DataTable columns={tableColumns} rows={items} onRowClick={(row) => onOpenItem(row.id)} />
+          <TotalsStrip totals={resource.totals} rows={items} />
+        </>
       )}
 
       {items !== null && items.length > 0 && !resource.tableView && (
