@@ -13,6 +13,9 @@ import type { ResourceItem } from '../lib/api'
 export interface TableColumn {
   name: string
   label: string
+  // Класс выравнивания колонки: числа вправо, даты приглушённо. Ставится
+  // тем, кто собирает колонки, — он знает kind поля, а таблица нет.
+  className?: string
   render?: (value: unknown, row: ResourceItem) => ReactNode
 }
 
@@ -35,7 +38,9 @@ export function DataTable({
         <thead>
           <tr>
             {columns.map((col) => (
-              <th key={col.name}>{col.label}</th>
+              <th key={col.name} className={col.className}>
+                {col.label}
+              </th>
             ))}
           </tr>
         </thead>
@@ -49,7 +54,7 @@ export function DataTable({
               {columns.map((col) => {
                 const value = row[col.name]
                 return (
-                  <td key={col.name}>
+                  <td key={col.name} className={col.className}>
                     {col.render
                       ? col.render(value, row)
                       : value != null && value !== ''

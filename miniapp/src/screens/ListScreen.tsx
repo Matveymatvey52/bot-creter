@@ -110,6 +110,7 @@ export function ListScreen({
           return {
             name: f.name,
             label: f.label,
+            className: 'col-number',
             render: (value, row) => {
               const n = Number(value)
               if (!Number.isFinite(n)) return '—'
@@ -124,7 +125,28 @@ export function ListScreen({
             },
           }
         }
-        return { name: f.name, label: f.label }
+        if (f.kind === 'status') {
+          // Цвет нужен и в таблице: статус — это состояние записи, а не
+          // просто слово. Та же точка и тот же тон, что на карточке.
+          return {
+            name: f.name,
+            label: f.label,
+            render: (value) =>
+              value == null || value === '' ? (
+                '—'
+              ) : (
+                <span className={`sol-st tone-${statusToneRich(value)}`}>
+                  <span className="sol-dot" />
+                  {String(value)}
+                </span>
+              ),
+          }
+        }
+        return {
+          name: f.name,
+          label: f.label,
+          className: f.kind === 'number' ? 'col-number' : f.kind === 'date' ? 'col-date' : undefined,
+        }
       }),
   ]
 

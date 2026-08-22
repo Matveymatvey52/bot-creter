@@ -1680,6 +1680,13 @@ select.sol-spec-in {
   color: var(--text-tertiary);
 }
 
+/* Числовая колонка выравнивается по правому краю — так столбик сумм читается
+   как в финансовом отчёте, а не рваной лесенкой. Дата приглушена, как в
+   эталоне: она вспомогательная. */
+.data-table td.col-number,
+.data-table th.col-number { text-align: right; }
+.data-table td.col-date { color: var(--text-tertiary); }
+
 /* Знаковые суммы в таблице: приход зелёным, расход красным — как в эталоне. */
 .data-table .num { font-variant-numeric: tabular-nums; white-space: nowrap; }
 .data-table .num.pos { color: var(--success-text); }
@@ -1788,11 +1795,18 @@ select.sol-spec-in {
 .data-table-wrap {
   width: 100%;
   overflow-x: auto;
+  /* Наплывающая полоса прокрутки перекрывала половину первой строки при
+     горизонтальном свайпе. Жест остаётся, видимой полосы нет — так же, как в
+     эталоне (.tbl-scroll::-webkit-scrollbar { height: 0 }). */
+  scrollbar-width: none;
+  -ms-overflow-style: none;
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-md);
   background: var(--surface);
   -webkit-overflow-scrolling: touch;
 }
+
+.data-table-wrap::-webkit-scrollbar { height: 0; width: 0; }
 
 .data-table {
   width: 100%;

@@ -316,7 +316,32 @@ function relatedColumns(
     if (shown.length > 0 || childResource.titleField) {
       return [
         { name: childResource.titleField, label: childResource.title },
-        ...shown.map((f) => ({ name: f.name, label: f.label })),
+        // Те же правила, что в таблице раздела: числа вправо, дата
+        // приглушённо, статус цветной. Таблица внутри карточки не должна
+        // выглядеть беднее той же таблицы на своём экране.
+        ...shown.map((f): TableColumn => {
+          if (f.kind === 'status') {
+            return {
+              name: f.name,
+              label: f.label,
+              render: (value) =>
+                value == null || value === '' ? (
+                  '—'
+                ) : (
+                  <span className={`sol-st tone-${statusToneRich(value)}`}>
+                    <span className="sol-dot" />
+                    {String(value)}
+                  </span>
+                ),
+            }
+          }
+          return {
+            name: f.name,
+            label: f.label,
+            className:
+              f.kind === 'number' ? 'col-number' : f.kind === 'date' ? 'col-date' : undefined,
+          }
+        }),
       ]
     }
   }
