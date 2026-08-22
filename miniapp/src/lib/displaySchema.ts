@@ -28,6 +28,7 @@ export interface ResourceDisplay {
   canCreate: boolean
   tableView: boolean
   totals: SchemaTotal[]
+  addLabel: string | null
   children: SchemaChild[]
   listFields: FieldDisplay[]
   detailFields: FieldDisplay[]
@@ -73,6 +74,7 @@ export function normalizeResource(resource: SchemaResource): ResourceDisplay {
     canCreate: resource.canCreate === true,
     tableView: resource.tableView === true,
     totals: resource.totals ?? [],
+    addLabel: resource.addLabel ?? null,
     children: resource.children ?? [],
     // Old configs (no list/detail/create flags) fall back to "show
     // everything in detail, nothing extra in the list chips, everything

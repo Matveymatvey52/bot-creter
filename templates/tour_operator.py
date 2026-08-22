@@ -121,6 +121,7 @@ miniapp_config = {
             "table": "tours",
             "order_by": "created_at DESC",
             "creatable": True,
+            "addLabel": "Добавить тур",
             # Everything that belongs to a tour renders inside that tour's own
             # detail card (runtime/miniapp_api.py's `related`) instead of
             # forcing the user into a sibling tab and a match-by-id hunt.
@@ -148,6 +149,7 @@ miniapp_config = {
             "table": "program",
             "order_by": "day_num ASC, date ASC, time ASC",
             "creatable": True,
+            "addLabel": "Добавить пункт программы",
             "tableView": True,
             "title": "Программа",
             "titleField": "title",
@@ -172,6 +174,7 @@ miniapp_config = {
             "table": "locations",
             "order_by": "region ASC, category ASC, name ASC",
             "creatable": True,
+            "addLabel": "Добавить локацию",
             "tableView": True,
             "title": "ЛиП",
             "titleField": "name",
@@ -197,6 +200,7 @@ miniapp_config = {
             "table": "hotels",
             "order_by": "region ASC, name ASC",
             "creatable": True,
+            "addLabel": "Добавить отель",
             "tableView": True,
             "title": "Отели",
             "titleField": "name",
@@ -221,6 +225,7 @@ miniapp_config = {
             "table": "guests",
             "order_by": "created_at DESC",
             "creatable": True,
+            "addLabel": "Добавить гостя",
             "tableView": True,
             "title": "Гости",
             "titleField": "name",
@@ -240,6 +245,7 @@ miniapp_config = {
             "table": "cashflow_entries",
             "order_by": "created_at DESC",
             "creatable": True,
+            "addLabel": "Добавить операцию",
             # Однотипные короткие строки читаются таблицей, а не карточками.
             "tableView": True,
             # Итоги под таблицей считаются ТОЛЬКО по объявленным здесь

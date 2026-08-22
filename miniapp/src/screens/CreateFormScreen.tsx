@@ -84,8 +84,12 @@ export function CreateFormScreen({
             <Icon name="back" size={13} />
             Отмена
           </button>
-          <h1>Новая запись</h1>
-          <div className="sol-sheet-sub">Раздел «{resource.title}»</div>
+          {/* «Добавить тур» вместо «Новая запись · Раздел "Туры"»: фразу
+              объявляет шаблон, потому что из «Туры» не вывести «тур» — падеж
+              и род автоматически не получить. Не объявил — остаётся прежний
+              нейтральный заголовок, он верен для любого раздела. */}
+          <h1>{resource.addLabel ?? 'Новая запись'}</h1>
+          {!resource.addLabel && <div className="sol-sheet-sub">Раздел «{resource.title}»</div>}
         </div>
 
         {resource.createFields.map((f) => (
@@ -118,7 +122,7 @@ export function CreateFormScreen({
           onClick={handleSubmit}
           disabled={!requiredFilled || submitting}
         >
-          {submitting ? 'Создание…' : 'Создать'}
+          {submitting ? 'Сохранение…' : (resource.addLabel ?? 'Создать')}
         </button>
       </div>
     </div>

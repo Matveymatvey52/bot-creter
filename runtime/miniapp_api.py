@@ -312,7 +312,11 @@ async def me_handler(request: web.Request) -> web.Response:
 # объявленные шаблоном: автоматическая сумма по всем числовым полям
 # складывала бы рубли с долларами и с чужими id.
 _SCHEMA_RESOURCE_KEYS = (
-    "name", "creatable", "title", "titleField", "children", "tableView", "totals",
+    # "addLabel" — готовая фраза создания («Добавить тур»). Вывести её из
+    # "title" нельзя: из «Туры» не получить винительный падеж единственного
+    # числа автоматически, а «Новая запись в раздел Туры» человек читать не
+    # должен.
+    "name", "creatable", "title", "titleField", "children", "tableView", "totals", "addLabel",
 )
 _SCHEMA_FIELD_KEYS = ("name", "required", "creatable", "label", "kind", "list", "detail", "create", "ref")
 

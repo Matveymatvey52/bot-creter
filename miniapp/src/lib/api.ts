@@ -178,6 +178,7 @@ export interface SchemaResource {
   titleField?: string
   tableView?: boolean
   totals?: SchemaTotal[]
+  addLabel?: string
   children?: SchemaChild[]
   fields: SchemaField[]
 }
