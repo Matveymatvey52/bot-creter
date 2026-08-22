@@ -57,7 +57,7 @@ from db.database import (
 )
 from features.excel_export import MAX_FILE_SIZE, build_workbook, fetch_export_rows
 from features.sales_analytics import Period, compute_metrics
-from runtime.registry import FACTORY_BOT_ID, Registry, _load_template_module_async
+from runtime.registry import FACTORY_BOT_ID, Registry, _load_template_module_async, is_template_backed
 from services.client_link import ContactFormatError, parse_contact
 
 logger = logging.getLogger(__name__)
@@ -225,14 +225,41 @@ async def _resolve_entry_and_config(request: web.Request) -> tuple[int, Any, Any
     if entry is None:
         return web.json_response({"error": "unknown bot"}, status=404)
 
-    miniapp_config = await get_bot_miniapp_config(bot_id)
-    if miniapp_config is None and entry.template_id:
-        module = await _load_template_module_async(entry.template_id)
-        miniapp_config = getattr(module, "miniapp_config", None) if module is not None else None
+    miniapp_config = await load_miniapp_config(bot_id, entry)
     if miniapp_config is None:
         return web.json_response({"error": "mini-app not available for this bot"}, status=404)
 
     return bot_id, entry, miniapp_config
+
+
+async def load_miniapp_config(bot_id: int, entry: Any) -> dict | None:
+    """Resolves which miniapp_config actually governs this bot.
+
+    The rule this encodes: a TEMPLATE-BACKED bot ignores its stored
+    bot_miniapp_config row entirely. That row is an LLM snapshot taken once at
+    creation time (services/claude_service.py's _generate_miniapp_config), and
+    because the DB was consulted first it silently shadowed every later edit to
+    the template. That is exactly how bots 12/13/14 kept serving a config
+    generated 2026-08-20 — no `children`, no `ref`, projects not creatable —
+    long after the templates had moved on, and why those rows had to be deleted
+    by hand. For a bot whose file IS templates/<id>.py the template's own dict is
+    the source of truth by construction, so there is nothing to snapshot.
+
+    Custom, generated-from-scratch bots are deliberately untouched: they have no
+    template to defer to, and their stored config IS their truth. (Their own
+    staleness — a snapshot predating an engine change — is a separate problem
+    this does not try to solve.)
+    """
+    file_path = entry.config.get("file_path") if isinstance(entry.config, dict) else None
+    if not is_template_backed(file_path):
+        stored = await get_bot_miniapp_config(bot_id)
+        if stored is not None:
+            return stored
+
+    if entry.template_id:
+        module = await _load_template_module_async(entry.template_id)
+        return getattr(module, "miniapp_config", None) if module is not None else None
+    return None
 
 
 async def bot_session_handler(request: web.Request) -> web.Response:

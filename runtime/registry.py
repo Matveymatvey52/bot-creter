@@ -41,6 +41,34 @@ FACTORY_BOT_ID = 0
 _TEMPLATE_MARKER_RE = re.compile(r"^#\s*TEMPLATE:\s*(\S+)", re.MULTILINE)
 
 
+TEMPLATES_DIR = Path(__file__).parent.parent / "templates"
+
+
+def is_template_backed(file_path: str | None) -> bool:
+    """True when this bot RUNS the repo's shared templates/<id>.py itself.
+
+    Deliberately a PATH check rather than infer_template_id()'s "# TEMPLATE:"
+    marker below: a COPY of a template under generated_bots/ inherits that
+    marker, but the copy is its own file — rewriting it, or reading a stale
+    config snapshot for it, affects nobody else. The shared template is the
+    opposite: every bot built on it is downstream of that one file.
+
+    Two callers depend on this, for the two things that go wrong otherwise:
+      - runtime/miniapp_api.py's load_miniapp_config(): a template-backed bot
+        must ignore its stored bot_miniapp_config snapshot, which would
+        otherwise shadow the template forever.
+      - handlers/manage_bots.py's write_bot_code(): a template-backed bot must
+        never have its source rewritten by an LLM and pushed to GitHub.
+    """
+    if not file_path:
+        return False
+    try:
+        Path(file_path).resolve().relative_to(TEMPLATES_DIR.resolve())
+        return True
+    except (ValueError, OSError):
+        return False
+
+
 def infer_template_id(file_path: str | None) -> str | None:
     """Best-effort: reads the '# TEMPLATE: <id>' marker comment that templates/*.py
     files carry as their first line. Custom Claude-generated bots not based on a
@@ -871,6 +899,13 @@ async def build_entry(
         # configured" even though the bot itself works fine, since
         # typed_config was otherwise only used internally above.
         config["db_path"] = typed_config.db_path
+
+    # Carried for the same reason db_path is: consumers get a BotEntry, not the
+    # bots row. runtime/miniapp_api.py's load_miniapp_config() needs to know
+    # whether this bot RUNS the repo's shared templates/<id>.py, and re-reading
+    # the bots row on every mini-app request just to learn a path it was already
+    # handed here would be a query per request on a hot path.
+    config["file_path"] = file_path
 
     # "Офисы" (docs/OFFICES_DESIGN.md) — by-convention opt-in, same pattern as
     # `router`/`init_db`/`config_from_bot_row`: a template that wants to
