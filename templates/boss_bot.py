@@ -51,6 +51,7 @@ miniapp_config = {
             "table": "tasks",
             "order_by": "created_at DESC",
             "creatable": False,
+            "scope": {"type": "global"},
             "title": "Задачи",
             "titleField": "title",
             "fields": [

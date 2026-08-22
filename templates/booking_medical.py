@@ -186,6 +186,7 @@ miniapp_config = {
             "table": "doctors",
             "order_by": "id DESC",
             "creatable": True,
+            "scope": {"type": "global"},
             "title": "Врачи",
             "titleField": "name",
             "fields": [
@@ -199,6 +200,7 @@ miniapp_config = {
             "table": "slots",
             "order_by": "slot_date DESC, slot_time DESC",
             "creatable": False,
+            "scope": {"type": "global"},
             "title": "Слоты",
             "titleField": "slot_time",
             "fields": [
@@ -214,6 +216,7 @@ miniapp_config = {
             "table": "patients",
             "order_by": "created_at DESC",
             "creatable": False,
+            "scope": {"type": "global"},
             "title": "Пациенты",
             "titleField": "full_name",
             "fields": [
@@ -229,6 +232,7 @@ miniapp_config = {
             "table": "appointments",
             "order_by": "created_at DESC",
             "creatable": False,
+            "scope": {"type": "global"},
             "title": "Записи на приём",
             "titleField": "status",
             "fields": [

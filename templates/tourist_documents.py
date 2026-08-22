@@ -60,6 +60,7 @@ miniapp_config = {
             "table": "tourists",
             "order_by": "created_at DESC",
             "creatable": True,
+            "scope": {"type": "scoped", "parent": "tour_groups", "via": "tour_group_id"},
             "title": "Туристы",
             "titleField": "full_name",
             "fields": [
@@ -78,6 +79,7 @@ miniapp_config = {
             "table": "tour_groups",
             "order_by": "id DESC",
             "creatable": True,
+            "scope": {"type": "global"},
             "title": "Группы",
             "titleField": "name",
             "fields": [

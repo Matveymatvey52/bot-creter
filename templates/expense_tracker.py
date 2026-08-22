@@ -250,6 +250,7 @@ miniapp_config = {
             "table": "categories",
             "order_by": "name",
             "creatable": True,
+            "scope": {"type": "global"},
             "title": "Категории",
             "titleField": "name",
             "fields": [
@@ -262,6 +263,7 @@ miniapp_config = {
             "table": "expenses",
             "order_by": "expense_date DESC",
             "creatable": True,
+            "scope": {"type": "global"},
             "title": "Расходы",
             "titleField": "comment",
             "fields": [

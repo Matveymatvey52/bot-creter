@@ -316,7 +316,8 @@ _SCHEMA_RESOURCE_KEYS = (
     # "title" нельзя: из «Туры» не получить винительный падеж единственного
     # числа автоматически, а «Новая запись в раздел Туры» человек читать не
     # должен.
-    "name", "creatable", "title", "titleField", "children", "tableView", "totals", "addLabel",
+    # "scope" — чему принадлежат записи раздела; см. resource_scope() ниже.
+    "name", "creatable", "title", "titleField", "children", "tableView", "totals", "addLabel", "scope",
 )
 _SCHEMA_FIELD_KEYS = ("name", "required", "creatable", "label", "kind", "list", "detail", "create", "ref")
 
@@ -602,6 +603,169 @@ async def _admin_gate_ok(bot_id: int, resource: dict, telegram_user_id: int) -> 
     return str(telegram_user_id) in admin_ids
 
 
+# ── parent scoping (docs/SCOPE_AUDIT_STAGE_A.md) ─────────────────────────────
+# Every resource declares what it belongs to. "scoped" means the rows belong
+# to a parent row and a list without one is meaningless (ДДС operations of a
+# tour, guests of an event); "global" means they don't (a price list, a
+# category reference). The declaration is the ONLY source of this knowledge —
+# nothing here infers a parent from column names, because that inference
+# provably misses real links (channel_posts.monitored_channel_id ->
+# monitored_channels was missed by exactly that heuristic during the audit).
+#
+# The GLOBAL guarantee is structural, not a matter of care: resource_scope()
+# collapses both "global" and "not declared at all" to None, and every line
+# that touches a parent below sits inside `if scope is not None`. There is no
+# code path that can resolve, filter on, or render a parent for a global
+# resource — the mockup-E bug (showing a tour on the hotel reference table)
+# cannot be written here even deliberately.
+#
+# Runtime degrades, CI does not. A config with no "scope" key renders exactly
+# as it did before (treated as global) — the LLM-generated configs already
+# stored in the miniapp_configs table predate this field and must keep
+# working. Requiring the declaration is scripts/check_miniapp_drift.py's job,
+# where a missing scope is a hard build failure; see validate_scope_declarations.
+_SCOPE_TYPES = frozenset(("scoped", "global"))
+
+# Sentinels a caller may pass as ?parent= instead of a real parent id.
+_PARENT_ALL = "all"      # every parent at once — the summary view
+_PARENT_NONE = "none"    # rows whose parent is missing — the "Не привязано" group
+
+
+class ScopeError(ValueError):
+    """Raised when a resource's "scope" declaration is malformed. Authoring
+    bug in miniapp_config, never something a request can trigger."""
+
+
+def resource_scope(resource: dict) -> dict | None:
+    """Returns {"parent", "via", "label_field"} for a scoped resource, or
+    None for a global one AND for one that declares nothing at all. Callers
+    branch on None to decide whether a parent exists at all — see the
+    GLOBAL guarantee in the block comment above."""
+    scope = resource.get("scope")
+    if scope is None:
+        return None
+    if not isinstance(scope, dict):
+        raise ScopeError(f"scope must be a dict, got {type(scope).__name__}")
+    scope_type = scope.get("type")
+    if scope_type not in _SCOPE_TYPES:
+        raise ScopeError(f"scope.type must be one of {sorted(_SCOPE_TYPES)}, got {scope_type!r}")
+    if scope_type == "global":
+        return None
+    parent = scope.get("parent")
+    via = scope.get("via")
+    if not parent or not via:
+        raise ScopeError('a "scoped" scope needs both "parent" and "via"')
+    # "label" — готовая подпись панели контекста («Раздел по туру»). Вывести
+    # её из title родителя нельзя: из «Туры» не получить дательный падеж
+    # единственного числа, а «Раздел по туры» человек читать не должен — та же
+    # причина, по которой у ресурса объявляется "addLabel".
+    return {
+        "parent": parent,
+        "via": via,
+        "label_field": scope.get("label_field"),
+        "label": scope.get("label"),
+    }
+
+
+def validate_scope_declarations(miniapp_config: dict) -> list[str]:
+    """Every authoring rule about "scope", as a list of human-readable
+    errors (empty means valid). Split out from resource_scope() because the
+    runtime deliberately tolerates an absent declaration while CI must
+    reject it — see the block comment above."""
+    errors: list[str] = []
+    resources = miniapp_config.get("resources", [])
+    by_name = {r.get("name"): r for r in resources if isinstance(r, dict)}
+
+    for resource in resources:
+        if not isinstance(resource, dict):
+            continue
+        name = resource.get("name", "<unnamed>")
+        if "scope" not in resource:
+            errors.append(f'resource "{name}": no "scope" declared (must be "scoped" or "global")')
+            continue
+        try:
+            scope = resource_scope(resource)
+        except ScopeError as exc:
+            errors.append(f'resource "{name}": {exc}')
+            continue
+        if scope is None:
+            continue
+
+        parent = by_name.get(scope["parent"])
+        if parent is None:
+            errors.append(
+                f'resource "{name}": scope.parent "{scope["parent"]}" is not a resource in this config'
+            )
+        elif not (scope["label_field"] or parent.get("titleField")):
+            errors.append(
+                f'resource "{name}": parent "{scope["parent"]}" has no titleField and scope '
+                f"declares no label_field, so the parent cannot be named in the UI"
+            )
+
+        field_names = {f.get("name") for f in resource.get("fields", []) if isinstance(f, dict)}
+        if scope["via"] not in field_names:
+            # Being a declared field is what makes the column real: the drift
+            # check already verifies every field name against the template's
+            # own CREATE TABLE, so this one rule inherits that verification
+            # instead of re-deriving the schema here.
+            errors.append(
+                f'resource "{name}": scope.via "{scope["via"]}" is not among this resource\'s fields'
+            )
+    return errors
+
+
+async def _parent_options(
+    db: aiosqlite.Connection, miniapp_config: dict, scope: dict
+) -> list[dict]:
+    """Every parent the viewer could switch to, as {"id", "label"} pairs.
+    Resolved here rather than by the client fetching the parent resource
+    itself: the client would then need to know which column carries the
+    parent's name, which is exactly the knowledge the scope declaration
+    exists to keep in one place. Lives inside the same `scope is not None`
+    branch as everything else parent-shaped, so a global resource cannot
+    reach it."""
+    parent_resource = _resource_spec(miniapp_config, scope["parent"])
+    if parent_resource is None:
+        return []
+    label_column = scope["label_field"] or parent_resource.get("titleField")
+    if not label_column:
+        return []
+    sql = (
+        f"SELECT id, {label_column} AS _label FROM {parent_resource['table']} "
+        f"ORDER BY id DESC LIMIT 200"
+    )
+    async with db.execute(sql) as cursor:
+        return [{"id": str(r["id"]), "label": r["_label"]} for r in await cursor.fetchall()]
+
+
+async def _parent_labels(
+    db: aiosqlite.Connection, miniapp_config: dict, scope: dict, rows: list[dict]
+) -> dict[str, str]:
+    """Maps parent id -> human-readable parent name, for the rows at hand.
+    One extra query rather than a JOIN, so the main list SQL keeps its exact
+    previous shape (and its role_filter/order_by handling) untouched."""
+    parent_resource = _resource_spec(miniapp_config, scope["parent"])
+    if parent_resource is None:
+        return {}
+    label_column = scope["label_field"] or parent_resource.get("titleField")
+    if not label_column:
+        return {}
+    ids = {
+        str(row[scope["via"]])
+        for row in rows
+        if row.get(scope["via"]) not in (None, "")
+    }
+    if not ids:
+        return {}
+    placeholders = ", ".join("?" for _ in ids)
+    sql = (
+        f"SELECT id, {label_column} AS _label FROM {parent_resource['table']} "
+        f"WHERE id IN ({placeholders})"
+    )
+    async with db.execute(sql, tuple(ids)) as cursor:
+        return {str(r["id"]): r["_label"] for r in await cursor.fetchall()}
+
+
 async def list_resource_handler(request: web.Request) -> web.Response:
     resolved = await _resolve_entry_and_config(request)
     if isinstance(resolved, web.Response):
@@ -620,6 +784,21 @@ async def list_resource_handler(request: web.Request) -> web.Response:
     if not await _admin_gate_ok(bot_id, resource, telegram_user_id):
         return web.json_response({"error": "forbidden"}, status=403)
 
+    try:
+        scope = resource_scope(resource)
+    except ScopeError as exc:
+        return web.json_response({"error": f"resource scope is misconfigured: {exc}"}, status=500)
+
+    # ?parent= on a global resource is refused rather than ignored: silently
+    # dropping it would let a caller believe a reference table had been
+    # narrowed to a parent it does not have.
+    parent_raw = request.query.get("parent")
+    if scope is None and parent_raw is not None:
+        return web.json_response(
+            {"error": f'resource "{resource_name}" is global and has no parent to filter by'},
+            status=400,
+        )
+
     db_path = entry.config.get("db_path") if isinstance(entry.config, dict) else None
     if not db_path:
         return web.json_response({"error": "bot has no database configured"}, status=500)
@@ -634,16 +813,44 @@ async def list_resource_handler(request: web.Request) -> web.Response:
         except RoleFilterDenied:
             return web.json_response({"resource": resource_name, "items": []})
 
-        sql = f"SELECT id, {columns} FROM {resource['table']}"
-        params: tuple = ()
+        clauses: list[str] = []
+        params: list = []
         if role_clause is not None:
             where_sql, where_params = role_clause
-            sql += f" WHERE {where_sql}"
-            params = where_params
+            clauses.append(where_sql)
+            params.extend(where_params)
+        if scope is not None and parent_raw not in (None, "", _PARENT_ALL):
+            if parent_raw == _PARENT_NONE:
+                clauses.append(f"({scope['via']} IS NULL OR TRIM({scope['via']}) = '')")
+            else:
+                clauses.append(f"{scope['via']} = ?")
+                params.append(parent_raw)
+
+        sql = f"SELECT id, {columns} FROM {resource['table']}"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
         sql += f" ORDER BY {order_by} LIMIT 200"
-        async with db.execute(sql, params) as cursor:
+        async with db.execute(sql, tuple(params)) as cursor:
             rows = [dict(r) for r in await cursor.fetchall()]
-    return web.json_response({"resource": resource_name, "items": rows})
+
+        payload: dict = {"resource": resource_name, "items": rows}
+        if scope is not None:
+            labels = await _parent_labels(db, miniapp_config, scope, rows)
+            for row in rows:
+                key = row.get(scope["via"])
+                # None for an unparented row — the client renders it as its
+                # own "Не привязано" group rather than guessing an owner.
+                row["parent_label"] = None if key in (None, "") else labels.get(str(key))
+            parent_resource = _resource_spec(miniapp_config, scope["parent"])
+            payload["scope"] = {
+                "parent": scope["parent"],
+                "via": scope["via"],
+                "parentTitle": (parent_resource or {}).get("title", scope["parent"]),
+                "sectionLabel": scope["label"] or f'Раздел: {(parent_resource or {}).get("title", scope["parent"])}',
+                "parentId": None if parent_raw in (None, "", _PARENT_ALL) else parent_raw,
+                "options": await _parent_options(db, miniapp_config, scope),
+            }
+    return web.json_response(payload)
 
 
 async def get_resource_handler(request: web.Request) -> web.Response:
@@ -829,7 +1036,19 @@ async def create_resource_handler(request: web.Request) -> web.Response:
     allowed_fields = {f["name"] for f in resource["fields"] if f.get("create", True)}
     required_fields = {f["name"] for f in resource["fields"] if f.get("required", False)}
     values = {k: v for k, v in payload.items() if k in allowed_fields}
-    missing = required_fields - values.keys()
+    # A required field is missing when its key is absent AND when it carries
+    # nothing but whitespace: the key IS present then, so a plain set
+    # difference waves it through. That gap is how a blank parent used to
+    # reach the INSERT and produce a row belonging to nobody. Applies to
+    # every kind; the contact-specific check further down stays as an extra
+    # rule about contact FORMAT, not as the emptiness check.
+    missing = {
+        name
+        for name in required_fields
+        if name not in values
+        or values[name] is None
+        or (isinstance(values[name], str) and not values[name].strip())
+    }
     if missing:
         return web.json_response({"error": f"missing required fields: {sorted(missing)}"}, status=400)
     if not values:

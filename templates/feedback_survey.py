@@ -232,6 +232,7 @@ miniapp_config = {
             "table": "feedback",
             "order_by": "created_at DESC",
             "creatable": True,
+            "scope": {"type": "global"},
             "title": "Отзывы",
             "titleField": "client_label",
             "fields": [

@@ -122,6 +122,7 @@ miniapp_config = {
             "order_by": "created_at DESC",
             "creatable": True,
             "addLabel": "Добавить тур",
+            "scope": {"type": "global"},
             # Everything that belongs to a tour renders inside that tour's own
             # detail card (runtime/miniapp_api.py's `related`) instead of
             # forcing the user into a sibling tab and a match-by-id hunt.
@@ -151,6 +152,7 @@ miniapp_config = {
             "creatable": True,
             "addLabel": "Добавить пункт программы",
             "tableView": True,
+            "scope": {"type": "scoped", "parent": "tours", "via": "tour_id", "label": "Раздел по туру"},
             "title": "Программа",
             "titleField": "title",
             "fields": [
@@ -176,6 +178,7 @@ miniapp_config = {
             "creatable": True,
             "addLabel": "Добавить локацию",
             "tableView": True,
+            "scope": {"type": "scoped", "parent": "tours", "via": "tour_id", "label": "Раздел по туру"},
             "title": "ЛиП",
             "titleField": "name",
             "fields": [
@@ -202,6 +205,7 @@ miniapp_config = {
             "creatable": True,
             "addLabel": "Добавить отель",
             "tableView": True,
+            "scope": {"type": "scoped", "parent": "tours", "via": "tour_id", "label": "Раздел по туру"},
             "title": "Отели",
             "titleField": "name",
             "fields": [
@@ -227,6 +231,7 @@ miniapp_config = {
             "creatable": True,
             "addLabel": "Добавить гостя",
             "tableView": True,
+            "scope": {"type": "scoped", "parent": "tours", "via": "tour_id", "label": "Раздел по туру"},
             "title": "Гости",
             "titleField": "name",
             "fields": [
@@ -257,10 +262,15 @@ miniapp_config = {
             "totals": [
                 {"field": "amount_rub", "label": "₽", "signBy": {"field": "type", "positive": "in"}},
             ],
+            "scope": {"type": "scoped", "parent": "tours", "via": "parent_id", "label": "Раздел по туру"},
             "title": "ДДС",
             "titleField": "description",
             "fields": [
-                {"name": "parent_id", "label": "Тур", "kind": "text", "list": True, "detail": True, "create": True, "ref": {"resource": "tours", "labelField": "name"}},
+                # required — иначе запись ложится без тура и потом не видна
+                # ни в одной секции Telegram (docs/SCOPE_AUDIT_STAGE_A.md §6.2).
+                # list: True оставлено дизайн-сессией: в сводном режиме колонка
+                # тура и есть то, чем строки различаются.
+                {"name": "parent_id", "required": True, "label": "Тур", "kind": "text", "list": True, "detail": True, "create": True, "ref": {"resource": "tours", "labelField": "name"}},
                 {"name": "type", "required": True, "label": "Тип (in/out)", "kind": "status", "list": True, "detail": True, "create": True},
                 {"name": "amount_rub", "label": "Сумма ₽", "kind": "number", "list": True, "detail": True, "create": True},
                 {"name": "amount_usd", "label": "Сумма $", "kind": "number", "list": False, "detail": True, "create": True},

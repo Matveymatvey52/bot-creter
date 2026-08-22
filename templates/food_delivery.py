@@ -290,6 +290,7 @@ miniapp_config = {
             "table": "menu_items",
             "order_by": "id DESC",
             "creatable": False,
+            "scope": {"type": "global"},
             "title": "Меню",
             "titleField": "name",
             "fields": [
@@ -306,6 +307,7 @@ miniapp_config = {
             "table": "orders",
             "order_by": "created_at DESC",
             "creatable": False,
+            "scope": {"type": "global"},
             "title": "Заказы (все)",
             "titleField": "delivery_address",
             "fields": [
@@ -327,6 +329,7 @@ miniapp_config = {
             "table": "orders",
             "order_by": "created_at DESC",
             "creatable": False,
+            "scope": {"type": "global"},
             "title": "Мои заказы",
             "titleField": "delivery_address",
             "fields": [
@@ -343,6 +346,7 @@ miniapp_config = {
             "table": "couriers",
             "order_by": "id DESC",
             "creatable": False,
+            "scope": {"type": "global"},
             "title": "Курьеры",
             "titleField": "name",
             "fields": [

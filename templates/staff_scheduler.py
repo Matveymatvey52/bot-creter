@@ -67,6 +67,7 @@ miniapp_config = {
             "table": "employees",
             "order_by": "id DESC",
             "creatable": True,
+            "scope": {"type": "global"},
             "title": "Сотрудники",
             "titleField": "name",
             "fields": [
@@ -81,6 +82,7 @@ miniapp_config = {
             "table": "shifts",
             "order_by": "shift_date DESC",
             "creatable": True,
+            "scope": {"type": "scoped", "parent": "employees", "via": "employee_id"},
             "title": "Смены",
             "titleField": "shift_date",
             "fields": [

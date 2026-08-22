@@ -93,6 +93,7 @@ miniapp_config = {
             "table": "rental_items",
             "order_by": "id DESC",
             "creatable": True,
+            "scope": {"type": "global"},
             "title": "Автомобили",
             "titleField": "name",
             "fields": [
@@ -107,6 +108,7 @@ miniapp_config = {
             "table": "rental_bookings",
             "order_by": "created_at DESC",
             "creatable": True,
+            "scope": {"type": "global"},
             # 0 = "not linked to a Telegram account yet". Filled with the
             # real id by services/client_link.py the first time this
             # customer messages the bot.

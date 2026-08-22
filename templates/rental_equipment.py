@@ -70,6 +70,7 @@ miniapp_config = {
             "table": "clients",
             "order_by": "name ASC",
             "creatable": False,
+            "scope": {"type": "global"},
             "title": "Клиенты",
             "titleField": "name",
             "fields": [
@@ -83,6 +84,7 @@ miniapp_config = {
             "table": "items",
             "order_by": "created_at DESC",
             "creatable": True,
+            "scope": {"type": "global"},
             "title": "Инвентарь",
             "titleField": "name",
             "fields": [
@@ -97,6 +99,7 @@ miniapp_config = {
             "table": "rentals",
             "order_by": "issued_at DESC",
             "creatable": True,
+            "scope": {"type": "global"},
             "title": "Аренды",
             "titleField": "status",
             "fields": [

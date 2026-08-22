@@ -184,6 +184,7 @@ miniapp_config = {
             "table": "monitored_channels",
             "order_by": "added_at DESC",
             "creatable": False,
+            "scope": {"type": "global"},
             "title": "Каналы",
             "titleField": "channel_title",
             "fields": [
@@ -199,6 +200,7 @@ miniapp_config = {
             "table": "channel_posts",
             "order_by": "posted_at DESC",
             "creatable": False,
+            "scope": {"type": "scoped", "parent": "channels", "via": "monitored_channel_id"},
             "title": "Посты",
             "titleField": "text",
             "fields": [

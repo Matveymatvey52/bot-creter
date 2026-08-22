@@ -83,6 +83,7 @@ miniapp_config = {
             "table": "surveys",
             "order_by": "created_at DESC",
             "creatable": True,
+            "scope": {"type": "global"},
             "title": "Опросы",
             "titleField": "title",
             "fields": [
@@ -96,6 +97,7 @@ miniapp_config = {
             "table": "survey_responses",
             "order_by": "submitted_at DESC",
             "creatable": False,
+            "scope": {"type": "scoped", "parent": "surveys", "via": "survey_id"},
             "title": "Ответы",
             "titleField": "user_name",
             "fields": [

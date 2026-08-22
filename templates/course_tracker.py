@@ -78,6 +78,7 @@ miniapp_config = {
             "table": "courses",
             "order_by": "created_at DESC",
             "creatable": False,
+            "scope": {"type": "global"},
             "title": "Курсы",
             "titleField": "title",
             "fields": [
@@ -90,9 +91,14 @@ miniapp_config = {
             "table": "course_assignments",
             "order_by": "created_at DESC",
             "creatable": False,
+            "scope": {"type": "scoped", "parent": "courses", "via": "course_id"},
             "title": "Задания",
             "titleField": "title",
             "fields": [
+                # The course this assignment belongs to. Declared so the
+                # engine can scope the list by it — see this resource's
+                # "scope" above and docs/SCOPE_AUDIT_STAGE_A.md.
+                {"name": "course_id", "label": "Курс", "kind": "number", "list": False, "detail": True, "create": False, "ref": {"resource": "courses", "labelField": "title"}},
                 {"name": "title", "label": "Название", "kind": "text", "list": True, "detail": True, "create": False},
                 {"name": "description", "label": "Описание", "kind": "text", "list": False, "detail": True, "create": False},
                 {"name": "deadline", "label": "Срок", "kind": "date", "list": True, "detail": True, "create": False},
@@ -103,6 +109,7 @@ miniapp_config = {
             "table": "course_submissions",
             "order_by": "submitted_at DESC",
             "creatable": False,
+            "scope": {"type": "scoped", "parent": "course_assignments", "via": "assignment_id"},
             "title": "Сдачи",
             "titleField": "status",
             "fields": [

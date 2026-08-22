@@ -88,6 +88,7 @@ miniapp_config = {
             "table": "projects",
             "order_by": "created_at DESC",
             "creatable": True,
+            "scope": {"type": "global"},
             # Reads stay membership-scoped by role_filter below, but the FIRST
             # project can't be created by a member (nobody is a member of a
             # project that doesn't exist yet) — so the write is authorized by
@@ -144,6 +145,7 @@ miniapp_config = {
             "table": "tasks",
             "order_by": "deadline ASC",
             "creatable": False,
+            "scope": {"type": "scoped", "parent": "projects", "via": "project_id"},
             "title": "Задания",
             "titleField": "text",
             "children": [
@@ -178,6 +180,7 @@ miniapp_config = {
             "table": "reports",
             "order_by": "submitted_at DESC",
             "creatable": False,
+            "scope": {"type": "scoped", "parent": "tasks", "via": "task_id"},
             "title": "Отчёты",
             "titleField": "text",
             "fields": [
@@ -207,6 +210,7 @@ miniapp_config = {
             "table": "attachments",
             "order_by": "id DESC",
             "creatable": False,
+            "scope": {"type": "scoped", "parent": "tasks", "via": "task_id"},
             "title": "Вложения",
             "titleField": "name",
             "fields": [

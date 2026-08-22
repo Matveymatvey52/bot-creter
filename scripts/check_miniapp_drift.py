@@ -44,6 +44,7 @@ from pathlib import Path
 # validator uses (services/claude_service.py's _validate_miniapp_config_
 # against_code / _extract_create_table_names) — don't reinvent a second,
 # possibly-drifted regex for the same job.
+from runtime.miniapp_api import resource_scope, validate_scope_declarations
 from services.claude_service import _extract_create_table_names
 
 TEMPLATES_DIR = Path(__file__).resolve().parent.parent / "templates"
@@ -265,6 +266,38 @@ def check_template(template_path: Path) -> tuple[list[str], list[str]]:
                     f"{template_path.name}: miniapp_config resource '{table}' field "
                     f"'{name}' not found among that table's real columns {sorted(columns)}"
                 )
+
+    # HARD: every resource must declare what it belongs to, and a scoped one
+    # must point at a column that really exists. The runtime deliberately
+    # tolerates an absent declaration so the LLM-generated configs already
+    # stored in the DB keep rendering (see runtime/miniapp_api.py's
+    # resource_scope) — this is where the tolerance stops. Undeclared scope
+    # is the exact hole docs/SCOPE_AUDIT_STAGE_A.md found in 29 sections.
+    for error in validate_scope_declarations(miniapp_config):
+        hard_errors.append(f"{template_path.name}: {error}")
+
+    # The declaration names a column; only this file knows whether that
+    # column exists. Checking it here rather than in validate_scope_
+    # declarations keeps that function usable at runtime, where no CREATE
+    # TABLE source is available.
+    for resource in miniapp_config["resources"]:
+        if not isinstance(resource, dict):
+            continue
+        try:
+            scope = resource_scope(resource)
+        except Exception as exc:  # ScopeError — already reported above
+            continue
+        if scope is None:
+            continue
+        table = resource.get("table")
+        if not isinstance(table, str) or table not in tables:
+            continue  # already reported as a drift error above
+        if scope["via"] not in tables[table]:
+            hard_errors.append(
+                f"{template_path.name}: resource '{resource.get('name', table)}' is declared "
+                f"scoped by '{scope['via']}', which is not a real column of table '{table}' "
+                f"{sorted(tables[table])}"
+            )
 
     # Soft heuristic: CRUD-ish callback_data prefixes with no corresponding
     # miniapp_config resource table name mentioned anywhere in the prefix.

@@ -1,10 +1,17 @@
 import { useEffect, useState } from 'react'
-import { listResource, ApiError, type ResourceItem } from '../lib/api'
+import {
+  listResource,
+  ApiError,
+  PARENT_NONE,
+  type ListScope,
+  type ResourceItem,
+} from '../lib/api'
 import { statusToneRich, type FieldDisplay, type ResourceDisplay } from '../lib/displaySchema'
 import { DataTable, type TableColumn } from '../components/DataTable'
 import { refLabelKey, type RefLabels } from '../components/FieldValue'
 import { TotalsStrip } from '../components/TotalsStrip'
 import { Icon } from '../components/Icon'
+import { ParentPickerScreen } from './ParentPickerScreen'
 
 /* Раскладка карточки — вариант I (утверждён владельцем 2026-08-21,
    эталон design/mockups/miniapp_mockup_I.html): заголовок и подпись слева,
@@ -87,6 +94,16 @@ function splitFields(fields: FieldDisplay[], item: ResourceItem) {
   return { subText, amount, facts }
 }
 
+/* Что читается в панели контекста. Имя родителя берём из scope.options, а не
+   из строк: тогда пустой отфильтрованный список всё равно назван — а пустой
+   раздел это ровно тот случай, когда вопрос «чьё это?» звучит громче всего. */
+function contextLabel(scope: ListScope, parent: string | null): string {
+  if (parent === null) return `Все · сводно`
+  if (parent === PARENT_NONE) return 'Не привязано'
+  const option = scope.options.find((o) => o.id === parent)
+  return option ? (option.label ?? `#${option.id}`) : '—'
+}
+
 export function ListScreen({
   resource,
   onOpenItem,
@@ -102,14 +119,30 @@ export function ListScreen({
   // «Сочи», а не id 12. Раздел, недоступный этому зрителю, просто остаётся без
   // подписи — экран из-за этого не ломается.
   const [refLabels, setRefLabels] = useState<RefLabels>({})
+  /* Чем ограничен этот список — как это сообщил бэкенд. У глобального ресурса
+     остаётся null: блок scope не приходит вовсе, поэтому здесь нет состояния,
+     из-за которого справочник мог бы нарисовать себе родителя
+     (docs/SCOPE_AUDIT_STAGE_A.md). */
+  const [scope, setScope] = useState<ListScope | null>(null)
+  const [parent, setParent] = useState<string | null>(null)
+  const [picking, setPicking] = useState(false)
+
+  /* Смена раздела не тащит за собой прежнего родителя: id тура ничего не
+     значит для списка сотрудников. */
+  useEffect(() => {
+    setParent(null)
+    setPicking(false)
+  }, [resource.name])
 
   useEffect(() => {
     let cancelled = false
     setItems(null)
     setError(null)
-    listResource(resource.name)
+    listResource(resource.name, parent)
       .then((data) => {
-        if (!cancelled) setItems(data.items)
+        if (cancelled) return
+        setItems(data.items)
+        setScope(data.scope ?? null)
       })
       .catch((err) => {
         if (cancelled) return
@@ -118,7 +151,7 @@ export function ListScreen({
     return () => {
       cancelled = true
     }
-  }, [resource.name])
+  }, [resource.name, parent])
 
   useEffect(() => {
     let cancelled = false
@@ -208,8 +241,46 @@ export function ListScreen({
       }),
   ]
 
+  if (picking && scope !== null) {
+    return (
+      <ParentPickerScreen
+        scope={scope}
+        sectionTitle={resource.title}
+        selected={parent}
+        onSelect={(next) => {
+          setParent(next)
+          setPicking(false)
+        }}
+        onCancel={() => setPicking(false)}
+      />
+    )
+  }
+
   return (
     <div className="screen">
+      {/* Панель контекста из эталона (design/mockups/miniapp_mockup_I.html,
+          .ctxbar): раздел всегда говорит, чьи записи показывает, и здесь же
+          меняется. Справочник на том же месте говорит, что родителя у него
+          нет, — молчание выглядело бы как непомеченный scoped-раздел. */}
+      {scope !== null && (
+        <div className="ctxbar" onClick={() => setPicking(true)} role="button" tabIndex={0}>
+          <div className="ctx-x">
+            <div className="ctx-k">{scope.sectionLabel}</div>
+            <div className="ctx-v">
+              <span className="ctx-dot" />
+              {contextLabel(scope, parent)}
+            </div>
+          </div>
+          <span className="ctx-sw">
+            Сменить
+            <Icon name="chevron" />
+          </span>
+        </div>
+      )}
+      {scope === null && (
+        <div className="ctx-glob">Общий справочник — записи ни к чему не привязаны</div>
+      )}
+
       <div className="sol-head">
         <div>
           <h1>{resource.title}</h1>

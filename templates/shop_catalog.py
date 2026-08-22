@@ -68,6 +68,7 @@ miniapp_config = {
             "table": "categories",
             "order_by": "name ASC",
             "creatable": False,
+            "scope": {"type": "global"},
             "title": "Категории",
             "titleField": "name",
             "fields": [
@@ -80,6 +81,7 @@ miniapp_config = {
             "table": "products",
             "order_by": "id DESC",
             "creatable": True,
+            "scope": {"type": "global"},
             "title": "Товары",
             "titleField": "name",
             "fields": [
@@ -95,6 +97,7 @@ miniapp_config = {
             "table": "orders",
             "order_by": "created_at DESC",
             "creatable": True,
+            "scope": {"type": "global"},
             "title": "Заказы",
             "titleField": "client_name",
             "fields": [

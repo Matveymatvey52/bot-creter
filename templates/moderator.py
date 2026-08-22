@@ -63,6 +63,7 @@ miniapp_config = {
             "table": "moderation_log",
             "order_by": "created_at DESC",
             "creatable": False,
+            "scope": {"type": "global"},
             "title": "Журнал модерации",
             "titleField": "action",
             "fields": [

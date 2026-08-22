@@ -213,6 +213,7 @@ miniapp_config = {
             "table": "campaigns",
             "order_by": "created_at DESC",
             "creatable": True,
+            "scope": {"type": "global"},
             "title": "Кампании",
             "titleField": "name",
             "fields": [
@@ -231,6 +232,7 @@ miniapp_config = {
             "table": "metric_entries",
             "order_by": "entered_at DESC",
             "creatable": False,
+            "scope": {"type": "scoped", "parent": "campaigns", "via": "campaign_id"},
             "title": "Метрики",
             "titleField": "entered_at",
             "fields": [
