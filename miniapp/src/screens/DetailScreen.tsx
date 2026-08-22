@@ -17,7 +17,6 @@ import { statusToneRich, type FieldDisplay, type ResourceDisplay } from '../lib/
 import { DataTable, type TableColumn } from '../components/DataTable'
 import { FieldValue, refLabelKey, type RefLabels } from '../components/FieldValue'
 import { Icon, iconForResource } from '../components/Icon'
-import { useTelegramMainButton } from '../lib/useMainButton'
 
 /* Иконка вложения по расширению — в эталоне у договора, ваучера и схемы
    рассадки разные глифы. Расширение берём из значения поля; чего не узнали,
@@ -104,8 +103,13 @@ export function DetailScreen({
     }
   }, [resource])
 
-  const handlePrimaryAction = useCallback(() => onBack(), [onBack])
-  useTelegramMainButton('Назад к списку', handlePrimaryAction, Boolean(item))
+  /* Нативной MainButton здесь нет намеренно. Она умеет показать РОВНО ОДНО
+     действие, а утверждённая раскладка карточки несёт целый ряд: переходы в
+     разделы связанных записей плюс возврат к списку. Раньше MainButton висела
+     с текстом «Назад к списку» одновременно с этими кнопками — то же
+     дублирование, что и на форме создания, только менее заметное. Возврат
+     назад в Telegram и так есть: системная стрелка в шапке мини-аппа и крошка
+     «Все …» в самой карточке. */
 
   const copyValue = useCallback(async (label: string, value: unknown) => {
     const text = String(value ?? '')

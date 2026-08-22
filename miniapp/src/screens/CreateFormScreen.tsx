@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react'
 import { createResource, listResource, ApiError, type ResourceItem } from '../lib/api'
 import type { FieldDisplay, ResourceDisplay } from '../lib/displaySchema'
 import { useTelegramMainButton } from '../lib/useMainButton'
+import { hasMainButton } from '../lib/telegram'
 import { Icon } from '../components/Icon'
 
 export function CreateFormScreen({
@@ -113,18 +114,22 @@ export function CreateFormScreen({
 
       {error && <div className="state-message">{error}</div>}
 
-      {/* Кнопка видна всегда, а не только вне Telegram: главная кнопка
-          Telegram живёт за пределами страницы, и без этой строки внутри
-          мессенджера форма выглядит как документ без действия. */}
-      <div className="sol-acts">
-        <button
-          className="sol-btn pri"
-          onClick={handleSubmit}
-          disabled={!requiredFilled || submitting}
-        >
-          {submitting ? 'Сохранение…' : (resource.addLabel ?? 'Создать')}
-        </button>
-      </div>
+      {/* Ровно ОДНА кнопка отправки. Внутри Telegram её берёт на себя нативная
+          MainButton (она живёт в хроме мессенджера, ниже страницы) — своя тогда
+          не рисуется вовсе, иначе видно две кнопки сразу: медную в форме и
+          синюю системную снизу. Вне Telegram нативной нет, и своя обязательна,
+          иначе отправлять будет нечем. */}
+      {!hasMainButton() && (
+        <div className="sol-acts">
+          <button
+            className="sol-btn pri"
+            onClick={handleSubmit}
+            disabled={!requiredFilled || submitting}
+          >
+            {submitting ? 'Сохранение…' : (resource.addLabel ?? 'Создать')}
+          </button>
+        </div>
+      )}
     </div>
   )
 }
