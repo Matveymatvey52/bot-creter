@@ -11,6 +11,7 @@
 
 import { PARENT_ALL, PARENT_NONE, type ListScope } from '../lib/api'
 import { Icon } from '../components/Icon'
+import { dismissKeyboardOnBackdrop } from '../lib/keyboard'
 
 export function ParentPickerScreen({
   scope,
@@ -47,7 +48,9 @@ export function ParentPickerScreen({
   ]
 
   return (
-    <div className="screen">
+    /* Тап мимо поля прячет клавиатуру — то же правило, что на форме создания и
+       в поиске: одно поведение на всех экранах. */
+    <div className="screen" onPointerDown={dismissKeyboardOnBackdrop}>
       <div className="sol-head">
         <div>
           <h1>{scope.parentTitle}</h1>

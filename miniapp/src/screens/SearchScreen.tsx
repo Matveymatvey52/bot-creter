@@ -2,6 +2,7 @@ import { useState } from 'react'
 import type { ResourceItem } from '../lib/api'
 import { statusToneRich, type ResourceDisplay } from '../lib/displaySchema'
 import { Icon, iconForResource } from '../components/Icon'
+import { dismissKeyboardOnBackdrop } from '../lib/keyboard'
 
 /* Поиск по всем разделам сразу. До него найти запись можно было только глазами
    и только в том разделе, где она лежит, — а человек обычно помнит имя, но не
@@ -68,12 +69,7 @@ export function SearchScreen({
        иначе результаты поиска остаются наполовину закрыты ею. */
     <div
       className="screen"
-      onPointerDown={(e) => {
-        if (!(e.target as HTMLElement).closest('input, select, textarea, button, label')) {
-          const active = document.activeElement
-          if (active instanceof HTMLElement) active.blur()
-        }
-      }}
+      onPointerDown={dismissKeyboardOnBackdrop}
     >
       <div className="sol-head">
         <div>
