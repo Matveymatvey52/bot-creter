@@ -150,7 +150,7 @@
   flex-direction: column;
   gap: 10px;
   padding-bottom: 4px;
-  border-bottom: 1px solid var(--border-hair);
+  border-bottom: 1px solid var(--hairline);
 }
 
 .factory-dashboard-header .screen-header h1 {
@@ -488,7 +488,7 @@
   align-items: center;
   justify-content: space-between;
   padding-top: 10px;
-  border-top: 1px solid var(--border-hair);
+  border-top: 1px solid var(--hairline);
   font-size: 12.5px;
   color: var(--text-tertiary);
 }
@@ -594,7 +594,7 @@
   gap: 4px;
   padding: 12px 18px 0;
   background: var(--surface);
-  border-bottom: 1px solid var(--border-hair);
+  border-bottom: 1px solid var(--hairline);
   overflow-x: auto;
   /* Tabs still scroll horizontally when they overflow, but the native
      scrollbar itself reads as a distracting "loading bar" under the tab
@@ -683,7 +683,7 @@
   align-items: center;
   gap: 8px;
   padding: 8px 10px;
-  border-bottom: 1px solid var(--border-hair);
+  border-bottom: 1px solid var(--hairline);
   font-size: 13px;
   cursor: pointer;
   white-space: nowrap;
@@ -739,7 +739,7 @@
 .registry-table td {
   padding: 8px 10px;
   text-align: left;
-  border-bottom: 1px solid var(--border-hair);
+  border-bottom: 1px solid var(--hairline);
 }
 
 .registry-table th {
@@ -791,7 +791,7 @@
   align-items: center;
   gap: 10px;
   padding: 10px 12px;
-  border-bottom: 1px solid var(--border-hair);
+  border-bottom: 1px solid var(--hairline);
   font-size: 14px;
   cursor: pointer;
 }
@@ -805,7 +805,7 @@
   align-items: center;
   justify-content: space-between;
   padding: 12px 0;
-  border-bottom: 1px solid var(--border-hair);
+  border-bottom: 1px solid var(--hairline);
   gap: 12px;
 }
 
@@ -953,7 +953,7 @@
   align-items: center;
   gap: 10px;
   padding: 10px 0;
-  border-bottom: 1px solid var(--border-hair);
+  border-bottom: 1px solid var(--hairline);
 }
 
 .admin-avatar {
@@ -1031,7 +1031,7 @@
   gap: 8px;
   margin-bottom: 16px;
   padding-bottom: 16px;
-  border-bottom: 1px solid var(--border-hair);
+  border-bottom: 1px solid var(--hairline);
 }
 
 .metric-hero .num {
@@ -1110,7 +1110,7 @@
 
   .card:only-of-type .meta-row {
     padding: 10px 0;
-    border-bottom: 1px solid var(--border-hair);
+    border-bottom: 1px solid var(--hairline);
   }
 
   .card:only-of-type .meta-row:last-of-type {
@@ -1166,8 +1166,8 @@
   align-items: center;
   gap: 10px;
   padding: 14px 16px 12px;
-  border-bottom: 1px solid var(--border-hair);
-  background: var(--surface);
+  border-bottom: 1px solid var(--hairline);
+  background: var(--surface-raise);
 }
 .sol-mark {
   width: 32px;
@@ -1175,7 +1175,7 @@
   flex: 0 0 auto;
   border-radius: var(--radius-md);
   background: var(--surface-inset);
-  border: 1px solid var(--border-subtle);
+  border: 1px solid var(--hairline-2);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1212,7 +1212,7 @@
   gap: 8px;
   overflow-x: auto;
   padding: 14px 16px 15px;
-  border-bottom: 1px solid var(--border-hair);
+  border-bottom: 1px solid var(--hairline);
   scrollbar-width: none;
 }
 .sol-lane::-webkit-scrollbar { display: none; }
@@ -1362,7 +1362,7 @@
   background: currentColor;
   flex: 0 0 auto;
 }
-.sol-st.tone-ok { color: var(--success-text); }
+.sol-st.tone-ok { color: var(--status-ok); }
 .sol-st.tone-warn { color: var(--warning-text); }
 .sol-st.tone-done { color: var(--accent); }
 .sol-st.tone-danger { color: var(--danger-text); }
@@ -1409,7 +1409,7 @@
 }
 .sol-sheet-h {
   padding: 16px 16px 14px;
-  border-bottom: 1px solid var(--border-hair);
+  border-bottom: 1px solid var(--hairline);
 }
 .sol-crumb {
   display: inline-flex;
@@ -1443,7 +1443,7 @@
   justify-content: space-between;
   gap: 12px;
   padding: 12px 16px;
-  border-bottom: 1px solid var(--border-hair);
+  border-bottom: 1px solid var(--hairline);
 }
 .sol-spec:last-child { border-bottom: none; }
 .sol-spec-k { font-size: 12.5px; color: var(--text-tertiary); flex: 0 0 auto; }
@@ -1455,13 +1455,238 @@
   overflow-wrap: anywhere;
 }
 
+/* Правая половина строки спец-листа: значение + шеврон, если строка ведёт
+   куда-то дальше. Шеврон рисуется только у кликабельных строк — иначе он
+   обещает переход, которого нет. */
+.sol-spec-rt {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 9px;
+  /* Занимает всё, что осталось от подписи слева: без flex-grow вложенное
+     поле ввода (у него width:0) получало нулевую ширину и форма выглядела
+     пустой. */
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+}
+.sol-chev {
+  color: var(--text-tertiary);
+  flex: 0 0 auto;
+  display: block;
+}
+/* Кликабельная строка — это <button>, а не div с onClick: клавиатура и
+   скринридер должны видеть её как кнопку. Сброс родных стилей кнопки
+   оставляет ровно ту же геометрию, что у обычной строки. */
+button.sol-spec {
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: 0;
+  border-bottom: 1px solid var(--hairline);
+  font: inherit;
+  cursor: pointer;
+}
+button.sol-spec:last-child { border-bottom: none; }
+button.sol-spec:active { background: var(--surface-inset); }
+
+/* Поля ввода живут прямо в строке спец-листа: подпись слева, значение
+   справа — форма выглядит тем же документом, что и карточка, а не отдельным
+   бланком. Рамка и фон снимаются, потому что границу строки уже рисует
+   .sol-spec. */
+.sol-spec-in {
+  /* width:0 + flex-grow, а не min-width:0: у <input> есть собственная
+     предпочтительная ширина от атрибута size (~20 символов), из-за которой
+     длинный placeholder («@username, имя или телефон») распирал строку и
+     вылезал за край карточки. */
+  flex: 1 1 auto;
+  width: 0;
+  min-width: 0;
+  text-overflow: ellipsis;
+  background: none;
+  border: 0;
+  border-radius: 0;
+  padding: 0;
+  text-align: right;
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+.sol-spec-in:focus { outline: none; color: var(--accent); }
+.sol-spec-in::placeholder { color: var(--text-tertiary); font-weight: 500; }
+/* Нативная стрелка select'а рядом с текстом справа выглядит инородно —
+   роль «здесь есть выбор» уже выполняет шеврон строки. */
+select.sol-spec-in {
+  appearance: none;
+  -webkit-appearance: none;
+  /* Растянутый на всю строку <select> рисует свой текст по левому краю (то,
+     что text-align на нём не работает в WebKit) — значение отрывалось от
+     правого края и вставало вплотную к подписи. Ширина по содержимому
+     возвращает его в общий строй с остальными значениями. */
+  flex: 0 1 auto;
+  width: auto;
+  max-width: 100%;
+  text-align: right;
+  text-align-last: right;
+}
+
+/* ── Кнопки в шапке приложения ──
+   Слева «назад» (рисуется только когда есть куда возвращаться), справа «⋯» —
+   открывает экран «Все разделы». Обе из эталона-мокапа. */
+.sol-tb {
+  width: 32px;
+  height: 32px;
+  flex: 0 0 auto;
+  border-radius: var(--radius-md);
+  background: var(--surface-inset);
+  border: 1px solid var(--border-subtle);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+.sol-tb:active { background: var(--surface-elevated); color: var(--text-primary); }
+/* Пустышка на месте «назад» на корневом экране: без неё квадрат с
+   инициалами прыгал бы влево-вправо при каждом переходе. */
+.sol-tb-gap { width: 32px; flex: 0 0 auto; }
+
+/* ── Файлы и вложения ──
+   Строки-файлы внутри спец-листа: цветная плашка-иконка, имя, шеврон.
+   Кликабельны всегда — файл открывается на своём экране. */
+.sol-frow {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 11px 13px;
+  border-bottom: 1px solid var(--hairline);
+  width: 100%;
+  background: none;
+  border-left: 0;
+  border-right: 0;
+  border-top: 0;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.sol-frow:last-child { border-bottom: none; }
+.sol-frow:active { background: var(--surface-inset); }
+.sol-frow-ic {
+  width: 30px;
+  height: 30px;
+  border-radius: var(--radius-md);
+  background: var(--accent-wash);
+  color: var(--accent);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+}
+.sol-frow-n {
+  font-size: 13px;
+  font-weight: 580;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-primary);
+}
+
+/* Экран одного файла: крупная иконка вместо превью — движок не знает, что
+   внутри вложения, и показывать «пустой лист бумаги» честнее, чем врать
+   миниатюрой. */
+.sol-fview {
+  margin: 0 0 14px;
+  background: var(--surface);
+  border: 1px solid var(--border-hair);
+  border-radius: var(--radius-lg);
+  padding: 52px 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-tertiary);
+}
+
+/* ── Строка экрана «Все разделы» ── */
+.sol-mrow {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--hairline);
+  width: 100%;
+  background: none;
+  border-left: 0;
+  border-right: 0;
+  border-top: 0;
+  font: inherit;
+  color: var(--text-tertiary);
+  text-align: left;
+  cursor: pointer;
+}
+.sol-mrow:last-child { border-bottom: none; }
+.sol-mrow:active { background: var(--surface-inset); }
+.sol-mrow-n {
+  flex: 1;
+  min-width: 0;
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+.sol-mrow-c { font-size: 12.5px; color: var(--text-tertiary); }
+
+/* ── Кнопки действий под спец-листом ── */
+.sol-acts {
+  padding: 2px 16px 22px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.sol-acts-row { display: flex; gap: 8px; }
+.sol-btn {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 13px;
+  border-radius: var(--radius-md);
+  font-size: 13.5px;
+  font-weight: 620;
+  letter-spacing: -0.005em;
+  background: var(--surface-inset);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-primary);
+  cursor: pointer;
+}
+.sol-btn:active { background: var(--surface-elevated); }
+.sol-btn.pri {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-text);
+}
+.sol-btn.pri:active { background: var(--accent-dim); border-color: var(--accent-dim); }
+.sol-btn:disabled { opacity: 0.5; cursor: default; }
+
+/* Заголовок блока связанных записей под спец-листом. */
+.sol-block-h {
+  padding: 4px 16px 8px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+}
+
 /* ── Нижняя навигация ── */
 .sol-nav {
   margin-top: auto;
   position: sticky;
   bottom: 0;
   display: flex;
-  border-top: 1px solid var(--border-hair);
+  border-top: 1px solid var(--hairline);
   background: var(--bg);
   padding-bottom: env(safe-area-inset-bottom, 0px);
   z-index: 20;
@@ -1503,6 +1728,9 @@
   .screen > .sol-list,
   .screen > .sol-sheet,
   .screen > .sol-top,
+  .screen > .sol-acts,
+  .screen > .screen-section,
+  .screen > .state-message,
   .screen > .sol-nav { grid-column: 1 / -1; }
   .sol-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 12px; }
 }
@@ -1529,7 +1757,7 @@
   text-align: left;
   padding: 10px 14px;
   white-space: nowrap;
-  border-bottom: 1px solid var(--border-hair);
+  border-bottom: 1px solid var(--hairline);
 }
 
 .data-table th {

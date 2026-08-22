@@ -2395,13 +2395,21 @@ _TOUR_OPERATOR_MINIAPP_CONFIG_EXAMPLE = """{
             "creatable": true,
             "title": "Туры",
             "titleField": "name",
+            "children": [
+                {"resource": "program", "via": "tour_id", "title": "Программа тура", "as": "table"},
+                {"resource": "guests", "via": "tour_id", "title": "Гости", "as": "list"}
+            ],
             "fields": [
                 {"name": "name", "required": true, "label": "Название", "kind": "text", "list": false, "detail": false, "create": true},
                 {"name": "destination", "label": "Направление", "kind": "text", "list": true, "detail": true, "create": true},
                 {"name": "date_start", "label": "Начало", "kind": "date", "list": false, "detail": true, "create": true},
                 {"name": "date_end", "label": "Окончание", "kind": "date", "list": false, "detail": true, "create": true},
-                {"name": "guests_count", "label": "Гостей", "kind": "number", "list": false, "detail": true, "create": true},
+                {"name": "guests_count", "label": "Гостей", "kind": "number", "list": true, "detail": true, "create": true},
+                {"name": "total_cost", "label": "Бюджет", "kind": "number", "list": true, "detail": true, "create": true},
+                {"name": "hotel_id", "label": "Отель", "kind": "number", "ref": {"resource": "hotels", "labelField": "name"}, "list": false, "detail": true, "create": true},
+                {"name": "contract_url", "label": "Договор", "kind": "file", "list": false, "detail": true, "create": true},
                 {"name": "status", "label": "Статус", "kind": "status", "list": true, "detail": true, "create": false},
+                {"name": "payment_status", "label": "Оплата", "kind": "status", "list": true, "detail": true, "create": false},
                 {"name": "created_at", "creatable": false, "label": "Создано", "kind": "date", "list": false, "detail": false, "create": false}
             ]
         },
@@ -2413,14 +2421,28 @@ _TOUR_OPERATOR_MINIAPP_CONFIG_EXAMPLE = """{
             "title": "Гости",
             "titleField": "name",
             "fields": [
-                {"name": "tour_id", "required": true, "label": "ID тура", "kind": "number", "list": false, "detail": false, "create": true},
+                {"name": "tour_id", "required": true, "label": "Тур", "kind": "number", "ref": {"resource": "tours", "labelField": "name"}, "list": false, "detail": true, "create": true},
                 {"name": "name", "required": true, "label": "Имя гостя", "kind": "text", "list": false, "detail": false, "create": true},
+                {"name": "contact", "label": "Контакт", "kind": "contact", "list": false, "detail": true, "create": true},
                 {"name": "total_cost", "label": "Стоимость", "kind": "number", "list": true, "detail": true, "create": true},
                 {"name": "prepaid", "label": "Предоплата", "kind": "number", "list": false, "detail": true, "create": true},
-                {"name": "our_price", "label": "Наша цена", "kind": "number", "list": false, "detail": true, "create": false},
                 {"name": "status", "label": "Статус", "kind": "status", "list": true, "detail": true, "create": false},
-                {"name": "notes", "label": "Заметки", "kind": "text", "list": false, "detail": true, "create": false},
                 {"name": "created_at", "creatable": false, "label": "Создано", "kind": "date", "list": false, "detail": false, "create": false}
+            ]
+        },
+        {
+            "name": "program",
+            "table": "program_items",
+            "order_by": "day ASC",
+            "creatable": true,
+            "title": "Программа",
+            "titleField": "title",
+            "tableView": true,
+            "fields": [
+                {"name": "tour_id", "required": true, "label": "Тур", "kind": "number", "ref": {"resource": "tours", "labelField": "name"}, "list": false, "detail": true, "create": true},
+                {"name": "day", "label": "День", "kind": "date", "list": true, "detail": true, "create": true},
+                {"name": "time", "label": "Время", "kind": "text", "list": true, "detail": true, "create": true},
+                {"name": "title", "required": true, "label": "Пункт", "kind": "text", "list": true, "detail": true, "create": true}
             ]
         }
     ]
@@ -2443,7 +2465,14 @@ Rules:
 - Every "table" and every field "name" MUST match a real table/column that appears in the given code's CREATE TABLE statements. Never invent a table or column that isn't there.
 - Only include tables that hold user-facing records worth browsing (bookings, orders, items, clients, etc). Skip purely internal/administrative tables (admins, state, sessions, migration/version tables, FSM storage).
 - If the bot has no table worth showing as a mini-app screen (e.g. a purely conversational bot with no data table, or only internal tables), respond with exactly {{"resources": []}}. This is a valid, expected answer — not an error.
-- Do not include any resource whose table you are not certain is a literal, verbatim CREATE TABLE name in the given code."""
+- Do not include any resource whose table you are not certain is a literal, verbatim CREATE TABLE name in the given code.
+
+The mini-app renders a record's card as a "spec sheet" (approved layout, design/mockups/miniapp_mockup_I.html): coloured status tags under the heading, key-value rows, an attachments block, tables of related sub-records, and buttons into those sections. Every one of those elements is driven by the metadata below — a resource that omits it gets a bare list of strings instead. So declare them WHENEVER the bot's own tables support it, for every bot, not just data-rich ones:
+- "ref": {{"resource": <another resource's "name">, "labelField": <a column of that resource>}} on EVERY foreign-key column. This is mandatory whenever a column holds another table's id (tour_id, order_id, client_id, master_id, ...). It is what turns the row into a tappable link showing the related record's NAME. A foreign key WITHOUT "ref" shows the human a raw number like "ID тура: 7" and lets the create form ask them to type an id — never acceptable. Also give such a field a human label ("Тур"), never "ID тура".
+- "children": [{{"resource": ..., "via": <the child's foreign-key column pointing back at this resource>, "title": <human plural>, "as": "table" | "list"}}] on any resource that OWNS sub-records (a tour owns its program and guests; an order owns its items; a repair owns its parts). The card then shows those sub-records in place, as a table ("table" — for uniform short rows like a schedule or a line-item list) or as cards ("list" — for records with a name plus a few details). Without it the user has to hunt through sibling tabs and match ids by eye.
+- "kind": "file" for a column holding an attachment (a URL, a Telegram file_id, a document/photo/contract/voucher column) — those become the "Файлы и вложения" block with an openable screen per file. "kind": "link" for a plain URL column (a map, a booking page, a spreadsheet). "kind": "contact" for a person's contact column (a Telegram @username, phone, or name).
+- "kind": "status" for EVERY state-like column, not only one per resource: a tour with both a stage ("planning") and a payment state ("оплачено 40%") should declare both, and each becomes its own coloured tag.
+- "tableView": true on a resource whose records are short uniform rows better read as a spreadsheet (a schedule, a cash-flow ledger, line items) rather than as cards."""
 
 
 def _extract_create_table_names(bot_code: str) -> dict[str, set[str]]:
