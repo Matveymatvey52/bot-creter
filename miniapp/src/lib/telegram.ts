@@ -49,16 +49,6 @@ export function isInTelegram(): boolean {
   return Boolean(getInitData())
 }
 
-/** Доступна ли нативная кнопка Telegram. Единственный источник правды для
-    правила «одна кнопка отправки»: если она есть, экран НЕ рисует свою — иначе
-    внутри Telegram видно две кнопки сразу, медную в теле формы и синюю
-    системную снизу. Вне Telegram (десктоп-браузер, страница /site/{bot_id})
-    её нет, и свою кнопку рисовать обязательно — иначе отправлять будет
-    нечем. */
-export function hasMainButton(): boolean {
-  return isInTelegram() && Boolean(getTelegramWebApp()?.MainButton)
-}
-
 /** The Telegram WebApp's own `initDataUnsafe.user.photo_url` field (see
     Telegram's Mini Apps docs) — undefined outside Telegram or when Telegram
     hasn't handed one back (e.g. the user has no profile photo). Deliberately

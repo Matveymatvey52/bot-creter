@@ -1,8 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { createResource, listResource, ApiError, type ResourceItem } from '../lib/api'
 import type { FieldDisplay, ResourceDisplay } from '../lib/displaySchema'
-import { useTelegramMainButton } from '../lib/useMainButton'
-import { hasMainButton } from '../lib/telegram'
 import { Icon } from '../components/Icon'
 
 export function CreateFormScreen({
@@ -70,8 +68,6 @@ export function CreateFormScreen({
     }
   }, [resource, submitting, values, onCreated])
 
-  useTelegramMainButton('Создать', handleSubmit, requiredFilled && !submitting)
-
   const setValue = (name: string, value: string) => setValues((prev) => ({ ...prev, [name]: value }))
 
   return (
@@ -114,22 +110,20 @@ export function CreateFormScreen({
 
       {error && <div className="state-message">{error}</div>}
 
-      {/* Ровно ОДНА кнопка отправки. Внутри Telegram её берёт на себя нативная
-          MainButton (она живёт в хроме мессенджера, ниже страницы) — своя тогда
-          не рисуется вовсе, иначе видно две кнопки сразу: медную в форме и
-          синюю системную снизу. Вне Telegram нативной нет, и своя обязательна,
-          иначе отправлять будет нечем. */}
-      {!hasMainButton() && (
-        <div className="sol-acts">
-          <button
-            className="sol-btn pri"
-            onClick={handleSubmit}
-            disabled={!requiredFilled || submitting}
-          >
-            {submitting ? 'Сохранение…' : (resource.addLabel ?? 'Создать')}
-          </button>
-        </div>
-      )}
+      {/* Единственная кнопка отправки — своя, одинаковая на телефоне и на
+          десктопе. Нативная MainButton Telegram здесь сознательно не
+          поднимается: она рисуется системным синим поверх страницы, ломает
+          утверждённую раскладку и повторяет кнопку, которая уже есть в форме.
+          Владелец видел обе сразу и выбрал оставить эту. */}
+      <div className="sol-acts">
+        <button
+          className="sol-btn pri"
+          onClick={handleSubmit}
+          disabled={!requiredFilled || submitting}
+        >
+          {submitting ? 'Сохранение…' : (resource.addLabel ?? 'Создать')}
+        </button>
+      </div>
     </div>
   )
 }
