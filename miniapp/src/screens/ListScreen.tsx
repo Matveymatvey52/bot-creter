@@ -278,7 +278,7 @@ export function ListScreen({
         </div>
       )}
       {scope === null && (
-        <div className="ctx-glob">Общий справочник — не зависит от родителя</div>
+        <div className="ctx-glob">Общий справочник — записи ни к чему не привязаны</div>
       )}
 
       <div className="sol-head">

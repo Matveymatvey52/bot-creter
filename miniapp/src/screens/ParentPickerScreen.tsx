@@ -42,7 +42,7 @@ export function ParentPickerScreen({
       key: PARENT_NONE,
       value: PARENT_NONE as string | null,
       title: 'Не привязано',
-      sub: 'записи без родителя — назначить можно вручную',
+      sub: 'записи без привязки — назначить можно вручную',
     },
   ]
 
