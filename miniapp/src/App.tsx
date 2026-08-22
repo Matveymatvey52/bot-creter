@@ -2,12 +2,14 @@ import { useEffect, useState } from 'react'
 import './components/ui.css'
 import { getSchema, getFeatures, listResource, ApiError, type SchemaBot } from './lib/api'
 import { AppHeader } from './components/AppHeader'
-import { normalizeResources, type ResourceDisplay } from './lib/displaySchema'
+import { normalizeResources, type FieldDisplay, type ResourceDisplay } from './lib/displaySchema'
 import { getTelegramWebApp } from './lib/telegram'
 import { Icon, iconForResource } from './components/Icon'
 import { ListScreen } from './screens/ListScreen'
 import { DetailScreen } from './screens/DetailScreen'
 import { CreateFormScreen } from './screens/CreateFormScreen'
+import { MenuScreen } from './screens/MenuScreen'
+import { FileScreen } from './screens/FileScreen'
 import { FactoryDashboardScreen } from './screens/FactoryDashboardScreen'
 import { AnalyticsScreen } from './screens/AnalyticsScreen'
 import { OwnerReportScreen } from './screens/OwnerReportScreen'
@@ -36,6 +38,11 @@ type Route =
   | { kind: 'detail'; resource: string; itemId: number }
   | { kind: 'create'; resource: string }
   | { kind: 'analytics' }
+  // «Все разделы» — экран за кнопкой «⋯» в шапке (вариант I).
+  | { kind: 'menu' }
+  // Один файл записи: поле и его значение уже загружены деталкой, повторно
+  // ходить за записью незачем.
+  | { kind: 'file'; field: FieldDisplay; value: unknown; back: Route }
 
 export default function App() {
   // Telegram's own bootstrap sequence — no-op outside the WebView (see
@@ -156,7 +163,21 @@ function TenantApp() {
   // доступ к тем, куда ходят чаще всего.
   const navNames = resourceNames.slice(0, 3)
 
-  const activeResource = route.kind === 'analytics' ? null : route.resource
+  const activeResource =
+    route.kind === 'list' || route.kind === 'detail' || route.kind === 'create'
+      ? route.resource
+      : null
+
+  // Куда ведёт «назад» в шапке. На корневом экране (список раздела) возвращать
+  // некуда — кнопка не рисуется вовсе, вместо неё пустой отступ.
+  const backRoute: Route | null =
+    route.kind === 'detail' || route.kind === 'create'
+      ? { kind: 'list', resource: route.resource }
+      : route.kind === 'file'
+        ? route.back
+        : route.kind === 'menu'
+          ? { kind: 'list', resource: resourceNames[0] ?? '' }
+          : null
 
   // «Аналитика» показывается, только если владелец реально подключил фичу
   // этому боту. analytics_handler по-прежнему сам решает, кому отдавать
@@ -165,7 +186,11 @@ function TenantApp() {
 
   return (
     <>
-      <AppHeader bot={bot} />
+      <AppHeader
+        bot={bot}
+        onBack={backRoute ? () => setRoute(backRoute) : undefined}
+        onMenu={resourceNames.length > 0 ? () => setRoute({ kind: 'menu' }) : undefined}
+      />
 
       {/* Лента разделов — свайп по горизонтали, а не ряд обособленных
           pill-кнопок: раскладка варианта I, утверждённая владельцем
@@ -212,6 +237,11 @@ function TenantApp() {
           resources={resources}
           itemId={route.itemId}
           onBack={() => setRoute({ kind: 'list', resource: route.resource })}
+          onOpenRef={(refResource, itemId) =>
+            setRoute({ kind: 'detail', resource: refResource, itemId })
+          }
+          onOpenChild={(childResource) => setRoute({ kind: 'list', resource: childResource })}
+          onOpenFile={(field, value) => setRoute({ kind: 'file', field, value, back: route })}
         />
       )}
 
@@ -227,6 +257,19 @@ function TenantApp() {
       )}
 
       {route.kind === 'analytics' && <AnalyticsScreen />}
+
+      {route.kind === 'menu' && (
+        <MenuScreen
+          resources={resources}
+          counts={counts}
+          onOpen={(name) => setRoute({ kind: 'list', resource: name })}
+          onBack={() => backRoute && setRoute(backRoute)}
+        />
+      )}
+
+      {route.kind === 'file' && (
+        <FileScreen field={route.field} value={route.value} onBack={() => setRoute(route.back)} />
+      )}
 
       {navNames.length > 0 && (
         <nav className="sol-nav">

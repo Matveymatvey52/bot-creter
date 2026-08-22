@@ -2,8 +2,7 @@ import { useCallback, useEffect, useState } from 'react'
 import { createResource, listResource, ApiError, type ResourceItem } from '../lib/api'
 import type { FieldDisplay, ResourceDisplay } from '../lib/displaySchema'
 import { useTelegramMainButton } from '../lib/useMainButton'
-import { isInTelegram } from '../lib/telegram'
-import { CTAButton } from '../components/CTAButton'
+import { Icon } from '../components/Icon'
 
 export function CreateFormScreen({
   resource,
@@ -76,37 +75,52 @@ export function CreateFormScreen({
 
   return (
     <div className="screen">
-      <div className="screen-header-v2">
-        <div className="screen-header-v2-titles">
-          <span className="label-caps">{resource.title}</span>
-          <h1 className="display-lg">Новая запись</h1>
+      {/* Форма — тот же спец-лист, что и карточка записи (вариант I):
+          подпись слева, поле ввода справа. Отдельного «бланка» с крупными
+          полями в утверждённой раскладке нет. */}
+      <div className="sol-sheet">
+        <div className="sol-sheet-h">
+          <button className="sol-crumb" onClick={onCancel}>
+            <Icon name="back" size={13} />
+            Отмена
+          </button>
+          <h1>Новая запись</h1>
+          <div className="sol-sheet-sub">Раздел «{resource.title}»</div>
         </div>
-        <CTAButton variant="secondary" onClick={onCancel}>
-          ✕
-        </CTAButton>
+
+        {resource.createFields.map((f) => (
+          <div className="sol-spec" key={f.name}>
+            <label className="sol-spec-k" htmlFor={f.name}>
+              {f.label}
+              {f.required && ' *'}
+            </label>
+            <span className="sol-spec-rt">
+              <FormInput
+                field={f}
+                value={values[f.name] ?? ''}
+                options={f.ref ? (refOptions[f.ref.resource] ?? []) : []}
+                onChange={(value) => setValue(f.name, value)}
+              />
+              {f.ref && <Icon name="chevron" size={14} />}
+            </span>
+          </div>
+        ))}
       </div>
 
       {error && <div className="state-message">{error}</div>}
 
-      {resource.createFields.map((f) => (
-        <div className="field" key={f.name}>
-          <label htmlFor={f.name}>{f.label}</label>
-          <FormInput
-            field={f}
-            value={values[f.name] ?? ''}
-            options={f.ref ? (refOptions[f.ref.resource] ?? []) : []}
-            onChange={(value) => setValue(f.name, value)}
-          />
-        </div>
-      ))}
-
-      {!isInTelegram() && (
-        <div className="bottom-bar">
-          <CTAButton variant="primary" onClick={handleSubmit} disabled={!requiredFilled || submitting}>
-            {submitting ? 'Создание…' : 'Создать'}
-          </CTAButton>
-        </div>
-      )}
+      {/* Кнопка видна всегда, а не только вне Telegram: главная кнопка
+          Telegram живёт за пределами страницы, и без этой строки внутри
+          мессенджера форма выглядит как документ без действия. */}
+      <div className="sol-acts">
+        <button
+          className="sol-btn pri"
+          onClick={handleSubmit}
+          disabled={!requiredFilled || submitting}
+        >
+          {submitting ? 'Создание…' : 'Создать'}
+        </button>
+      </div>
     </div>
   )
 }
@@ -125,7 +139,7 @@ function FormInput({
   if (field.ref) {
     const labelField = field.ref.labelField
     return (
-      <select id={field.name} value={value} onChange={(e) => onChange(e.target.value)}>
+      <select className="sol-spec-in" id={field.name} value={value} onChange={(e) => onChange(e.target.value)}>
         <option value="">— выберите —</option>
         {options.map((option) => (
           <option key={option.id} value={String(option.id)}>
@@ -142,12 +156,13 @@ function FormInput({
     // backend — a name or a phone is a perfectly good contact.
     return (
       <input
+        className="sol-spec-in"
         id={field.name}
         type="text"
         autoCapitalize="none"
         autoCorrect="off"
         spellCheck={false}
-        placeholder="@username, имя или телефон"
+        placeholder="@username или телефон"
         value={value}
         onChange={(e) => onChange(e.target.value)}
       />
@@ -156,6 +171,7 @@ function FormInput({
 
   return (
     <input
+      className="sol-spec-in"
       id={field.name}
       type={field.kind === 'number' ? 'number' : field.kind === 'date' ? 'date' : 'text'}
       value={value}
