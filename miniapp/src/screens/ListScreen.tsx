@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { listResource, ApiError, type ResourceItem } from '../lib/api'
 import { statusToneRich, type FieldDisplay, type ResourceDisplay } from '../lib/displaySchema'
 import { DataTable, type TableColumn } from '../components/DataTable'
+import { refLabelKey, type RefLabels } from '../components/FieldValue'
 import { TotalsStrip } from '../components/TotalsStrip'
 import { Icon } from '../components/Icon'
 
@@ -39,6 +40,10 @@ export function ListScreen({
 }) {
   const [items, setItems] = useState<ResourceItem[] | null>(null)
   const [error, setError] = useState<string | null>(null)
+  // Названия связанных записей для ref-колонок таблицы: «Тур» обязан показывать
+  // «Сочи», а не id 12. Раздел, недоступный этому зрителю, просто остаётся без
+  // подписи — экран из-за этого не ломается.
+  const [refLabels, setRefLabels] = useState<RefLabels>({})
 
   useEffect(() => {
     let cancelled = false
@@ -57,11 +62,70 @@ export function ListScreen({
     }
   }, [resource.name])
 
+  useEffect(() => {
+    let cancelled = false
+    const refs = resource.listFields.filter((f) => f.ref)
+    if (refs.length === 0) return
+    const targets = new Map(refs.map((f) => [f.ref!.resource, f.ref!.labelField]))
+    Promise.all(
+      [...targets].map(([refResource, labelField]) =>
+        listResource(refResource)
+          .then((data) =>
+            data.items.map(
+              (row) => [refLabelKey(refResource, row.id), String(row[labelField] ?? row.id)] as const,
+            ),
+          )
+          .catch(() => []),
+      ),
+    ).then((results) => {
+      if (!cancelled) setRefLabels(Object.fromEntries(results.flat()))
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [resource])
+
+  // Колонка суммы, которую шаблон объявил знаковой: рисуем со знаком и
+  // цветом — приход зелёным, расход красным, как в эталоне.
+  const signedTotal = resource.totals.find((t) => t.signBy)
+
   const tableColumns: TableColumn[] = [
     { name: resource.titleField, label: resource.title },
     ...resource.listFields
-      .filter((f) => f.name !== resource.titleField && !f.ref)
-      .map((f) => ({ name: f.name, label: f.label })),
+      .filter((f) => f.name !== resource.titleField)
+      .map((f): TableColumn => {
+        if (f.ref) {
+          const ref = f.ref
+          return {
+            name: f.name,
+            label: f.label,
+            render: (value) =>
+              value == null || value === ''
+                ? '—'
+                : (refLabels[refLabelKey(ref.resource, value)] ?? String(value)),
+          }
+        }
+        if (signedTotal && f.name === signedTotal.field) {
+          const { field: signField, positive } = signedTotal.signBy!
+          return {
+            name: f.name,
+            label: f.label,
+            render: (value, row) => {
+              const n = Number(value)
+              if (!Number.isFinite(n)) return '—'
+              const income = String(row[signField]) === positive
+              const text = new Intl.NumberFormat('ru-RU').format(Math.abs(n))
+              return (
+                <span className={income ? 'num pos' : 'num neg'}>
+                  {income ? '+' : '−'}
+                  {text}
+                </span>
+              )
+            },
+          }
+        }
+        return { name: f.name, label: f.label }
+      }),
   ]
 
   return (

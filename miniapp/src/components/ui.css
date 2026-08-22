@@ -1680,6 +1680,11 @@ select.sol-spec-in {
   color: var(--text-tertiary);
 }
 
+/* Знаковые суммы в таблице: приход зелёным, расход красным — как в эталоне. */
+.data-table .num { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.data-table .num.pos { color: var(--success-text); }
+.data-table .num.neg { color: var(--danger-text); }
+
 /* ── Итоги под таблицей раздела ── */
 .sol-totals {
   display: flex;
@@ -1697,6 +1702,7 @@ select.sol-spec-in {
 }
 .sol-tot:last-child { border-right: none; }
 .sol-tot-k {
+  white-space: nowrap;
   font-size: 9px;
   text-transform: uppercase;
   letter-spacing: 0.09em;
@@ -1709,7 +1715,9 @@ select.sol-spec-in {
   margin-top: 4px;
   letter-spacing: -0.01em;
   color: var(--text-primary);
-  overflow-wrap: anywhere;
+  /* Числа не переносим: «−45 00 / 0» в две строки — то, из-за чего полоса
+     итогов выглядела сломанной. Узкой плитке лучше растянуться. */
+  white-space: nowrap;
 }
 .sol-tot-v.pos { color: var(--success-text); }
 .sol-tot-v.neg { color: var(--danger-text); }
@@ -1764,9 +1772,15 @@ select.sol-spec-in {
   .screen > .sol-top,
   .screen > .sol-acts,
   .screen > .screen-section,
+  .screen > .data-table-wrap,
+  .screen > .sol-totals,
   .screen > .state-message,
   .screen > .sol-nav { grid-column: 1 / -1; }
-  .sol-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 12px; }
+  /* Карточки записей тянутся во всю ширину колонки, а не встают плиткой по
+     340px: на широком экране (Telegram Desktop, /site/{bot_id}) одна запись
+     занимала узкий столбик слева, а остальные три четверти экрана пустовали.
+     Владелец просил ровно обратного — чтобы информация шла до правого края. */
+  .sol-list { display: flex; flex-direction: column; gap: 10px; }
 }
 /* ── Data table ───────────────────────────────────────────────────────────
    The wrapper is what scrolls when a table is wider than the viewport, so a
