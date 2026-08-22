@@ -1266,6 +1266,18 @@ async def office_dashboard_handler(request: web.Request) -> web.Response:
     return web.Response(text=_OFFICE_DASHBOARD_HTML, content_type="text/html")
 
 
+# Оболочка SPA не кэшируется, а ассеты — кэшируются вечно. Имена ассетов несут
+# хэш содержимого (index-B6Sd8w4L.js), поэтому новый билд — это новые имена;
+# опасен только index.html: если WebView Telegram отдаст его из кэша, человек
+# продолжит открывать СТАРУЮ сборку и не увидит ни одной выкатанной правки.
+# Ровно это и случилось у владельца: на телефоне осталась синяя кнопка, убранная
+# двумя деплоями раньше.
+_SHELL_NO_CACHE = {
+    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+    "Pragma": "no-cache",
+}
+
+
 async def serve_app_shell(request: web.Request) -> web.Response:
     """Serves the SPA's index.html for /app/{bot_id} (and any client-side
     sub-route under it — the SPA does its own in-memory routing per
@@ -1289,7 +1301,7 @@ async def serve_app_shell(request: web.Request) -> web.Response:
             return web.json_response(
                 {"error": "mini-app build not found — run `npm run build` in miniapp/"}, status=503
             )
-        return web.FileResponse(index_path)
+        return web.FileResponse(index_path, headers=_SHELL_NO_CACHE)
 
     resolved = await _resolve_entry_and_config(request)
     if isinstance(resolved, web.Response):
@@ -1300,7 +1312,7 @@ async def serve_app_shell(request: web.Request) -> web.Response:
         return web.json_response(
             {"error": "mini-app build not found — run `npm run build` in miniapp/"}, status=503
         )
-    return web.FileResponse(index_path)
+    return web.FileResponse(index_path, headers=_SHELL_NO_CACHE)
 
 
 async def serve_owner_report_shell(request: web.Request) -> web.Response:
@@ -1318,7 +1330,7 @@ async def serve_owner_report_shell(request: web.Request) -> web.Response:
         return web.json_response(
             {"error": "mini-app build not found — run `npm run build` in miniapp/"}, status=503
         )
-    return web.FileResponse(index_path)
+    return web.FileResponse(index_path, headers=_SHELL_NO_CACHE)
 
 
 def _register_static_routes(app: web.Application) -> None:
