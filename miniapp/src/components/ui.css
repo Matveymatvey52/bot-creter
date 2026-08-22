@@ -1508,7 +1508,12 @@ button.sol-spec:active { background: var(--surface-inset); }
   border-radius: 0;
   padding: 0;
   text-align: right;
-  font-size: 13.5px;
+  /* 16px, а не 13.5 как у остальных значений строки: iOS автоматически
+     приближает страницу при фокусе на поле со шрифтом меньше 16px, и экран
+     дёргался при каждом тапе по вводу. Ровно об этом предупреждает правило
+     `font-size: max(16px, 1em)` в index.css — мой прежний 13.5px его
+     перебивал. Разница в размере заметна только пока поле заполняют. */
+  font-size: 16px;
   font-weight: 600;
   color: var(--text-primary);
 }

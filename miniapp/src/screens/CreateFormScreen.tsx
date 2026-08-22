@@ -3,6 +3,14 @@ import { createResource, listResource, ApiError, type ResourceItem } from '../li
 import type { FieldDisplay, ResourceDisplay } from '../lib/displaySchema'
 import { Icon } from '../components/Icon'
 
+/* Спрятать клавиатуру. В WebView нет своей кнопки «свернуть», и единственный
+   способ её убрать — снять фокус с поля. Без этого человек, начав печатать,
+   оставался с поднятой клавиатурой до самой отправки или отмены. */
+function dismissKeyboard() {
+  const active = document.activeElement
+  if (active instanceof HTMLElement) active.blur()
+}
+
 export function CreateFormScreen({
   resource,
   onCreated,
@@ -71,7 +79,17 @@ export function CreateFormScreen({
   const setValue = (name: string, value: string) => setValues((prev) => ({ ...prev, [name]: value }))
 
   return (
-    <div className="screen">
+    /* Тап мимо поля прячет клавиатуру: на самих полях, кнопках и подписях
+       обработчик не срабатывает, чтобы не перебивать переход фокуса между
+       строками формы. */
+    <div
+      className="screen"
+      onPointerDown={(e) => {
+        if (!(e.target as HTMLElement).closest('input, select, textarea, button, label')) {
+          dismissKeyboard()
+        }
+      }}
+    >
       {/* Форма — тот же спец-лист, что и карточка записи (вариант I):
           подпись слева, поле ввода справа. Отдельного «бланка» с крупными
           полями в утверждённой раскладке нет. */}
@@ -162,6 +180,8 @@ function FormInput({
         className="sol-spec-in"
         id={field.name}
         type="text"
+        enterKeyHint="done"
+        onKeyDown={(e) => e.key === 'Enter' && e.currentTarget.blur()}
         autoCapitalize="none"
         autoCorrect="off"
         spellCheck={false}
@@ -176,6 +196,8 @@ function FormInput({
     <input
       className="sol-spec-in"
       id={field.name}
+      enterKeyHint="done"
+      onKeyDown={(e) => e.key === 'Enter' && e.currentTarget.blur()}
       type={field.kind === 'number' ? 'number' : field.kind === 'date' ? 'date' : 'text'}
       value={value}
       onChange={(e) => onChange(e.target.value)}

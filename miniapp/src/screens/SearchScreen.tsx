@@ -64,7 +64,17 @@ export function SearchScreen({
   }
 
   return (
-    <div className="screen">
+    /* Тап мимо поля прячет клавиатуру — то же правило, что на форме создания:
+       иначе результаты поиска остаются наполовину закрыты ею. */
+    <div
+      className="screen"
+      onPointerDown={(e) => {
+        if (!(e.target as HTMLElement).closest('input, select, textarea, button, label')) {
+          const active = document.activeElement
+          if (active instanceof HTMLElement) active.blur()
+        }
+      }}
+    >
       <div className="sol-head">
         <div>
           <h1>Поиск</h1>
@@ -84,6 +94,8 @@ export function SearchScreen({
               className="sol-spec-in"
               id="sol-search"
               type="search"
+              enterKeyHint="search"
+              onKeyDown={(e) => e.key === 'Enter' && e.currentTarget.blur()}
               placeholder="имя, сумма, статус…"
               value={query}
               onChange={(e) => setQuery(e.target.value)}
