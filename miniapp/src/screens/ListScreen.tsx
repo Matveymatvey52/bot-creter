@@ -265,7 +265,7 @@ export function ListScreen({
       {scope !== null && (
         <div className="ctxbar" onClick={() => setPicking(true)} role="button" tabIndex={0}>
           <div className="ctx-x">
-            <div className="ctx-k">Раздел по {scope.parentTitle.toLowerCase()}</div>
+            <div className="ctx-k">{scope.sectionLabel}</div>
             <div className="ctx-v">
               <span className="ctx-dot" />
               {contextLabel(scope, parent)}

@@ -655,7 +655,16 @@ def resource_scope(resource: dict) -> dict | None:
     via = scope.get("via")
     if not parent or not via:
         raise ScopeError('a "scoped" scope needs both "parent" and "via"')
-    return {"parent": parent, "via": via, "label_field": scope.get("label_field")}
+    # "label" — готовая подпись панели контекста («Раздел по туру»). Вывести
+    # её из title родителя нельзя: из «Туры» не получить дательный падеж
+    # единственного числа, а «Раздел по туры» человек читать не должен — та же
+    # причина, по которой у ресурса объявляется "addLabel".
+    return {
+        "parent": parent,
+        "via": via,
+        "label_field": scope.get("label_field"),
+        "label": scope.get("label"),
+    }
 
 
 def validate_scope_declarations(miniapp_config: dict) -> list[str]:
@@ -837,6 +846,7 @@ async def list_resource_handler(request: web.Request) -> web.Response:
                 "parent": scope["parent"],
                 "via": scope["via"],
                 "parentTitle": (parent_resource or {}).get("title", scope["parent"]),
+                "sectionLabel": scope["label"] or f'Раздел: {(parent_resource or {}).get("title", scope["parent"])}',
                 "parentId": None if parent_raw in (None, "", _PARENT_ALL) else parent_raw,
                 "options": await _parent_options(db, miniapp_config, scope),
             }

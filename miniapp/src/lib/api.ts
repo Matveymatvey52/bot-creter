@@ -110,6 +110,8 @@ export interface ListScope {
   parent: string
   via: string
   parentTitle: string
+  /** Готовая подпись панели контекста, объявленная шаблоном. */
+  sectionLabel: string
   // null in summary mode: every parent's rows at once, told apart by each
   // row's own parent_label.
   parentId: string | null

@@ -152,7 +152,7 @@ miniapp_config = {
             "creatable": True,
             "addLabel": "Добавить пункт программы",
             "tableView": True,
-            "scope": {"type": "scoped", "parent": "tours", "via": "tour_id"},
+            "scope": {"type": "scoped", "parent": "tours", "via": "tour_id", "label": "Раздел по туру"},
             "title": "Программа",
             "titleField": "title",
             "fields": [
@@ -178,7 +178,7 @@ miniapp_config = {
             "creatable": True,
             "addLabel": "Добавить локацию",
             "tableView": True,
-            "scope": {"type": "scoped", "parent": "tours", "via": "tour_id"},
+            "scope": {"type": "scoped", "parent": "tours", "via": "tour_id", "label": "Раздел по туру"},
             "title": "ЛиП",
             "titleField": "name",
             "fields": [
@@ -205,7 +205,7 @@ miniapp_config = {
             "creatable": True,
             "addLabel": "Добавить отель",
             "tableView": True,
-            "scope": {"type": "scoped", "parent": "tours", "via": "tour_id"},
+            "scope": {"type": "scoped", "parent": "tours", "via": "tour_id", "label": "Раздел по туру"},
             "title": "Отели",
             "titleField": "name",
             "fields": [
@@ -231,7 +231,7 @@ miniapp_config = {
             "creatable": True,
             "addLabel": "Добавить гостя",
             "tableView": True,
-            "scope": {"type": "scoped", "parent": "tours", "via": "tour_id"},
+            "scope": {"type": "scoped", "parent": "tours", "via": "tour_id", "label": "Раздел по туру"},
             "title": "Гости",
             "titleField": "name",
             "fields": [
@@ -262,7 +262,7 @@ miniapp_config = {
             "totals": [
                 {"field": "amount_rub", "label": "₽", "signBy": {"field": "type", "positive": "in"}},
             ],
-            "scope": {"type": "scoped", "parent": "tours", "via": "parent_id"},
+            "scope": {"type": "scoped", "parent": "tours", "via": "parent_id", "label": "Раздел по туру"},
             "title": "ДДС",
             "titleField": "description",
             "fields": [
