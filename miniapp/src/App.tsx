@@ -1,6 +1,13 @@
 import { useEffect, useState } from 'react'
 import './components/ui.css'
-import { getSchema, getFeatures, listResource, ApiError, type SchemaBot } from './lib/api'
+import {
+  getSchema,
+  getFeatures,
+  listResource,
+  ApiError,
+  type ResourceItem,
+  type SchemaBot,
+} from './lib/api'
 import { AppHeader } from './components/AppHeader'
 import { normalizeResources, type FieldDisplay, type ResourceDisplay } from './lib/displaySchema'
 import { getTelegramWebApp } from './lib/telegram'
@@ -9,6 +16,8 @@ import { ListScreen } from './screens/ListScreen'
 import { DetailScreen } from './screens/DetailScreen'
 import { CreateFormScreen } from './screens/CreateFormScreen'
 import { MenuScreen } from './screens/MenuScreen'
+import { TodayScreen } from './screens/TodayScreen'
+import { SearchScreen } from './screens/SearchScreen'
 import { FileScreen } from './screens/FileScreen'
 import { FactoryDashboardScreen } from './screens/FactoryDashboardScreen'
 import { AnalyticsScreen } from './screens/AnalyticsScreen'
@@ -40,6 +49,10 @@ type Route =
   | { kind: 'analytics' }
   // «Все разделы» — экран за кнопкой «⋯» в шапке (вариант I).
   | { kind: 'menu' }
+  // Сводка «что у меня сейчас» и поиск по всем разделам: то, чего лента
+  // сверху не умеет, — потому они и стоят внизу, а не дублируют её.
+  | { kind: 'today' }
+  | { kind: 'search' }
   // Один файл записи: поле и его значение уже загружены деталкой, повторно
   // ходить за записью незачем.
   | { kind: 'file'; field: FieldDisplay; value: unknown; back: Route }
@@ -84,7 +97,13 @@ function TenantApp() {
   // отдаёт, поэтому считаем сами — по одному запросу на раздел, параллельно.
   // Раздел, который не отдался, просто остаётся без счётчика: подпись для
   // навигации второстепенна и не должна ломать экран.
-  const [counts, setCounts] = useState<Record<string, number>>({})
+  // Записи всех разделов. Раньше здесь лежали только счётчики, но за ними всё
+  // равно ходил запрос в каждый раздел — теперь сохраняем сами строки: на них
+  // работают «Сегодня» и «Поиск», ни одного лишнего запроса не добавляя.
+  const [datasets, setDatasets] = useState<Record<string, ResourceItem[]>>({})
+  const counts: Record<string, number> = Object.fromEntries(
+    Object.entries(datasets).map(([name, rows]) => [name, rows.length]),
+  )
   // Кто этот бот — для шапки (вариант I). Приходит тем же /schema,
   // отдельного запроса не нужно.
   const [bot, setBot] = useState<SchemaBot | null>(null)
@@ -138,12 +157,16 @@ function TenantApp() {
     Promise.all(
       names.map((name) =>
         listResource(name)
-          .then((data) => [name, data.items.length] as const)
-          .catch(() => [name, -1] as const),
+          .then((data) => [name, data.items] as const)
+          // Раздел, который не отдался, просто выпадает из сводки и поиска —
+          // молча и без счётчика, вместо того чтобы валить весь экран.
+          .catch(() => [name, null] as const),
       ),
     ).then((pairs) => {
       if (cancelled) return
-      setCounts(Object.fromEntries(pairs.filter(([, n]) => n >= 0)))
+      setDatasets(
+        Object.fromEntries(pairs.filter((p): p is readonly [string, ResourceItem[]] => p[1] !== null)),
+      )
     })
     return () => {
       cancelled = true
@@ -158,15 +181,21 @@ function TenantApp() {
   }
 
   const resourceNames = Object.keys(resources)
-  // Нижняя навигация — первые три раздела плюс «Аналитика» (вариант I).
-  // Лента выше остаётся полным списком разделов; нижняя панель — быстрый
-  // доступ к тем, куда ходят чаще всего.
-  const navNames = resourceNames.slice(0, 3)
 
-  const activeResource =
-    route.kind === 'list' || route.kind === 'detail' || route.kind === 'create'
+  // «Сегодня» показывает ближайшие даты и объявленные итоги. Если у бота нет
+  // ни одного поля-даты и ни одного итога, экран был бы пустым — кнопки не
+  // будет вовсе, вместо того чтобы вести в пустоту.
+  const hasToday = resourceNames.some(
+    (n) =>
+      resources[n].totals.length > 0 ||
+      resources[n].listFields.concat(resources[n].detailFields).some((f) => f.kind === 'date'),
+  )
+  // «Создать» ведёт в текущий раздел, а вне разделов — в первый, куда этому
+  // зрителю вообще разрешено писать. Backend решает через canCreate.
+  const createTarget =
+    (route.kind === 'list' || route.kind === 'detail') && resources[route.resource]?.canCreate
       ? route.resource
-      : null
+      : resourceNames.find((n) => resources[n].canCreate)
 
   // Куда ведёт «назад» в шапке. На корневом экране (список раздела) возвращать
   // некуда — кнопка не рисуется вовсе, вместо неё пустой отступ.
@@ -175,7 +204,7 @@ function TenantApp() {
       ? { kind: 'list', resource: route.resource }
       : route.kind === 'file'
         ? route.back
-        : route.kind === 'menu'
+        : route.kind === 'menu' || route.kind === 'today' || route.kind === 'search'
           ? { kind: 'list', resource: resourceNames[0] ?? '' }
           : null
 
@@ -269,35 +298,65 @@ function TenantApp() {
         />
       )}
 
+      {route.kind === 'today' && (
+        <TodayScreen
+          resources={resources}
+          datasets={datasets}
+          onOpenItem={(name, itemId) => setRoute({ kind: 'detail', resource: name, itemId })}
+        />
+      )}
+
+      {route.kind === 'search' && (
+        <SearchScreen
+          resources={resources}
+          datasets={datasets}
+          onOpenItem={(name, itemId) => setRoute({ kind: 'detail', resource: name, itemId })}
+        />
+      )}
+
       {route.kind === 'file' && (
         <FileScreen field={route.field} value={route.value} onBack={() => setRoute(route.back)} />
       )}
 
-      {navNames.length > 0 && (
-        <nav className="sol-nav">
-          {navNames.map((name) => (
-            <button
-              key={name}
-              className={`sol-nv${activeResource === name ? ' is-on' : ''}`}
-              onClick={() => setRoute({ kind: 'list', resource: name })}
-            >
-              <Icon name={iconForResource(name, resources[name].title)} size={18} />
-              <span>{resources[name].title}</span>
-            </button>
-          ))}
-          {/* Четвёртый пункт — «Ещё», как в эталоне: первые три раздела уже
-              есть в ленте выше, дублировать четвёртым тот же список незачем.
-              «Ещё» ведёт на «Все разделы», где видны ВСЕ разделы сразу и
-              «Аналитика», если она подключена этому боту. */}
+      {/* Нижняя навигация НЕ повторяет ленту разделов сверху: лента водит
+          между разделами, а здесь — то, чего в ней нет. Состав собирается по
+          возможностям конкретного бота, а не задан одинаковым для всех: у
+          справочника без создания кнопки «Создать» не будет, у бота без дат и
+          итогов — «Сегодня». Кнопка, которой нечего показать, не рисуется. */}
+      <nav className="sol-nav">
+        {hasToday && (
           <button
-            className={`sol-nv${route.kind === 'menu' || route.kind === 'analytics' ? ' is-on' : ''}`}
-            onClick={() => setRoute({ kind: 'menu' })}
+            className={`sol-nv${route.kind === 'today' ? ' is-on' : ''}`}
+            onClick={() => setRoute({ kind: 'today' })}
           >
-            <Icon name="dots" size={18} />
-            <span>Ещё</span>
+            <Icon name="check" size={18} />
+            <span>Сегодня</span>
           </button>
-        </nav>
-      )}
+        )}
+        {createTarget && (
+          <button
+            className={`sol-nv${route.kind === 'create' ? ' is-on' : ''}`}
+            onClick={() => setRoute({ kind: 'create', resource: createTarget })}
+          >
+            <Icon name="plus" size={18} />
+            <span>Создать</span>
+          </button>
+        )}
+        <button
+          className={`sol-nv${route.kind === 'search' ? ' is-on' : ''}`}
+          onClick={() => setRoute({ kind: 'search' })}
+        >
+          <Icon name="section" size={18} />
+          <span>Поиск</span>
+        </button>
+        <button
+          className={`sol-nv${route.kind === 'menu' || route.kind === 'analytics' ? ' is-on' : ''}`}
+          onClick={() => setRoute({ kind: 'menu' })}
+        >
+          <Icon name="dots" size={18} />
+          <span>Ещё</span>
+        </button>
+      </nav>
     </>
   )
 }
